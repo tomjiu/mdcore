@@ -77,6 +77,7 @@ import { setupEvidencePanel } from './evidence_panel.js';
 import { setupPdfView } from './pdf_view.js';
 import { setupXlsxGrid, gridOpenBytesWhenReady } from './xlsx_grid.js';
 import { t, tCount, initI18n, applyStaticI18n } from './i18n/index.js';
+import { asyncImport, cancelAsyncImport, asyncImportBusy, WORKER_INFRA_CODES } from './import_async.js';
 
 // ---------------------------------------------------------------------------
 // 核侧数据形状（blocks_json / take_events 的最小面）
@@ -1362,6 +1363,18 @@ declare global {
     __setSetting: (path: string, value: number | boolean | string) => boolean;
     /** t16：DOCX 字节导入（兼容模式读面 + 模型→MD 映射；成功后经 __inject 重建核）。 */
     __importDocx: (bytes: Uint8Array) => { ok: true; markdown: string; stats: Record<string, unknown> } | { ok: false; code: string; message: string };
+    /** #479：异步导入调试/测试面（与 __perf/__blockCount 同族——生产代码
+     * 只读 workerEnabled；cancel/busy/enable 供 e2e 与 Esc 键面消费）。 */
+    __asyncImportDebug: {
+      /** 取消在途导入（terminate worker）；无在途 = false。 */
+      cancel: () => boolean;
+      /** 是否有在途导入。 */
+      busy: () => boolean;
+      /** 测试注入：false = 禁用 worker 路径（下次导入直走同步回落）。 */
+      enable: (v: boolean) => void;
+      /** 最近一次 file-input 导入的路径模式与 infra 错误（若回落）。 */
+      state: () => { lastMode: 'idle' | 'worker' | 'sync-fallback'; lastError?: string; busy: boolean };
+    };
     /** t16：最近一次 DOCX 导入结果（成功 = {ok, markdown, stats}；失败 = {ok:false, code, message}）。 */
     __lastDocxImport: { ok: boolean; markdown?: string; stats?: Record<string, unknown>; code?: string; message?: string } | null;
     /** t17：XLSX 字节导入（表→GFM 表映射 + 规模上限 stats；成功后经 __inject 重建核）。 */
@@ -1922,6 +1935,39 @@ function docxStatusLine(stats: DocxImportStats): string {
   return t('status.imported', { parts: parts.join(' · ') });
 }
 
+// ---------------------------------------------------------------------------
+// #479 — 异步导入桥状态（方案 A：专职 worker 主路径 + 同步回落双轨）。
+//
+// 状态面（asyncImportBridge）+ 测试面（window.__asyncImportDebug）+
+// Esc 取消键（v0 取消 UX——进度面板属后续轮，见 issue 范围「不改」）。
+// worker 客户端实现 = web/src/import_async.ts；worker 入口 =
+// web/src/import-worker.ts（协议单一真源在 import_async.ts 模块文档）。
+// ---------------------------------------------------------------------------
+/** worker 路径使能（测试注入面：false = 强制同步回落）。 */
+let asyncWorkerEnabled = true;
+/** file-input 导入路径记账（e2e 断言面：worker 主路径确实在跑 / 回落确实发生）。 */
+const asyncImportBridge = {
+  lastMode: 'idle' as 'idle' | 'worker' | 'sync-fallback',
+  lastError: undefined as string | undefined,
+  workerEnabled: (): boolean => asyncWorkerEnabled,
+};
+window.__asyncImportDebug = {
+  cancel: (): boolean => cancelAsyncImport(),
+  busy: (): boolean => asyncImportBusy(),
+  enable: (v: boolean): void => {
+    asyncWorkerEnabled = v;
+  },
+  state: (): { lastMode: 'idle' | 'worker' | 'sync-fallback'; lastError?: string; busy: boolean } => ({
+    lastMode: asyncImportBridge.lastMode,
+    lastError: asyncImportBridge.lastError,
+    busy: asyncImportBusy(),
+  }),
+};
+// Esc 取消在途导入（v0 UX——无面板无按钮，键盘面最小；无在途零动作）。
+document.addEventListener('keydown', (e: KeyboardEvent) => {
+  if (e.key === 'Escape' && asyncImportBusy()) cancelAsyncImport();
+});
+
 function setupDocxImport(): void {
   const fileInput = document.getElementById('docx-file') as HTMLInputElement | null;
   const statusEl = document.getElementById('docx-status') as HTMLElement | null;
@@ -1950,10 +1996,13 @@ function setupDocxImport(): void {
     }
     if (isError) clearWarnings();
   };
-  window.__importDocx = (bytes: Uint8Array):
+  // #479：结果应用面（同步桥与异步 worker 路径共用——零第二真相：
+  // 同一 __lastDocxImport / __inject / 状态行 / 警告面板发射）。
+  const applyDocxResult = (result:
+    | { ok: true; markdown: string; stats: DocxImportStats }
+    | { ok: false; code: string; message: string }):
     | { ok: true; markdown: string; stats: Record<string, unknown> }
     | { ok: false; code: string; message: string } => {
-    const result = docxImport(bytes);
     if (!result.ok) {
       window.__lastDocxImport = { ok: false, code: result.code, message: result.message };
       showStatus(t('status.importFailed', { code: result.code, message: result.message }), true);
@@ -1973,12 +2022,46 @@ function setupDocxImport(): void {
     if (statusEl) renderImportWarnings(statusEl, 'docx-warning-panel', result.stats.warnings);
     return { ok: true, markdown: result.markdown, stats: result.stats as unknown as Record<string, unknown> };
   };
+  window.__importDocx = (bytes: Uint8Array):
+    | { ok: true; markdown: string; stats: Record<string, unknown> }
+    | { ok: false; code: string; message: string } => applyDocxResult(docxImport(bytes));
+  // #479：file input 异步主路径（方案 A 双轨）——worker 导入；infra
+  // 失败（init/构造/超时）自动回落同步桥（CONTRACT 同步面恒保留）；
+  // 取消/顶替 = import_cancelled（状态行诚实提示，不注入）。
+  const runDocxImport = async (bytes: Uint8Array): Promise<void> => {
+    if (!asyncImportBridge.workerEnabled()) {
+      asyncImportBridge.lastMode = 'sync-fallback';
+      window.__importDocx(bytes);
+      return;
+    }
+    showStatus(t('status.importing'), false);
+    const result = await asyncImport<DocxImportStats>('docx', bytes);
+    if (!result.ok && result.code === 'import_cancelled') {
+      // 取消先行判（在 infra 回落前——取消是意图非故障，回落同步
+      // 重导入会让「Esc 取消」变「同步阻塞再导一次」，语义自反）。
+      asyncImportBridge.lastMode = 'worker';
+      asyncImportBridge.lastError = undefined;
+      showStatus(t('status.importCancelled'), false);
+      return; // 取消：不注入不计数（诚实面）
+    }
+    if (!result.ok && WORKER_INFRA_CODES.has(result.code)) {
+      // worker 不可用 → 同步回落（结果面与直接同步导入零差异）。
+      asyncImportBridge.lastMode = 'sync-fallback';
+      asyncImportBridge.lastError = result.message;
+      window.__importDocx(bytes);
+      return;
+    }
+    asyncImportBridge.lastMode = 'worker';
+    asyncImportBridge.lastError = undefined;
+    applyDocxResult(result);
+  };
   fileInput?.addEventListener('change', () => {
     void (async (): Promise<void> => {
       const file = fileInput.files?.[0];
       if (!file) return;
-      window.__importDocx(new Uint8Array(await file.arrayBuffer()));
-      fileInput.value = ''; // 同名重选可再触发 change
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      fileInput.value = ''; // 立即重置（#479：异步在途时可再选文件——顶替旧导入）
+      await runDocxImport(bytes);
     })();
   });
   window.__lastDocxImport = null;
@@ -2096,10 +2179,14 @@ function setupXlsxImport(): void {
     }
     if (isError) clearWarnings();
   };
-  window.__importXlsx = (bytes: Uint8Array):
+  // #479：结果应用面（同步桥与异步 worker 路径共用——docx 面同构；
+  // Grid 联动（#42）以 bytes 为参——worker 路径同样持主线程侧 bytes）。
+  const applyXlsxResult = (result:
+    | { ok: true; markdown: string; stats: XlsxImportStats }
+    | { ok: false; code: string; message: string },
+    bytes: Uint8Array):
     | { ok: true; markdown: string; stats: Record<string, unknown> }
     | { ok: false; code: string; message: string } => {
-    const result = xlsxImport(bytes);
     if (!result.ok) {
       window.__lastXlsxImport = { ok: false, code: result.code, message: result.message };
       showStatus(t('status.importFailed', { code: result.code, message: result.message }), true);
@@ -2141,12 +2228,43 @@ function setupXlsxImport(): void {
     })();
     return { ok: true, markdown: result.markdown, stats: result.stats as unknown as Record<string, unknown> };
   };
+  window.__importXlsx = (bytes: Uint8Array):
+    | { ok: true; markdown: string; stats: Record<string, unknown> }
+    | { ok: false; code: string; message: string } => applyXlsxResult(xlsxImport(bytes), bytes);
+  // #479：file input 异步主路径（docx 面同构——worker 主路径 + infra
+  // 回落同步桥 + 取消诚实提示）。
+  const runXlsxImport = async (bytes: Uint8Array): Promise<void> => {
+    if (!asyncImportBridge.workerEnabled()) {
+      asyncImportBridge.lastMode = 'sync-fallback';
+      window.__importXlsx(bytes);
+      return;
+    }
+    showStatus(t('status.importing'), false);
+    const result = await asyncImport<XlsxImportStats>('xlsx', bytes);
+    if (!result.ok && result.code === 'import_cancelled') {
+      // 取消先行判（docx 面同构——取消 ≠ infra 回落）。
+      asyncImportBridge.lastMode = 'worker';
+      asyncImportBridge.lastError = undefined;
+      showStatus(t('status.importCancelled'), false);
+      return; // 取消：不注入不计数（诚实面）
+    }
+    if (!result.ok && WORKER_INFRA_CODES.has(result.code)) {
+      asyncImportBridge.lastMode = 'sync-fallback';
+      asyncImportBridge.lastError = result.message;
+      window.__importXlsx(bytes);
+      return;
+    }
+    asyncImportBridge.lastMode = 'worker';
+    asyncImportBridge.lastError = undefined;
+    applyXlsxResult(result, bytes);
+  };
   fileInput?.addEventListener('change', () => {
     void (async (): Promise<void> => {
       const file = fileInput.files?.[0];
       if (!file) return;
-      window.__importXlsx(new Uint8Array(await file.arrayBuffer()));
-      fileInput.value = ''; // 同名重选可再触发 change
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      fileInput.value = ''; // 立即重置（#479：异步在途时可再选文件——顶替旧导入）
+      await runXlsxImport(bytes);
     })();
   });
   window.__lastXlsxImport = null;

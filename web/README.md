@@ -200,7 +200,22 @@ afterprint 恢复懒态。Ctrl+P 为 best-effort（beforeprint 无法 await，�
 （打印编辑器正文）。测试 `tests/pdf_print.py`（8 锁——含 `page.pdf()`
 真实打印管线分页主锁）。
 
-### 8.5 测试面
+### 8.5 异步导入 Worker（#479）
+
+`#docx-file` / `#xlsx-file` 的 change 路径走**专职导入 worker**
+（`src/import-worker.ts`，esbuild 单独打包为 `dist/import-worker.js`）：
+init 握手（ready）→ `{type:'import', format, bytes}` → result 回传 →
+主线程 terminate。大档（50MB 级）导入期间 rAF 保活（主线程零阻塞，
+R-1 实测同步路径冻结 4.9s 的问题面）。**双轨**：worker 构造/init 失败
+（infra 码 `worker_init_failed` / `worker_timeout` / `worker_error`）
+自动回落同步桥——`window.__importDocx` / `__importXlsx` 的 CONTRACT
+同步契约恒保留（15+ 既有套件零改动）。在途导入：Esc 取消 / 新导入
+顶替（terminate——无晚到竞态）；单次导入单 worker（峰值内存导入毕
+即释放）。bytes 传**拷贝**非 transfer（#42 Grid 联动需要主线程侧
+bytes——与设计文档原案的登记偏离）。测试 `tests/import_worker.py`
+（rAF 保活 + 双路字节一致 + 回落 + 取消四态）。
+
+### 8.6 测试面
 
 `editor_toolbar.py`（26 checks）+ `hostile_ui.py`（8 checks：
 空文档/200KB 大文档/emoji 代理对/BIDI/面板叠加/连击 20 次/

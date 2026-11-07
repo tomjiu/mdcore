@@ -106,6 +106,9 @@ export const zhCN: Dict = {
 
   // ---- 导入/导出状态行（main.ts 组合串）----
   'status.imported': '已导入：{parts}',
+  // #479：异步导入在途/取消态（worker 主路径状态行）
+  'status.importing': '导入中……（Esc 取消）',
+  'status.importCancelled': '导入已取消',
   'status.exported': '已导出：{parts}',
   'status.importFailed': '导入失败（{code}）：{message}',
   'status.exportFailed': '导出失败（{code}）：{message}',

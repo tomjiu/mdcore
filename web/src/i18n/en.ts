@@ -110,6 +110,9 @@ export const en = {
 
   // ---- 导入/导出状态行（main.ts 组合串）----
   'status.imported': 'imported: {parts}',
+  // #479: async import in-flight / cancelled (worker path status line)
+  'status.importing': 'importing… (Esc to cancel)',
+  'status.importCancelled': 'import cancelled',
   'status.exported': 'exported: {parts}',
   'status.importFailed': 'import failed ({code}): {message}',
   'status.exportFailed': 'export failed ({code}): {message}',
