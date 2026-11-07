@@ -382,11 +382,17 @@ impl FileTree {
         // 按下点坐标；动作派发回 shell 的 activate_context_menu_item。
         // ListItem.on_secondary_mouse_down——组件内 MouseButton::Right）。
         .on_secondary_mouse_down(
-            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 let pos =
                     context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
                 let _ = this.shell.update(cx, |shell, cx| {
-                    shell.open_file_tree_context_menu(pos, path_for_menu.clone(), is_dir, cx)
+                    shell.open_file_tree_context_menu(
+                        pos,
+                        path_for_menu.clone(),
+                        is_dir,
+                        window,
+                        cx,
+                    )
                 });
             }),
         )
