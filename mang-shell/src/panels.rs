@@ -15,10 +15,17 @@
 //! 按 #166 判定表归档②（不该出现在界面）：真实导入/导出功能属标书
 //! 业务面（#171 裁决：标书侧后端未迁移前不接入），等能力就位再随
 //! 功能一起回来，不先摆死节点。
+//!
+//! #385 批 5a（2026-11-08）：行渲染迁 `ui::List` 组件族——
+//! `ListHeader`（分组头：静态展开箭头 + 图标 + 组名）/ `ListItem`
+//! （行：hover/选中态/缩进语义/ARIA）/ `List`（容器 + 空态）。
+//! 手写 hover 背景与 pl 缩进退役，行视觉与 zed 语系统一
+//! （ghost_element_hover / ghost_element_selected / 12px 缩进步进
+//! ——与旧手写值同值）。属性行迁 `ListItem`（selectable=false 静态）。
 
-use gpui::{App, Entity, Hsla, MouseButton, Pixels, WeakEntity, px};
+use gpui::{App, Entity, Pixels, WeakEntity, px};
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, List, ListHeader, ListItem};
 
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
@@ -79,7 +86,6 @@ pub fn left_panel(
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
-    let hover = colors.element_hover;
     let open_docs: Vec<(String, bool)> = match editor {
         Some(ed) => vec![(ed.read(cx).display_name().to_string(), true)],
         None => vec![],
@@ -136,16 +142,9 @@ pub fn left_panel(
         // 无工作区时自然高度内容不溢出）。
         .when(!git_view, |el| {
             el.when_some(workspace, |el, tree| el.child(tree.clone()))
-                .child(tree_group(
-                    "tg-docs",
-                    "打开的文档",
-                    true,
-                    &open_docs,
-                    hover,
-                    colors.element_selected,
-                ))
+                .child(tree_group("tg-docs", "打开的文档", true, &open_docs))
                 .when_some((!headings.is_empty()).then_some(()), |el, _| {
-                    el.child(heading_tree("tg-outline", &headings, editor, shell, hover))
+                    el.child(heading_tree("tg-outline", &headings, editor, shell))
                 })
         })
 }
@@ -153,32 +152,24 @@ pub fn left_panel(
 /// 结构树（批 3 docx 标题树 + 批 4 pdf 书签树）：层级缩进 +
 /// 点击跳转（光标落条目行首 + 滚入可视区顶部；pdf 页面视图下
 /// 书签随页滚动——#289-④）。
+///
+/// #385 批 5a：行迁 `ListItem`——hover/圆角/缩进（步进 12px 与旧手写
+/// 同值）/ARIA listitem 语义，点击走 ListItem::on_click；分组头迁
+/// `ListHeader`（静态展开箭头 + 类型图标）。手写 hover 闭包与 pl
+/// 缩进退役。
 fn heading_tree(
     id: &'static str,
     headings: &[(String, usize, usize)],
     editor: Option<&Entity<Editor>>,
     shell: Option<WeakEntity<ShellApp>>,
-    hover_bg: Hsla,
 ) -> impl IntoElement {
-    v_flex()
-        .id(id)
-        .gap_1()
-        .child(
-            h_flex()
-                .id(SharedString::from(format!("{id}-head")))
-                .gap_1()
-                .rounded_sm()
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(IconSize::XSmall)
-                        .color(ui::Color::Muted),
-                )
-                .child(
-                    Icon::new(IconName::ListTree)
-                        .size(IconSize::XSmall)
-                        .color(ui::Color::Muted),
-                )
-                .child(Label::new("文档结构").size(LabelSize::Small)),
+    List::new()
+        .header(
+            ListHeader::new("文档结构").toggle(true).start_slot(
+                Icon::new(IconName::ListTree)
+                    .size(IconSize::XSmall)
+                    .color(ui::Color::Muted),
+            ),
         )
         .children(
             headings
@@ -188,15 +179,14 @@ fn heading_tree(
                     let editor = editor.cloned();
                     let shell = shell.clone();
                     let line = *line;
-                    h_flex()
-                        .id(SharedString::from(format!("{id}-item-{i}")))
-                        // 层级缩进：每级 12px（1 级不缩进——条目已带 Hn/页号前缀）。
-                        .pl(px(12. + (level.saturating_sub(1)) as f32 * 12.))
-                        .gap_1()
-                        .rounded_sm()
-                        .hover(move |el| el.bg(hover_bg))
+                    ListItem::new(SharedString::from(format!("{id}-item-{i}")))
+                        .inset(true)
+                        // 层级缩进：每级 12px（1 级不缩进——条目已带 Hn/页号
+                        // 前缀；ListItem 缺省步进即 12px，与旧手写同值）。
+                        .indent_level(level.saturating_sub(1))
+                        .child(Label::new(label.as_str()).size(LabelSize::Small))
                         .when_some(editor, |el, ed| {
-                            el.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            el.on_click(move |_, window, cx| {
                                 ed.update(cx, |ed, _| ed.jump_to_line(line));
                                 // #289-④：pdf 页面视图下书签随页滚动
                                 //（行号 → 页号 → scroll_pdf_to_page；
@@ -212,7 +202,6 @@ fn heading_tree(
                                 window.prevent_default();
                             })
                         })
-                        .child(Label::new(label.as_str()).size(LabelSize::Small))
                 }),
         )
 }
@@ -406,85 +395,98 @@ pub fn right_panel(editor: Option<&Entity<Editor>>, width: Pixels, cx: &App) -> 
 
 /// 属性键值行（_owned 变体——docx 行动态 String 键；视觉与
 /// [`property_row`] 恒同）。
+///
+/// #385 批 5a：迁 `ListItem`（selectable=false——静态展示行无 hover；
+/// inset 行距与 zed 语系统一，ARIA listitem 语义自带）。
 fn property_row_owned(key: String, value: String) -> impl IntoElement {
-    h_flex()
-        .id(SharedString::from(format!("prop-{key}")))
-        .w_full()
-        .justify_between()
+    ListItem::new(SharedString::from(format!("prop-{key}")))
+        .selectable(false)
+        .inset(true)
         .child(
-            Label::new(key)
-                .size(LabelSize::Small)
-                .color(ui::Color::Muted),
+            h_flex()
+                .w_full()
+                .justify_between()
+                .child(
+                    Label::new(key)
+                        .size(LabelSize::Small)
+                        .color(ui::Color::Muted),
+                )
+                .child(Label::new(value).size(LabelSize::Small)),
         )
-        .child(Label::new(value).size(LabelSize::Small))
 }
 
 /// 文件树分组：折叠箭头 + 文件夹图标 + 组名，展开时子行缩进。
+///
+/// #385 批 5a：分组头迁 `ListHeader`（静态展开箭头 Disclosure + 图标），
+/// 子行迁 `ListItem`（激活文档 toggle_state → ghost_element_selected，
+/// 与旧手写 selected_bg 同语义）。手写 hover/选中背景闭包退役。
+/// （折叠交互未接——`expanded` 恒 true 于现役调用点，与旧行为一致；
+/// 接折叠时给 ListHeader 挂 on_toggle 即可，状态面归 shell。）
 fn tree_group(
     id: &'static str,
     name: &'static str,
     expanded: bool,
     children: &[(&str, bool)],
-    hover_bg: Hsla,
-    selected_bg: Hsla,
 ) -> impl IntoElement {
-    let (chevron, folder) = if expanded {
-        (IconName::ChevronDown, IconName::FolderOpen)
+    let folder = if expanded {
+        IconName::FolderOpen
     } else {
-        (IconName::ChevronRight, IconName::Folder)
+        IconName::Folder
     };
-    v_flex()
-        .id(id)
-        .gap_1()
-        .child(
-            h_flex()
-                .id(SharedString::from(format!("{id}-head")))
-                .gap_1()
-                .rounded_sm()
-                .hover(move |el| el.bg(hover_bg))
-                .child(
-                    Icon::new(chevron)
-                        .size(IconSize::XSmall)
-                        .color(ui::Color::Muted),
-                )
-                .child(
-                    Icon::new(folder)
-                        .size(IconSize::XSmall)
-                        .color(ui::Color::Muted),
-                )
-                .child(Label::new(name).size(LabelSize::Small)),
-        )
-        .when(expanded, |el| {
-            el.children(children.iter().map(|(child, active)| {
-                h_flex()
-                    .id(SharedString::from(format!("{id}-{child}")))
-                    .pl_5()
-                    .gap_1()
-                    .rounded_sm()
-                    .when(*active, |el| el.bg(selected_bg))
-                    .hover(move |el| el.bg(hover_bg))
-                    .child(
+    // 折叠态/空子行不渲染子行；空子行时 List.toggle(false) 抑制
+    // "No items" 空态（与旧行为一致——组头恒在、不摆空态占位）。
+    let rows: Vec<_> = if expanded {
+        children
+            .iter()
+            .map(|(child, active)| {
+                ListItem::new(SharedString::from(format!("{id}-{child}")))
+                    .inset(true)
+                    .toggle_state(*active)
+                    .start_slot(
                         Icon::new(IconName::File)
                             .size(IconSize::XSmall)
                             .color(ui::Color::Muted),
                     )
                     .child(Label::new(*child).size(LabelSize::Small))
-            }))
-        })
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    let mut list = List::new().header(
+        ListHeader::new(name).toggle(expanded).start_slot(
+            Icon::new(folder)
+                .size(IconSize::XSmall)
+                .color(ui::Color::Muted),
+        ),
+    );
+    if rows.is_empty() {
+        list = list.toggle(false);
+    } else {
+        list = list.children(rows);
+    }
+    list
 }
 
 /// 属性键值行：键（muted）— 值（默认色），两端对齐。
+///
+/// #385 批 5a：迁 `ListItem`（同 [`property_row_owned`]——静态行，
+/// selectable=false）。
 fn property_row(key: &str, value: &str) -> impl IntoElement {
-    h_flex()
-        .id(SharedString::from(format!("prop-{key}")))
-        .w_full()
-        .justify_between()
+    ListItem::new(SharedString::from(format!("prop-{key}")))
+        .selectable(false)
+        .inset(true)
         .child(
-            Label::new(key)
-                .size(LabelSize::Small)
-                .color(ui::Color::Muted),
+            h_flex()
+                .w_full()
+                .justify_between()
+                .child(
+                    Label::new(key)
+                        .size(LabelSize::Small)
+                        .color(ui::Color::Muted),
+                )
+                .child(Label::new(value).size(LabelSize::Small)),
         )
-        .child(Label::new(value).size(LabelSize::Small))
 }
 
 // =============================================================================
