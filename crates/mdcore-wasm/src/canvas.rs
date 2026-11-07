@@ -372,6 +372,8 @@ pub fn batch_receipt_json(r: &mdc_canvas::BatchReceipt) -> String {
                 // #350 笔迹面：与单命令 receipt_json 同构
                 CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
                 CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+                // #402 z 序面：与单命令 receipt_json 同构
+                CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
             };
             format!(
                 "{{\"outcome\":\"{kind}\",\"{key}\":{}}}",
