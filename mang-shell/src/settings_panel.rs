@@ -33,7 +33,10 @@
 
 use gpui::{App, ClickEvent, Context, Hsla, Pixels, Window, px};
 use ui::prelude::*;
-use ui::{Color, Icon, IconName, IconSize, Label, LabelSize, Tooltip};
+use ui::{
+    Color, Icon, IconName, IconSize, Label, LabelSize, Modal, ModalHeader, Section, SectionHeader,
+    Tooltip,
+};
 
 use crate::editor::buffer::IndentUnit;
 use crate::shell::ShellApp;
@@ -41,17 +44,25 @@ use crate::theme_switch;
 
 /// 弹窗卡片宽度（px）。
 const MODAL_W: Pixels = px(400.);
-/// 卡片主内边距（px，与 panels.rs 同规格）。
-const PANEL_PADDING: Pixels = px(16.);
-/// 分组标题上缘留白（px）。
-const GROUP_MARGIN: Pixels = px(8.);
 /// 控件钮纵向高度（px）。
 const CONTROL_H: Pixels = px(26.);
 /// 「标签 + 控件」行的标签列宽（px）。
 const LABEL_W: Pixels = px(64.);
 
-/// 渲染设置弹窗（`ShellApp::settings_open` 为真时由 shell 渲染链尾
-/// 挂载——模态遮罩拦截外部点按，后画的卡片承接内部交互）。
+/// 渲染设置弹窗（#385 批 3：卡片骨架迁 `ui::Modal`；`ShellApp::settings_open`
+/// 为真时由 shell 渲染链尾挂载）。
+///
+/// 迁移面（原 378 行手写外壳 → 组件）：
+/// - 卡片骨架/标题行/关闭钮 → `Modal` + `ModalHeader`（headline 排版、
+///   dismiss 钮、分组间距全组件）；
+/// - 分组 → `Section` + `SectionHeader`（原 group_header 手写退役）；
+/// - 控件行容器 → `ModalRow`；
+/// - 保留：遮罩/居中（ui crate 无遮罩组件——模态容器是 zed 主仓
+///   闭包外能力）、按钮族（choice/step/action——bar_button 同款自绘
+///   视觉语系，对照表不迁清单）。
+///
+/// 关闭链：组件 dismiss 钮 dispatch `menu::Cancel` → 本层 `on_action`
+/// 接住 → `close_settings`（与 Esc / 点遮罩同一条链）。
 ///
 /// `theme_mode` / `font_size` / `indent_unit` 均为 ShellApp 运行时状态
 /// （调用处传入），点击经 `cx.listener` 回写 ShellApp（单一状态源，
@@ -77,26 +88,25 @@ pub fn settings_modal(
         .on_mouse_down(gpui::MouseButton::Left, {
             cx.listener(|this, _, _, cx| this.close_settings(cx))
         })
-        .child(settings_card(
-            theme_mode,
-            font_size,
-            indent_unit,
-            &colors,
-            cx,
-        ))
+        // ModalHeader 的 dismiss 钮 dispatch menu::Cancel——在这里
+        // 接住（与 Esc / 点遮罩同一条 close_settings 链）。
+        .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
+            this.close_settings(cx);
+        }))
+        .child(ui_modal(theme_mode, font_size, indent_unit, &colors, cx))
 }
 
-/// 弹窗卡片（居中、固定宽、标题行 + 可滚动内容体）。
-fn settings_card(
+/// 弹窗卡片（#385 批 3：骨架迁 `ui::Modal`——header/section 排版全
+/// 组件；卡片尺寸/浮层视觉容器由本层提供，`Modal` 是填充式骨架
+/// （size_full——zed 用法即「放进预设尺寸的卡片容器」）。
+fn ui_modal(
     theme_mode: &'static str,
     font_size: f32,
     indent_unit: IndentUnit,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
-    let hover = colors.element_hover;
-    let selected = colors.element_selected;
-    v_flex()
+    div()
         .id("settings-card")
         .w(MODAL_W)
         .max_h(px(520.))
@@ -106,168 +116,190 @@ fn settings_card(
         .border_color(colors.border)
         .rounded_md()
         .shadow_lg()
-        .p(PANEL_PADDING)
-        .gap_1()
         .overflow_y_scroll()
-        // 标题行：「设置」+ 右侧关闭钮（与 Esc / 点遮罩同一条 close 链）。
-        .child(
-            h_flex()
-                .id("settings-header")
-                .w_full()
-                .justify_between()
-                .items_center()
-                .mb(GROUP_MARGIN)
-                .child(
-                    Label::new("设置")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    div()
-                        .id("settings-close")
-                        .size(CONTROL_H)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .hover(|el| el.bg(hover))
-                        .tooltip(Tooltip::text("关闭（Esc）"))
-                        .child(Icon::new(IconName::Close).size(IconSize::XSmall))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
-                ),
+        .child(modal_body(theme_mode, font_size, indent_unit, colors, cx))
+}
+
+/// `ui::Modal` 骨架（标题行 + 分区——排版/间距/主题色全组件）。
+fn modal_body(
+    theme_mode: &'static str,
+    font_size: f32,
+    indent_unit: IndentUnit,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> Modal {
+    Modal::new("settings", None)
+        .header(
+            ModalHeader::new()
+                .headline("设置")
+                .show_dismiss_button(true),
         )
         // ── 外观 ───────────────────────────────────────────
-        .child(group_header("sg-appearance", "外观"))
-        .child(control_row(
-            "sg-theme-row",
-            "主题",
-            h_flex()
-                .id("sg-theme-choices")
-                .gap_1()
-                .child(choice_button(
-                    "sg-theme-system",
-                    "跟随系统",
-                    theme_mode == theme_switch::MODE_SYSTEM,
-                    hover,
-                    selected,
-                    cx.listener(|this, _, _, cx| {
-                        this.set_theme_mode(theme_switch::MODE_SYSTEM, cx)
-                    }),
-                ))
-                .child(choice_button(
-                    "sg-theme-light",
-                    "浅色",
-                    theme_mode == theme_switch::MODE_LIGHT,
-                    hover,
-                    selected,
-                    cx.listener(|this, _, _, cx| this.set_theme_mode(theme_switch::MODE_LIGHT, cx)),
-                ))
-                .child(choice_button(
-                    "sg-theme-dark",
-                    "深色",
-                    theme_mode == theme_switch::MODE_DARK,
-                    hover,
-                    selected,
-                    cx.listener(|this, _, _, cx| this.set_theme_mode(theme_switch::MODE_DARK, cx)),
+        .section(
+            Section::new()
+                .header(SectionHeader::new("外观"))
+                .child(control_row(
+                    "sg-theme-row",
+                    "主题",
+                    theme_choices(theme_mode, colors, cx),
                 )),
-        ))
+        )
         // ── 编辑器 ─────────────────────────────────────────
-        .child(group_header("sg-editor", "编辑器"))
-        .child(control_row(
-            "sg-font-row",
-            "字号",
-            h_flex()
-                .id("sg-font-stepper")
-                .gap_1()
-                .child(step_button(
-                    "sg-font-dec",
-                    IconName::SquareMinus,
-                    "减小字号",
-                    font_size > 8.,
-                    hover,
-                    cx.listener(move |this, _, _, cx| {
-                        this.apply_font_size(px((font_size - 1.).max(8.)), cx);
-                    }),
+        .section(
+            Section::new()
+                .header(SectionHeader::new("编辑器"))
+                .child(control_row(
+                    "sg-font-row",
+                    "字号",
+                    font_stepper(font_size, colors, cx),
                 ))
-                .child(
-                    div()
-                        .id("sg-font-value")
-                        .h(CONTROL_H)
-                        .flex()
-                        .items_center()
-                        .px_2()
-                        .child(
-                            Label::new(format!("{font_size:.0} px"))
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                        ),
-                )
-                .child(step_button(
-                    "sg-font-inc",
-                    IconName::Plus,
-                    "增大字号",
-                    font_size < 32.,
-                    hover,
-                    cx.listener(move |this, _, _, cx| {
-                        this.apply_font_size(px((font_size + 1.).min(32.)), cx);
-                    }),
+                .child(control_row(
+                    "sg-indent-row",
+                    "缩进单位",
+                    indent_choices(indent_unit, colors, cx),
                 )),
-        ))
-        .child(control_row(
-            "sg-indent-row",
-            "缩进单位",
-            h_flex()
-                .id("sg-indent-choices")
-                .gap_1()
-                .child(choice_button(
-                    "sg-indent-4",
-                    "4 空格",
-                    indent_unit == IndentUnit::Spaces4,
-                    hover,
-                    selected,
-                    cx.listener(|this, _, _, cx| this.set_indent_unit_all(IndentUnit::Spaces4, cx)),
-                ))
-                .child(choice_button(
-                    "sg-indent-2",
-                    "2 空格",
-                    indent_unit == IndentUnit::Spaces2,
-                    hover,
-                    selected,
-                    cx.listener(|this, _, _, cx| this.set_indent_unit_all(IndentUnit::Spaces2, cx)),
-                ))
-                .child(choice_button(
-                    "sg-indent-tab",
-                    "Tab",
-                    indent_unit == IndentUnit::Tab,
-                    hover,
-                    selected,
-                    cx.listener(|this, _, _, cx| this.set_indent_unit_all(IndentUnit::Tab, cx)),
-                )),
-        ))
+        )
         // ── 布局 ───────────────────────────────────────────
-        .child(group_header("sg-layout", "布局"))
-        .child(control_row(
-            "sg-width-row",
-            "面板宽度",
-            action_button(
-                "sg-width-reset",
-                "重置默认",
-                hover,
-                cx.listener(|this, _, _, cx| this.reset_panel_widths(cx)),
-            ),
+        .section(
+            Section::new()
+                .header(SectionHeader::new("布局"))
+                .child(control_row(
+                    "sg-width-row",
+                    "面板宽度",
+                    action_button(
+                        "sg-width-reset",
+                        "重置默认",
+                        colors.element_hover,
+                        cx.listener(|this, _, _, cx| this.reset_panel_widths(cx)),
+                    ),
+                )),
+        )
+}
+
+/// 主题三选钮（跟随系统/浅色/深色）。
+fn theme_choices(
+    theme_mode: &'static str,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    let selected = colors.element_selected;
+    h_flex()
+        .id("sg-theme-choices")
+        .gap_1()
+        .child(choice_button(
+            "sg-theme-system",
+            "跟随系统",
+            theme_mode == theme_switch::MODE_SYSTEM,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_theme_mode(theme_switch::MODE_SYSTEM, cx)),
+        ))
+        .child(choice_button(
+            "sg-theme-light",
+            "浅色",
+            theme_mode == theme_switch::MODE_LIGHT,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_theme_mode(theme_switch::MODE_LIGHT, cx)),
+        ))
+        .child(choice_button(
+            "sg-theme-dark",
+            "深色",
+            theme_mode == theme_switch::MODE_DARK,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_theme_mode(theme_switch::MODE_DARK, cx)),
         ))
 }
 
-/// 分组标题（外观/编辑器/布局——panels.rs 分组头同形态）。
-fn group_header(id: &'static str, title: &str) -> impl IntoElement {
-    h_flex().id(id).mt(GROUP_MARGIN).mb(px(4.)).child(
-        Label::new(title.to_string())
-            .size(LabelSize::Small)
-            .color(Color::Muted),
-    )
+/// 字号步进（−/值/+；域界 8-32 灰显）。
+fn font_stepper(
+    font_size: f32,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    h_flex()
+        .id("sg-font-stepper")
+        .gap_1()
+        .child(step_button(
+            "sg-font-dec",
+            IconName::SquareMinus,
+            "减小字号",
+            font_size > 8.,
+            hover,
+            cx.listener(move |this, _, _, cx| {
+                this.apply_font_size(px((font_size - 1.).max(8.)), cx);
+            }),
+        ))
+        .child(
+            div()
+                .id("sg-font-value")
+                .h(CONTROL_H)
+                .flex()
+                .items_center()
+                .px_2()
+                .child(
+                    Label::new(format!("{font_size:.0} px"))
+                        .size(LabelSize::Small)
+                        .color(Color::Default),
+                ),
+        )
+        .child(step_button(
+            "sg-font-inc",
+            IconName::Plus,
+            "增大字号",
+            font_size < 32.,
+            hover,
+            cx.listener(move |this, _, _, cx| {
+                this.apply_font_size(px((font_size + 1.).min(32.)), cx);
+            }),
+        ))
+}
+
+/// 缩进单位三选钮（4 空格/2 空格/Tab）。
+fn indent_choices(
+    indent_unit: IndentUnit,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    let selected = colors.element_selected;
+    h_flex()
+        .id("sg-indent-choices")
+        .gap_1()
+        .child(choice_button(
+            "sg-indent-4",
+            "4 空格",
+            indent_unit == IndentUnit::Spaces4,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_indent_unit_all(IndentUnit::Spaces4, cx)),
+        ))
+        .child(choice_button(
+            "sg-indent-2",
+            "2 空格",
+            indent_unit == IndentUnit::Spaces2,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_indent_unit_all(IndentUnit::Spaces2, cx)),
+        ))
+        .child(choice_button(
+            "sg-indent-tab",
+            "Tab",
+            indent_unit == IndentUnit::Tab,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_indent_unit_all(IndentUnit::Tab, cx)),
+        ))
 }
 
 /// 「标签 + 控件」行（标签定宽对齐，控件靠左跟随）。
+///
+/// 容器不换 `ModalRow`（组件仅是 py_1 行包装，不 impl
+/// `InteractiveElement`——无 id/无事件面，包装价值低于 id 损失；
+/// 迁移重心在 Modal/ModalHeader/Section 骨架层）。
 fn control_row(id: &'static str, label: &str, controls: impl IntoElement) -> impl IntoElement {
     h_flex()
         .id(id)

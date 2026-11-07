@@ -63,6 +63,11 @@ gpui_platform = { path = "../third_party/zed/crates/gpui_platform", features = [
 ] }
 theme = { path = "../third_party/zed/crates/theme" }
 ui = { path = "../third_party/zed/crates/ui" }
+# #385 批 3：menu crate（action 定义——ui 的直接依赖，闭包内零新增
+# 编译成本）。ModalHeader 的 dismiss 钮 dispatch menu::Cancel——本层
+# on_action 接住归一到 close_settings；批 4 menu_bar 键盘导航
+# （SelectFirst/Next/...）同源。
+menu = { path = "../third_party/zed/crates/menu" }
 # 日志面（#68 批 5 前置）：zlog 读 ZED_LOG/RUST_LOG——激活 gpui_wgpu
 # 适配器枚举与 gpui_windows DirectX 设备选择的既有 log 调用（此前无
 # logger，RUST_LOG 无效）。Apache-2.0，闭包内 crate（PROVENANCE 已录）。
