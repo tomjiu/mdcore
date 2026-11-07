@@ -83,6 +83,11 @@
 //!   + 键域 Ctrl+0/Ctrl+1/Ctrl+Shift+0/Ctrl+=·Ctrl+-（shell 键分派
 //!   前置分支——canvas 态键域同构）+ 右下角百分比 chip（可点开预设
 //!   菜单）。横向平移（超宽裁边导航）属后续轮；
+//! - **#420 缩略图侧栏已接**：左侧固定宽侧栏（uniform_list 虚拟化
+//!   ——任意页数懒加载不卡）+ 点击跳页 + 当前页高亮跟随（视口中
+//!   心页推算 + Nearest 滚入）；缩略图与主视图共用同一 RenderWorker
+//!   /PageCache/pending 三账本——键 (页, 120) 与 (页, 光栅宽) 天然
+//!   不冲突；批注 flush 后缩略图随 rev 同步重光栅；
 //! - 扫描件（无文本层）在页面视图下**正是正确呈现**（位图就是内容）
 //!   ——文本视图的「OCR 不支持」提示不再挡路；
 //! - **沙箱无 GUI**：右键拖框交互层只有编译面验证（本机 cargo check），
@@ -140,6 +145,13 @@ pub const PDF_ZOOM_STEP: f32 = 1.25;
 const PDF_ZOOM_WHEEL_STEP: f32 = 1.1;
 /// #421：几何预读失败时 ActualSize 百分比基准兜底（A4 纵向 595pt）。
 const PAGE_PT_W_FALLBACK: f32 = 595.0;
+/// #420：缩略图光栅宽（px）——低 DPI 快渲（issue 提议 120；键
+/// (页, 120) 与主视图键 (页, 光栅宽) 天然不冲突——共用账本）。
+pub const THUMB_WIDTH: u32 = 120;
+/// #420：缩略图页码标签带高（px）——位图 + 标签的槽内布局。
+const THUMB_LABEL_H: f32 = 18.0;
+/// #420：侧栏宽（px）——缩略图 + 呼吸边距（flex_none 固定列）。
+const THUMB_SIDEBAR_W: Pixels = px(148.);
 /// 看门狗预算（单页光栅超时——与 mdc-pdf worker 文档的 20s 预算同源）。
 const RENDER_WATCHDOG: Duration = Duration::from_secs(20);
 /// 回执轮询间隔（渲染中 ~60fps 足够；空闲零轮询）。
@@ -193,6 +205,22 @@ fn zoom_mode_percent(mode: ZoomMode, page_pt_w: f32, vw: f32, vh: f32) -> u32 {
     (w / page_pt_w * 100.).round().clamp(10., 800.) as u32
 }
 
+/// #420：缩略图槽高（px）——位图 + 页码标签带（纯函数——单测锚点；
+/// 主视图槽高与侧栏槽高两套，各自稳定）。
+fn thumb_slot_height(aspect: f32) -> f32 {
+    THUMB_WIDTH as f32 * aspect + THUMB_LABEL_H
+}
+
+/// #420：当前页（0 基）——主视图视口中心所在页（纯函数——单测锚
+/// 点；侧栏高亮跟随的推算源）。越界钳到末页；空文档/零槽高兑 0。
+fn current_page_from_offset(offset_y: f32, vh: f32, slot_h: f32, page_count: usize) -> usize {
+    if page_count == 0 || slot_h <= 0. {
+        return 0;
+    }
+    let center = (offset_y.max(0.) + vh.max(1.) * 0.5) / slot_h;
+    (center as usize).min(page_count - 1)
+}
+
 /// #421：缩放预设菜单行（label, 目标模式, 键域提示——空串 = 无键位）。
 const ZOOM_PRESETS: &[(&str, ZoomMode, &str)] = &[
     ("适应宽度", ZoomMode::FitWidth, "Ctrl+Shift+0"),
@@ -239,6 +267,11 @@ pub struct PdfPagesView {
     /// #421：缩放预设菜单开（右下角百分比 chip 点击弹出——backdrop
     /// 模态；点选项/点空白即关，不再占屏）。
     zoom_menu_open: bool,
+    /// #420：缩略图侧栏滚动句柄（独立 uniform_list——懒加载虚拟化）。
+    thumb_scroll: UniformListScrollHandle,
+    /// #420：当前页（0 基——主视图滚动推算；侧栏高亮跟随 + Nearest
+    /// 滚入视野；点击缩略图立即更新）。
+    current_page: usize,
     /// #302 验收 1：当前批注工具（三手势——高亮/下划线/便签；退化
     /// 右键单击循环切换，见 [`Self::finish_drag_annotation`]）。
     annotate_tool: AnnotateTool,
@@ -312,6 +345,8 @@ impl PdfPagesView {
             page_pt_w,
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
+            thumb_scroll: UniformListScrollHandle::new(),
+            current_page: 0,
             worker: Some(worker),
             cache: mdc_pdf::cache::PageCache::new(CACHE_BUDGET_BYTES),
             pending: HashMap::new(),
@@ -341,6 +376,8 @@ impl PdfPagesView {
             page_pt_w: PAGE_PT_W_FALLBACK,
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
+            thumb_scroll: UniformListScrollHandle::new(),
+            current_page: 0,
             worker: None,
             cache: mdc_pdf::cache::PageCache::new(CACHE_BUDGET_BYTES),
             pending: HashMap::new(),
@@ -528,6 +565,15 @@ impl PdfPagesView {
         let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
         // 滚动偏移（内容坐标——base_handle.offset）。
         let offset_y = f32::from(self.scroll.0.borrow().base_handle.offset().y).max(0.);
+        // #420：当前页 = 视口中心页（侧栏高亮跟随 + Nearest 滚入；
+        // 变更才通知——滚动中每帧推算零成本）。
+        let new_current = current_page_from_offset(offset_y, vh, slot_h, self.page_count);
+        if new_current != self.current_page {
+            self.current_page = new_current;
+            self.thumb_scroll
+                .scroll_to_item(new_current, gpui::ScrollStrategy::Nearest);
+            cx.notify();
+        }
         let first = (((offset_y / slot_h) as i64).saturating_sub(1)).max(0) as u32;
         let visible_rows = (((vh / slot_h).ceil() as i64) + 2).max(1) as u32;
         let last = (first + visible_rows).min(self.page_count as u32);
@@ -553,6 +599,62 @@ impl PdfPagesView {
             self.polling = true;
             Self::spawn_poll_loop(cx);
         }
+    }
+
+    /// #420：缩略图侧栏 render 期派单——侧栏可见区间（±1 槽过扫描）
+    /// 的 THUMB_WIDTH 键逐个 submit。与主视图共用 RenderWorker /
+    /// pending/failed/rendered_heights 三账本（键宽不同天然不冲突）；
+    /// 回执经同一轮询循环收账——done 即 cache.put + notify（下一帧换
+    /// 真图，与主视图同构）。侧栏懒加载 = uniform_list 虚拟化（任意页
+    /// 数只渲染可见槽——issue「60 页阈值」由虚拟化覆盖）。
+    fn submit_thumbs(&mut self, cx: &mut Context<Self>) {
+        if self.worker.is_none() || self.page_count == 0 {
+            return;
+        }
+        let (_, vh) = self.viewport_size;
+        if vh <= 0. {
+            return; // 首帧视口未记录——主视图探针本帧落位，下一帧起算。
+        }
+        let slot_h = thumb_slot_height(self.aspect).max(1.);
+        let offset_y = f32::from(self.thumb_scroll.0.borrow().base_handle.offset().y).max(0.);
+        let first = (((offset_y / slot_h) as i64).saturating_sub(1)).max(0) as u32;
+        let visible_rows = (((vh / slot_h).ceil() as i64) + 2).max(1) as u32;
+        let last = (first + visible_rows).min(self.page_count as u32);
+        let mut submitted = false;
+        for page in first..last {
+            let key = (page, THUMB_WIDTH);
+            if self
+                .render_key(&key)
+                .is_some_and(|k| self.cache.contains(&k))
+                || self.failed.contains(&key)
+                || self.pending.values().any(|k| *k == key)
+            {
+                continue;
+            }
+            let id = self.worker.as_mut().unwrap().submit(RenderRequest {
+                page: PageIndex(key.0),
+                width_px: key.1,
+            });
+            self.pending.insert(id, key);
+            submitted = true;
+        }
+        if submitted && !self.polling {
+            self.polling = true;
+            Self::spawn_poll_loop(cx);
+        }
+    }
+
+    /// #420：缩略图点击跳页（主视图滚到该页顶 + 高亮立即跟随——不等
+    /// 滚动回调）。越界由 [`Self::scroll_to_page`] 钳制。
+    fn jump_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let clamped = if self.page_count == 0 {
+            0
+        } else {
+            page.min(self.page_count - 1)
+        };
+        self.scroll_to_page(page);
+        self.current_page = clamped;
+        cx.notify();
     }
 
     /// 预渲染键 → 缓存全键（#305 RenderKey）：高度取引擎侧实测
@@ -678,6 +780,93 @@ impl PdfPagesView {
                     .into_any_element()
             }
         }
+    }
+
+    /// #420：缩略图槽元素（侧栏 uniform_list 回调）——读缓存出 120px
+    /// 位图 + 页码标签；当前页高亮（element_selected 底 + 边框 + 页码
+    /// 着色）；未就绪出占位框（渲染中 / 失败两态）。**点击 = 跳页**
+    /// （plain 闭包持 WeakEntity——uniform_list 回调期只有 &mut App，
+    /// 无 cx.listener 面；主视图滚到该页顶 + 高亮立即跟随）。
+    fn render_thumb_slot(
+        &mut self,
+        idx: usize,
+        cx: &App,
+        entity: gpui::WeakEntity<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let key = (idx as u32, THUMB_WIDTH);
+        let thumb_h = THUMB_WIDTH as f32 * self.aspect;
+        let page_no = idx + 1;
+        let is_current = idx == self.current_page;
+        let image = self
+            .render_key(&key)
+            .and_then(|k| self.cache.get(&k).cloned());
+        let image_element = match image {
+            Some(image) => gpui::img(ImageSource::Render(image))
+                .id(gpui::ElementId::NamedInteger(
+                    "pdf-thumb".into(),
+                    idx as u64,
+                ))
+                .w(px(THUMB_WIDTH as f32))
+                .h(px(thumb_h))
+                .flex_none()
+                .rounded_sm()
+                .when(is_current, |el| {
+                    el.border_1().border_color(colors.border_focused)
+                })
+                .into_any_element(),
+            None => {
+                let failed = self.failed.contains(&key);
+                div()
+                    .id(gpui::SharedString::from(format!("pdf-thumb-pending-{idx}")))
+                    .w(px(THUMB_WIDTH as f32))
+                    .h(px(thumb_h))
+                    .flex_none()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel_background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        ui::Label::new(if failed { "✕" } else { "…" })
+                            .size(ui::LabelSize::XSmall)
+                            .color(ui::Color::Muted),
+                    )
+                    .into_any_element()
+            }
+        };
+        div()
+            .id(gpui::SharedString::from(format!("pdf-thumb-slot-{idx}")))
+            .flex_none()
+            .py_1()
+            .px_1()
+            .when(is_current, |el| el.bg(colors.element_selected).rounded_sm())
+            .hover(|el| el.bg(colors.element_hover))
+            .on_click(
+                move |_ev: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |view, cx| view.jump_to_page(idx, cx));
+                },
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(image_element)
+                    .child(
+                        ui::Label::new(format!("{page_no}"))
+                            .size(ui::LabelSize::XSmall)
+                            .color(if is_current {
+                                ui::Color::Default
+                            } else {
+                                ui::Color::Muted
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 
     // ------------------------------------------------------------------
@@ -818,6 +1007,8 @@ impl Render for PdfPagesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 派单（render 期直接改 self——uniform_list 回调期只读，无重入面）。
         self.submit_visible(cx);
+        // #420：缩略图侧栏同帧派单（共用 worker/账本——见 submit_thumbs）。
+        self.submit_thumbs(cx);
         let colors = cx.theme().colors().clone();
         // error 态：明示面板（不白屏）。
         if self.error.is_some() || self.worker.is_none() {
@@ -839,6 +1030,7 @@ impl Render for PdfPagesView {
         let entity = cx.entity().downgrade();
         let viewport_cell = self.viewport.clone();
         let zoom_entity = entity.clone();
+        let thumb_entity = entity.clone();
         let page_count = self.page_count;
         // #421：缩放百分比（首帧视口未记录时用下限兜底——与 v1 适宽
         // hint 同款下限口径，不闪屏错值）。
@@ -865,6 +1057,26 @@ impl Render for PdfPagesView {
             },
         )
         .track_scroll(&self.scroll)
+        .h_full();
+        // #420：缩略图侧栏列表（独立 uniform_list——虚拟化懒加载；槽
+        // 元素见 render_thumb_slot：位图 + 页码 + 当前页高亮 + 点击跳页）。
+        let thumb_list = gpui::uniform_list(
+            "pdf-thumbs",
+            page_count,
+            move |visible: std::ops::Range<usize>, _window: &mut Window, cx: &mut App| {
+                visible
+                    .clone()
+                    .filter_map(|idx| {
+                        thumb_entity
+                            .update(cx, |view, cx| {
+                                view.render_thumb_slot(idx, cx, thumb_entity.clone())
+                            })
+                            .ok()
+                    })
+                    .collect::<Vec<AnyElement>>()
+            },
+        )
+        .track_scroll(&self.thumb_scroll)
         .h_full();
         // #302④：批注路径错误横幅（最近一次——不静默丢，用户可重试）。
         let error_banner = annotate_error.map(|message| {
@@ -1055,79 +1267,105 @@ impl Render for PdfPagesView {
             );
         div()
             .id("pdf-pages-root")
-            .relative()
             .size_full()
             .min_w_0()
             .bg(colors.background)
+            // #420：横向分栏——左缩略图侧栏（固定宽 flex_none）+ 右主
+            // 内容列（flex_1：原 root 的纵向结构原样内移——探针只测内
+            // 容列宽，适宽/缩放不受侧栏挤占影响）。
             .flex()
-            .flex_col()
-            .items_center()
-            .child(list)
-            // #302④：批注错误横幅（在位时叠加顶部）。
-            .children(error_banner)
-            // #302 验收 1：工具提示横幅（在位时叠加底部）。
-            .children(hint_banner)
-            // #421：缩放预设菜单（backdrop + 面板——在位时叠加；菜单
-            // 开时盖住列表左键（点空白即关），chip/菜单行在其上仍可点）。
-            .children(zoom_menu)
-            // #421：缩放控制条（常驻右下角）。
-            .child(zoom_chip)
-            // 覆盖 canvas：透明、绝对铺满——paint 期回写视口尺寸（Cell
-            // 共享，零实体更新零重入；不注册命中区，不挡列表滚轮）+
-            // #421 Ctrl+滚轮 capture 期拦截（缩放——止冒泡防列表滚动）。
+            .flex_row()
+            // #420：缩略图侧栏（右分隔线 + 面板底色；懒加载虚拟化）。
             .child(
                 div()
-                    .id("pdf-viewport-probe")
-                    .absolute()
-                    .size_full()
-                    .child(gpui::canvas(
-                        move |bounds, _window, _cx| bounds,
-                        move |bounds: gpui::Bounds<gpui::Pixels>,
-                              _t,
-                              window: &mut Window,
-                              _cx: &mut App| {
-                            viewport_cell.set(Some((
-                                f32::from(bounds.size.width),
-                                f32::from(bounds.size.height),
-                            )));
-                            // #421：Ctrl+滚轮缩放——capture 期窗口级拦截
-                            //（annotate_overlay paint 注册先例同款；capture
-                            // 先于 bubble = 先于 uniform_list 滚动消费，
-                            // stop_propagation 后列表不随缩放滚动）。横向
-                            // 分量占优（触控板双指横扫）不拦截——让事件
-                            // 冒泡照常滚动。修饰键 control||platform 归一
-                            //（与 shell 键分派同口径）。
-                            window.on_mouse_event(
-                                move |event: &ScrollEvent,
-                                      phase: DispatchPhase,
-                                      _window: &mut Window,
-                                      cx: &mut App| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    if !(event.modifiers.control || event.modifiers.platform) {
-                                        return;
-                                    }
-                                    if !bounds.contains(&event.position) {
-                                        return;
-                                    }
-                                    let (dx, dy) = match event.delta {
-                                        ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
-                                        ScrollDelta::Lines(l) => {
-                                            (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
+                    .id("pdf-thumb-sidebar")
+                    .flex_none()
+                    .w(THUMB_SIDEBAR_W)
+                    .h_full()
+                    .min_h_0()
+                    .border_r_1()
+                    .border_color(colors.border)
+                    .bg(colors.panel_background)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .py_2()
+                    .child(thumb_list),
+            )
+            // 主内容列（原 root 结构原样内移——相对定位基准/横幅/chip/
+            // 菜单/探针全在其内）。
+            .child(
+                div()
+                    .id("pdf-pages-content")
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(list)
+                    // #302④：批注错误横幅（在位时叠加顶部）。
+                    .children(error_banner)
+                    // #302 验收 1：工具提示横幅（在位时叠加底部）。
+                    .children(hint_banner)
+                    // #421：缩放预设菜单（backdrop + 面板——在位时叠加；菜单
+                    // 开时盖住列表左键（点空白即关），chip/菜单行在其上仍可点）。
+                    .children(zoom_menu)
+                    // #421：缩放控制条（常驻右下角）。
+                    .child(zoom_chip)
+                    // 覆盖 canvas：透明、绝对铺满——paint 期回写视口尺寸（Cell
+                    // 共享，零实体更新零重入；不注册命中区，不挡列表滚轮）+
+                    // #421 Ctrl+滚轮 capture 期拦截（缩放——止冒泡防列表滚动）。
+                    .child(div().id("pdf-viewport-probe").absolute().size_full().child(
+                        gpui::canvas(
+                            move |bounds, _window, _cx| bounds,
+                            move |bounds: gpui::Bounds<gpui::Pixels>,
+                                  _t,
+                                  window: &mut Window,
+                                  _cx: &mut App| {
+                                viewport_cell.set(Some((
+                                    f32::from(bounds.size.width),
+                                    f32::from(bounds.size.height),
+                                )));
+                                // #421：Ctrl+滚轮缩放——capture 期窗口级拦截
+                                //（annotate_overlay paint 注册先例同款；capture
+                                // 先于 bubble = 先于 uniform_list 滚动消费，
+                                // stop_propagation 后列表不随缩放滚动）。横向
+                                // 分量占优（触控板双指横扫）不拦截——让事件
+                                // 冒泡照常滚动。修饰键 control||platform 归一
+                                //（与 shell 键分派同口径）。
+                                window.on_mouse_event(
+                                    move |event: &ScrollEvent,
+                                          phase: DispatchPhase,
+                                          _window: &mut Window,
+                                          cx: &mut App| {
+                                        if phase != DispatchPhase::Capture {
+                                            return;
                                         }
-                                    };
-                                    if dy.abs() < dx.abs() {
-                                        return; // 横向手势不缩放——冒泡照旧。
-                                    }
-                                    let steps = dy / WHEEL_LINE_PX;
-                                    let _ = zoom_entity.update(cx, |view, cx| {
-                                        view.zoom_wheel(steps, cx);
-                                    });
-                                    cx.stop_propagation();
-                                },
-                            );
-                        },
+                                        if !(event.modifiers.control || event.modifiers.platform) {
+                                            return;
+                                        }
+                                        if !bounds.contains(&event.position) {
+                                            return;
+                                        }
+                                        let (dx, dy) = match event.delta {
+                                            ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
+                                            ScrollDelta::Lines(l) => {
+                                                (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
+                                            }
+                                        };
+                                        if dy.abs() < dx.abs() {
+                                            return; // 横向手势不缩放——冒泡照旧。
+                                        }
+                                        let steps = dy / WHEEL_LINE_PX;
+                                        let _ = zoom_entity.update(cx, |view, cx| {
+                                            view.zoom_wheel(steps, cx);
+                                        });
+                                        cx.stop_propagation();
+                                    },
+                                );
+                            },
+                        ),
                     )),
             )
             .into_any_element()
@@ -1421,5 +1659,36 @@ mod tests {
         assert!(PDF_ZOOM_MIN < 1.0 && PDF_ZOOM_MAX > 1.0);
         assert!((PDF_ZOOM_WHEEL_STEP - 1.1).abs() < 1e-6, "issue 步进 10%");
         assert!((PDF_ZOOM_STEP - 1.25).abs() < 1e-6, "canvas ZOOM_STEP 同款");
+    }
+
+    // ─── #420：缩略图侧栏纯函数面（零引擎依赖——同款纪律真跑） ──────
+
+    /// 缩略图槽高 = 位图高 + 标签带（aspect 恒定 → 与主视图槽高同比
+    /// 例但独立基准——侧栏不随主视图缩放联动，尺寸自稳）。
+    #[test]
+    fn thumb_slot_height_follows_aspect_plus_label() {
+        assert!(
+            (thumb_slot_height(1.5) - (120. * 1.5 + 18.)).abs() < 1e-6,
+            "120px 宽 × aspect + 18px 标签带"
+        );
+        assert!((thumb_slot_height(0.5) - (120. * 0.5 + 18.)).abs() < 1e-6);
+    }
+
+    /// 当前页推算：视口中心页；顶部 = 中心页 0；深处 = 后页；越界钳
+    /// 到末页；空文档/零槽高兑 0（防 0 除）。
+    #[test]
+    fn current_page_from_offset_center_clamps_and_floors() {
+        // 视口顶（offset 0）+ 视口高 800 / 槽高 1000 → 中心 0.4 → 页 0。
+        assert_eq!(current_page_from_offset(0., 800., 1000., 100), 0);
+        // 滚到第 5 页中部：offset 4600 → 中心 (4600+400)/1000 = 5.0 → 页 5。
+        assert_eq!(current_page_from_offset(4600., 800., 1000., 100), 5);
+        // 负 offset（回弹）兑 0。
+        assert_eq!(current_page_from_offset(-50., 800., 1000., 100), 0);
+        // 深处越界 → 钳末页。
+        assert_eq!(current_page_from_offset(1e9, 800., 1000., 100), 99);
+        // 空文档兑 0（防 page_count-1 下溢）。
+        assert_eq!(current_page_from_offset(0., 800., 1000., 0), 0);
+        // 零槽高兑 0（防 0 除）。
+        assert_eq!(current_page_from_offset(100., 800., 0., 100), 0);
     }
 }
