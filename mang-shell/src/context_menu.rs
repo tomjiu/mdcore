@@ -1,19 +1,22 @@
-//! 右键菜单（#63 Lead 打磨项）。
+//! 右键菜单（#63 Lead 打磨项；#385 批 1：渲染层迁 `ui::ContextMenu`）。
 //!
-//! # 分层：数据 / 渲染 / 接线 三段分离
+//! # 分层：数据 / 几何 / 渲染 三段分离
 //!
-//! - [`MenuItem`] / [`ContextMenu`]：**纯数据**，零 GPUI 依赖——可单测、
-//!   可在无窗口环境构造。菜单长什么样、点哪一项干什么，全在这一层定死。
-//! - [`menu_geometry`]：菜单**几何**（尺寸/边距/每项行高）纯函数——
-//!   屏幕边缘翻转、子菜单飞出方向这些「到底弹在哪」的判断必须可测，
-//!   不能埋在渲染闭包里。
-//! - 渲染与点击接线在 `shell.rs` / `file_tree.rs`（需要 `Window`）。
+//! - [`MenuItem`]：**纯数据**，零 GPUI 依赖——可单测、可在无窗口环境
+//!   构造。菜单长什么样、点哪一项干什么，全在这一层定死。
+//! - [`menu_geometry`]：菜单**几何**（尺寸/边距/每项行高）纯函数。
+//!   #385 批 1 后**右键菜单的摆放已交给 gpui `anchored`**（按实际渲染
+//!   尺寸做边缘翻转/吸附，见 `context_menu_view`）；本层保留是因为
+//!   `menu_bar_view`（顶部菜单栏，批 4 迁移对象）仍在消费同一套
+//!   几何——批 4 迁完一并退役。
+//! - 渲染与接线：`context_menu_view`（构建 `ui::ContextMenu` 实体 +
+//!   锚定渲染）与 `shell.rs`（状态机与动作派发）。
 //!
 //! # 为什么几何要单独抽出来
 //!
-//! 右键菜单最容易出的 bug 不是「菜单不显示」，而是**在屏幕右下角弹到
-//! 屏幕外**——用户看不见但程序一切正常。这类问题只有把摆放算法做成
-//! 纯函数、对着边界写断言才抓得住（见本文件测试 `flip_at_edges` 一族）。
+//! 屏幕边缘翻转这类「到底弹在哪」的判断做成纯函数、对着边界写断言
+//! 才抓得住（见本文件测试 `flip_at_edges` 一族）——`menu_bar` 消费
+//! 面不变，单测随函数保留。
 
 /// 屏幕/窗口坐标点（逻辑像素，f32——与 gpui 的 `Point<Pixels>` 同域，
 /// 但本模块不依赖 gpui，故自带一份最小结构）。
@@ -218,42 +221,6 @@ pub fn place_submenu(parent: Rect, row_y: f32, size: (f32, f32), screen: Rect) -
     Point::new(x, y)
 }
 
-/// 已打开的右键菜单（位置 + 项集）。
-#[derive(Clone, Debug, PartialEq)]
-pub struct ContextMenu {
-    pub items: Vec<MenuItem>,
-    /// 请求的展开点（点击处，屏幕坐标）。实际摆放由 [`Self::layout`] 算。
-    pub pos: Point,
-}
-
-impl ContextMenu {
-    pub fn new(items: Vec<MenuItem>, pos: Point) -> Self {
-        Self { items, pos }
-    }
-
-    /// 算出菜单在 `screen` 内的最终矩形（含边缘翻转）。
-    pub fn layout(&self, screen: Rect) -> Rect {
-        let (w, h) = menu_size(&self.items);
-        let p = place_menu(self.pos, (w, h), screen);
-        Rect::new(p.x, p.y, w, h)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// 所有动作项 id（接线层批绑定用；顺序 = 菜单顺序）。
-    pub fn action_ids(&self) -> Vec<&'static str> {
-        self.items
-            .iter()
-            .filter_map(|i| match i {
-                MenuItem::Action { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect()
-    }
-}
-
 // ── 预置菜单 ───────────────────────────────────────────────────
 
 /// 编辑器右键菜单。
@@ -420,23 +387,6 @@ mod tests {
                     assert!(!ids.contains(id), "菜单项 id 重复：{id}");
                     ids.push(id);
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn layout_never_leaves_screen() {
-        // 暴力扫一圈展开点：任何位置算出的菜单矩形都必须在屏幕内。
-        let menu = ContextMenu::new(editor_menu(false, false), Point::new(0., 0.));
-        let (w, h) = menu_size(&menu.items);
-        for x in (0..1200).step_by(37) {
-            for y in (0..800).step_by(41) {
-                let m = ContextMenu::new(menu.items.clone(), Point::new(x as f32, y as f32));
-                let r = m.layout(screen());
-                assert!(r.x >= -0.01, "x 越界 {r:?}");
-                assert!(r.y >= -0.01, "y 越界 {r:?}");
-                assert!(r.right() <= 1200.01, "右边越界 {r:?}（宽 {w}）");
-                assert!(r.bottom() <= 800.01, "下边越界 {r:?}（高 {h}）");
             }
         }
     }

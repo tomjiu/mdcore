@@ -1,146 +1,150 @@
-//! 右键菜单渲染层（#63 打磨项）——数据与几何在 [`crate::context_menu`]。
+//! 右键菜单渲染层（#385 批 1：手写浮层 → `ui::ContextMenu` 组件）。
 //!
-//! 本模块只做「把已算好的矩形画出来」，不做摆放判断：
-//! 尺寸/翻转/夹紧全部由 `context_menu::ContextMenu::layout` 在点击那一刻
-//! 算好（那里有单测），这里拿到的是一个已经保证在屏幕内的 [`Rect`]。
+//! # 分层（迁移后）
 //!
-//! 菜单是**浮层**：绝对定位 + 全屏透明遮罩承接「点空白处关闭」。
-//! 遮罩必须在菜单之前渲染（先画的在下层），否则遮罩会盖住菜单吞掉点击。
+//! - 数据/预置菜单在 [`crate::context_menu`]（零 gpui 依赖，lib/bin 共用
+//!   ——不变）；几何 `place_menu` 一族仍在彼处供 `menu_bar_view` 消费
+//!  （批 4 迁移时一并退役）。
+//! - 本模块只做两件桥接：
+//!   ① [`build_context_menu`]——`MenuItem` 数据 → `ui::ContextMenu`
+//!     实体（键盘导航 / 焦点 / ARIA / dismiss 全部由组件自带）；
+//!   ② [`context_menu_anchor`]——`gpui::anchored` 锚定渲染（SwitchAnchor
+//!     溢出翻转 + 边缘吸附，与原 `place_menu` 语义一致，但按**实际渲染
+//!     尺寸**而非文本估宽判定）。
+//!
+//! # 为什么 shortcut 走 `custom_entry` 而不是 `ContextMenuEntry::action`
+//!
+//! zed entry 的快捷键显示绑定 gpui Action 注册体系
+//! （`KeyBinding::for_action`）；mang-shell 的键位标签来自自研 keymap
+//! 表（用户可换绑，非 gpui action）。`custom_entry` 是组件公开的行级
+//! 扩展点——行内自绘 label + shortcut，容器级导航/hover/选中态仍由
+//! 组件的 `ListItem` + `selected_index` 承载（零内部逻辑拷贝）。
+//!
+//! 灰显项：`custom_entry` 无 `disabled` 槽（那是 `ContextMenuEntry` 的），
+//! 等价组合 = 行内 `Color::Muted` 灰显 + `.selectable(false)`（键盘
+//! 导航跳过、点击无 handler——与原实现的「enabled 才挂 on_click」
+//! 同语义）。
 
-use gpui::{App, Context, SharedString, px};
+use gpui::{App, Entity, Pixels, Point, WeakEntity, Window, anchored, deferred, px};
+use ui::ContextMenu as UiContextMenu;
 use ui::prelude::*;
 
-use crate::context_menu::{ContextMenu, ITEM_HEIGHT, MENU_PADDING_Y, MenuItem, Rect as MenuRect};
+use crate::context_menu::MenuItem;
 use crate::shell::ShellApp;
 
-/// 右键菜单浮层（返回 (遮罩, 菜单) 两件——遮罩先渲染）。
+/// 单个动作项的行渲染（label 左 / shortcut 右）。
 ///
-/// `rect` = 已由 `ContextMenu::layout` 算好的屏幕内矩形。
-pub fn context_menu_overlay(
-    menu: &ContextMenu,
-    rect: MenuRect,
-    cx: &mut Context<ShellApp>,
-) -> impl IntoElement {
-    let colors = cx.theme().colors().clone();
-
-    // 遮罩：全屏透明，左键点一下即关菜单。
-    let backdrop = div()
-        .id("ctx-menu-backdrop")
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .on_mouse_down(
-            gpui::MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.close_context_menu(cx);
-            }),
-        )
-        .on_mouse_down(
-            gpui::MouseButton::Right,
-            cx.listener(|this, _, _, cx| {
-                this.close_context_menu(cx);
-            }),
-        );
-
-    let mut list = div()
-        .id("ctx-menu")
-        .absolute()
-        .left(px(rect.x))
-        .top(px(rect.y))
-        .w(px(rect.w))
-        .rounded_md()
-        .border_1()
-        .border_color(colors.border)
-        .bg(colors.background)
-        .shadow_lg()
-        .py(px(MENU_PADDING_Y))
-        .flex()
-        .flex_col()
-        .text_size(px(13.));
-
-    for (i, item) in menu.items.iter().enumerate() {
-        match item {
-            MenuItem::Separator => {
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("ctx-sep-{i}")))
-                        .h(px(1.))
-                        .my(px(4.))
-                        .mx_1()
-                        .bg(colors.border),
-                );
-            }
-            MenuItem::Action {
-                id,
-                label,
-                shortcut,
-                enabled,
-            } => {
-                let colors2 = colors.clone();
-                let mut row = div()
-                    .id(SharedString::from(format!("ctx-item-{id}")))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .h(px(ITEM_HEIGHT - 2.))
-                    .px_2()
-                    .mx_1()
-                    .rounded_sm()
-                    .when(*enabled, |el| {
-                        el.cursor_pointer().hover(|e| e.bg(colors2.element_hover))
-                    });
-                let text_color = if *enabled {
-                    colors.text
-                } else {
-                    colors.text_muted
-                };
-                row = row.child(div().text_color(text_color).child(label.clone()));
-                row = row.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(colors.text_muted)
-                        .child(shortcut.clone().unwrap_or_default()),
-                );
-                if *enabled {
-                    let action_id = *id;
-                    row = row.on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_context_menu_item(action_id, window, cx);
-                    }));
-                }
-                list = list.child(row);
-            }
-            MenuItem::Submenu { label, .. } => {
-                // 本批只做一层菜单；子菜单项渲染为带箭头但不可点的提示行，
-                // 不假装支持（诚实登记：真子菜单需要在 layout 层再算一次
-                // place_submenu，接线留待后续）。
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("ctx-sub-{i}")))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .h(px(ITEM_HEIGHT - 2.))
-                        .px_2()
-                        .mx_1()
-                        .text_color(colors.text_muted)
-                        .child(label.clone())
-                        .child(div().text_size(px(11.)).child("›")),
-                );
-            }
-        }
+/// 颜色用语义色 `ui::Color`（渲染时从主题解析——主题切换即时跟随，
+/// zed entry 的 `Color::Default`/`Color::Disabled` 同口径：灰显项用
+/// `Muted` 与组件 entry 的 disabled 视觉语系一致）。
+fn action_row(
+    label: &str,
+    shortcut: Option<&str>,
+    label_color: ui::Color,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyElement + 'static {
+    let label = label.to_string();
+    let shortcut = shortcut.map(str::to_string);
+    move |_, cx| {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .w_full()
+            .text_color(label_color.color(cx))
+            .child(label.clone())
+            .children(shortcut.clone().map(|s| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(ui::Color::Muted.color(cx))
+                    .child(s)
+            }))
+            .into_any_element()
     }
-
-    div()
-        .id("ctx-menu-layer")
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .child(backdrop)
-        .child(list)
 }
 
-/// 供 `shell.rs` 引用的空上下文（避免未使用导入警告时占位）。
-pub fn _unused(_: &App) {}
+/// [`crate::context_menu::MenuItem`] 列表 → `ui::ContextMenu` 实体。
+///
+/// 动作执行统一回 `ShellApp::activate_context_menu_item`（id 派发单点
+/// ——本批不改派发面）。子菜单项本批仍不支持（原实现即只做一层，
+/// 数据层 `MenuItem::Submenu` 变体保留，渲染为灰显提示行——诚实登记
+/// 不假装支持）。
+pub fn build_context_menu(
+    items: &[MenuItem],
+    shell: WeakEntity<ShellApp>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<UiContextMenu> {
+    UiContextMenu::build(window, cx, |menu, _window, _cx| {
+        let mut menu = menu;
+        for item in items {
+            menu = match item {
+                MenuItem::Action {
+                    id,
+                    label,
+                    shortcut,
+                    enabled,
+                } => {
+                    let label_color = if *enabled {
+                        ui::Color::Default
+                    } else {
+                        ui::Color::Muted
+                    };
+                    let action_id = *id;
+                    let shell = shell.clone();
+                    menu.custom_entry(
+                        action_row(label, shortcut.as_deref(), label_color),
+                        move |window, cx| {
+                            let _ = shell.update(cx, |shell, cx| {
+                                shell.activate_context_menu_item(action_id, window, cx)
+                            });
+                        },
+                    )
+                    // 灰显项不可选（键盘导航跳过 + 点击无 handler）。
+                    .selectable(*enabled)
+                }
+                MenuItem::Separator => menu.separator(),
+                MenuItem::Submenu { label, .. } => {
+                    // 一层菜单：子菜单渲染为不可选的灰显提示行（与原
+                    // context_menu_view 的「带箭头但不可点」同语义）。
+                    let label = label.clone();
+                    menu.custom_row(move |_, cx| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .w_full()
+                            .text_color(ui::Color::Muted.color(cx))
+                            .child(label.clone())
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(ui::Color::Muted.color(cx))
+                                    .child("›"),
+                            )
+                            .into_any_element()
+                    })
+                }
+            };
+        }
+        menu
+    })
+}
+
+/// 锚定渲染：`deferred` + `anchored`（SwitchAnchor）+ `occlude` 遮挡。
+///
+/// - **点外部关闭**：组件 on_blur → `menu::Cancel` → `DismissEvent`
+///   （shell 侧订阅清状态），不再需要全屏透明遮罩；
+/// - **边缘翻转**：`anchored` 默认 SwitchAnchor（翻得动就翻转、翻不动
+///   吸附窗口边——原 `place_menu` 语义的引擎级实现，按实际尺寸判定）；
+/// - `with_priority(1)`：浮层置顶（右键菜单遮罩退役后点击命中的次序
+///   由 hitbox/occlude 决定，优先级沿用 `RightClickMenu` 同款值）。
+pub fn context_menu_anchor(menu: &Entity<UiContextMenu>, pos: Point<Pixels>) -> impl IntoElement {
+    deferred(
+        anchored()
+            .anchor(gpui::Anchor::TopLeft)
+            .position(pos)
+            .child(gpui::div().occlude().child(menu.clone())),
+    )
+    .with_priority(1)
+}
