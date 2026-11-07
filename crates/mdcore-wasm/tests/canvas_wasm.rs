@@ -530,3 +530,117 @@ fn tag_idempotent_and_error_codes_via_json() {
     let e: mdcore_wasm::canvas::CvError = e.into();
     assert_eq!(e.code, "cv_object_not_found");
 }
+
+// ── frame 面（#404——命名区 + parent 树：wasm 互译零语义）──────────
+
+/// #404：create_frame/rename_frame/set_parent 命令 JSON 解析 + 端到端
+/// （回执/读模型 JSON name+parent 字段/环路拒绝错误码）。
+#[test]
+fn frame_commands_parse_and_json_shapes() {
+    // 解析全形态：create_frame（含 parent null/缺省/string 三态）。
+    let c = parse_cmd_core(
+        r#"{"t":"create_frame","id":"f1","name":"第一章","x":0,"y":0,"w":400,"h":300,"parent":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::CreateFrame { ref id, ref name, parent: None, .. }
+            if id.as_deref() == Some("f1") && name == "第一章"
+    ));
+    let c = parse_cmd_core(r#"{"t":"create_frame","id":null,"name":"外","x":1,"y":2,"w":3,"h":4}"#)
+        .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::CreateFrame {
+            id: None,
+            parent: None,
+            ..
+        }
+    ));
+    let c = parse_cmd_core(
+        r#"{"t":"create_frame","id":"f2","name":"内","x":0,"y":0,"w":10,"h":10,"parent":"f1"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::CreateFrame { parent: Some(ref p), .. } if p == "f1"
+    ));
+    let c = parse_cmd_core(r#"{"t":"rename_frame","id":"f1","name":"B"}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::RenameFrame { ref id, ref name } if id == "f1" && name == "B"
+    ));
+    // set_parent 两态：挂接 / 提顶层。
+    let c = parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":"f1"}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::SetParent { ref id, parent: Some(ref p) } if id == "n1" && p == "f1"
+    ));
+    let c = parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":null}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::SetParent {
+            id: _,
+            parent: None
+        }
+    ));
+    // 错误面：缺 name / parent 非 string / 缺 id。
+    for bad in [
+        r#"{"t":"create_frame","id":"f1","x":0,"y":0,"w":1,"h":1}"#,
+        r#"{"t":"create_frame","id":"f1","name":"X","x":0,"y":0,"w":1,"h":1,"parent":42}"#,
+        r#"{"t":"rename_frame","name":"X"}"#,
+        r#"{"t":"set_parent","parent":"f1"}"#,
+    ] {
+        let e = parse_cmd_core(bad).err().unwrap();
+        assert_eq!(e.code, "cv_bad_json", "{bad} → {e:?}");
+    }
+
+    // 端到端：建 frame → 节点入 frame → 读模型 JSON 含 name/parent。
+    let mut s = session(53);
+    add_node(&mut s, "n1", 10.0, 10.0);
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(
+                r#"{"t":"create_frame","id":"f1","name":"第一章","x":0,"y":0,"w":400,"h":300,"parent":null}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"frame_created""#), "{rj}");
+    assert!(rj.contains(r#""id":"f1""#), "{rj}");
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":"f1"}"#).unwrap(),
+    )
+    .unwrap();
+
+    // frame JSON：kind/name/parent 字段。
+    let oj = object_json(&s.find_object("f1").unwrap());
+    assert!(oj.contains(r#""kind":"frame""#), "{oj}");
+    assert!(oj.contains(r#""name":"第一章""#), "{oj}");
+    assert!(oj.contains(r#""parent":null"#), "{oj}");
+    // 节点 JSON：parent 挂接值；name 缺省 null。
+    let oj = object_json(&s.find_object("n1").unwrap());
+    assert!(oj.contains(r#""parent":"f1""#), "{oj}");
+    assert!(oj.contains(r#""name":null"#), "{oj}");
+
+    // 重命名 + 环路拒绝（引擎校验 → 既有错误码）。
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Ai,
+            parse_cmd_core(r#"{"t":"rename_frame","id":"f1","name":"第二章"}"#).unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"frame_renamed""#), "{rj}");
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"set_parent","id":"f1","parent":"n1"}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_invalid_input", "非 frame 目标拒收");
+}

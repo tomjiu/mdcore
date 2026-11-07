@@ -988,15 +988,96 @@ impl CanvasRendering {
     }
 
     /// 从读模型快照构建（会话或纯数据皆可）。
+    ///
+    /// #404：容器分层——Frame 背景框 + 标题恒在内容层之下（验收：
+    /// 「渲染时 frame 背景框在最底层」）。两趟发射：第一趟全部
+    /// Frame（背景 + 标题，帧间序 = 传入序）；第二趟非 Frame 内容
+    /// （z 序/ID 序由调用方决定）。容器不遮内容是 frame 的存在语义
+    /// （Figma/Miro 同款：区域是背景不是图元）。
     pub fn from_objects(objects: &[CanvasObject]) -> CanvasRendering {
         let mut out = CanvasRendering::default();
+        for o in objects.iter().filter(|o| o.kind == ObjectKind::Frame) {
+            for (s, tf) in frame_shapes(o) {
+                out.shapes.push((s, tf));
+            }
+        }
         for o in objects {
+            if o.kind == ObjectKind::Frame {
+                continue; // 容器面已发射
+            }
             if let Some((shape, tf)) = shape_from_object(o, objects) {
                 out.shapes.push((shape, tf));
             }
         }
         out
     }
+}
+
+// ── #404：frame 容器图元 ──────────────────────────────────────
+
+/// frame → 背景框 + 标题图元列（空名 frame 只发背景框）。
+///
+/// 缺省样式（props 可覆写，与 rect 同协议）：
+/// - 背景：极浅灰底 + 虚线边框（区域不是图元——虚线传递「容器」语义）；
+/// - 标题：名称文本，位于背景框左上角上方（Figma 同款标签位——不与
+///   内容争遮挡）；
+/// - 非法几何（NaN/inf）跳过发射（渲染面永不 panic 纪律）。
+fn frame_shapes(o: &CanvasObject) -> Vec<(Shape, Transform)> {
+    let props = &o.props;
+    if !(o.x.is_finite() && o.y.is_finite() && o.w.is_finite() && o.h.is_finite()) {
+        return vec![];
+    }
+    let rect = Rect::new(o.x, o.y, o.w, o.h);
+    let color_of = |key: &str, default: Color| -> Color {
+        match props.get(key) {
+            Some(v) => parse_color(v).unwrap_or(default),
+            None => default,
+        }
+    };
+    let stroke_width = props
+        .get("stroke_width")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.0);
+    let bg = Shape::Rect {
+        rect,
+        style: ShapeStyle {
+            fill: Some(color_of("fill", Color::rgb(0xf2, 0xf5, 0xf9))),
+            stroke: Some(StrokeStyle {
+                color: color_of("stroke", Color::rgb(0x9a, 0xa7, 0xb8)),
+                width: stroke_width,
+                cap: LineCap::Butt,
+                join: LineJoin::Round,
+                dash: StrokeDash::new(6, 4),
+            }),
+        },
+    };
+    let mut out = vec![(bg, Transform::IDENTITY)];
+    if let Some(name) = o.name.as_deref().filter(|n| !n.is_empty()) {
+        let size = props
+            .get("font_size")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(12.0);
+        out.push((
+            Shape::Text {
+                pos: Point::new(o.x, o.y - size * 0.25),
+                text: name.to_string(),
+                style: TextStyle {
+                    color: color_of("title_color", Color::rgb(0x4a, 0x55, 0x68)),
+                    size,
+                    anchor: TextAnchor::Start,
+                    family: props.get("font").cloned(),
+                    bold: props
+                        .get("bold")
+                        .map(|v| v == "1" || v == "true")
+                        .unwrap_or(true),
+                },
+            },
+            Transform::IDENTITY,
+        ));
+    }
+    out
 }
 
 // ── 对象到图元 ─────────────────────────────────────────────────
@@ -1015,7 +1096,9 @@ impl CanvasRendering {
 /// - image_data：十六进制字节（shape=image）
 ///
 /// 未知键与非法值忽略并回退缺省（渲染面永不 panic：敌意/陈旧属性面是
-/// 常态）。Group 对象本身不画（成员各自成图元）。
+/// 常态）。Group 对象本身不画（成员各自成图元）。Frame 对象不画内容
+/// 图元（背景框 + 标题由 [`CanvasRendering::from_objects`] 容器分层
+/// 发射——容器恒在内容层之下）。
 ///
 /// Edge 几何：按两端 Node 的矩形中心求连线（端点缺失/悬空则不画；并发
 /// 删除留下的悬空边在读模型里合法，渲染面跳过而不是 panic）。
@@ -1063,10 +1146,11 @@ pub fn shape_from_object(o: &CanvasObject, all: &[CanvasObject]) -> Option<(Shap
             ObjectKind::Edge => "line",
             ObjectKind::Group => "none",
             ObjectKind::Stroke => "stroke",
+            ObjectKind::Frame => "none",
         });
 
     let (shape, pivot) = match (o.kind, kind) {
-        (ObjectKind::Group, _) | (_, "none") => return None,
+        (ObjectKind::Group, _) | (ObjectKind::Frame, _) | (_, "none") => return None,
         (ObjectKind::Stroke, _) => {
             // 笔迹（#350——#44 第 1 步）：引擎渲染**中线真相**（原始
             // 采样点直连——MoveTo + LineTo）；perfect-freehand 平滑
