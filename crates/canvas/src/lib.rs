@@ -32,6 +32,16 @@ pub use render::{
     Shape, ShapeStyle, StrokeDash, StrokeStyle, SvgRenderer, TextAnchor, TextStyle, Transform,
 };
 pub use session::{
-    Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, CommandReceipt,
-    ObjectKind, SessionOptions, StrokeTool,
+    Actor,
+    BatchReceipt,
+    CanvasCommand,
+    CanvasError,
+    CanvasObject,
+    CanvasSession,
+    CommandOutcome,
+    CommandReceipt,
+    ObjectKind,
+    SessionOptions,
+    StrokeTool,
+
 };
