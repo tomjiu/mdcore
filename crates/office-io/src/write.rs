@@ -93,8 +93,10 @@
 //!   9/9 仅覆盖 bold/字色/填充/thin 边框/自定义 numFmt/居中对齐）；
 //! - 数值型合并区左上格（引擎 merge_range 仅字符串面——数值合并区
 //!   以文本形态落盘，类型扁平化如实登记）；
-//! - 图表/透视表/图片/数据验证/冻结窗格/列宽行高（引擎能力在，本
-//!   包装面未实测不宣称，按需增量）。
+//! - 图表/数据验证/冻结窗格（#496：[`SheetWriter::set_freeze_panes`]
+//!   ——XML 级 roundtrip 在 tests/write_roundtrip.rs）已实测宣称；
+//!   透视表/图片/列宽行高（引擎能力在，本包装面未实测不宣称，
+//!   按需增量）。
 //!
 //! 证据链：tests/write_roundtrip.rs（create → save → reopen → verify
 //! 全环）+ 本模块内联单测（验证/纪律/错误面）。
@@ -725,6 +727,31 @@ impl SheetWriter<'_> {
     /// （图表不触单元格写路径，不参与行序水位纪律）。
     pub fn add_chart(&mut self, spec: crate::xlsx_chart::ChartSpec) -> Result<(), WriteError> {
         crate::xlsx_chart::apply(self.ws, &spec)
+    }
+
+    /// 冻结窗格（#496）：`row`/`col` = 冻结分隔**之前**的行列数
+    /// （0 基计数——`set_freeze_panes(1, 0)` = 冻结首行，
+    /// `(0, 2)` = 冻结前两列；Excel 语义：分割在该格上方与左侧）。
+    ///
+    /// typed 预验证与 [`Self::write`] 同族（越界值不触引擎——
+    /// InvalidInput）；引擎错误（引擎内部维度约束）经 [`WriteError::Engine`]
+    /// 归一。与写入次序无耦合（pane 是表级设置非单元格写——流式
+    /// 表同样可用，无水位约束）。
+    pub fn set_freeze_panes(&mut self, row: u32, col: u16) -> Result<(), WriteError> {
+        if row > MAX_ROW {
+            return Err(WriteError::InvalidInput(format!(
+                "freeze row {row} exceeds max {MAX_ROW}"
+            )));
+        }
+        if col > MAX_COL {
+            return Err(WriteError::InvalidInput(format!(
+                "freeze col {col} exceeds max {MAX_COL}"
+            )));
+        }
+        self.ws
+            .set_freeze_panes(row, col)
+            .map(|_| ())
+            .map_err(|e| WriteError::Engine(e.to_string()))
     }
 }
 
