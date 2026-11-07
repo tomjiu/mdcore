@@ -3792,7 +3792,35 @@ mod pdf_annot_save_tests {
                 panic!("页视图构造失败（夹具/真缺陷，非环境缺件）：{e}")
             }
             Some(None) => {} // 页视图在位——全量真跑。
-            None => panic!("pdf 标签开后页视图槽应在位"),
+            // 槽缺位 = 打开本身失败（无标签可挂，open_document_tab 走
+            // Failed 分支）——失败文案在 notice：libpdfium 定位/装载
+            // = 环境缺件（SKIP 横幅，同上口径，AGENTS 13.1 门序）；
+            // 其他 = 夹具/真缺陷（panic，不放过）。
+            None => {
+                let notice = window
+                    .update(cx, |_host, _window, cx| {
+                        shell.update(cx, |shell, _| {
+                            shell.notice_board.message().map(str::to_owned)
+                        })
+                    })
+                    .expect("窗口更新");
+                match notice {
+                    Some(msg) if msg.contains("libpdfium") => {
+                        eprintln!(
+                            "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                             本机无 libpdfium——#386 Shell 分流 e2e 未真跑\n  \
+                             （pdf 打开面即失败：引擎绑定缺库）。\n  \
+                             有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                             cargo test）全量执行。\n═══════════════════════════\n"
+                        );
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                    other => {
+                        panic!("pdf 标签未开（夹具/真缺陷，非环境缺件）：{other:?}")
+                    }
+                }
+            }
         }
 
         // ① 手势驱动页视图（生产入口 = finish_drag_annotation 收尾同款
@@ -3911,7 +3939,33 @@ mod pdf_annot_save_tests {
                 panic!("页视图构造失败（夹具/真缺陷，非环境缺件）：{e}")
             }
             Some(None) => {}
-            None => panic!("pdf 标签开后页视图槽应在位"),
+            // 槽缺位 = 打开本身失败（同上一条口径：libpdfium 缺件 SKIP
+            // 横幅；其他失败 panic 不放过——两处门文案见上）。
+            None => {
+                let notice = window
+                    .update(cx, |_host, _window, cx| {
+                        shell.update(cx, |shell, _| {
+                            shell.notice_board.message().map(str::to_owned)
+                        })
+                    })
+                    .expect("窗口更新");
+                match notice {
+                    Some(msg) if msg.contains("libpdfium") => {
+                        eprintln!(
+                            "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                             本机无 libpdfium——#386 退出面 e2e 未真跑\n  \
+                             （pdf 打开面即失败：引擎绑定缺库）。\n  \
+                             有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                             cargo test）全量执行。\n═══════════════════════════\n"
+                        );
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                    other => {
+                        panic!("pdf 标签未开（夹具/真缺陷，非环境缺件）：{other:?}")
+                    }
+                }
+            }
         }
 
         // 手势置脏 → 模拟用户点窗口关闭钮（真实 should-close 回调链）
