@@ -861,6 +861,32 @@ fn walk_blocks(blocks: &[Block], top: bool, c: &mut Mc) {
     }
 }
 
+/// #318 D4 验收①：文本框文本采集（文档序，每框 = 内层段落拼接）。
+fn textbox_texts(doc: &DocxDocument) -> Vec<String> {
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for b in blocks {
+            if let Block::TextBox(tb) = b {
+                let text: Vec<String> = tb
+                    .blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if let Block::Paragraph(p) = b {
+                            Some(p.text().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                out.push(text.join(" "));
+                walk(&tb.blocks, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&doc.blocks, &mut out);
+    out
+}
+
 fn model_counts(doc: &DocxDocument) -> Mc {
     let mut c = Mc::default();
     walk_blocks(&doc.blocks, true, &mut c);
@@ -897,10 +923,11 @@ fn parity_violations(file: &str, gt: &Gt, m: &Mc) -> Vec<String> {
         gt.tbl_nested - gt.tbl_nested_in_sdt,
         m.all_nested_table,
     );
-    let group_loss = gt.txbx_in_group - gt.groups_with_txbx.min(gt.txbx_in_group);
+    // #318 D4 修复后组内文本框全保留（旧扣除项 group_loss =
+    // txbx_in_group − groups_with_txbx 移除——第二趟补发射被丢成员）。
     chk(
         "textboxes",
-        gt.txbx_outermost - gt.txbx_in_sdt - gt.txbx_in_tc - group_loss,
+        gt.txbx_outermost - gt.txbx_in_sdt - gt.txbx_in_tc,
         m.all_textbox,
     );
     chk("top_para", gt.p_direct + gt.p_in_ac, m.top_para);
@@ -933,8 +960,7 @@ fn full_corpus_structural_parity() {
     let mut gt_fails: Vec<String> = Vec::new();
     let mut violations: Vec<String> = Vec::new();
     // 已知损失可见性聚合（不静默——汇总打印）。
-    let (mut sdt_loss, mut txbx_tc_loss, mut group_loss_files, mut odd_ref_files) =
-        (0usize, 0usize, 0usize, 0usize);
+    let (mut sdt_loss, mut txbx_tc_loss, mut odd_ref_files) = (0usize, 0usize, 0usize);
     let (mut ac_flatten_files, mut strict_files, mut attr_drop_files) = (0usize, 0usize, 0usize);
     let (
         mut nested_files,
@@ -1010,9 +1036,6 @@ fn full_corpus_structural_parity() {
         if gt.txbx_in_tc > 0 {
             txbx_tc_loss += 1;
         }
-        if gt.txbx_in_group > gt.groups_with_txbx {
-            group_loss_files += 1;
-        }
         if gt.refs_odd > 0 {
             odd_ref_files += 1;
         }
@@ -1065,7 +1088,7 @@ fn full_corpus_structural_parity() {
     // ---- 可见性汇总（已知损失不静默——#260 账本面）----
     eprintln!("[structural-ledger] 630 件：ok {ok} / 容器拒绝 {reject_container} / 解析拒绝 {reject_parse} / panic 0");
     eprintln!("[structural-ledger] 五类覆盖：嵌套表 {nested_files} / 文本框 {txbx_files} / 修订 {ins_files} / 页眉页脚 {hf_files} / 脚注 {fn_files} / 批注 {cm_files} / 多节 {multi_sect}");
-    eprintln!("[structural-ledger] 已知损失（登记缺陷，非平价门内）：sdt 内容丢 {sdt_loss} 件 / 表内文本框丢 {txbx_tc_loss} 件 / 组内文本框丢 {group_loss_files} 件 / odd 型引用丢 {odd_ref_files} 件 / strict 引用丢 {strict_files} 件 / 空属性节丢 {attr_drop_files} 件 / AC 扁平重复 {ac_flatten_files} 件");
+    eprintln!("[structural-ledger] 已知损失（登记缺陷，非平价门内）：sdt 内容丢 {sdt_loss} 件 / 表内文本框丢 {txbx_tc_loss} 件 / odd 型引用丢 {odd_ref_files} 件 / strict 引用丢 {strict_files} 件 / 空属性节丢 {attr_drop_files} 件 / AC 扁平重复 {ac_flatten_files} 件");
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,11 +1182,37 @@ fn five_category_pinned_anchors() {
     assert_eq!(m.all_table, 0, "Bug54771a sdt 内表全丢（P1-2 可见性）");
     let g = gt_one("poi-docx/Bug54771a.docx");
     assert_eq!(g.tbl_in_sdt, 2, "Bug54771a GT sdt 内表数");
-    // 组内文本框：60316（组 2 框留 1[已知损失 #3]）。
+    // 组内文本框（#318 D4 修复后全保留）：60316（组 2 框——模型面
+    // 幸存末位 [Address…] + 第二趟补发首位 [Allison…]）+
+    // shapes-with-text（散 3 框 + 组 2 框 = 5，幸存末位
+    // "Where some contain text"，补发首位 "A group of shapes"）。
     let m = model_counts(&read_one("poi-docx/60316.docx"));
-    assert_eq!(m.all_textbox, 1, "60316 组内框保留数");
+    assert_eq!(m.all_textbox, 2, "60316 组内框全保留（D4）");
     let g = gt_one("poi-docx/60316.docx");
     assert_eq!(g.txbx_in_group, 2, "60316 GT 组内框数");
+    let m = model_counts(&read_one("poi-docx/shapes-with-text.docx"));
+    assert_eq!(m.all_textbox, 5, "shapes-with-text 全框保留（散3+组2，D4）");
+    let g = gt_one("poi-docx/shapes-with-text.docx");
+    assert_eq!(g.txbx_in_group, 2, "shapes-with-text GT 组内框数");
+    // D4 验收①：被丢成员具体文本在场（补发首位 + 幸存末位双断言）。
+    let texts = textbox_texts(&read_one("poi-docx/60316.docx"));
+    assert!(
+        texts.iter().any(|t| t.contains("Allison")),
+        "60316 补发成员（组首位）文本在场：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("Address 1")),
+        "60316 幸存成员（组末位）文本在场：{texts:?}"
+    );
+    let texts = textbox_texts(&read_one("poi-docx/shapes-with-text.docx"));
+    assert!(
+        texts.iter().any(|t| t.contains("A group of shapes")),
+        "shapes-with-text 补发成员（组首位）文本在场：{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("Where some contain text")),
+        "shapes-with-text 幸存成员（组末位）文本在场：{texts:?}"
+    );
     // AC 扁平（内容重复缺陷钉定）：mc-block 2 直段 + 11 AC 段 = 13。
     let m = model_counts(&read_one("docx4j/mc-fun_mc-block.docx"));
     assert_eq!(m.top_para, 13, "mc-block AC 全展开段数（钉现行為）");
