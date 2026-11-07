@@ -656,6 +656,15 @@ impl ShellApp {
             .is_some_and(|ed| ed.read(cx).doc_kind() == "pdf")
     }
 
+    /// #421：当前 pdf 页视图实体（页视图激活 + 当前标签是 pdf 才有——
+    /// 字号/缩放键位的路由目标；与 Ctrl+F 切文本视图同拦截口径）。
+    fn active_pdf_pages_view(&self, cx: &Context<Self>) -> Option<Entity<PdfPagesView>> {
+        if !self.pdf_view_mode || !self.active_is_pdf(cx) {
+            return None;
+        }
+        self.pdf_pages.as_ref().map(|(_, e)| e.clone())
+    }
+
     /// 确保当前 pdf 标签的页视图实体在场（非 pdf 态 / 已在同路径实体
     /// 上 = 无操作）。切到不同 pdf 标签时重建（旧实体 drop——页缓存
     /// 随之释放，单实体生命周期与单 pdf 标签对齐）。
@@ -2150,26 +2159,56 @@ impl Render for ShellApp {
                             return;
                         }
                         // F6：Ctrl+= / Ctrl++ 放大（shift 兼容——"+" 多为
-                        // shift+= 产生）。
+                        // shift+= 产生）。#421：pdf 页视图激活时改页面缩放
+                        //（位图页无字号语义——Acrobat parity）。
                         ShellAction::FontBigger => {
+                            if let Some(view) = this.active_pdf_pages_view(cx) {
+                                view.update(cx, |v, cx| v.zoom_in(cx));
+                                return;
+                            }
                             let next = this.font_size + 1.;
                             this.apply_font_size(px(next), cx);
                             return;
                         }
-                        // F6：Ctrl+- 缩小。
+                        // F6：Ctrl+- 缩小。#421：pdf 页视图 → 页面缩小。
                         ShellAction::FontSmaller => {
+                            if let Some(view) = this.active_pdf_pages_view(cx) {
+                                view.update(cx, |v, cx| v.zoom_out(cx));
+                                return;
+                            }
                             let next = this.font_size - 1.;
                             this.apply_font_size(px(next), cx);
                             return;
                         }
-                        // F6：Ctrl+0 重置 15px。
+                        // F6：Ctrl+0 重置 15px。#421：pdf 页视图 → 适应
+                        // 页面（issue 口径：Ctrl+0 适应页面）。
                         ShellAction::FontReset => {
+                            if let Some(view) = this.active_pdf_pages_view(cx) {
+                                view.update(cx, |v, cx| v.zoom_fit_page(cx));
+                                return;
+                            }
                             this.apply_font_size(px(15.), cx);
                             return;
                         }
                         // F6：Ctrl+T 循环主题（system → light → dark → system）。
                         ShellAction::CycleTheme => {
                             this.cycle_theme(cx);
+                            return;
+                        }
+                        // #421：Ctrl+1 pdf 页视图实际大小（1pt = 96/72px；
+                        // 非 pdf 页视图态无操作——动作面 pdf 专属）。
+                        ShellAction::PdfZoomActualSize => {
+                            if let Some(view) = this.active_pdf_pages_view(cx) {
+                                view.update(cx, |v, cx| v.zoom_actual_size(cx));
+                            }
+                            return;
+                        }
+                        // #421：Ctrl+2 / Ctrl+Shift+0 pdf 页视图适应宽度
+                        //（倍率复位 1.0）。
+                        ShellAction::PdfZoomFitWidth => {
+                            if let Some(view) = this.active_pdf_pages_view(cx) {
+                                view.update(cx, |v, cx| v.zoom_fit_width(cx));
+                            }
                             return;
                         }
                         // F1：Ctrl+O 文件打开。

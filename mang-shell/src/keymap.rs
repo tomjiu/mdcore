@@ -119,6 +119,8 @@
 //! | S9 | 0(plain) | [`ShellAction::FontReset`] | Ctrl+0 |
 //! | S10 | t(plain) | [`ShellAction::CycleTheme`] | Ctrl+T |
 //! | S11 | o(plain) | [`ShellAction::PromptOpenFile`] | Ctrl+O |
+//! | S12 | 1(plain) | [`ShellAction::PdfZoomActualSize`] | Ctrl+1（#421——pdf 页视图实际大小） |
+//! | S13 | 2(plain)；0(ctrl+shift) | [`ShellAction::PdfZoomFitWidth`] | Ctrl+2 / Ctrl+Shift+0（#421——适应宽度双键位） |
 //!
 //! （plain = ctrl 按下且 shift/alt 未按下——对应 shell `plain_ctrl`。）
 //!
@@ -433,6 +435,12 @@ pub enum ShellAction {
     FontReset,
     /// Ctrl+T 循环主题（`cycle_theme`）。
     CycleTheme,
+    /// #421：Ctrl+1 pdf 页面视图实际大小（1pt = 96/72px；非 pdf 页
+    /// 视图态无操作——动作面 pdf 专属）。
+    PdfZoomActualSize,
+    /// #421：Ctrl+2 / Ctrl+Shift+0 pdf 页面视图适应宽度（倍率复位；
+    /// 非 pdf 页视图态无操作）。
+    PdfZoomFitWidth,
 }
 
 /// 两域动作统一面（用户覆盖的 `action` 机器名解析目标 / 冲突检测的
@@ -571,6 +579,8 @@ impl ShellAction {
             ShellAction::FontSmaller => "font_smaller",
             ShellAction::FontReset => "font_reset",
             ShellAction::CycleTheme => "cycle_theme",
+            ShellAction::PdfZoomActualSize => "pdf_zoom_actual_size",
+            ShellAction::PdfZoomFitWidth => "pdf_zoom_fit_width",
         }
     }
 }
@@ -623,6 +633,8 @@ const SHELL_ACTION_IDS: &[ShellAction] = &[
     ShellAction::FontSmaller,
     ShellAction::FontReset,
     ShellAction::CycleTheme,
+    ShellAction::PdfZoomActualSize,
+    ShellAction::PdfZoomFitWidth,
 ];
 
 /// 查表点（dispatch 守卫序列中的位置——绑定条目的归属域）。
@@ -849,6 +861,17 @@ fn default_shell() -> Vec<Entry> {
         ),
         // S9：Ctrl+0 重置。
         e(Binding::Single(plain("0")), A::FontReset),
+        // #421 S12：Ctrl+1 pdf 实际大小（pdf 页视图外无操作——动作面
+        // pdf 专属，其他态静默）。
+        e(Binding::Single(plain("1")), A::PdfZoomActualSize),
+        // #421 S13：适应宽度双键位——Ctrl+2（Acrobat 同款主键位）+
+        // Ctrl+Shift+0（issue 原文键位；部分布局 shift+0 产生 ")"
+        // 不命中，Ctrl+2 兕底）。
+        e(Binding::Single(plain("2")), A::PdfZoomFitWidth),
+        e(
+            Binding::Single(KeyPattern::key("0").with(Yes, Yes, No)),
+            A::PdfZoomFitWidth,
+        ),
         // S10：Ctrl+T 循环主题。
         e(Binding::Single(plain("t")), A::CycleTheme),
         // S11：Ctrl+O 打开文件（和弦续接优先——无挂起时才到此）。
@@ -2029,7 +2052,13 @@ mod tests {
         shell_hit("+", true, true, false, ShellAction::FontBigger);
         shell_hit("-", true, false, false, ShellAction::FontSmaller);
         shell_hit("0", true, false, false, ShellAction::FontReset);
-        shell_miss("0", true, true, false); // plain_ctrl
+        // #421：Ctrl+Shift+0 现命中适应宽度（原 plain_ctrl 未命中态
+        // 被 S13 双键位取代）。
+        shell_hit("0", true, true, false, ShellAction::PdfZoomFitWidth);
+        shell_hit("1", true, false, false, ShellAction::PdfZoomActualSize);
+        shell_miss("1", true, true, false); // shift 守卫（S12 plain）
+        shell_hit("2", true, false, false, ShellAction::PdfZoomFitWidth);
+        shell_miss("2", false, false, false); // 无 ctrl 不命中
         shell_hit("t", true, false, false, ShellAction::CycleTheme);
         shell_hit("o", true, false, false, ShellAction::PromptOpenFile);
         shell_miss("o", true, true, false);

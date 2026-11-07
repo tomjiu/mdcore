@@ -57,15 +57,30 @@
 //!   定槽高，真图内接呈现（`ObjectFit::Contain` 缺省），不裁不拉；
 //!   异形页上的右键拖框坐标按等比槽近似（拖框落点在异形页上有
 //!   letterbox 偏移——与「异形页内接呈现」同源边界，登记待后续轮）；
+//! - **#421 放大态水平裁切**：zoom > 1 时页面宽超视口——uniform_list
+//!   垂直专用无水平滚动，超宽部分居中裁切（读小字场景够用；水平
+//!   平移/横向滚动条属后续轮——需重构列表容器为双向滚动）；
 //! - **页面视图下无文本查找**：Ctrl+F 自动切文本视图（提示横幅说明）
 //!   ——跨视图查找/选区属后续轮；
-//! - **无缩放**：适宽单档（Ctrl+= 字号缩放对 pdf 页不适用——页面
-//!   缩放属后续轮）；
 //! - 扫描件（无文本层）在页面视图下**正是正确呈现**（位图就是内容）
 //!   ——文本视图的「OCR 不支持」提示不再挡路；
 //! - **沙箱无 GUI**：右键拖框交互层只有编译面验证（本机 cargo check），
 //!   手势体验待真机；写路径逻辑面（坐标变换/命令/flush/落盘/签名
-//!   保持）在 `tests/pdf_annotate_e2e.rs` 全量真跑（无 GUI 依赖）。
+//!   保持）在 `tests/pdf_annotate_e2e.rs` 全量真跑（无 GUI 依赖）；
+//!
+//! ## 缩放（#421——Acrobat parity）
+//!
+//! - **Ctrl+滚轮**：步进 10%（Capture 相拦截——ctrl 按住时不落入
+//!   列表滚动）；锚点滚动（光标处内容缩放后仍在光标下，不跳页）；
+//! - **快捷键**（shell 键位面路由，页视图激活时接管字号键位）：
+//!   Ctrl+=/- 放大缩小、Ctrl+0 适应页面、Ctrl+1 实际大小（1pt =
+//!   96/72px）、Ctrl+2 / Ctrl+Shift+0 适应宽度；
+//! - **位图先缩后清**：zoom 变更瞬间新光栅在途，未落地前显示旧好图
+//!   拉伸（`last_good` 回退面——即时反馈）；新光栅落地后换清晰图
+//!   （光栅宽 = 量化(适宽×zoom)，光栅:显示 1:1 不二次模糊）；
+//! - **批注坐标**：dpi = 当前显示宽/页宽(pt)×72——随 zoom 校正，
+//!   缩放后拖框落点仍准确（#304 变换面不变）；
+//! - 视级状态：切页/滚动保持倍率（验收 4）。
 //!
 //! ## 引擎绑定纪律
 //!
@@ -110,6 +125,12 @@ const RENDER_WATCHDOG: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// 页左右留白（px）——页面与视口缘的呼吸。
 const PAGE_MARGIN_X: Pixels = px(12.);
+/// #421：缩放域下限（相对适宽倍率）。
+pub const ZOOM_MIN: f32 = 0.25;
+/// #421：缩放域上限。
+pub const ZOOM_MAX: f32 = 4.0;
+/// #421：Ctrl+滚轮/快捷键步进（10%——issue 口径）。
+pub const ZOOM_STEP: f32 = 1.10;
 
 /// 预渲染身份键：（0 基页号, 量子化光栅宽）——渲染前不知引擎侧
 /// 实际高（页各自纵横比），缓存全键（[`RenderKey`]）待回执落地后
@@ -151,6 +172,15 @@ pub struct PdfPagesView {
     /// 工具切换提示（最近一次退化单击——底部横幅明示当前工具与切换
     /// 手势；下一次手势提交时清零——不永久占屏）。
     annotate_hint: Option<String>,
+    /// #421：缩放倍率（相对适宽；1.0 = 适宽。光栅宽/槽高/批注 dpi
+    /// 全随动；视级状态——切页保持）。
+    zoom: f32,
+    /// #421：首页有效宽（pt）——「实际大小」（1pt = 96/72px）基准；
+    /// 几何预读失败 = None（实际大小退化为适宽）。
+    page_pt_w: Option<f32>,
+    /// #421：页级最近好图（zoom 变更的位图缩放回退面——新光栅在途
+    /// 时旧图拉伸显示，落地后换清晰图；flush 后 rev 变更即清零）。
+    last_good: HashMap<u32, RenderKey>,
     /// 回执轮询循环进行中（防重复起循环）。
     polling: bool,
     /// 虚拟列表滚动句柄（scroll_to_page / 可见区间推算共用）。
@@ -173,21 +203,23 @@ impl PdfPagesView {
     pub fn new(bytes: Vec<u8>, cx: &mut App) -> Self {
         let bytes = Arc::new(bytes);
         let focus_handle = cx.focus_handle();
-        // 几何预读（一次性）：页数 + 首页纵横比（前 3 页取首个有效几何
-        // ——封面页偶有异形，首页族比单首页稳）。失败 → error 态面板。
-        let (page_count, aspect) = match PdfiumEngine::open((*bytes).clone()) {
+        // 几何预读（一次性）：页数 + 首页纵横比与页宽 pt（前 3 页取
+        // 首个有效几何——封面页偶有异形，首页族比单首页稳）。失败 →
+        // error 态面板。
+        let (page_count, aspect, page_pt_w) = match PdfiumEngine::open((*bytes).clone()) {
             Ok(engine) => {
                 let count = engine.page_count() as usize;
-                let aspect = (0..count.min(3))
+                let geom = (0..count.min(3))
                     .filter_map(|i| engine.page_geometry(PageIndex(i as u32)).ok())
-                    .map(|g| {
-                        let w = g.effective_width();
-                        let h = g.effective_height();
-                        if w > 0. && h > 0. { h / w } else { 1.414 }
-                    })
-                    .next()
-                    .unwrap_or(1.414);
-                (count, aspect)
+                    .find(|g| g.effective_width() > 0. && g.effective_height() > 0.);
+                match geom {
+                    Some(g) => (
+                        count,
+                        g.effective_height() / g.effective_width(),
+                        Some(g.effective_width()),
+                    ),
+                    None => (count, 1.414, None),
+                }
             }
             Err(err) => {
                 return Self::error_state(
@@ -222,6 +254,9 @@ impl PdfPagesView {
             annotate_tool: AnnotateTool::Highlight,
             annotate_error: None,
             annotate_hint: None,
+            zoom: 1.,
+            page_pt_w,
+            last_good: HashMap::new(),
             polling: false,
             scroll: UniformListScrollHandle::new(),
             focus_handle,
@@ -248,6 +283,9 @@ impl PdfPagesView {
             annotate_tool: AnnotateTool::Highlight,
             annotate_error: None,
             annotate_hint: None,
+            zoom: 1.,
+            page_pt_w: None,
+            last_good: HashMap::new(),
             polling: false,
             scroll: UniformListScrollHandle::new(),
             focus_handle,
@@ -267,6 +305,105 @@ impl PdfPagesView {
     /// 槽高（px）：适宽 × 首页纵横比（纯函数——单测锚点）。
     fn slot_height(fit_w: u32, aspect: f32) -> f32 {
         fit_w as f32 * aspect
+    }
+
+    // ── #421：缩放面 ─────────────────────────────────────────
+
+    /// 当前倍率（相对适宽）。
+    pub fn zoom_factor(&self) -> f32 {
+        self.zoom
+    }
+
+    /// 缩放后的光栅/显示宽（px）——量化（缓存键稳定 + 光栅:显示 1:1
+    /// 不二次模糊；域钳随 [`quantize_width`]）。
+    fn zoomed_width_for(&self, vw: f32) -> u32 {
+        zoomed_width(Self::fit_width(vw), self.zoom)
+    }
+
+    /// 有效倍率（量子化后的实际显示比——角标口径；与名义 zoom 的差
+    /// = 量子化合步）。
+    fn effective_zoom(&self) -> f32 {
+        let vw = self.viewport_size.0.max(320.);
+        let fit = Self::fit_width(vw) as f32;
+        if fit <= 0. {
+            return self.zoom;
+        }
+        self.zoomed_width_for(vw) as f32 / fit
+    }
+
+    /// 设倍率（域钳制；变化才 notify——幂等零重绘）。
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let z = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (z - self.zoom).abs() < 1e-6 {
+            return;
+        }
+        self.zoom = z;
+        cx.notify();
+    }
+
+    /// 放大一步（Ctrl+= / Ctrl+滚轮上）。
+    pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        let z = self.zoom;
+        self.set_zoom(z * ZOOM_STEP, cx);
+    }
+
+    /// 缩小一步（Ctrl+- / Ctrl+滚轮下）。
+    pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        let z = self.zoom;
+        self.set_zoom(z / ZOOM_STEP, cx);
+    }
+
+    /// 适应页面（整页入视口高——Ctrl+0）。
+    pub fn zoom_fit_page(&mut self, cx: &mut Context<Self>) {
+        let (vw, vh) = self.viewport_size;
+        if vw <= 0. || vh <= 0. {
+            return; // 首帧视口未记录——无基准不缩。
+        }
+        let z = fit_page_zoom(vh, Self::fit_width(vw), self.aspect);
+        self.set_zoom(z, cx);
+    }
+
+    /// 实际大小（1pt = 96/72 px——Ctrl+1；页宽缺失退化为适宽）。
+    pub fn zoom_actual_size(&mut self, cx: &mut Context<Self>) {
+        let vw = self.viewport_size.0.max(320.);
+        let Some(pt_w) = self.page_pt_w.filter(|w| *w > 0.) else {
+            self.set_zoom(1., cx);
+            return;
+        };
+        let z = actual_size_zoom(pt_w, Self::fit_width(vw));
+        self.set_zoom(z, cx);
+    }
+
+    /// 适应宽度（倍率复位 1.0——Ctrl+2 / Ctrl+Shift+0）。
+    pub fn zoom_fit_width(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(1., cx);
+    }
+
+    /// Ctrl+滚轮缩放 + 锚点滚动（光标处内容缩放后仍在光标下——不跳
+    /// 页；量化合步带来的 ≤64px 漂移可接受，v1 登记）。滚动偏移校正
+    /// 在 zoom 生效后、列表重排前设置（uniform_list 下帧按新槽高消费）。
+    fn wheel_zoom(&mut self, wheel_dy: f32, cursor_y: f32, cx: &mut Context<Self>) {
+        let old = self.zoom;
+        if wheel_dy > 0. {
+            self.zoom_in(cx);
+        } else if wheel_dy < 0. {
+            self.zoom_out(cx);
+        } else {
+            return;
+        }
+        let ratio = self.zoom / old;
+        if (ratio - 1.).abs() < 1e-6 {
+            return; // 域边界——无变化零校正。
+        }
+        let cursor = cursor_y.max(0.);
+        let offset_y = f32::from(self.scroll.0.borrow().base_handle.offset().y).max(0.);
+        let content_y = offset_y + cursor;
+        let new_offset = (content_y * ratio - cursor).max(0.);
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(gpui::Point::new(px(0.), px(new_offset)));
     }
 
     /// 滚到指定页（0 基——书签跳转锚；越界钳到末页）。
@@ -294,7 +431,8 @@ impl PdfPagesView {
         if vw <= 0. {
             return; // 首帧视口未记录——覆盖 canvas 本帧落位，下一帧起算。
         }
-        let fit_w = Self::fit_width(vw);
+        // #421：光栅/槽高随 zoom（zoomed_width_for 含量化+域钳）。
+        let fit_w = self.zoomed_width_for(vw);
         let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
         // 滚动偏移（内容坐标——base_handle.offset）。
         let offset_y = f32::from(self.scroll.0.borrow().base_handle.offset().y).max(0.);
@@ -374,6 +512,8 @@ impl PdfPagesView {
                                 self.rendered_heights.insert(key, page.height_px);
                                 let full =
                                     RenderKey::new(key.0, key.1, page.height_px, self.annotate_rev);
+                                // #421：页级最近好图（zoom 变更的回退面）。
+                                self.last_good.insert(key.0, full);
                                 let _evicted = self.cache.put(full, Arc::new(image), cost);
                                 cx.notify();
                             } else {
@@ -404,8 +544,9 @@ impl PdfPagesView {
     fn render_page_slot(&mut self, idx: usize, cx: &App) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let (vw, _) = self.viewport_size;
+        // #421：光栅/显示宽随 zoom（量化——与缓存键同源）。
         let fit_w = if vw > 0. {
-            Self::fit_width(vw)
+            self.zoomed_width_for(vw)
         } else {
             WIDTH_MIN
         };
@@ -414,7 +555,15 @@ impl PdfPagesView {
         let page_no = idx + 1;
         let image = self
             .render_key(&key)
-            .and_then(|k| self.cache.get(&k).cloned());
+            .and_then(|k| self.cache.get(&k).cloned())
+            .or_else(|| {
+                // #421：位图缩放回退——新光栅在途时旧好图拉伸显示（即时
+                // 反馈），落地后同键命中换清晰图（img 的 w/h 即显示尺寸，
+                // 位图自动伸缩）。
+                self.last_good
+                    .get(&(idx as u32))
+                    .and_then(|k| self.cache.get(k).cloned())
+            });
         match image {
             Some(image) => gpui::img(ImageSource::Render(image))
                 .id(gpui::ElementId::NamedInteger("pdf-page".into(), idx as u64))
@@ -509,12 +658,14 @@ impl PdfPagesView {
         let transform = controller.page_transform(page)?;
         let display_w = transform.display_size().width.max(1.0);
         let (vw, _) = self.viewport_size;
-        let fit_w = if vw > 0. {
-            Self::fit_width(vw)
+        // #421：dpi 随 zoom（位图宽 = 量化(适宽×zoom)——拖框坐标在
+        // 缩放后的槽内像素，与位图分辨率同口径）。
+        let raster_w = if vw > 0. {
+            self.zoomed_width_for(vw)
         } else {
             WIDTH_MIN
         };
-        let dpi = fit_w as f32 / display_w * 72.0;
+        let dpi = raster_w as f32 / display_w * 72.0;
         // 三手势派发（issue #302 验收 1：高亮/下划线/便签）。
         match self.annotate_tool {
             AnnotateTool::Highlight => {
@@ -563,6 +714,9 @@ impl PdfPagesView {
         // 机械丢弃路径）；新工人重提时这些键不在位即会重派。
         self.pending.clear();
         self.failed.clear();
+        // #421：回退面同步作废（旧 rev 位图已从缓存回收——拉伸显示
+        // 无素材，直接走占位框）。
+        self.last_good.clear();
         // #305：旧 rev 条目即刻回收（不等 LRU 驱逐——预算即时归位）。
         let _evicted = self.cache.invalidate_stale_revisions(self.annotate_rev);
         // 重建工人：工厂持新字节快照（原字节前缀 + 追加修订——增量
@@ -610,8 +764,12 @@ impl Render for PdfPagesView {
         }
         let entity = cx.entity().downgrade();
         let viewport_cell = self.viewport.clone();
+        // #421：滚轮缩放实体句柄（probe canvas paint 期注册观察器用）。
+        let zoom_entity = cx.entity().downgrade();
         let page_count = self.page_count;
-        let fit_w_hint = Self::fit_width(self.viewport_size.0.max(320.));
+        // #421：槽高提示随 zoom（zoomed_width_for 含量化——与页槽
+        // 同源；既有死代码链保留，_slot_h 仅作几何自检）。
+        let fit_w_hint = self.zoomed_width_for(self.viewport_size.0.max(320.));
         let _slot_h = Self::slot_height(fit_w_hint, self.aspect);
         let annotate_error = self.annotate_error.clone();
         let annotate_hint = self.annotate_hint.clone();
@@ -675,6 +833,30 @@ impl Render for PdfPagesView {
                         .color(ui::Color::Muted),
                 )
         });
+        // #421：缩放角标（非 1.0 时右下明示——有效倍率（量子化后实
+        // 际显示比）；提示键位便于发现）。
+        let zoom_badge = ((self.zoom - 1.).abs() > 1e-3).then(|| {
+            let pct = (self.effective_zoom() * 100.).round() as i32;
+            div()
+                .id("pdf-zoom-badge")
+                .absolute()
+                .bottom_4()
+                .right_12()
+                .opacity(0.95)
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.panel_background)
+                .px_3()
+                .py_2()
+                .child(
+                    ui::Label::new(format!(
+                        "缩放 {pct}%（Ctrl+滚轮 / Ctrl+0 适应页面 / Ctrl+1 实际大小 / Ctrl+2 适应宽度）"
+                    ))
+                    .size(ui::LabelSize::Small)
+                    .color(ui::Color::Muted),
+                )
+        });
         div()
             .id("pdf-pages-root")
             .relative()
@@ -689,8 +871,13 @@ impl Render for PdfPagesView {
             .children(error_banner)
             // #302 验收 1：工具提示横幅（在位时叠加底部）。
             .children(hint_banner)
+            // #421：缩放角标（非 1.0 时右下明示有效倍率——量子化后
+            // 的实际显示比；与横幅同款面板样式）。
+            .children(zoom_badge)
             // 覆盖 canvas：透明、绝对铺满——paint 期回写视口尺寸（Cell
-            // 共享，零实体更新零重入；不注册命中区，不挡列表滚轮）。
+            // 共享，零实体更新零重入；不注册命中区）+ #421 Ctrl+滚轮
+            // 缩放观察器（Capture 相 + bounds 过滤 + ctrl 守卫——仅
+            // ctrl 按住时拦截，普通滚动照常落列表）。
             .child(
                 div()
                     .id("pdf-viewport-probe")
@@ -706,6 +893,40 @@ impl Render for PdfPagesView {
                                 f32::from(bounds.size.width),
                                 f32::from(bounds.size.height),
                             )));
+                            // #421：Ctrl+滚轮缩放（Capture 相先行——
+                            // 拦截列表滚动；无 ctrl/光标不在视口内放行）。
+                            let ent = zoom_entity.clone();
+                            _window.on_mouse_event(
+                                move |event: &gpui::ScrollEvent,
+                                      phase: DispatchPhase,
+                                      _w: &mut Window,
+                                      cx: &mut App| {
+                                    if !phase.capture() || !event.modifiers.control {
+                                        return;
+                                    }
+                                    // 光标在视口内（窗口级观察器的手动
+                                    // 过滤——与 annotate_overlay 同模式）。
+                                    let in_x = event.position.x >= bounds.origin.x
+                                        && event.position.x <= bounds.origin.x + bounds.size.width;
+                                    let in_y = event.position.y >= bounds.origin.y
+                                        && event.position.y <= bounds.origin.y + bounds.size.height;
+                                    if !(in_x && in_y) {
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    // 滚轮方向 → 缩放向（上/右 = 放大；
+                                    // Lines 档位折算 40px/行）。
+                                    let dy = match event.delta {
+                                        gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+                                        gpui::ScrollDelta::Lines(l) => l.y * 40.,
+                                    };
+                                    let cursor_y =
+                                        f32::from(event.position.y - bounds.origin.y).max(0.);
+                                    let _ = ent.update(cx, |view, cx| {
+                                        view.wheel_zoom(dy, cursor_y, cx);
+                                    });
+                                },
+                            );
                         },
                     )),
             )
@@ -820,6 +1041,23 @@ pub fn quantize_width(w: u32) -> u32 {
     (clamped.div_ceil(WIDTH_QUANTUM) * WIDTH_QUANTUM).min(WIDTH_MAX)
 }
 
+/// #421：缩放光栅宽 = 量化(适宽 × zoom)（纯函数——单测锚点）。
+pub fn zoomed_width(fit_w: u32, zoom: f32) -> u32 {
+    quantize_width((fit_w as f32 * zoom) as u32)
+}
+
+/// #421：适应页面倍率 = 视口高 / 适宽槽高（纯函数——单测锚点）。
+pub fn fit_page_zoom(viewport_h: f32, fit_w: u32, aspect: f32) -> f32 {
+    let slot_h = (fit_w as f32 * aspect).max(1.);
+    (viewport_h / slot_h).max(0.)
+}
+
+/// #421：实际大小倍率 = 页宽(pt) × 96/72 / 适宽（纯函数——单测锚
+/// 点；1pt = 96/72px 是 Windows DPI 基准的等价口径）。
+pub fn actual_size_zoom(page_pt_w: f32, fit_w: u32) -> f32 {
+    page_pt_w * (96. / 72.) / fit_w.max(1) as f32
+}
+
 // ─── 纯函数面单测（零引擎依赖——CI 无 libpdfium 同样真跑） ──────────
 
 #[cfg(test)]
@@ -850,6 +1088,43 @@ mod tests {
         assert_eq!(PdfPagesView::fit_width(1024.), 1024);
         // 极窄视口 → 下限。
         assert_eq!(PdfPagesView::fit_width(10.), WIDTH_MIN);
+    }
+
+    /// #421：zoomed_width = 量化(适宽 × zoom)——域钳随量化面。
+    #[test]
+    fn zoomed_width_follows_zoom_and_clamps() {
+        assert_eq!(zoomed_width(1024, 1.0), 1024, "1.0 = 适宽不变");
+        // 1024 × 1.1 = 1126.4 → 量子化 1152。
+        assert_eq!(zoomed_width(1024, 1.1), 1152);
+        assert_eq!(zoomed_width(1024, 0.5), 512);
+        // 域上限：WIDTH_MAX 钳制（4.0 × 1024 = 4096 恰在域内；8.0 钳）。
+        assert_eq!(zoomed_width(1024, 4.0), 4096);
+        assert_eq!(zoomed_width(1024, 8.0), WIDTH_MAX);
+        // 极小 zoom → WIDTH_MIN 兕底。
+        assert_eq!(zoomed_width(1024, 0.01), WIDTH_MIN);
+    }
+
+    /// #421：适应页面倍率（整页入视口高）。
+    #[test]
+    fn fit_page_zoom_fits_viewport_height() {
+        // 适宽槽高 1024×1.414 = 1447.9；视口高 724 → 倍率 ≈ 0.5。
+        let z = fit_page_zoom(724., 1024, 1.414);
+        assert!((z - 724. / (1024. * 1.414)).abs() < 1e-6, "{z}");
+        // 槽高小于视口 → 放大到整页恰满。
+        let z = fit_page_zoom(2000., 1024, 1.0);
+        assert!((z - 2000. / 1024.).abs() < 1e-6);
+        // 兕底：零视口 → 0（上层不缩）。
+        assert_eq!(fit_page_zoom(0., 1024, 1.4), 0.);
+    }
+
+    /// #421：实际大小倍率（1pt = 96/72px）。
+    #[test]
+    fn actual_size_zoom_maps_pt_to_96dpi_px() {
+        // A4 宽 595pt → 793.3px；适宽 1024 → 倍率 ≈ 0.775。
+        let z = actual_size_zoom(595., 1024);
+        assert!((z - 595. * 96. / 72. / 1024.).abs() < 1e-6, "{z}");
+        // 零宽頁兜底（fit_w.max(1) 防除零）。
+        assert!(actual_size_zoom(595., 0).is_finite());
     }
 
     /// 尺寸/缓冲不一致 → None（failed 面，不 panic）。
