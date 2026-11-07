@@ -63,6 +63,8 @@
     body[data-pdf-active] .pdf-page .pdf-overlay { display: none !important; }
     /* #475：注释抽屉是屏面导航件——不进纸面。 */
     body[data-pdf-active] #pdf-annots-drawer { display: none !important; }
+    /* #463：大纲抽屉是屏面导航件——不进纸面。 */
+    body[data-pdf-active] #pdf-outline-drawer { display: none !important; }
   }
   /* 帮助面板（TR-UI 批 C-3）：快捷键速查 */
   #help-overlay { position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,.38);
@@ -374,6 +376,7 @@
   #pdf-panel { display: none; max-width: 1128px; margin: 8px auto 0; padding: 0 16px;
                height: calc(100vh - 170px); position: relative; }
   #pdf-toolbar { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 32px;
+  #pdf-toolbar { display: flex; align-items: center; gap: 6px; font-size: 13px; height: 32px;
                  flex-wrap: wrap; }
   .pdf-btn { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid var(--border);
              border-radius: 6px; background: var(--panel); cursor: pointer; }
@@ -409,6 +412,29 @@
   .pdf-annots-page { flex: none; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
   .pdf-annots-preview { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden;
                         text-overflow: ellipsis; color: var(--fg-soft); }
+  /* #463（长尾④）：大纲抽屉（面板内浮层——绝对定位不重排页流；打印态
+     不进纸面，见 @media print 块）。 */
+  #pdf-outline-drawer { position: absolute; left: 18px; top: 40px; bottom: 30px; width: 232px;
+                        z-index: 60; display: flex; flex-direction: column; overflow: hidden;
+                        background: var(--panel); border: 1px solid var(--border-strong);
+                        border-radius: 8px; box-shadow: 0 4px 14px rgb(0 0 0 / 0.16); }
+  #pdf-outline-drawer[hidden] { display: none; }
+  .pdf-outline-head { padding: 7px 10px; font-size: 12px; font-weight: 600; letter-spacing: .04em;
+                      text-transform: uppercase; color: var(--fg-muted);
+                      border-bottom: 1px solid var(--border); flex: none; }
+  .pdf-outline-body { overflow-y: auto; flex: 1; padding: 4px 0 10px; }
+  .pdf-outline-empty { padding: 12px 10px; font-size: 12px; color: var(--fg-muted); }
+  .pdf-outline-list { list-style: none; margin: 0; padding: 0; }
+  .pdf-outline-row { display: flex; align-items: center; gap: 3px; }
+  .pdf-outline-toggle { flex: none; width: 16px; height: 20px; border: none; background: none;
+                        color: var(--fg-muted); cursor: pointer; font-size: 10px; line-height: 1;
+                        padding: 0; }
+  .pdf-outline-leaf { flex: none; width: 16px; }
+  .pdf-outline-label { flex: 1; min-width: 0; text-align: left; border: none; background: none;
+                       font: inherit; font-size: 12.5px; padding: 3px 6px 3px 0; cursor: pointer;
+                       color: var(--fg); white-space: nowrap; overflow: hidden;
+                       text-overflow: ellipsis; border-radius: 4px; }
+  .pdf-outline-label:hover { background: var(--panel-hover); }
   #pdf-zoom-label { min-width: 42px; text-align: center; color: var(--fg-soft); font-variant-numeric: tabular-nums; }
   #pdf-search { font: inherit; font-size: 13px; padding: 2px 6px; border: 1px solid var(--border);
                 border-radius: 6px; background: var(--bg); width: 140px; }

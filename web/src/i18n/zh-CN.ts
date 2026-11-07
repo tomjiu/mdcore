@@ -216,6 +216,10 @@ export const zhCN: Dict = {
   'pdf.annotKInk': '墨迹',
   // #466（长尾①）：链接面（内链 title——外链 title = URL 本身）
   'pdf.linkToPage': '跳到第 {n} 页',
+  // #463（长尾④）：大纲面（pdf.js getOutline → 树 + 点击跳页）
+  'pdf.outline': '大纲',
+  'pdf.outlineTitle': '文档大纲（书签）面板',
+  'pdf.outlineEmpty': '本文档无大纲',
   'pdf.zoomOutTitle': '缩小',
   'pdf.zoomInTitle': '放大',
   'pdf.fitWidth': '适应宽度',

@@ -220,6 +220,10 @@ export const en = {
   'pdf.annotKInk': 'ink',
   // #466（长尾①）：链接面（内链 title——外链 title = URL 本身）
   'pdf.linkToPage': 'go to page {n}',
+  // #463（长尾④）：大纲面（pdf.js getOutline → 树 + 点击跳页）
+  'pdf.outline': 'outline',
+  'pdf.outlineTitle': 'Document outline (bookmarks) panel',
+  'pdf.outlineEmpty': 'no outline in this document',
   'pdf.zoomOutTitle': 'zoom out',
   'pdf.zoomInTitle': 'zoom in',
   'pdf.fitWidth': 'fit width',
