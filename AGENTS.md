@@ -63,8 +63,11 @@ gh api "repos/mmqz/<repo>/pulls?state=closed&per_page=100" --jq '.[] | select(.m
 # 第 3 步：这个 issue 有没有对应的分支？
 gh api "repos/mmqz/<repo>/branches?per_page=100" --jq '.[].name' | grep -i "<N>"
 
-# 第 4 步：任务池里有没有人登记了
-gh api repos/mmqz/<repo>/issues/<pool> --jq '.body' | grep "<N>"
+# 第 4 步：全局同题搜——有没有别处已登记同一问题（防同题撞车，详见 0.0.12）
+gh api "search/issues?q=repo:mmqz/<repo>+<核心词>&state=open" --jq '.items[] | "#\(.number) \(.title)"'
+
+# （原第 4 步「查任务池」已废弃：#272/#310 任务池已作废，
+#   任务状态以 label + milestone + 认领评论为准，见 0.0.11）
 ```
 
 **判定规则：**
@@ -1187,9 +1190,10 @@ gh issue comment <number> --repo mmqz/<repo> --body "认领：<你的身份> 承
 **避免重复**：
 
 ```
-生成后先查一下有没有被占用：
-  在任务面板 #229 看已有的名字列表
-  或 gh api repos/mmqz/<repo>/issues?state=all --jq 筛选
+生成后先查一下有没有被占用（任务面板 #229 已废弃、不再维护名字列表，改用搜索）：
+  gh api "search/commits?q=repo:mmqz/<repo>+%22Agent-<后缀>%22" --jq '.total_count'
+  gh api "search/issues?q=repo:mmqz/<repo>+%22Agent-<后缀>%22" --jq '.total_count'
+  两处都为 0 = 未被占用（issues 搜索含评论，commits 搜索含 Co-Authored-By 尾注）
 
 重复了 → 重新生成一个
 ```
