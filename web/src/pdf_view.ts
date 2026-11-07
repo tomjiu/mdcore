@@ -602,6 +602,7 @@ export class PdfViewUI {
   private viewportEl!: HTMLDivElement;
   private contentEl!: HTMLElement;
   /** #475：工具栏句柄（抽屉 top 动态锚——wrap 到两行时不叠盖）。 */
+
   private toolbarEl!: HTMLDivElement;
   /** #3 UI 批 E：空态引导卡片层（文档在场 = hidden）。 */
   private guideEl!: HTMLDivElement;
@@ -1274,7 +1275,8 @@ export class PdfViewUI {
   }
 
   /** #463：大纲面板同步（树渲染 + 按钮态 + 抽屉开合——有大纲档自动展开，
-   * Acrobat 同款；无大纲/拆卸态 = 抽屉隐藏 + 按钮禁用）。 */
+   * Acrobat 同款；无大纲/拆卸态 = 抽屉隐藏 + 按钮禁用；抽屉 top 随
+   * 工具栏实际高度动态锚定——wrap 两行不叠盖）。 */
   private syncOutlinePanel(): void {
     if (
       !this.outlineBtn ||
@@ -1283,6 +1285,9 @@ export class PdfViewUI {
       !this.outlineEmptyEl
     ) {
       return;
+    }
+    if (this.toolbarEl) {
+      this.outlineDrawer.style.top = `${this.toolbarEl.offsetHeight + 8}px`;
     }
     const has = this.outlineTree.length > 0;
     this.outlineBtn.disabled = !has;

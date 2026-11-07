@@ -145,6 +145,18 @@ def main() -> int:
                 f"collapsed={hidden_child} expanded={shown_child} label={label_after_toggle}",
             )
 
+            # 5.5 按钮开合(手势级点击 #pdf-outline-btn——工具栏 wrap 两行
+            # 时按钮曾溢出 32px 盒被 textLayer 叠盖,此锁专防回归)
+            page.click("#pdf-outline-btn")
+            hidden_after = page.eval_on_selector("#pdf-outline-drawer", "el => el.hidden")
+            page.click("#pdf-outline-btn")
+            shown_after = page.eval_on_selector("#pdf-outline-drawer", "el => el.hidden")
+            check(
+                "outline_button_toggle",
+                hidden_after is True and shown_after is False,
+                f"hidden={hidden_after} shown={shown_after}",
+            )
+
             # 6. 空态对照：无大纲件 → 按钮禁用 + 抽屉隐藏 + 树空
             r2 = page.evaluate("window.__pdfOpenBytes('%s')" % b64(PLAIN))
             check("outline_plain_open", r2.get("ok") is True, json.dumps(r2))
