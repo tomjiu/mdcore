@@ -1,22 +1,23 @@
-//! 多标签（#68 阶段 F3）——标签栏 + 标签集纯逻辑。
+//! 多标签（#68 阶段 F3；#385 批 2：渲染层迁 `ui::TabBar`/`Tab`）。
 //!
 //! 分层：
 //! - 纯逻辑（无 gpui 依赖，单测钉定）：[`TabItem`] 载体、
 //!   [`active_after_close`]（关闭后邻位规则）、[`cycle_active`]（循环
 //!   切换）、[`tab_label`]（同名消歧——文件名/工作区相对路径/父目录
 //!   前缀三级）；
-//! - 渲染：[`tab_bar`]（标题栏下方一条——文件名 + 未保存 ● +
-//!   active 态 + 点击切换）。
+//! - 渲染：[`tab_bar`]——zed ui 组件语系（激活态/选中凸起边框/
+//!   标签栏背景/高度全部主题推导，主题切换即时跟随）。
 //!
 //! 快捷键（shell 级）：Ctrl+W 关闭当前（切邻位）；Ctrl+Tab /
 //! Ctrl+Shift+Tab 循环切换。编辑器 `tab` 键臂已加 `!ctrl` 守卫、
 //! 只读门禁放行 `tab + ctrl`（导航组合）——Ctrl+Tab 从编辑态冒泡。
 
+use std::cmp::Ordering;
 use std::path::Path;
 
-use gpui::{Context, Entity, MouseButton, px};
+use gpui::{Context, Entity, MouseButton, SharedString, px};
 use ui::prelude::*;
-use ui::{Label, LabelSize};
+use ui::{Label, LabelSize, Tab, TabBar, TabPosition};
 
 use crate::editor::Editor;
 use crate::shell::ShellApp;
@@ -83,14 +84,25 @@ pub fn tab_label(path: &Path, all: &[&Path], workspace: Option<&Path>) -> String
     }
 }
 
-/// 标签栏（标题栏下方一条，仅在有标签时渲染）。
+/// 标签栏（标题栏下方一条，仅在有标签时渲染；#385 批 2：zed 组件语系）。
+///
+/// 迁移面（原 152 行手写 → 组件）：
+/// - 激活/非激活背景、文字色、选中凸起边框（`TabPosition` 位置语义
+///   ——首/中/末与相对选中位）全部由 `Tab` 主题推导，主题切换即时
+///   跟随（原手写 element_selected/element_hover 固定搭配退役）；
+/// - 标签栏背景/高度/底部边框线/溢出横滚由 `TabBar` 承担
+///   （原 h(30px) + title_bar_background 硬编码退役）；
+/// - 保留：max_w(220) 长名限宽、脏标 ●（Accent，zed 习惯放 start_slot
+///   图标位）、同名消歧文案、点击切换。
+///
+/// 未迁移（诚实登记）：关闭钮（现状即无，Ctrl+W 关闭——end_slot +
+/// IconButton 增强待后续批次，避免单批行为面扩张）。
 pub fn tab_bar(
     tabs: &[TabItem],
     active: usize,
     workspace: Option<&Path>,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
-    let colors = cx.theme().colors().clone();
     let paths: Vec<&Path> = tabs.iter().map(|t| t.path.as_path()).collect();
     let rows: Vec<(String, bool)> = tabs
         .iter()
@@ -101,54 +113,53 @@ pub fn tab_bar(
             )
         })
         .collect();
+    let dirty_dot_color = ui::Color::Accent.color(cx);
 
-    h_flex()
-        .id("tab-bar")
-        .w_full()
-        .h(px(30.))
-        .flex_none()
-        .bg(colors.title_bar_background)
-        .px_1()
-        .gap_1()
-        .overflow_x_scroll()
-        .children(rows.into_iter().enumerate().map(|(idx, (label, dirty))| {
-            let is_active = idx == active;
-            let selected = colors.element_selected;
-            let hover = colors.element_hover;
-            h_flex()
-                .id(gpui::SharedString::from(format!("tab-{idx}")))
-                .px_2()
-                .h_full()
-                .max_w(px(220.))
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .rounded_sm()
-                .when(is_active, move |el| el.bg(selected))
-                .hover(move |el| el.bg(hover))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.activate_tab(idx, window, cx);
-                    }),
-                )
-                .child(
-                    Label::new(label)
+    TabBar::new("tab-bar").children(rows.iter().enumerate().map(|(idx, (label, dirty))| {
+        let is_active = idx == active;
+        let last = idx + 1 == rows.len();
+        // 位置语义（Tab 边框策略的输入）：首/末固定；中间按相对
+        // 选中位（Equal = 选中自身——完整边框 + 无底线「凸起」）。
+        let position = if !last && idx == 0 {
+            TabPosition::First
+        } else if last && idx != 0 {
+            TabPosition::Last
+        } else if is_active {
+            TabPosition::Middle(Ordering::Equal)
+        } else if idx < active {
+            TabPosition::Middle(Ordering::Less)
+        } else {
+            TabPosition::Middle(Ordering::Greater)
+        };
+        Tab::new(SharedString::from(format!("tab-{idx}")))
+            .toggle_state(is_active)
+            .position(position)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.activate_tab(idx, window, cx);
+                }),
+            )
+            .when(*dirty, |tab| {
+                tab.start_slot(div().text_color(dirty_dot_color).child("●"))
+            })
+            .child(
+                // 长名限宽（Tab 无宽度 API——限在 label 面并中段截断
+                // `…`，VS Code 同款；溢出横滚由 TabBar 承担）。
+                div().max_w(px(220.)).child(
+                    Label::new(label.clone())
                         .size(LabelSize::XSmall)
-                        .color(if is_active {
-                            ui::Color::Default
-                        } else {
-                            ui::Color::Muted
-                        }),
-                )
-                .when(dirty, |el| {
-                    el.child(
-                        Label::new("●")
-                            .size(LabelSize::XSmall)
-                            .color(ui::Color::Accent),
-                    )
-                })
-        }))
+                        .map(|l| {
+                            if is_active {
+                                l
+                            } else {
+                                l.color(ui::Color::Muted)
+                            }
+                        })
+                        .truncate_middle(),
+                ),
+            )
+    }))
 }
 
 // ---------------------------------------------------------------------------
