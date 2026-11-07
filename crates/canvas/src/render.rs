@@ -992,7 +992,46 @@ impl CanvasRendering {
         let mut out = CanvasRendering::default();
         for o in objects {
             if let Some((shape, tf)) = shape_from_object(o, objects) {
+                // #406：边标题——路径中点叠加 Text（关系语义可见面，
+                // 主图元之后同帧发射）。中点 = tf.origin（边图元的
+                // translate 恒 (0,0) + 绕支点旋转——支点即不动点）。
+                let edge_caption = if o.kind == ObjectKind::Edge {
+                    o.caption
+                        .as_deref()
+                        .filter(|c| !c.is_empty())
+                        .map(|caption| {
+                            let pos = tf.origin.unwrap_or_else(|| shape.pivot());
+                            (
+                                Shape::Text {
+                                    pos,
+                                    text: caption.to_string(),
+                                    style: TextStyle {
+                                        color: o
+                                            .props
+                                            .get("fill")
+                                            .and_then(|v| parse_color(v))
+                                            .unwrap_or(Color::rgb(0x33, 0x33, 0x33)),
+                                        size: o
+                                            .props
+                                            .get("font_size")
+                                            .and_then(|v| v.parse::<f64>().ok())
+                                            .filter(|v| v.is_finite() && *v > 0.0)
+                                            .unwrap_or(12.0),
+                                        anchor: TextAnchor::Middle,
+                                        family: o.props.get("font").cloned(),
+                                        bold: false,
+                                    },
+                                },
+                                Transform::IDENTITY,
+                            )
+                        })
+                } else {
+                    None
+                };
                 out.shapes.push((shape, tf));
+                if let Some(caption_shape) = edge_caption {
+                    out.shapes.push(caption_shape);
+                }
             }
         }
         out
@@ -1112,13 +1151,16 @@ pub fn shape_from_object(o: &CanvasObject, all: &[CanvasObject]) -> Option<(Shap
             (Shape::Path { cmds, style }, pivot)
         }
         (ObjectKind::Edge, _) => {
-            let center_of = |id: &str| -> Option<Point> {
+            let rect_of = |id: &str| -> Option<Rect> {
                 all.iter()
                     .find(|c| c.id == id && c.kind == ObjectKind::Node)
-                    .map(|c| Rect::new(c.x, c.y, c.w, c.h).center())
+                    .map(|c| Rect::new(c.x, c.y, c.w, c.h))
             };
-            let from = center_of(o.from.as_deref()?)?;
-            let to = center_of(o.to.as_deref()?)?;
+            let from_rect = rect_of(o.from.as_deref()?)?;
+            let to_rect = rect_of(o.to.as_deref()?)?;
+            // #406：锚点 = 指定边中点（缺省中心——既有行为向后兼容）。
+            let from = side_anchor(from_rect, o.from_side);
+            let to = side_anchor(to_rect, o.to_side);
             let style = StrokeStyle {
                 color: dim(color_of("stroke", Color::rgb(0x33, 0x33, 0x33))),
                 width: stroke_width,
@@ -1126,10 +1168,34 @@ pub fn shape_from_object(o: &CanvasObject, all: &[CanvasObject]) -> Option<(Shap
                 join: LineJoin::Round,
                 dash,
             };
-            (
-                Shape::Line { from, to, style },
-                Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5),
-            )
+            // #406：双侧指定 = 直角折线路由（stub 引出 + 单肘——不做
+            // 避障，issue 明确排除）；任一侧缺省 = 中心直线（既有行为）。
+            let (shape, pivot) = match (o.from_side, o.to_side) {
+                (Some(fs), Some(ts)) => {
+                    let pts = orthogonal_route(from_rect, fs, to_rect, ts);
+                    let pivot = polyline_midpoint(&pts);
+                    let mut cmds = Vec::with_capacity(pts.len());
+                    cmds.push(PathCmd::MoveTo(pts[0]));
+                    for p in &pts[1..] {
+                        cmds.push(PathCmd::LineTo(*p));
+                    }
+                    (
+                        Shape::Path {
+                            cmds,
+                            style: ShapeStyle {
+                                fill: None,
+                                stroke: Some(style),
+                            },
+                        },
+                        pivot,
+                    )
+                }
+                _ => (
+                    Shape::Line { from, to, style },
+                    Point::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5),
+                ),
+            };
+            (shape, pivot)
         }
         (_, "ellipse") => {
             let style = ShapeStyle {
@@ -1249,6 +1315,121 @@ fn centroid(pts: &[Point]) -> Point {
         y += p.y;
     }
     Point::new(x / pts.len() as f64, y / pts.len() as f64)
+}
+
+// ── #406：富 connector 几何 ─────────────────────────────────────
+
+/// 锚点：指定边中点（None = 中心——既有行为）。
+fn side_anchor(rect: Rect, side: Option<crate::session::Side>) -> Point {
+    use crate::session::Side;
+    match side {
+        None => rect.center(),
+        Some(Side::Top) => Point::new(rect.x + rect.w * 0.5, rect.y),
+        Some(Side::Bottom) => Point::new(rect.x + rect.w * 0.5, rect.y + rect.h),
+        Some(Side::Left) => Point::new(rect.x, rect.y + rect.h * 0.5),
+        Some(Side::Right) => Point::new(rect.x + rect.w, rect.y + rect.h * 0.5),
+    }
+}
+
+/// 侧别外法向（引出方向）。
+fn side_outward(side: crate::session::Side) -> (f64, f64) {
+    use crate::session::Side;
+    match side {
+        Side::Top => (0.0, -1.0),
+        Side::Bottom => (0.0, 1.0),
+        Side::Left => (-1.0, 0.0),
+        Side::Right => (1.0, 0.0),
+    }
+}
+
+/// 直角折线路由（#406 ④——简单路由，不做避障）：锚点 → 外引 stub →
+/// 单肘 → 对侧引出点 → 锚点。stub = 24（视觉惯例引出段；节点贴邻时
+/// 仍可分辨挂接侧）。连续共线/重复点折叠（干净折线）。
+fn orthogonal_route(
+    from_rect: Rect,
+    fs: crate::session::Side,
+    to_rect: Rect,
+    ts: crate::session::Side,
+) -> Vec<Point> {
+    const STUB: f64 = 24.0;
+    let p0 = side_anchor(from_rect, Some(fs));
+    let p3 = side_anchor(to_rect, Some(ts));
+    let (dx0, dy0) = side_outward(fs);
+    let (dx3, dy3) = side_outward(ts);
+    let p1 = Point::new(p0.x + dx0 * STUB, p0.y + dy0 * STUB);
+    let p2 = Point::new(p3.x + dx3 * STUB, p3.y + dy3 * STUB);
+    // 单肘：起点水平 → 肘 (p2.x, p1.y)；起点垂直 → 肘 (p1.x, p2.y)。
+    let elbow = if dx0 != 0.0 {
+        Point::new(p2.x, p1.y)
+    } else {
+        Point::new(p1.x, p2.y)
+    };
+    let pts = vec![p0, p1, elbow, p2, p3];
+    // 折叠共线中点与重复点（stub 零距/肘重合的干净输出）。
+    let mut out: Vec<Point> = Vec::with_capacity(pts.len());
+    for p in pts {
+        if let Some(&last) = out.last() {
+            if (last.x - p.x).abs() < 1e-9 && (last.y - p.y).abs() < 1e-9 {
+                continue;
+            }
+        }
+        out.push(p);
+    }
+    // 三点共线折叠（水平或垂直方向上的中间冗余点）。
+    let mut i = 1;
+    while i + 1 < out.len() {
+        let a = out[i - 1];
+        let b = out[i];
+        let c = out[i + 1];
+        let collinear = ((a.x - b.x).abs() < 1e-9 && (b.x - c.x).abs() < 1e-9)
+            || ((a.y - b.y).abs() < 1e-9 && (b.y - c.y).abs() < 1e-9);
+        if collinear {
+            out.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    if out.len() < 2 {
+        out = vec![p0, p3]; // 防御（理论不可达）
+    }
+    out
+}
+
+/// 折线按长度中点（caption 锚——空/单点防御返回首点）。
+fn polyline_midpoint(pts: &[Point]) -> Point {
+    if pts.is_empty() {
+        return Point::new(0.0, 0.0);
+    }
+    if pts.len() == 1 {
+        return pts[0];
+    }
+    let total: f64 = pts
+        .windows(2)
+        .map(|w| {
+            let dx = w[1].x - w[0].x;
+            let dy = w[1].y - w[0].y;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .sum();
+    if total <= 0.0 {
+        return pts[0];
+    }
+    let mut walked = 0.0;
+    for w in pts.windows(2) {
+        let dx = w[1].x - w[0].x;
+        let dy = w[1].y - w[0].y;
+        let seg = (dx * dx + dy * dy).sqrt();
+        if walked + seg >= total * 0.5 {
+            let t = if seg > 0.0 {
+                (total * 0.5 - walked) / seg
+            } else {
+                0.0
+            };
+            return Point::new(w[0].x + dx * t, w[0].y + dy * t);
+        }
+        walked += seg;
+    }
+    *pts.last().unwrap()
 }
 
 fn scale_alpha(c: Color, k: f64) -> u8 {

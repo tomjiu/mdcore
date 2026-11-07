@@ -35,5 +35,5 @@ pub use render::{
 };
 pub use session::{
     Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, CommandReceipt,
-    ObjectKind, ReorderOp, SessionOptions, StrokeTool,
+    ObjectKind, ReorderOp, SessionOptions, Side, StrokeTool,
 };

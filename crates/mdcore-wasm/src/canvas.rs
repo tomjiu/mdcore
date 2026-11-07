@@ -31,7 +31,7 @@ use wasm_bindgen::prelude::*;
 
 use mdc_canvas::{
     Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, ObjectKind,
-    ReorderOp, SessionOptions, StrokeTool,
+    ReorderOp, SessionOptions, Side, StrokeTool,
 };
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,17 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             _ => Err(bad_json("command", format!("missing/invalid `{field}`"))),
         }
     };
+    // #406：可选 caption（string | null——null/缺省 = 清除）。
+    let opt_caption = |field: &str| -> Result<Option<String>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(sv)) => Ok(Some(sv.clone())),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
+            )),
+        }
+    };
     let tool = |field: &str| -> Result<StrokeTool, CvError> {
         match s(field)?.as_str() {
             "pen" => Ok(StrokeTool::Pen),
@@ -216,6 +227,22 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             other => Err(bad_json(
                 "command",
                 format!("`{field}` must be pen/highlighter, got {other}"),
+            )),
+        }
+    };
+    // #406：锚侧（top/right/bottom/left——null/缺省 = 清除回中心）。
+    let opt_side = |field: &str| -> Result<Option<Side>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Side::from_wire(s).map(Some).ok_or_else(|| {
+                bad_json(
+                    "command",
+                    format!("`{field}` must be top/right/bottom/left or null, got {s}"),
+                )
+            }),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
             )),
         }
     };
@@ -269,6 +296,13 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             width: f("width")?,
             tool: tool("tool")?,
         }),
+        // #406：边路由/标题终态替换（锚侧 ×2 + caption——null/缺省 = 清除）。
+        "set_edge_route" => Ok(CanvasCommand::SetEdgeRoute {
+            id: s("id")?,
+            from_side: opt_side("from_side")?,
+            to_side: opt_side("to_side")?,
+            caption: opt_caption("caption")?,
+        }),
         "reorder" => {
             // #402：z 序重排（op = front/back/forward/backward）。
             let op = ReorderOp::from_wire(&s("op")?).ok_or_else(|| {
@@ -281,7 +315,7 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
         }
         other => Err(bad_json(
             "command",
-            format!("unknown command `{other}` (11 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder)"),
+            format!("unknown command `{other}` (12 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/set_edge_route/reorder)"),
         )),
     }
 }
@@ -331,8 +365,18 @@ pub fn object_json(o: &CanvasObject) -> String {
         Some(StrokeTool::Highlighter) => "\"highlighter\"".to_string(),
         None => "null".to_string(),
     };
+    // #406：锚侧 + 标题（null 缺省——同 from/to null 纪律）。
+    let opt_side_str = |v: &Option<Side>| -> String {
+        match v {
+            Some(sv) => format!("\"{}\"", sv.wire()),
+            None => "null".to_string(),
+        }
+    };
+    let from_side = opt_side_str(&o.from_side);
+    let to_side = opt_side_str(&o.to_side);
+    let caption = opt_str(&o.caption);
     format!(
-        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"props\":{{{}}}}}",
+        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"from_side\":{},\"to_side\":{},\"caption\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"props\":{{{}}}}}",
         serde_json::to_string(&o.id).unwrap(),
         kind_wire(o.kind),
         o.x,
@@ -341,6 +385,9 @@ pub fn object_json(o: &CanvasObject) -> String {
         o.h,
         opt_str(&o.from),
         opt_str(&o.to),
+        from_side,
+        to_side,
+        caption,
         members.join(","),
         points.join(","),
         opt_str(&o.color),
@@ -364,6 +411,8 @@ pub fn receipt_json(outcome: &CommandOutcome, undo_depth: usize, undo_cleared: b
         CommandOutcome::Ungrouped { group_id } => ("ungrouped", "group_id", group_id.clone()),
         CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
         CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+        // #406：边路由/标题已设。
+        CommandOutcome::EdgeRouted { id } => ("edge_routed", "id", id.clone()),
         CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
     };
     format!(
