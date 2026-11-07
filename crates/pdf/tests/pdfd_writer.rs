@@ -106,7 +106,15 @@ fn pdfium() -> &'static Pdfium {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Ok(path) = std::env::var(PDFIUM_LIB_ENV) {
-            candidates.push(PathBuf::from(path));
+            // #477：env 语义与引擎 `bind_by_resolution` 对齐——先按库文件
+            // 完整路径直绑（引擎生产语义）；失败再按目录形态入候选链
+            // （下方统一 append 库名）。两态兼容，不再要求用户「按文件设
+            // env 时引擎能跑、本文件不能跑」的分裂形态。
+            let file_form = PathBuf::from(&path);
+            if let Ok(bindings) = Pdfium::bind_to_library(&file_form) {
+                return Pdfium::new(bindings);
+            }
+            candidates.push(file_form);
         }
         candidates.extend([
             manifest.join("../../../cleanroom-analysis/md-line/pdf-a/spike/bin/lib"), // spike 取件位
