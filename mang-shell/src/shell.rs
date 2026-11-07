@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, FocusHandle,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels, Render,
-    Window, canvas, px,
+    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    Render, Window, canvas, px,
 };
 use theme::Theme;
 use ui::prelude::*;
@@ -150,7 +150,8 @@ pub struct ShellApp {
     /// ——切到不同 pdf 标签时重建；关闭该标签时丢弃）。
     pdf_pages: Option<(PathBuf, Entity<PdfPagesView>)>,
     /// #289-④：pdf 显示模式（true = 页面位图视图——缺省；false =
-    /// 文本行模型。状态栏「页面/文本」钮切换；Ctrl+F 自动切文本）。
+    /// 文本行模型。状态栏「页面/文本」钮切换；两视图各有查找面
+    /// （#422：页面视图内查找条，不再强制切文本）。
     pdf_view_mode: bool,
     /// #389 阶段 1：xlsx 网格视图（当前 xlsx 标签的真网格渲染实体 +
     /// 归属路径——生命周期与 pdf_pages 同模式：切标签重建/关标签丢弃）。
@@ -930,14 +931,23 @@ impl ShellApp {
         let Some(editor) = self.editor().cloned() else {
             return;
         };
-        // #289-④：页视图下 Ctrl+F → 先切回文本视图（查找是文本面能力
-        // ——明示而非无响应；后续轮做跨视图高亮）。
+        // #422：页视图下 Ctrl+F → 页内查找条（不切视图——#297 折中
+        // 升级为正式能力：文本层索引 + 高亮 + 导航见 PdfPagesView）。
+        // 页视图实体缺位（error 态）→ 保底旧折中：切文本视图查找。
         if matches!(cmd, crate::editor::commands::Cmd::OpenFind)
             && self.pdf_view_mode
             && editor.read(cx).doc_kind() == "pdf"
         {
+            let view = self.pdf_pages.as_ref().map(|(_, e)| e.clone());
+            if let Some(view) = view {
+                view.update(cx, |v, cx| v.open_search(window, cx));
+                return;
+            }
             self.pdf_view_mode = false;
-            self.show_notice("已切换到文本视图（页面视图暂不支持查找）".into(), cx);
+            self.show_notice(
+                "已切换到文本视图（页面视图不可用，查找走文本面）".into(),
+                cx,
+            );
         }
         editor.update(cx, |ed, cx| ed.run_command(cmd, window, cx));
     }
@@ -1143,6 +1153,7 @@ impl ShellApp {
                     ed.set_menu_opener(menu_opener_for(shell_weak));
                 });
                 let focus = editor.read(cx).focus_handle().clone();
+                let is_pdf = editor.read(cx).doc_kind() == "pdf";
                 self.tabs.push(TabItem {
                     path: path.clone(),
                     editor,
@@ -1167,6 +1178,15 @@ impl ShellApp {
                 // #389 阶段 1：xlsx 标签 → 网格视图落位（真网格主显示面）。
                 self.ensure_xlsx_grid(cx);
                 cx.notify();
+                // #422：页视图态 pdf 标签——主显示面是页视图（编辑器
+                // 不在树内，其焦点句柄游离）：焦点句柄改返页视图，调用
+                // 方落焦后键事件可达（Ctrl+F 视图级拦截）。
+                if self.pdf_view_mode
+                    && is_pdf
+                    && let Some((_, view)) = self.pdf_pages.as_ref()
+                {
+                    return Some(view.read(cx).focus_handle(cx).clone());
+                }
                 Some(focus)
             }
             OpenOutcome::Unsupported { path, message } => {
@@ -1322,6 +1342,16 @@ impl ShellApp {
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.get(self.active) {
             Some(tab) => {
+                // #422：页视图态 pdf 标签——焦点落页视图（编辑器不在
+                // 树内，其句柄游离则键事件死在合成根）。
+                if self.pdf_view_mode
+                    && tab.editor.read(cx).doc_kind() == "pdf"
+                    && let Some((_, view)) = self.pdf_pages.as_ref()
+                {
+                    let focus = view.read(cx).focus_handle(cx).clone();
+                    window.focus(&focus, cx);
+                    return;
+                }
                 let focus = tab.editor.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
             }
@@ -2178,6 +2208,28 @@ impl Render for ShellApp {
                         }
                     },
                 }
+
+                // #422：pdf 页面视图内查找——Ctrl+F（或用户换绑的
+                // open_find）不切视图，直接开页内查找条。页视图态编辑
+                // 器不在树内，键落到本根节点（Ctrl+F 是编辑器动作，
+                // resolve_shell 不解析——查 keymap 编辑表保持换绑跟随；
+                // 命中即吞，未命中照常下沉不拦）。
+                if this.pdf_view_mode
+                    && this
+                        .editor()
+                        .is_some_and(|ed| ed.read(cx).doc_kind() == "pdf")
+                    && let Some(view) = this.pdf_pages.as_ref().map(|(_, e)| e.clone())
+                {
+                    let editor_outcome = keymap::store()
+                        .resolve_editor_main(&kq, this.chord.as_ref().map(|(q, _)| q));
+                    if let keymap::EditorOutcome::Matched(keymap::EditorAction::OpenFind) =
+                        editor_outcome
+                    {
+                        this.chord = None;
+                        view.update(cx, |v, cx| v.open_search(window, cx));
+                        return;
+                    }
+                }
             }))
             .child(title_bar::title_bar(&title, &menus, &self.menu_bar, cx))
             // F3：标签栏（有标签才渲染；标题栏与主体之间）。
@@ -2460,8 +2512,8 @@ fn notice_bar(message: &str, colors: &theme::ThemeColors) -> impl IntoElement {
 fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
     // #289-④：pdf 标签的页面视图（位图渲染主显示面）——模式开且有
-    // 实体时替代文本编辑器呈现（查找/书签锚仍在文本模型上，Ctrl+F
-    // 自动切回文本视图）。
+    // 实体时替代文本编辑器呈现（查找面：#422 页内查找条随视图在位，
+    // 书签锚仍在文本模型上）。
     let pdf_pages_entity = shell
         .editor()
         .filter(|ed| ed.read(cx).doc_kind() == "pdf")
@@ -3109,6 +3161,188 @@ mod tab_workflow_tests {
                 assert_eq!(shell.active, 0, "越界激活不改 active（再证）");
             });
         });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #422：页内查找 Shell 接线——Ctrl+F 不切视图（页面视图内查找条）
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod pdf_search_wiring_tests {
+    use super::*;
+
+    /// 测试宿主（ShellApp 不作根视图但**必须进渲染树**——#422 的键
+    /// 派发走真实管线：焦点路径经 shell-root → editor_area → 页视图
+    /// 的 track_focus 节点；空 div 宿主会把整棵树挡在派发树外）。
+    struct WiringHost(Entity<ShellApp>);
+
+    impl gpui::Render for WiringHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// smoke.pdf 夹具字节（两页——pdf_pages/#422 视图级测试同源夹具）。
+    fn smoke_pdf_bytes() -> Vec<u8> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.pdf");
+        std::fs::read(&p).unwrap_or_else(|e| panic!("夹具不可读（{}）：{e}", p.display()))
+    }
+
+    /// #422 接线面：页面视图下 Ctrl+F（真实键击管线）→ 开页内查找条
+    /// （**不切视图**——#297 折中升级为正式能力）；Esc 关条清态；菜单
+    /// 路径（dispatch_editor_cmd）同源。引擎门控：无 libpdfium 时打开
+    /// 本身失败（错误进 notice）→ SKIP 横幅（AGENTS 13.1——不伪装通过）。
+    #[gpui::test]
+    fn pdf_view_ctrl_f_opens_in_page_search(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("mdc-422-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("s.pdf");
+        std::fs::write(&pdf, smoke_pdf_bytes()).unwrap();
+
+        // 渲染面全局件（main.rs 生产同构——空 div 宿主时代不渲染整树
+        // 用不到；#422 键派发需要整树，theme provider 必须在位）。
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+
+        // 生产同构链：open_document（open_document_tab + 落焦——#422
+        // 后页视图态 pdf 标签落焦页视图，键事件可达）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf.clone(), window, cx);
+            });
+        });
+        // 引擎门控：无 libpdfium → pdf_doc::load 即失败（open 走 Failed
+        // 分支，无标签无槽，错误文案进 notice）→ SKIP 横幅 + return；
+        // 槽在位 = 引擎健康（tab 开成功 ⇔ 引擎开成功——同一定位序）。
+        let open_notice = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, _| {
+                    shell.notice_board.message().map(str::to_owned)
+                })
+            })
+            .expect("窗口更新");
+        let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view = match (view, open_notice) {
+            (None, Some(msg)) if msg.contains("libpdfium") => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#422 Ctrl+F 接线 e2e 未真跑\n  \
+                     （pdf 打开面即失败：引擎绑定缺库）。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            (None, other) => {
+                panic!("pdf 标签未开（夹具/真缺陷，非环境缺件）：{other:?}")
+            }
+            (Some(view), _) => view,
+        };
+        // 前置：页面视图态（缺省开）。
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, _| {
+                    assert!(shell.pdf_view_mode, "前置：pdf 标签缺省页面视图");
+                });
+            })
+            .expect("前置");
+        // ① 键盘 Ctrl+F（真实派发管线——main.rs 烟雾同构的
+        // update_window + dispatch_event）：不切视图，开页内查找条
+        // （#297 的「自动切文本视图」在此必须不再发生）。焦点已落页
+        // 视图；先强制一帧绘制（派发树在位——键事件按焦点路径派发）。
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        key: "f".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Ctrl+F");
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    assert!(
+                        shell.pdf_view_mode,
+                        "#422：Ctrl+F 不切文本视图（#297 折中已升级）"
+                    );
+                    assert!(view.read(cx).search_open(), "#422：页内查找条应开");
+                });
+            })
+            .expect("断言");
+        // ② Esc（查找输入行焦点面）：关条清态。重绘一帧让焦点迁移
+        // 落进派发树（open_search 聚焦 search_focus）。
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: Default::default(),
+                        key: "escape".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Esc");
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    assert!(!view.read(cx).search_open(), "Esc 关条清态");
+                    assert!(shell.pdf_view_mode, "关条不动视图模式");
+                });
+            })
+            .expect("断言");
+        // ③ 菜单路径（「编辑 → 查找」同源分流——dispatch_editor_cmd）：
+        // 同样开页内查找条不切视图。
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.dispatch_editor_cmd(crate::editor::commands::Cmd::OpenFind, window, cx);
+                });
+            })
+            .expect("菜单路径");
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    assert!(shell.pdf_view_mode, "菜单查找同源不切视图");
+                    assert!(view.read(cx).search_open(), "菜单查找开页内查找条");
+                });
+            })
+            .expect("断言");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
