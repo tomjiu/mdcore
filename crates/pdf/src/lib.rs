@@ -145,6 +145,12 @@ pub mod stamp;
 // + CMS SignedData 遍历，零新增依赖；不验证证书链（第一版范围）。
 #[cfg(feature = "engine-lopdf")]
 pub mod signature;
+// #411：DocMDP（文档修改检测策略）检测 + 写前守卫——catalog
+// /Perms /DocMDP 三级策略（P=1 全拒 / P=2 表单+签署 / P=3 +标注），
+// writer_lopdf / forms / stamp 三写面接线。fail-closed：策略在场但
+// 级不可解析按 P=1。
+#[cfg(feature = "engine-lopdf")]
+pub mod docmdp;
 
 #[cfg(feature = "engine-lopdf")]
 pub use annotate::{read_annotations, PdfAnnotator, ReadReport};

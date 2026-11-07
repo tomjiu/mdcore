@@ -400,6 +400,9 @@ pub enum FormError {
     InvalidValue { name: String, reason: String },
     /// 扁平化遇到无法渲染的值（缺字体画不了中文等）。
     FlattenRefused(String),
+    /// DocMDP 修改策略拒写（#411：save 在 P=1 拒、P=2+ 放；flatten
+    /// 是页内容重写，任何 P 级都拒）。零脏 save 不触发（无写即无违约）。
+    DocMdp(crate::docmdp::DocMdpViolation),
     /// 写回失败。
     Save(String),
 }
@@ -422,6 +425,7 @@ impl std::fmt::Display for FormError {
                 write!(f, "表单域 {name} 的值不合法：{reason}")
             }
             FormError::FlattenRefused(e) => write!(f, "扁平化被拒：{e}"),
+            FormError::DocMdp(v) => write!(f, "表单写回被拒：{v}"),
             FormError::Save(e) => write!(f, "表单写回失败：{e}"),
         }
     }
@@ -1179,6 +1183,11 @@ impl PdfForm {
         if self.dirty.is_empty() {
             return Ok(self.original);
         }
+        // #411 DocMDP 门（表单写面）：P=1 拒填写写回，P=2+ 放行——
+        // 表单填写是 P=2 起明文允许的两操作之一（spec §12.8.2.2）。
+        // 零脏早退已过：本臂只拦真实写回（读/校验/无改动 save 不受影响）。
+        crate::docmdp::ensure_write_allowed(&self.doc, crate::docmdp::WriteOp::FormFill)
+            .map_err(FormError::DocMdp)?;
         self.build_appearances()?;
         // 守卫 1：xref 链可信（扫描重建档上做增量写 = 静默产毒，入口响亮拒绝）。
         if self.doc.xref_start == 0 {
@@ -1471,6 +1480,12 @@ impl PdfForm {
     /// - 有非 ASCII 值却没有字体（画出来是乱码，比不扁平化更危险）；
     /// - 字体缺字形。
     pub fn flatten(mut self) -> Result<Vec<u8>, FormError> {
+        // #411 DocMDP 门（扁平化 = 页内容重写 + widget 删除——超出
+        // 「表单填写」的放行面，任何 P 级都拒：P=3 的最大放行面也只到
+        // 标注增删改。与下方签名域守卫的分工：本门拦策略级（DocMDP
+        // 在场），彼门拦结构级（含已签字段）。
+        crate::docmdp::ensure_write_allowed(&self.doc, crate::docmdp::WriteOp::ContentRewrite)
+            .map_err(FormError::DocMdp)?;
         if self.has_signed_signature_fields() {
             return Err(FormError::FlattenRefused(
                 "文档含已签署的数字签名域——扁平化会删除签名域，既有签名将被销毁，已拒绝。\

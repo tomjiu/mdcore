@@ -70,6 +70,12 @@ pub enum StampError {
     /// 任一命中即拒。宽拒窄放：误拒（结构标记在但无实效签名）由调用
     /// 方显式放行兑底；误放（真签名档静默毁签）不可逆。
     SignedDocument,
+    /// DocMDP 修改策略拒盖（#411：盖章是页内容重写，任何 P 级都
+    /// 不放——P=3 的最大放行面也只到标注增删改）。与
+    /// [`StampError::SignedDocument`] 的分工：DocMDP 在场给本变体
+    /// （P 级可诊断），普通签名档给 SignedDocument。放行阀同为
+    /// [`StampOptions::allow_break_signature`]（#408 契约不回退）。
+    DocMdpRestricted(crate::docmdp::DocMdpLevel),
 }
 
 impl std::fmt::Display for StampError {
@@ -84,6 +90,11 @@ impl std::fmt::Display for StampError {
             StampError::SignedDocument => write!(
                 f,
                 "文档已签名（盖章被拒——全量重写将毁签；确需盖章置 allow_break_signature 显式放行）"
+            ),
+            StampError::DocMdpRestricted(level) => write!(
+                f,
+                "文档带 DocMDP {level} 修改策略（盖章被拒——页内容重写任何 P 级都不许；\
+                 确需盖章置 allow_break_signature 显式放行，放行即违反文档修改策略）"
             ),
         }
     }
@@ -895,8 +906,19 @@ pub fn stamp_image_with_limits(
     // ——对比 writer_lopdf 增量写保签。默认拒；显式放行 = 调用方已向
     // 用户揭示「签名将失效」（与 organize 头部「声明毁签」同哲学，
     // 但 stamp 此前连声明都没有——本门补齐）。
-    if !opts.allow_break_signature && doc_declares_signature(&doc) {
-        return Err(StampError::SignedDocument);
+    if !opts.allow_break_signature {
+        // #411 DocMDP 检测先行（比泛化签名门更精确的错误归因）：盖章
+        // 是页内容重写——任何 DocMDP P 级默认都拒（P=3 的最大放行面
+        // 也只到标注增删改）。DocMDP 缺席再走 #408 三路签名判定
+        // （普通签名档 ≠ DocMDP 认证档，两形态错误可区分）。
+        if let Err(v) =
+            crate::docmdp::ensure_write_allowed(&doc, crate::docmdp::WriteOp::ContentRewrite)
+        {
+            return Err(StampError::DocMdpRestricted(v.level()));
+        }
+        if doc_declares_signature(&doc) {
+            return Err(StampError::SignedDocument);
+        }
     }
     let pages = doc.get_pages();
     let page_id = *pages.get(&(page + 1)).ok_or(StampError::BadPage(page))?;
