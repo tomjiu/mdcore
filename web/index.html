@@ -61,6 +61,8 @@
     body[data-pdf-active] .pdf-page:last-child { break-after: auto; }
     body[data-pdf-active] .pdf-page .textLayer,
     body[data-pdf-active] .pdf-page .pdf-overlay { display: none !important; }
+    /* #475：注释抽屉是屏面导航件——不进纸面。 */
+    body[data-pdf-active] #pdf-annots-drawer { display: none !important; }
   }
   /* 帮助面板（TR-UI 批 C-3）：快捷键速查 */
   #help-overlay { position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,.38);
@@ -345,8 +347,8 @@
                      background: var(--bg); }
   /* ---- Phase 5 §8.4：PDF 表面视图（pdf_view.ts）---- */
   #pdf-panel { display: none; max-width: 1128px; margin: 8px auto 0; padding: 0 16px;
-               height: calc(100vh - 170px); }
-  #pdf-toolbar { display: flex; align-items: center; gap: 6px; font-size: 13px; height: 32px;
+               height: calc(100vh - 170px); position: relative; }
+  #pdf-toolbar { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 32px;
                  flex-wrap: wrap; }
   .pdf-btn { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid var(--border);
              border-radius: 6px; background: var(--panel); cursor: pointer; }
@@ -358,6 +360,30 @@
   .pdf-btn:hover:not(:disabled) { background: var(--panel-hover); }
   .pdf-btn:disabled { opacity: .45; cursor: default; }
   #pdf-page-label { min-width: 56px; text-align: center; color: var(--fg-soft); font-variant-numeric: tabular-nums; }
+  /* #475(长尾⑨):注释列表抽屉(top 动态随工具栏高度;打印态不进纸面)。 */
+  #pdf-annots-drawer { position: absolute; left: 18px; bottom: 30px; width: 262px;
+                      z-index: 60; display: flex; flex-direction: column; overflow: hidden;
+                      background: var(--panel); border: 1px solid var(--border-strong);
+                      border-radius: 8px; box-shadow: 0 4px 14px rgb(0 0 0 / 0.16); }
+  #pdf-annots-drawer[hidden] { display: none; }
+  .pdf-annots-head { padding: 7px 10px; font-size: 12px; font-weight: 600; letter-spacing: .04em;
+                     text-transform: uppercase; color: var(--fg-muted);
+                     border-bottom: 1px solid var(--border); flex: none; }
+  .pdf-annots-body { overflow-y: auto; flex: 1; padding: 4px 0 8px; }
+  .pdf-annots-empty { padding: 12px 10px; font-size: 12px; color: var(--fg-muted); }
+  .pdf-annots-list { list-style: none; margin: 0; padding: 0; }
+  .pdf-annots-item { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+                     font-size: 12.5px; cursor: pointer; border-bottom: 1px dotted var(--border); }
+  .pdf-annots-item:hover { background: var(--panel-hover); }
+  .pdf-annots-badge { flex: none; font-size: 11px; padding: 1px 6px; border-radius: 4px;
+                      border: 1px solid var(--border); color: var(--fg-muted); }
+  .pdf-annots-k-highlight { border-color: rgb(214 158 46); color: rgb(146 100 14); }
+  .pdf-annots-k-note { border-color: rgb(255 213 79); color: rgb(133 100 4); }
+  .pdf-annots-k-freetext { border-color: var(--accent); color: var(--accent); }
+  .pdf-annots-k-ink { border-color: rgb(142 78 198); color: rgb(110 55 163); }
+  .pdf-annots-page { flex: none; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+  .pdf-annots-preview { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden;
+                        text-overflow: ellipsis; color: var(--fg-soft); }
   #pdf-zoom-label { min-width: 42px; text-align: center; color: var(--fg-soft); font-variant-numeric: tabular-nums; }
   #pdf-search { font: inherit; font-size: 13px; padding: 2px 6px; border: 1px solid var(--border);
                 border-radius: 6px; background: var(--bg); width: 140px; }
