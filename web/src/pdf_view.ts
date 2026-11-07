@@ -49,6 +49,14 @@ import { t } from './i18n/index.js';
 // #475(长尾⑨缩小版):注释列表面板——会话 AnnotListed 数据可视化
 // (新模块:行形状 + DOM 纯函数;pdf_view 只做接线)。
 import { renderAnnotListDom, type AnnotRowLike } from './pdf_annot_list.js';
+// #472(长尾⑦):文档属性面板——pdf.js getMetadata + 会话/评估汇总
+// (新模块:数据形状 + 字段表 DOM;pdf_view 只做接线)。
+import {
+  propFields,
+  renderPropsDom,
+  type DocProps,
+  type PdfInfoLike,
+} from './pdf_props.js';
 import type {
   PageViewport,
   PDFDocumentProxy,
@@ -438,6 +446,27 @@ declare global {
       pages: number[];
       drawerOpen: boolean;
     };
+    /** #472：文档属性面观测（DocProps 镜像 + 抽屉开态——e2e 断言面）。 */
+    __pdfProps: () => {
+      open: boolean;
+      props: {
+        title: string | null;
+        author: string | null;
+        subject: string | null;
+        keywords: string | null;
+        producer: string | null;
+        creator: string | null;
+        creationDate: string | null;
+        modDate: string | null;
+        pdfVersion: string | null;
+        fileName: string;
+        pageCount: number;
+        fileSize: number;
+        encrypted: boolean;
+        warnings: number;
+      } | null;
+      drawerOpen: boolean;
+    };
   }
 }
 
@@ -523,12 +552,18 @@ export class PdfViewUI {
   private annotsDrawer: HTMLDivElement | null = null;
   private annotsBody: HTMLDivElement | null = null;
   private annotsEmptyEl: HTMLDivElement | null = null;
+  // 文档属性状态（#472——显示面数据源 pdf.js getMetadata + 会话/评估汇总）
+  private docProps: DocProps | null = null;
+  private propsBtn: HTMLButtonElement | null = null;
+  private propsDrawer: HTMLDivElement | null = null;
+  private propsBody: HTMLDivElement | null = null;
 
   // DOM 句柄
   private panel!: HTMLElement;
   private viewportEl!: HTMLDivElement;
   private contentEl!: HTMLElement;
   /** #475：工具栏句柄（抽屉 top 动态锚——wrap 到两行时不叠盖）。 */
+  /** #472：工具栏句柄（抽屉 top 动态锚——wrap 到两行时不叠盖）。 */
   private toolbarEl!: HTMLDivElement;
   /** #3 UI 批 E：空态引导卡片层（文档在场 = hidden）。 */
   private guideEl!: HTMLDivElement;
@@ -678,12 +713,16 @@ export class PdfViewUI {
 
     // #475：注释列表按钮（文档开 = 使能；零批注 = 空态文案）。
     const annotsBtn = mkBtn('pdf-annots-btn', t('pdf.annots'), t('pdf.annotsTitle'));
+    // #472(长尾⑦)：文档属性按钮（无文档态禁用——syncPropsPanel 维护）。
+    const propsBtn = mkBtn('pdf-props-btn', t('pdf.props'), t('pdf.propsTitle'));
+    propsBtn.disabled = true;
 
     toolbar.append(
       openBtn, fileInput, pageLabel,
       zoomOut, zoomLabel, zoomIn, zoomFit,
       searchInput, searchPrev, searchNext, searchCount,
       modeSelect, inkColor, inkWidth, saveBtn, printBtn, annotsBtn,
+      modeSelect, inkColor, inkWidth, saveBtn, printBtn, propsBtn,
     );
 
     const viewport = document.createElement('div');
@@ -715,6 +754,18 @@ export class PdfViewUI {
     annotsDrawer.append(annotsHead, annotsBody, annotsEmpty);
 
     panel.append(toolbar, viewport, status, annotsDrawer);
+    // #472：属性抽屉（面板内浮层——绝对定位；打印态不进纸面）。
+    const propsDrawer = document.createElement('div');
+    propsDrawer.id = 'pdf-props-drawer';
+    propsDrawer.hidden = true;
+    const propsHead = document.createElement('div');
+    propsHead.className = 'pdf-props-head';
+    propsHead.textContent = t('pdf.props');
+    const propsBody = document.createElement('div');
+    propsBody.className = 'pdf-props-body';
+    propsDrawer.append(propsHead, propsBody);
+
+    panel.append(toolbar, viewport, status, propsDrawer);
 
     this.panel = panel;
     this.viewportEl = viewport;
@@ -743,6 +794,9 @@ export class PdfViewUI {
     this.annotsDrawer = annotsDrawer;
     this.annotsBody = annotsBody;
     this.annotsEmptyEl = annotsEmpty;
+    this.propsBtn = propsBtn;
+    this.propsDrawer = propsDrawer;
+    this.propsBody = propsBody;
     this.syncButtons();
   }
 
@@ -793,6 +847,12 @@ export class PdfViewUI {
     this.annotsBtn?.addEventListener('click', () => {
       if (!this.annotsDrawer) return;
       this.annotsDrawer.hidden = !this.annotsDrawer.hidden;
+    });
+
+    // #472：属性抽屉开合（无文档态禁用；重开新档 = 保持用户开合选择）。
+    this.propsBtn?.addEventListener('click', () => {
+      if (!this.propsDrawer) return;
+      this.propsDrawer.hidden = !this.propsDrawer.hidden;
     });
 
     // #240 层③：Ctrl+P 路径（beforeprint）——best-effort 启动全页渲染
@@ -968,6 +1028,45 @@ export class PdfViewUI {
     this.originalBytes = bytes.slice();
     this.assessment = assessment;
 
+    // ③-bis #472：文档属性读面（pdf.js getMetadata → /Info 字段；
+    // 会话/评估汇总——文件名/页数/字节数/加密态/警告数）。失败 = 全空
+    // /Info 面（诚实空态，不阻断打开）。
+    this.docProps = null;
+    try {
+      const md = await doc.getMetadata();
+      const info = (md?.info ?? {}) as PdfInfoLike;
+      const pick = (s: string | undefined): string | null =>
+        typeof s === 'string' && s.trim() ? s : null;
+      this.docProps = {
+        title: pick(info.Title),
+        author: pick(info.Author),
+        subject: pick(info.Subject),
+        keywords: pick(info.Keywords),
+        producer: pick(info.Producer),
+        creator: pick(info.Creator),
+        creationDate: pick(info.CreationDate),
+        modDate: pick(info.ModDate),
+        pdfVersion: pick(info.PDFFormatVersion),
+        fileName,
+        pageCount: doc.numPages,
+        fileSize: this.originalBytes.byteLength,
+        encrypted: assessment.encrypted,
+        warnings: assessment.warnings.length,
+      };
+    } catch {
+      // getMetadata 异常（无 /Info 或损坏字典）——仅丢失属性面，主流程照常
+      this.docProps = {
+        title: null, author: null, subject: null, keywords: null,
+        producer: null, creator: null, creationDate: null, modDate: null,
+        pdfVersion: null,
+        fileName,
+        pageCount: doc.numPages,
+        fileSize: this.originalBytes.byteLength,
+        encrypted: assessment.encrypted,
+        warnings: assessment.warnings.length,
+      };
+    }
+
     // ③ 页几何（pdf.js 实数据 → 会话 pagesJson）
     const proxies: PDFPageProxy[] = [];
     const geoms: { widthPt: number; heightPt: number; rotationDeg: number }[] = [];
@@ -1030,6 +1129,7 @@ export class PdfViewUI {
     this.applySecurityStatus();
     this.syncButtons();
     this.syncGuide();
+    this.syncPropsPanel(); // #472：属性面板（按钮态 + 字段表重渲染）
     return { ok: true, value: { pages: doc.numPages } };
   }
 
@@ -1076,6 +1176,42 @@ export class PdfViewUI {
     this.guideEl.hidden = this.doc !== null;
   }
 
+  /** #472：属性面板同步（按钮态 + 字段表；抽屉 top 随工具栏实际高度
+   * 锚定——wrap 两行不叠盖；抽屉开合 = 用户选择，换档不强制重置）。 */
+  private syncPropsPanel(): void {
+    if (!this.propsBtn || !this.propsBody) return;
+    this.propsBtn.disabled = this.docProps === null;
+    if (this.propsDrawer && this.toolbarEl) {
+      this.propsDrawer.style.top = `${this.toolbarEl.offsetHeight + 8}px`;
+    }
+    if (this.docProps) {
+      const fields = propFields(
+        this.docProps,
+        t('pdf.propsEmpty'),
+        {
+          title: t('pdf.propsTitleField'),
+          author: t('pdf.propsAuthor'),
+          subject: t('pdf.propsSubject'),
+          keywords: t('pdf.propsKeywords'),
+          producer: t('pdf.propsProducer'),
+          creator: t('pdf.propsCreator'),
+          created: t('pdf.propsCreated'),
+          modified: t('pdf.propsModified'),
+          pdfVersion: t('pdf.propsPdfVersion'),
+          pages: t('pdf.propsPages'),
+          fileSize: t('pdf.propsFileSize'),
+          encrypted: t('pdf.propsEncrypted'),
+          warnings: t('pdf.propsWarnings'),
+        },
+        (n) => `${n} B`,
+        (b) => (b ? t('pdf.propsYes') : t('pdf.propsNo')),
+      );
+      renderPropsDom(this.propsBody, fields);
+    } else {
+      this.propsBody.replaceChildren();
+    }
+  }
+
   /** 旧文档拆卸（IO/渲染任务/位图缓存/overlay/文本缓存全清）。 */
   private teardownDocument(): void {
     this.io?.disconnect();
@@ -1108,6 +1244,11 @@ export class PdfViewUI {
     this.doc = null;
     // #475：注释列表面拆卸（层随页元素移除;开合保留用户选择）。
     this.syncAnnotsPanel();
+    // #472：属性面拆卸（数据归零 + 抽屉隐藏；按钮态随 syncPropsPanel）。
+    this.docProps = null;
+    if (this.propsBody) this.propsBody.replaceChildren();
+    if (this.propsDrawer) this.propsDrawer.hidden = true;
+    this.syncPropsPanel();
     // #3 UI 批 E：拆卸后表面归零——引导卡片回显（打开失败/换开路径）。
     this.syncGuide();
   }
@@ -2276,6 +2417,30 @@ export class PdfViewUI {
       ids: this.annotations.map((a) => a.id),
       pages: this.annotations.map((a) => a.page),
       drawerOpen: this.annotsDrawer !== null && !this.annotsDrawer.hidden,
+    });
+
+    // #472：属性面探针（DocProps 镜像——字段级断言 + 开态）。
+    window.__pdfProps = () => ({
+      open: this.docProps !== null,
+      props: this.docProps
+        ? {
+            title: this.docProps.title,
+            author: this.docProps.author,
+            subject: this.docProps.subject,
+            keywords: this.docProps.keywords,
+            producer: this.docProps.producer,
+            creator: this.docProps.creator,
+            creationDate: this.docProps.creationDate,
+            modDate: this.docProps.modDate,
+            pdfVersion: this.docProps.pdfVersion,
+            fileName: this.docProps.fileName,
+            pageCount: this.docProps.pageCount,
+            fileSize: this.docProps.fileSize,
+            encrypted: this.docProps.encrypted,
+            warnings: this.docProps.warnings,
+          }
+        : null,
+      drawerOpen: this.propsDrawer !== null && !this.propsDrawer.hidden,
     });
 
     // 证据跳转钩子（evidence_panel 的 evidence-jump 事件——后续阶段接真
