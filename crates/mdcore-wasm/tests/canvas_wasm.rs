@@ -3,7 +3,9 @@
 //! 双会话 LWW 收敛/快照恢复/事件 base64 转发/时钟注入确定性。
 
 use mdc_canvas::{CanvasSession, SessionOptions};
-use mdcore_wasm::canvas::{event_json, object_json, parse_cmd_core, receipt_json};
+use mdcore_wasm::canvas::{
+    event_json, list_by_tag_json_core, object_json, parse_cmd_core, receipt_json,
+};
 
 fn session(tag: u64) -> CanvasSession {
     CanvasSession::open(SessionOptions {
@@ -400,4 +402,245 @@ fn parse_reorder_command_and_z_index_json() {
     // 读模型 JSON 含 z_index 字段（字符串）
     let json = object_json(&s.find_object("n2").unwrap());
     assert!(json.contains("\"z_index\":\""), "z_index 应入 JSON：{json}");
+}
+
+// ── 标签面（#405——跨区分类标签：wasm 互译零语义）──────────────
+
+/// #405：add_tag/remove_tag 命令 JSON 解析 + 端到端（回执/读模型
+/// JSON tags 字段/list_by_tag 检索/幂等零撤销栈变化）。
+#[test]
+fn tag_commands_parse_and_json_shapes() {
+    // 解析全形态。
+    let c = parse_cmd_core(r#"{"t":"add_tag","id":"n1","tag":"风险"}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::AddTag { ref id, ref tag } if id == "n1" && tag == "风险"
+    ));
+    let c = parse_cmd_core(r#"{"t":"remove_tag","id":"n1","tag":"风险"}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::RemoveTag { ref id, ref tag } if id == "n1" && tag == "风险"
+    ));
+    // 错误面：缺 tag / tag 非 string / 缺 id。
+    for bad in [
+        r#"{"t":"add_tag","id":"n1"}"#,
+        r#"{"t":"add_tag","id":"n1","tag":42}"#,
+        r#"{"t":"remove_tag","tag":"x"}"#,
+        r#"{"t":"add_tag","id":null,"tag":"x"}"#,
+    ] {
+        let e = parse_cmd_core(bad).err().unwrap();
+        assert_eq!(e.code, "cv_bad_json", "{bad} → {e:?}");
+    }
+
+    // 端到端：加两 tag → 回执 tag_added；读模型 JSON 含 tags 数组。
+    let mut s = session(51);
+    add_node(&mut s, "n1", 0.0, 0.0);
+    add_node(&mut s, "n2", 100.0, 0.0);
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"add_tag","id":"n1","tag":"风险"}"#).unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"tag_added""#), "{rj}");
+    assert!(rj.contains(r#""id":"n1""#), "{rj}");
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"add_tag","id":"n1","tag":"报价"}"#).unwrap(),
+    )
+    .unwrap();
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"add_tag","id":"n2","tag":"风险"}"#).unwrap(),
+    )
+    .unwrap();
+
+    // 读模型 JSON：tags 排序数组（n1 两 tag 字典序）。
+    let oj = object_json(&s.find_object("n1").unwrap());
+    assert!(oj.contains(r#""tags":["报价","风险"]"#), "{oj}");
+    // n2 单 tag 形状。
+    let oj = object_json(&s.find_object("n2").unwrap());
+    assert!(oj.contains(r#""tags":["风险"]"#), "{oj}");
+    // 无标签对象缺省形状（空数组——同 members:[] 纪律）。
+    add_node(&mut s, "n3", 200.0, 0.0);
+    let oj = object_json(&s.find_object("n3").unwrap());
+    assert!(oj.contains(r#""tags":[]"#), "{oj}");
+
+    // list_by_tag 检索（wasm 方法薄委托的纯内核面）。
+    let lj = list_by_tag_json_core(&s, "风险");
+    assert_eq!(lj.matches("风险").count(), 2, "{lj}");
+    let lj = list_by_tag_json_core(&s, "报价");
+    assert!(lj.contains(r#""id":"n1""#), "{lj}");
+    assert!(!lj.contains(r#""id":"n2""#), "{lj}");
+    assert_eq!(list_by_tag_json_core(&s, "不存在"), "[]");
+
+    // 移除 → 回执 tag_removed + JSON 面同步。
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Ai,
+            parse_cmd_core(r#"{"t":"remove_tag","id":"n1","tag":"风险"}"#).unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"tag_removed""#), "{rj}");
+    let oj = object_json(&s.find_object("n1").unwrap());
+    assert!(oj.contains(r#""tags":["报价"]"#), "{oj}");
+}
+
+/// #405：幂等经 JSON 通道（重复 add_tag → 回执照常 + 撤销栈不涨）+
+/// 引擎校验错误码（空 tag / 对象不存在 → 既有码复用，错误面封闭）。
+#[test]
+fn tag_idempotent_and_error_codes_via_json() {
+    let mut s = session(52);
+    add_node(&mut s, "n1", 0.0, 0.0);
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"add_tag","id":"n1","tag":"风险"}"#).unwrap(),
+    )
+    .unwrap();
+    let depth = s.undo_depth(mdc_canvas::Actor::Human);
+
+    // 重复加：回执 tag_added 但 undo_depth 不变（幂等零写入）。
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"add_tag","id":"n1","tag":"风险"}"#).unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"tag_added""#), "{rj}");
+    assert!(rj.contains(&format!(r#""undo_depth":{depth}"#)), "{rj}");
+
+    // 引擎校验 → 既有错误码。
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"add_tag","id":"n1","tag":""}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_invalid_input");
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"remove_tag","id":"nope","tag":"x"}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_object_not_found");
+}
+
+// ── frame 面（#404——命名区 + parent 树：wasm 互译零语义）──────────
+
+/// #404：create_frame/rename_frame/set_parent 命令 JSON 解析 + 端到端
+/// （回执/读模型 JSON name+parent 字段/环路拒绝错误码）。
+#[test]
+fn frame_commands_parse_and_json_shapes() {
+    // 解析全形态：create_frame（含 parent null/缺省/string 三态）。
+    let c = parse_cmd_core(
+        r#"{"t":"create_frame","id":"f1","name":"第一章","x":0,"y":0,"w":400,"h":300,"parent":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::CreateFrame { ref id, ref name, parent: None, .. }
+            if id.as_deref() == Some("f1") && name == "第一章"
+    ));
+    let c = parse_cmd_core(r#"{"t":"create_frame","id":null,"name":"外","x":1,"y":2,"w":3,"h":4}"#)
+        .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::CreateFrame {
+            id: None,
+            parent: None,
+            ..
+        }
+    ));
+    let c = parse_cmd_core(
+        r#"{"t":"create_frame","id":"f2","name":"内","x":0,"y":0,"w":10,"h":10,"parent":"f1"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::CreateFrame { parent: Some(ref p), .. } if p == "f1"
+    ));
+    let c = parse_cmd_core(r#"{"t":"rename_frame","id":"f1","name":"B"}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::RenameFrame { ref id, ref name } if id == "f1" && name == "B"
+    ));
+    // set_parent 两态：挂接 / 提顶层。
+    let c = parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":"f1"}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::SetParent { ref id, parent: Some(ref p) } if id == "n1" && p == "f1"
+    ));
+    let c = parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":null}"#).unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::SetParent {
+            id: _,
+            parent: None
+        }
+    ));
+    // 错误面：缺 name / parent 非 string / 缺 id。
+    for bad in [
+        r#"{"t":"create_frame","id":"f1","x":0,"y":0,"w":1,"h":1}"#,
+        r#"{"t":"create_frame","id":"f1","name":"X","x":0,"y":0,"w":1,"h":1,"parent":42}"#,
+        r#"{"t":"rename_frame","name":"X"}"#,
+        r#"{"t":"set_parent","parent":"f1"}"#,
+    ] {
+        let e = parse_cmd_core(bad).err().unwrap();
+        assert_eq!(e.code, "cv_bad_json", "{bad} → {e:?}");
+    }
+
+    // 端到端：建 frame → 节点入 frame → 读模型 JSON 含 name/parent。
+    let mut s = session(53);
+    add_node(&mut s, "n1", 10.0, 10.0);
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(
+                r#"{"t":"create_frame","id":"f1","name":"第一章","x":0,"y":0,"w":400,"h":300,"parent":null}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"frame_created""#), "{rj}");
+    assert!(rj.contains(r#""id":"f1""#), "{rj}");
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":"f1"}"#).unwrap(),
+    )
+    .unwrap();
+
+    // frame JSON：kind/name/parent 字段。
+    let oj = object_json(&s.find_object("f1").unwrap());
+    assert!(oj.contains(r#""kind":"frame""#), "{oj}");
+    assert!(oj.contains(r#""name":"第一章""#), "{oj}");
+    assert!(oj.contains(r#""parent":null"#), "{oj}");
+    // 节点 JSON：parent 挂接值；name 缺省 null。
+    let oj = object_json(&s.find_object("n1").unwrap());
+    assert!(oj.contains(r#""parent":"f1""#), "{oj}");
+    assert!(oj.contains(r#""name":null"#), "{oj}");
+
+    // 重命名 + 环路拒绝（引擎校验 → 既有错误码）。
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Ai,
+            parse_cmd_core(r#"{"t":"rename_frame","id":"f1","name":"第二章"}"#).unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"frame_renamed""#), "{rj}");
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"set_parent","id":"f1","parent":"n1"}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_invalid_input", "非 frame 目标拒收");
 }
