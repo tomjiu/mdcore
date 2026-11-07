@@ -30,6 +30,13 @@ mkdirSync('dist', { recursive: true });
 const entries = [
   { in: 'src/main.ts', out: 'dist/main.js' },
   { in: 'src/bench.ts', out: 'dist/bench.js' }, // 阶段1宿主选型：原型A基准页
+  // #479 异步导入 worker：import_async.ts 以 new Worker(new URL(
+  // './import-worker.js', import.meta.url)) 引用——esbuild 对该模式的
+  // 自动入口推导不触发（.js→.ts 源映射在 URL 面不生效），显式入口 =
+  // pdf.worker.min.mjs 显式拷贝同款稳定路径；产物与 main.js 同目录，
+  // glue 的 wasm URL（new URL('mdcore_wasm_bg.wasm', import.meta.url)）
+  // 相对 dist/ 解析——与 main.js 共用同一份 .wasm。
+  { in: 'src/import-worker.ts', out: 'dist/import-worker.js' },
 ];
 
 for (const e of entries) {
