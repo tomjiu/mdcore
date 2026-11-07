@@ -97,7 +97,7 @@ use crate::keymap::{self, EditorAction, KeyQuery};
 use mouse::ClickKind;
 use theme::ThemeColors;
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, Popover};
 
 use buffer::{Buffer, FenceDirty, IndentUnit, Point};
 use docx_doc::{DocxPayload, DocxProps, EditablePayload, HeadingEntry};
@@ -3834,7 +3834,10 @@ impl Editor {
                     });
                 },
             )))
-            // r42 阶段 E：命令面板浮层（Ctrl+Shift+P；编辑区顶部居中）。
+            // r42 阶段 E（#385 批 3b）：命令面板浮层（Ctrl+Shift+P；
+            // 编辑区顶部居中）。定位容器（absolute/top/left/w）本层
+            // 保留；浮层视觉壳（圆角/边框/背景/阴影）迁 `ui::Popover`
+            // ——elevation_2 主题化浮层语系。
             .when_some(self.palette.clone(), |el, pal| {
                 let colors = cx.theme().colors().clone();
                 el.child(
@@ -3844,39 +3847,45 @@ impl Editor {
                         .top(px(8.))
                         .left(px(80.))
                         .w(px(420.))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border)
-                        .bg(colors.background)
-                        .shadow_md()
                         .p_3()
                         .flex()
                         .flex_col()
                         .gap_2()
                         .text_size(px(13.))
                         .child(
-                            div()
-                                .id("palette-query")
-                                .flex()
-                                .gap_1()
-                                .text_color(colors.text)
-                                .child(div().text_color(colors.text_accent).child("> "))
-                                .child(div().child(format!("{}▏", pal.query))),
-                        )
-                        .child(palette_view::palette_list(
-                            // #183 A-3：分组渲染接活（段标题 + 条目 +
-                            // 快捷键）——此前平铺 pal.items 直渲，
-                            // palette_view 三函数零调用的死代码链。
-                            &palette_view::palette_sections(&pal.query, &self.palette_recent),
-                            pal.selected,
-                            8,
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(colors.text_muted)
-                                .child("↑↓ 选择 · Enter 执行 · Esc 关闭"),
+                            Popover::new().child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("palette-query")
+                                            .flex()
+                                            .gap_1()
+                                            .text_color(colors.text)
+                                            .child(div().text_color(colors.text_accent).child("> "))
+                                            .child(div().child(format!("{}▏", pal.query))),
+                                    )
+                                    .child(palette_view::palette_list(
+                                        // #183 A-3：分组渲染接活（段标题 + 条目 +
+                                        // 快捷键）——此前平铺 pal.items 直渲，
+                                        // palette_view 三函数零调用的死代码链。
+                                        &palette_view::palette_sections(
+                                            &pal.query,
+                                            &self.palette_recent,
+                                        ),
+                                        pal.selected,
+                                        8,
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(colors.text_muted)
+                                            .child("↑↓ 选择 · Enter 执行 · Esc 关闭"),
+                                    ),
+                            ),
                         ),
                 )
             })
