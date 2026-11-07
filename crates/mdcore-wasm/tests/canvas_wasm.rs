@@ -356,7 +356,7 @@ fn stroke_error_codes_reuse_existing_variants() {
         )
         .unwrap_err();
     let e: mdcore_wasm::canvas::CvError = e.into();
-    assert_eq!(e.code, "cv_notfound");
+    assert_eq!(e.code, "cv_object_not_found");
 }
 
 // ── 批量面（#352）────────────────────────────────────────────────

@@ -374,6 +374,14 @@ pub fn batch_receipt_json(r: &mdc_canvas::BatchReceipt) -> String {
                 CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
                 // #402 z 序面：与单命令 receipt_json 同构
                 CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
+                // #405 标签面 + #404 frame 面：与单命令 receipt_json 同构
+                //（rebase 到新 main 后补——#352 母分支同样缺这五支，
+                // 本栈先行补齐，#369 rebase 时可直接取用）。
+                CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),
+                CommandOutcome::TagRemoved { id } => ("tag_removed", "id", id.clone()),
+                CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
+                CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
+                CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
             };
             format!(
                 "{{\"outcome\":\"{kind}\",\"{key}\":{}}}",
