@@ -149,6 +149,10 @@ def main() -> int:
                           "canvas_remote_not_in_undo", "canvas_error_faces",
                           "canvas_brush_smooth_stroke", "canvas_brush_undo_unit",
                           "canvas_brush_ai_mirror_sync", "canvas_brush_esc_cancel",
+                          "canvas_brush_style_selectors", "canvas_brush_custom_color",
+                          "canvas_brush_style_persist",
+                          "canvas_eraser_two_phase", "canvas_eraser_undo_unit",
+                          "canvas_eraser_esc_cancel",
                           "canvas_perf_smoke"]:
                     pending_wasm(n)
             else:
@@ -620,6 +624,244 @@ def main() -> int:
                       and esc["previewLeft"] == 0
                       and esc["brushActive"] is False,
                       json.dumps({"esc": esc, "depth": depth_e}, ensure_ascii=False))
+
+                # ---- 14f-14h. 步 3 画笔样式选择器（#44 落地顺序步 3：
+                # 工具/颜色/粗细 + 自定义色 + 快照往返保留）。----
+                # 14f. 荧光笔 + 黄 + 特粗：选择器改态 → 拖动中预览同步
+                # （fill/半透明）→ 松手提交 → 模型/DOM/撤销深度。
+                page.select_option('#canvas-brush-tool', 'highlighter')
+                page.select_option('#canvas-brush-color', '#ffd400')
+                page.select_option('#canvas-brush-width', '14')
+                page.click('#canvas-brush-btn')  # 14e ESC 已退画笔态
+                depth_f = page.evaluate("window.__canvasState().undoDepth")
+                svg_box = page.locator("#canvas-svg").bounding_box()
+                fx = svg_box["x"] + svg_box["width"] * 0.6
+                fy = svg_box["y"] + svg_box["height"] * 0.3
+                page.mouse.move(fx, fy)
+                page.mouse.down()
+                page.mouse.move(fx + 30, fy + 15, steps=3)
+                # 拖动中：预览 = 所选样式（黄 + 荧光笔半透明——所见即所提交）。
+                preview = page.evaluate(
+                    """() => { const p = document.querySelector(
+                           '#cv-l-strokes > .cv-brush-preview');
+                       return p ? { fill: p.getAttribute('fill'),
+                                    opacity: p.getAttribute('fill-opacity') } : null; }""")
+                page.mouse.move(fx + 60, fy + 50, steps=3)
+                page.mouse.up()
+                page.wait_for_function(
+                    "document.querySelectorAll('#cv-l-strokes > path.stroke').length === 2",
+                    timeout=5000)
+                # 注：redo（14c）会把重放对象排到模型 Map 末尾——不能
+                # 用 os[last] 定位新笔，按特征查找（荧光笔唯一）。
+                styled = page.evaluate("""() => ({
+                    dom: (() => { const p = document.querySelector(
+                                     '#cv-l-strokes > path.stroke[fill="#ffd400"]');
+                                  return p ? { fill: p.getAttribute('fill'),
+                                               opacity: p.getAttribute('fill-opacity') } : null; })(),
+                    obj: (() => { const os = window.__canvasObjects().filter(
+                                      o => o.kind === 'stroke');
+                                  return os.find(o => o.tool === 'highlighter') ?? null; })(),
+                    state: window.__canvasState(),
+                    previewLeft: document.querySelectorAll(
+                        '#cv-l-strokes > .cv-brush-preview').length,
+                })""")
+                check("canvas_brush_style_selectors",
+                      preview is not None and preview["fill"] == "#ffd400"
+                      and preview["opacity"] == "0.4"
+                      and styled["obj"] is not None
+                      and styled["obj"]["color"] == "#ffd400"
+                      and styled["obj"]["width"] == 14
+                      and styled["obj"]["tool"] == "highlighter"
+                      and styled["dom"] is not None
+                      and styled["dom"]["fill"] == "#ffd400"
+                      and styled["dom"]["opacity"] == "0.4"
+                      and styled["previewLeft"] == 0
+                      and styled["state"]["undoDepth"] == depth_f + 1,
+                      json.dumps({"preview": preview, "styled": styled,
+                                  "depth": [depth_f, styled["state"]["undoDepth"]]},
+                                 ensure_ascii=False))
+
+                # 14g. 自定义色（面板外 #009688）→ 钢笔 → 模型色透传。
+                page.evaluate("""() => {
+                    const el = document.getElementById('canvas-brush-custom');
+                    el.value = '#009688';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }""")
+                page.select_option('#canvas-brush-tool', 'pen')
+                page.mouse.move(fx, fy + 120)
+                page.mouse.down()
+                page.mouse.move(fx + 45, fy + 150, steps=3)
+                page.mouse.move(fx + 15, fy + 190, steps=3)
+                page.mouse.up()
+                page.wait_for_function(
+                    "document.querySelectorAll('#cv-l-strokes > path.stroke').length === 3",
+                    timeout=5000)
+                # 按特征查找（自定义色唯一——同 14f 的 Map 顺序规避）。
+                custom = page.evaluate("""() => {
+                    const os = window.__canvasObjects().filter(o => o.kind === 'stroke');
+                    const o = os.find(s => s.color === '#009688') ?? null;
+                    return o ? { color: o.color, width: o.width, tool: o.tool } : null;
+                }""")
+                check("canvas_brush_custom_color",
+                      custom is not None and custom["color"] == "#009688"
+                      and custom["tool"] == "pen",
+                      json.dumps({"custom": custom}, ensure_ascii=False))
+
+                # 14h. 重开后保留（save → restore 用户手势 + 探针 serde
+                # 往返：样式字段逐字段相等。注：不叠 clear——clear 产生
+                # 的删除 tombstone 会经 restore 的 AI 追赶回灌（CRDT
+                # 收敛语义 vs 快照恢复产品语义的既有冲突，另登记不修）。
+                before = page.evaluate(
+                    "() => window.__canvasObjects().filter(o => o.kind === 'stroke')"
+                    ".map(o => ({ color: o.color, width: o.width, tool: o.tool }))")
+                rr3 = page.evaluate("window.__canvasSnapshotRoundtrip()")
+                page.click('#canvas-save-btn')
+                page.click('#canvas-restore-btn')
+                page.wait_for_function(
+                    "document.querySelectorAll('#cv-l-strokes > path.stroke').length === 3",
+                    timeout=5000)
+                after = page.evaluate("""() => ({
+                    objs: window.__canvasObjects().filter(o => o.kind === 'stroke')
+                             .map(o => ({ color: o.color, width: o.width, tool: o.tool })),
+                    dom: Array.from(document.querySelectorAll(
+                             '#cv-l-strokes > path.stroke')).map(
+                             p => ({ fill: p.getAttribute('fill'),
+                                     opacity: p.getAttribute('fill-opacity') })),
+                    state: window.__canvasState(),
+                })""")
+                check("canvas_brush_style_persist",
+                      rr3.get("ok") is True
+                      and len(before) == 3
+                      and sorted(map(json.dumps, before)) == sorted(
+                          json.dumps({"color": o.get("color"), "width": o.get("width"),
+                                      "tool": o.get("tool")})
+                          for o in rr3.get("objects", [])
+                          if o.get("kind") == "stroke")
+                      and after["objs"] == before
+                      and len(after["dom"]) == 3
+                      and {d["fill"] for d in after["dom"]} == {b["color"] for b in before}
+                      and any(d["opacity"] == "0.4" for d in after["dom"])
+                      # restore 语义：undo 栈重置（新会话）。
+                      and after["state"]["undoDepth"] == 0,
+                      json.dumps({"rr3": {k: rr3.get(k) for k in ("ok", "code", "message")},
+                                  "before": before, "after": after},
+                                 ensure_ascii=False))
+
+                # ---- 14i-14k. #454 橡皮擦两段式（#44 落地顺序步 4：
+                # 拖过变预览色，松手才删，一次 Ctrl+Z 全恢复）。
+                # 14i. 两段式主路径：拖动中零命令+预览集（S2/S3 变暗、
+                # S1 无感）→ 松手单事务批删 → 模型/DOM/AI 镜像。
+                # 三笔坐标：S1 ≈ (0.3W, 0.3H) 竖向；S2 ≈ (0.6W,
+                # 0.3H)→+60/+50；S3 ≈ (0.6W, 0.3H+120)→+45/+70——
+                # 竖向扫 (0.6W, 0.3H+10..0.3H+200) 恰过 S2/S3，
+                # 与 S1 横向相距 0.3W（远超命中半径）。
+                if not page.evaluate(
+                        "document.getElementById('canvas-brush-btn')"
+                        ".classList.contains('active')"):
+                    page.click("#canvas-brush-btn")
+                page.select_option("#canvas-brush-tool", "eraser")
+                depth_i = page.evaluate("window.__canvasState().undoDepth")
+                page.mouse.move(fx, fy + 10)
+                page.mouse.down()
+                page.mouse.move(fx, fy + 60, steps=3)
+                page.mouse.move(fx, fy + 140, steps=3)
+                mid = page.evaluate("""() => ({
+                    hits: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke.cv-eraser-hit').length,
+                    strokes: window.__canvasState().strokes,
+                    undoDepth: window.__canvasState().undoDepth,
+                })""")
+                page.mouse.move(fx, fy + 200, steps=3)
+                page.mouse.up()
+                page.wait_for_function(
+                    "document.querySelectorAll('#cv-l-strokes > path.stroke').length === 1",
+                    timeout=5000)
+                erased = page.evaluate("""() => ({
+                    state: window.__canvasState(),
+                    domStrokes: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke').length,
+                    hitLeft: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke.cv-eraser-hit').length,
+                    left: window.__canvasObjects().filter(
+                        o => o.kind === 'stroke').map(o => o.color),
+                    aiDom: document.querySelectorAll(
+                        '#canvas-ai-svg path.stroke').length,
+                    aiModel: window.__canvasObjects('ai').filter(
+                        o => o.kind === 'stroke').length,
+                })""")
+                check("canvas_eraser_two_phase",
+                      # 拖动中（已过 S2/S3）：预览集恰 2、模型零变更。
+                      mid["hits"] == 2 and mid["strokes"] == 3
+                      and mid["undoDepth"] == depth_i
+                      # 松手：两笔消失（黄/青不足、墨黑保留），
+                      # 预览类清零，undoDepth 恰 +1（单撤销单元）。
+                      and erased["state"]["strokes"] == 1
+                      and erased["domStrokes"] == 1
+                      and erased["hitLeft"] == 0
+                      and erased["left"] == ["#1f1f1f"]
+                      and erased["state"]["undoDepth"] == depth_i + 1
+                      # AI 镜像同步：批删事件双端收敛。
+                      and erased["aiDom"] == 1 and erased["aiModel"] == 1,
+                      json.dumps({"mid": mid, "erased": erased,
+                                  "depth": [depth_i, erased["state"]["undoDepth"]]},
+                                 ensure_ascii=False))
+
+                # 14j. 一次 Ctrl+Z 全恢复（undo 单元 = 整拖）：两笔回归
+                # 模型 + DOM + AI 镜像，undoDepth 回到批删前。
+                page.click("#canvas-undo-btn")
+                page.wait_for_function(
+                    "document.querySelectorAll('#cv-l-strokes > path.stroke').length === 3",
+                    timeout=5000)
+                restored = page.evaluate("""() => ({
+                    state: window.__canvasState(),
+                    domStrokes: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke').length,
+                    model: window.__canvasObjects().filter(
+                        o => o.kind === 'stroke').length,
+                    aiDom: document.querySelectorAll(
+                        '#canvas-ai-svg path.stroke').length,
+                })""")
+                check("canvas_eraser_undo_unit",
+                      restored["state"]["strokes"] == 3
+                      and restored["domStrokes"] == 3
+                      and restored["model"] == 3
+                      and restored["aiDom"] == 3
+                      and restored["state"]["undoDepth"] == depth_i,
+                      json.dumps({"restored": restored,
+                                  "depth": [depth_i, restored["state"]["undoDepth"]]},
+                                 ensure_ascii=False))
+
+                # 14k. ESC 取消：拖动中 ESC → 预览集作废零命令（同在笔
+                # 取消纪律——undo 深度不变、预览类清零）。
+                depth_k = page.evaluate("window.__canvasState().undoDepth")
+                if not page.evaluate(
+                        "document.getElementById('canvas-brush-btn')"
+                        ".classList.contains('active')"):
+                    page.click("#canvas-brush-btn")
+                page.mouse.move(fx, fy + 10)
+                page.mouse.down()
+                page.mouse.move(fx, fy + 60, steps=3)
+                mid_k = page.evaluate("""() => ({
+                    hits: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke.cv-eraser-hit').length,
+                })""")
+                page.keyboard.press("Escape")
+                page.mouse.up()
+                esc_e = page.evaluate("""() => ({
+                    state: window.__canvasState(),
+                    hitLeft: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke.cv-eraser-hit').length,
+                    domStrokes: document.querySelectorAll(
+                        '#cv-l-strokes > path.stroke').length,
+                })""")
+                check("canvas_eraser_esc_cancel",
+                      mid_k["hits"] >= 1
+                      and esc_e["state"]["strokes"] == 3
+                      and esc_e["domStrokes"] == 3
+                      and esc_e["hitLeft"] == 0
+                      and esc_e["state"]["undoDepth"] == depth_k,
+                      json.dumps({"mid_k": mid_k, "esc": esc_e,
+                                  "depth": depth_k}, ensure_ascii=False))
 
             # ---- 15. canvas_perf_smoke（100 节点批量添加 < 2s——粗粒度烟测）----
             if not has_wasm:

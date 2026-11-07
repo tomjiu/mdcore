@@ -456,6 +456,11 @@
   .cv-btn:hover:not(:disabled) { background: var(--panel-hover); }
   .cv-btn:disabled { opacity: .45; cursor: default; }
   .cv-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  /* 步 3（#44）画笔样式选择器：select 与色板输入（同 .cv-btn 视觉族）。 */
+  .cv-sel { font: inherit; font-size: 13px; padding: 3px 4px; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--panel); cursor: pointer; }
+  .cv-color { font: inherit; width: 28px; height: 26px; padding: 1px 2px; border: 1px solid var(--border);
+              border-radius: 6px; background: var(--panel); cursor: pointer; }
   #canvas-status { margin-left: 8px; color: var(--fg-muted); font-size: 12px; min-height: 16px;
                    flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #canvas-status.cv-error { color: var(--danger); }
@@ -480,6 +485,8 @@
   /* #426 笔迹：outline 填充 path（fill 属性逐对象内联——此处只管指针面） */
   #canvas-svg .stroke { pointer-events: none; }
   #canvas-svg .cv-brush-preview { pointer-events: none; }
+  /* #454（#44 步4）橡皮擦两段式预览态：拖过变暗（松手才删）。 */
+  #canvas-svg .stroke.cv-eraser-hit { opacity: .25; }
   #canvas-svg .edge.dangling { stroke: #d97706; stroke-dasharray: 5 4; }
   #canvas-svg .group rect { fill: none; stroke: #9aa3af; stroke-dasharray: 6 4; }
   #canvas-svg .group.selected rect { stroke: #7c3aed; stroke-width: 2; }
