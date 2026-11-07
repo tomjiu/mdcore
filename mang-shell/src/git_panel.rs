@@ -19,7 +19,7 @@ use std::process::Command;
 
 use gpui::{AppContext, Context, IntoElement, MouseButton, Render, WeakEntity};
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize};
+use ui::{Chip, CountBadge, Icon, IconName, IconSize, Label, LabelSize, List, ListItem};
 
 use crate::shell::ShellApp;
 
@@ -333,7 +333,8 @@ impl Render for GitPanel {
                             .size(IconSize::XSmall)
                             .color(ui::Color::Muted),
                     )
-                    .child(Label::new(format!("改动（{changes_count}）")).size(LabelSize::Small)),
+                    .child(Label::new("改动").size(LabelSize::Small))
+                    .child(CountBadge::new(changes_count)),
             )
             .child(
                 h_flex()
@@ -381,104 +382,86 @@ impl Render for GitPanel {
 
         // 体：不可用提示 / 对应视图列表。
         let body: gpui::AnyElement = if let Some(reason) = &self.unavailable {
-            v_flex()
-                .id("git-unavailable")
-                .p_2()
-                .gap_1()
-                .child(
-                    Label::new(reason.as_str())
-                        .size(LabelSize::Small)
-                        .color(ui::Color::Muted),
-                )
-                .into_any_element()
+            List::new().empty_message(reason.clone()).into_any_element()
         } else {
             match self.view {
                 GitView::Changes => {
                     if self.changes.is_empty() {
-                        v_flex()
-                            .id("git-clean")
-                            .p_2()
-                            .child(
-                                Label::new("工作区干净（无改动）")
-                                    .size(LabelSize::Small)
-                                    .color(ui::Color::Muted),
-                            )
+                        List::new()
+                            .empty_message("工作区干净（无改动）")
                             .into_any_element()
                     } else {
                         v_flex()
                             .id("git-changes")
-                            .gap_1()
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .children(self.changes.iter().map(|change| {
+                            .child(List::new().children(self.changes.iter().map(|change| {
                                 let path = change.path.clone();
                                 let path_for_id = path.clone();
                                 let path_for_click = path.clone();
                                 let code = change.code.clone();
-                                h_flex()
-                                    .id(gpui::SharedString::from(format!("git-chg-{path_for_id}")))
-                                    .w_full()
-                                    .px_1()
-                                    .py_1()
-                                    .gap_2()
-                                    .items_center()
-                                    .rounded_sm()
-                                    .hover(move |el| el.bg(hover))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.open_diff(&path_for_click, window, cx);
-                                        }),
-                                    )
-                                    .child(
-                                        Label::new(code.as_str())
-                                            .size(LabelSize::XSmall)
-                                            .color(ui::Color::Accent),
-                                    )
-                                    .child(Label::new(path.as_str()).size(LabelSize::Small))
-                            }))
+                                ListItem::new(gpui::SharedString::from(format!(
+                                    "git-chg-{path_for_id}"
+                                )))
+                                .inset(true)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_diff(&path_for_click, window, cx);
+                                }))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .items_center()
+                                        // 状态码 → Chip（accent 色系与旧
+                                        // Label::Accent 同源；M/A/D/?? 等
+                                        // git 语义码一屏可辨）。
+                                        .child(
+                                            Chip::new(code)
+                                                .label_size(LabelSize::XSmall)
+                                                .label_color(ui::Color::Accent),
+                                        )
+                                        .child(Label::new(path.as_str()).size(LabelSize::Small)),
+                                )
+                            })))
                             .into_any_element()
                     }
                 }
                 GitView::History => v_flex()
                     .id("git-history")
-                    .gap_1()
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(self.commits.iter().map(|commit| {
+                    .child(List::new().children(self.commits.iter().map(|commit| {
                         let hash = commit.hash.clone();
-                        v_flex()
-                            .id(gpui::SharedString::from(format!("git-cmt-{hash}")))
-                            .w_full()
-                            .px_1()
-                            .py_1()
-                            .gap_0p5()
-                            .rounded_sm()
-                            .hover(move |el| el.bg(hover))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.open_commit(&hash, window, cx);
-                                }),
-                            )
+                        ListItem::new(gpui::SharedString::from(format!("git-cmt-{hash}")))
+                            .inset(true)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_commit(&hash, window, cx);
+                            }))
                             .child(
-                                h_flex()
-                                    .gap_2()
+                                v_flex()
+                                    .w_full()
+                                    .gap_0p5()
                                     .child(
-                                        Label::new(commit.hash.as_str())
-                                            .size(LabelSize::XSmall)
-                                            .color(ui::Color::Accent),
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Label::new(commit.hash.as_str())
+                                                    .size(LabelSize::XSmall)
+                                                    .color(ui::Color::Accent),
+                                            )
+                                            .child(
+                                                Label::new(commit.time.as_str())
+                                                    .size(LabelSize::XSmall)
+                                                    .color(ui::Color::Hidden),
+                                            ),
                                     )
                                     .child(
-                                        Label::new(commit.time.as_str())
-                                            .size(LabelSize::XSmall)
-                                            .color(ui::Color::Hidden),
+                                        Label::new(commit.subject.as_str()).size(LabelSize::Small),
                                     ),
                             )
-                            .child(Label::new(commit.subject.as_str()).size(LabelSize::Small))
-                    }))
+                    })))
                     .into_any_element(),
             }
         };
