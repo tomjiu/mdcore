@@ -22,11 +22,13 @@
 
 pub mod events;
 pub mod export;
+pub mod hit;
 pub mod render;
 pub mod session;
 pub mod zorder;
 
 pub use events::{CanvasChangeSource, CanvasEvent, Subscription};
+pub use hit::{hit_test, hit_test_rect, HitTarget};
 pub use render::{
     canvas_bounds, canvas_bounds_geometry, encode_png, export_png, export_svg, parse_color,
     shape_bounds, shape_bounds_padded, shape_from_object, Affine, Bitmap, CanvasRenderer,
