@@ -35,7 +35,11 @@ export function mount_surface_guide(
   host: HTMLElement,
   id: string,
   spec: SurfaceGuideSpec,
-): HTMLElement {
+): HTMLDivElement {
+  // #452：返回类型收窄 HTMLElement → HTMLDivElement——实现创建的就是
+  // div（下行 createElement('div')），三个调用方的 guideEl 字段本就
+  // 声明 HTMLDivElement（78c83f3 引入的类型面错配；纯类型收窄，
+  // 零运行时行为变化）。
   if (getComputedStyle(host).position === 'static') {
     host.style.position = 'relative';
   }
