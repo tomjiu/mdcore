@@ -131,6 +131,89 @@ pub struct OpenAssessment {
     /// 旧 JSON 缺省反序列化为 None，None 序列化时省略字段）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub form_probe: Option<FormProbe>,
+    /// 长尾⑤：/Encrypt 字典读面（P 权限位 + 处理器标识；#493）。
+    /// 承载态 = **仍加密**（口令保护档——`encrypted: true`；/Encrypt
+    /// 字典本身不加密[PDF 规范]，lopdf 未解密装载下经
+    /// `Document::get_encrypted` 可读）。**曾加密态不承载**（空口令
+    /// 自动解密后 lopdf 移除 trailer /Encrypt——装载模型不可见，
+    /// 诚实 None）；非加密档/字典畸形（缺 /P 或 /Filter）同 None。
+    /// serde 增量兼容同 form_probe（旧 JSON 缺省 None）。
+    ///
+    /// **只承载不裁定**：P 位是荣誉制声明（非密码学强制）——读/打印
+    /// 路径是否遵从 = 策略裁定（Lead 面，S5 写拒现状已比 P 位严）。
+    /// 本字段使权利声明**可见**，宿主/策略层可消费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionInfo>,
+}
+
+/// /Encrypt 字典读面（长尾⑤ / #493）：处理器标识 + 权限位。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptionInfo {
+    /// /Filter：安全处理器名（"Standard" 等——lopdf 写面恒 Standard，
+    /// 敌意档可能是任意名——原样承载不解释）。
+    pub filter: String,
+    /// /V：算法版本（1-5；None = 缺失——畸形档防御面）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+    /// /R：修订号（2-6；None = 缺失）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    /// /Length：密钥长度（bits；None = 缺省 40）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_length: Option<i64>,
+    /// /P 权限位解析（见 [`EncryptPermissions`]）。
+    pub permissions: EncryptPermissions,
+}
+
+/// /Encrypt P 权限位（8 个标准声明位 + 原值）。
+///
+/// 位定义 = PDF 规范 Table 22（lopdf `Permissions` 位标志同源）；
+/// **语义 = 权利声明**（查看器荣誉制遵从，非密码学强制——字段文档
+/// 见 [`EncryptionInfo`]）。`raw` = /P 整数原值（signed 32 位——
+/// 规范形；位运算按 u32 解释）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptPermissions {
+    /// /P 原值（signed 32 位原样承载——诊断与往返面）。
+    pub raw: i64,
+    /// bit 3：打印（R≥3 时受 `printable_in_high_quality` 调制——
+    /// 低清晰度打印仍可能允许）。
+    pub printable: bool,
+    /// bit 4：修改内容（批注/表单/汇编之外的面）。
+    pub modifiable: bool,
+    /// bit 5：复制/提取文本与图形（辅助技术豁免见
+    /// `copyable_for_accessibility`）。
+    pub copyable: bool,
+    /// bit 6：添加/修改批注与表单域。
+    pub annotable: bool,
+    /// bit 9：填写既有表单域。
+    pub fillable: bool,
+    /// bit 10：辅助技术用途提取（PDF 2.0 起恒置——历史兼容位）。
+    pub copyable_for_accessibility: bool,
+    /// bit 11：汇编（插/旋/删页 + 大纲/缩略图）。
+    pub assemblable: bool,
+    /// bit 12：高清晰度打印（R≥3）。
+    pub printable_in_high_quality: bool,
+}
+
+impl EncryptPermissions {
+    /// /P 整数（signed 32 位）→ 位解析。位域取 u32 解释
+    /// （`raw as u32`）——负值 = 高位置 1（保留位全 1 形态，规范
+    /// 常见——correct_bits 后合法）。
+    pub fn from_p_value(raw: i64) -> Self {
+        let bits = raw as u32;
+        let has = |mask: u32| bits & mask != 0;
+        Self {
+            raw,
+            printable: has(1 << 2),
+            modifiable: has(1 << 3),
+            copyable: has(1 << 4),
+            annotable: has(1 << 5),
+            fillable: has(1 << 8),
+            copyable_for_accessibility: has(1 << 9),
+            assemblable: has(1 << 10),
+            printable_in_high_quality: has(1 << 11),
+        }
+    }
 }
 
 /// S5 写拒理由码（`CommandError::SecurityDeny.reason` 稳定标识——协议面

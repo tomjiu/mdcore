@@ -80,6 +80,7 @@ fn session(page_count: u32) -> PdfSession {
             encrypted: false,
             warnings: vec![],
             form_probe: None,
+            encryption: None,
         },
         vec![geometry(); page_count as usize],
         OutlineTree::new(),

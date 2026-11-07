@@ -181,6 +181,7 @@ fn session_with_writer(
             encrypted,
             warnings: vec![],
             form_probe: None,
+            encryption: None,
         },
         vec![PageGeometry::simple(612.0, 792.0, Rotation::Deg0); page_count as usize],
         OutlineTree::new(),
