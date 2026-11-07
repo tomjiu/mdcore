@@ -23,7 +23,7 @@
 | 7 | 盖章 | 图章注释/公章 | **对齐**（注释 Stamp + 内容流图片盖章双路径） | `annotation.rs:198`、`stamp.rs:723` `stamp_image`（PNG/JPEG/透明度）；测试 `pdfh_stamp`(8)、`pdff2_annotate` Stamp 往返 | 长尾⑧ |
 | 8 | 标注 | 高亮/批注/注释管理 | **对齐**（11 kind 读/写/删 + 渲染可见 + Acrobat 互通公共面） | `annotate.rs:514` `PdfAnnotator`、`annotation.rs:153`；测试 `parity_annotation_add_persist_remove`、`pdfd_writer`(16)、`pdff2_annotate`(11) | 长尾⑨ |
 | 9 | 打印 | 页面设置/缩放/注释打印开关 | **部分**（web 面已通：打印态 PDF 页参与 + 全页渲染 + 一页一纸；引擎面打印渲染原语 #354/PR #373 在审；壳面系统打印对话框仍缺） | web：`web/index.html` `@media print`（`body[data-pdf-active]` 判据）+ `web/src/pdf_view.ts` `printDocument`/`renderAllPages`；测试 `web/tests/pdf_print.py`（8 锁含 `page.pdf()` 真分页主锁）。引擎：#354（PR #373 在审）。壳：mang-shell 打印对话框未接线（#240 任务②） | **P1（#240 分层跟进中）** |
-| 10 | 搜索 | 全文搜索/高亮定位 | **对齐**（无 rect 几何命中） | `command.rs:98` `Command::Search`、`document.rs:396`（限额/折叠/摘录）；web `pdf_view.ts`（计数+几何高亮）；测试 `pdfb_skeleton::search_*`(4) | 长尾② |
+| 10 | 搜索 | 全文搜索/高亮定位 | **对齐**（引擎 rect 几何命中已落地——长尾②收口） | `command.rs` `Command::Search`/`SearchHit.rects`（`serde(default)` 加性面）、`document.rs` search（引擎路径走 `page_text_geometry`——char 对齐契约 + 行分组矩形；注入路径/引擎不支持 = 诚实空集）；`engine_pdfium.rs` `page_text_geometry`（`all()` 文本 + 逐字符 `FPDFText_GetCharBox`，6 夹具实证 1:1 对齐）；测试 `pdfc_engine::search_hit_rects_*`(2)+`page_text_geometry_alignment_contract` | — |
 | 11 | OCR | Reader 无此功能 | **对齐（超 Reader）**（tesseract 外进程，中英混合） | `ocr.rs:107` `ocr_page`（200DPI→PGM→tesseract）；测试 `pdff4_ocr`(5，环境门控) | 长尾⑩ |
 | 12 | 文档安全 | 权限位/口令/证书 | **部分**（打开扫描八族 + 限额 + 加密写拒；无解密/权限位模型） | `security.rs`、`security_scan.rs:41` `open_scan`；测试 `pdfe_security`(12)、`pdfb_skeleton::encrypted_assessment_denies_writes…` | 长尾⑤⑦ |
 
@@ -56,7 +56,6 @@
 | # | 缺口 | 级 | 说明与锚点 |
 |---|---|---|---|
 | ① | 链接点击导航未接宿主 | P2 | 数据面就绪（`links.rs` 读全 /Dest/命名树/URI），壳/web 未接 click→page 路由与外链策略——接线即可闭环 |
-| ② | 搜索无 rect 几何命中 | P2 | `SearchHit` 仅页+摘录（`command.rs:50` 注明扩展点）；pdfium SearchEx 未封装——UI 定位高亮需几何 |
 | ③ | 壳侧无位图渲染 | P2 | mang-shell `pdf_doc.rs` 走文本行模型；web 面有完整 canvas 渲染（`pdf_view.ts` LRU 64MB）——壳侧渲染待 #68 阅读面 |
 | ④ | 书签编辑/命名目标 | P3 | 仅页目标读面（`outline.rs`）；web `buildOutlineJson` 恒空树（`pdf_view.ts:192` 登记） |
 | ⑤ | 加密档解密/权限位模型 | P3 | 曾解密档只读放行写拒（S5 策略）；无口令输入 UI、无 /Encrypt P 位遵从 |

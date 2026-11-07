@@ -34,4 +34,23 @@ pub trait DocumentEngine {
     /// 页区间文本抽取（页号升序，载荷形状与
     /// [`crate::command::Outcome::ExtractedText`] 一致）。
     fn extract_text(&self, span: PageSpan) -> Result<Vec<(PageIndex, String)>, CommandError>;
+
+    /// 单页文本几何（长尾②：Search 命中 rect 面）——`text` 与
+    /// [`Self::extract_text`] 同源同值（引擎单一文本真源），
+    /// `char_rects[i]` = 第 i 个 **char**（Unicode 标量——非字节位）
+    /// 的包围盒（PDF 用户空间；无盒字符 = 零面积退化盒）。
+    ///
+    /// **对齐契约**：`char_rects.len() == text.chars().count()` 恒成立
+    /// （消费方按此判定可用性——不成立时消费方弃用几何面，文本面
+    /// 不受影响）。默认实现 = 不支持（typed Err——注入态/未来引擎
+    /// 的诚实降级面，消费方按「无几何」处理不报错）。
+    fn page_text_geometry(
+        &self,
+        idx: PageIndex,
+    ) -> Result<crate::command::PageTextGeometry, CommandError> {
+        let _ = idx;
+        Err(CommandError::engine(
+            "text geometry unsupported by this engine",
+        ))
+    }
 }

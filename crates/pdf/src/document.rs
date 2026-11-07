@@ -44,7 +44,8 @@ use crate::annotation::{
     AnnotationPatch,
 };
 use crate::command::{
-    AnnotationFilter, Command, CommandError, Outcome, SearchHit, SearchOptions, TextTarget,
+    AnnotationFilter, Command, CommandError, Outcome, SearchHit, SearchOptions, SearchRect,
+    TextTarget,
 };
 use crate::engine::DocumentEngine;
 use crate::outline::{OutlineTarget, OutlineTree};
@@ -420,7 +421,9 @@ impl PdfSession {
 
     /// Search：限额/摘录/截断语义单一出口（两路径同锁）；引擎路径逐页
     /// 抽取后复用同一收集器（find_matches/snippet_around——注入路径的
-    /// 非重叠/Unicode 折叠/char 边界语义逐字保持）。
+    /// 非重叠/Unicode 折叠/char 边界语义逐字保持）。长尾②：引擎路径
+    /// 优先走文本几何（命中 rect 面——UI 定位高亮）；几何不可用
+    /// （引擎不支持/对齐契约不成立）诚实降级为无 rect，文本面零变化。
     fn search(&self, query: String, opts: SearchOptions) -> Result<Outcome, CommandError> {
         if query.is_empty() {
             // S3 ❶硬拒绝：空串无语义，"全匹配"是资源滥用面。
@@ -432,7 +435,8 @@ impl PdfSession {
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut truncated = false;
         // 收集器：单页命中收集；返回 true = 收满（❷钳制告知，见收满分支）。
-        let mut collect = |page_no: u32, text: &str| -> bool {
+        // `char_rects` = 当页字符几何（None = 几何不可用——rects 恒空）。
+        let mut collect = |page_no: u32, text: &str, char_rects: Option<&[SearchRect]>| -> bool {
             for byte_idx in find_matches(text, &query, opts.case_insensitive) {
                 if hits.len() >= max_hits as usize {
                     // 已收满且仍见新命中 → ❷钳制告知（不静默丢弃）。
@@ -440,26 +444,44 @@ impl PdfSession {
                     return true;
                 }
                 let snippet = snippet_around(text, byte_idx, snippet_chars);
+                // 长尾②：命中区间的字符矩形（对齐契约已在提供侧判定
+                // ——None = 不可用；Some = len == text.chars().count()）。
+                let rects = char_rects
+                    .map(|rects| hit_rects(text, byte_idx, &query, opts.case_insensitive, rects));
                 hits.push(SearchHit {
                     page: PageIndex(page_no),
                     snippet,
+                    rects: rects.unwrap_or_default(),
                 });
             }
             false
         };
         if let Some(engine) = self.engine.as_deref() {
-            // PDF-c 引擎路径：逐页抽取（流式，不整档驻留文本）。
+            // PDF-c 引擎路径：逐页（流式，不整档驻留文本）。优先文本
+            // 几何（rect 面）；不支持 → extract_text 同值降级（文本面
+            // 零变化——两 API 同源 all()，对齐见 engine_pdfium 文档）。
             'engine: for page_no in 0..self.meta.page_count.0 {
                 // start == end 单页区间——构造恒非反转（PageSpan 不变量）。
-                let span = PageSpan::new(PageIndex(page_no), PageIndex(page_no))
-                    .expect("单页区间恒非反转");
-                let text = engine
-                    .extract_text(span)?
-                    .into_iter()
-                    .next()
-                    .map(|(_, text)| text)
-                    .unwrap_or_default();
-                if collect(page_no, &text) {
+                let idx = PageIndex(page_no);
+                let geometry = engine.page_text_geometry(idx).ok().and_then(|g| {
+                    // 对齐契约：char 索引系 1:1（消费侧最后防线——
+                    // 提供侧已保，防御性复核零成本）。
+                    (g.char_rects.len() == g.text.chars().count()).then_some(g)
+                });
+                let (text, rects) = match geometry {
+                    Some(g) => (g.text, Some(g.char_rects)),
+                    None => {
+                        let span = PageSpan::new(idx, idx).expect("单页区间恒非反转");
+                        let text = engine
+                            .extract_text(span)?
+                            .into_iter()
+                            .next()
+                            .map(|(_, text)| text)
+                            .unwrap_or_default();
+                        (text, None)
+                    }
+                };
+                if collect(page_no, &text, rects.as_deref()) {
                     break 'engine;
                 }
             }
@@ -468,7 +490,7 @@ impl PdfSession {
                 let Some(text) = self.page_text.get(&page_no) else {
                     continue;
                 };
-                if collect(page_no, text) {
+                if collect(page_no, text, None) {
                     break 'injected;
                 }
             }
@@ -688,6 +710,100 @@ fn find_matches(text: &str, needle: &str, case_insensitive: bool) -> Vec<usize> 
         }
     }
     out
+}
+
+/// 长尾②：命中区间的字符矩形集（按行分组）。
+///
+/// `match_byte` = [`find_matches`] 报告的命中首字节位——先换算 char
+/// 索引区间 `[start, start + needle_chars)`，再取 `char_rects` 对应
+/// 矩形并**按行分组**：相邻字符矩形垂直跨度不相交（跨行）即断组，
+/// 每组输出一个包围盒（多行命中 = 多矩形，序 = 阅读序）。零面积
+/// 退化盒（无盒字符）并入当前组（不产出空组——全退化时输出单零盒，
+/// 诚实面：几何不可用但形态合法）。
+fn hit_rects(
+    text: &str,
+    match_byte: usize,
+    needle: &str,
+    case_insensitive: bool,
+    char_rects: &[SearchRect],
+) -> Vec<SearchRect> {
+    // 命中首字节 → char 起始索引（O(match_byte) 单次扫描——命中数受
+    // S3 限额，非每键热路径）。
+    let start_char = text[..match_byte].chars().count();
+    // 命中长度（char 数）：大小写不敏感折叠可能改变 char 数（`İ` →
+    // `i̇` 双字符——find_matches 文档登记的形态），命中区间的**文本侧
+    // 长度**以原文重扫为准：从 start_char 起重新做一次与收集器同语
+    // 义的窗口匹配（同折叠路径，不做第二套语义）。
+    let needle_chars: usize = if case_insensitive {
+        // 折叠形对位：以折叠序列逐字符推进原文窗口（与 find_matches
+        // 同款逻辑的最小化内联——长度面只需要窗口推进的终点）。
+        let folded: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).collect();
+        let hay: Vec<char> = text.chars().skip(start_char).collect();
+        let mut window = 0usize;
+        let mut consumed = 0usize;
+        'find: while window < hay.len() {
+            let mut ni = 0usize;
+            let mut hi = window;
+            let mut matched = true;
+            'attempt: while ni < folded.len() {
+                let Some(&hay_char) = hay.get(hi) else {
+                    matched = false;
+                    break 'attempt;
+                };
+                for folded_char in hay_char.to_lowercase() {
+                    let Some(&want) = folded.get(ni) else {
+                        matched = false;
+                        break 'attempt;
+                    };
+                    if folded_char != want {
+                        matched = false;
+                        break 'attempt;
+                    }
+                    ni += 1;
+                }
+                hi += 1;
+            }
+            if matched {
+                consumed = hi - window;
+                break 'find;
+            }
+            window += 1;
+        }
+        consumed
+    } else {
+        needle.chars().count()
+    };
+    if needle_chars == 0 {
+        return Vec::new();
+    }
+    // 矩形分组：垂直跨度不相交即断行。
+    let mut groups: Vec<SearchRect> = Vec::new();
+    for r in char_rects
+        .get(start_char..(start_char + needle_chars).min(char_rects.len()))
+        .into_iter()
+        .flatten()
+        .copied()
+    {
+        match groups.last_mut() {
+            Some(g) => {
+                // 垂直相交（同线/重叠带）→ 并入当前组；否则断组
+                // （下一行）。阈值不含容差——字符盒在同行恒有垂直
+                // 交叠（行高共享），跨行恒不相交（行间距 > 行内
+                // 抖动；6 夹具实测无边界形态）。
+                let v_overlap = r.top > g.bottom && r.bottom < g.top;
+                if v_overlap {
+                    g.left = g.left.min(r.left);
+                    g.bottom = g.bottom.min(r.bottom);
+                    g.right = g.right.max(r.right);
+                    g.top = g.top.max(r.top);
+                } else {
+                    groups.push(r);
+                }
+            }
+            None => groups.push(r),
+        }
+    }
+    groups
 }
 
 /// 命中点摘录：以匹配首字节为中心，向两侧各取至多 `max_chars / 2` 个

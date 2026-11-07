@@ -47,12 +47,44 @@ pub struct SearchOptions {
     pub max_hits: u32,
 }
 
-/// 搜索命中（v0 骨架：页 + 摘录；rect 命中面 PDF-c 文本层接入时扩展）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 搜索命中（页 + 摘录 + 几何命中面）。
+///
+/// `PartialEq`（非 `Eq`）：`rects` 的 `f32` 坐标无全序——命中等值
+/// 判定只在测试面消费，语义 = 页/摘录/几何逐字段相等。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchHit {
     pub page: PageIndex,
     /// 命中点上下文摘录（char 边界安全；长度受 S3 `snippet_max_chars` 钳制）。
     pub snippet: String,
+    /// 命中几何（PDF 用户空间矩形；引擎路径在场，注入路径/引擎不支持
+    /// 时为空——加性面：`serde(default)` + 空集不序列化，既有消费方
+    /// 零破坏）。多行命中 = 多矩形（按行分组，序 = 阅读序）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rects: Vec<SearchRect>,
+}
+
+/// 搜索命中矩形（PDF 用户空间——**未旋转**坐标，原点左下；与
+/// [`crate::page::PageGeometry`] 的 MediaBox 同系）。
+///
+/// 消费方（UI 高亮）经 `PageGeometry` 的 `/Rotate` 归一后映射到
+/// 显示面——引擎不在此做旋转预折算（几何单一真源纪律：坐标与
+/// 旋转分层，`engine_pdfium.rs` 单页几何文档同口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SearchRect {
+    pub left: f32,
+    pub bottom: f32,
+    pub right: f32,
+    pub top: f32,
+}
+
+/// 单页文本几何载荷（[`crate::engine::DocumentEngine::page_text_geometry`]
+/// 返回面）。`text`/`char_rects` 的对齐契约（char 索引系 1:1）见
+/// trait 方法文档——UTF-8 字节位换算由消费方经 `str::char_indices`
+/// 做，引擎不掺和字节面。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PageTextGeometry {
+    pub text: String,
+    pub char_rects: Vec<SearchRect>,
 }
 
 /// 标注列表过滤（多维度**合取**；`None` = 该维度不过滤）。
