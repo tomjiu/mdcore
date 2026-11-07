@@ -100,7 +100,20 @@
 //!
 //! - 图片（`images_skipped` = 正文/页眉页脚 run 级引用数 >0 的资产；
 //!   孤儿媒体不计——非用户可见内容）；
-//! - 脚注（引擎读面受限，office-io 侧登记面原样继承）。
+//! - 尾注（`endnotes` 承载计数——内容接入待后续轮，脚注先行
+//!   [#485 模式同构]）。
+//!
+//! ## 脚注接入（#485：GFM 脚注语法）
+//!
+//! - **引用位**：段落尾接 ` [^N]`（`ParagraphData::footnote_refs`
+//!   [#19 读面段落粒度标注]——run 级位置引擎模型不承载，尾接是
+//!   诚实近似而非位置保真；表内段引用位读面不标注 = 已知边界）；
+//! - **定义块**：文档尾节（正文之后、页脚尾接之前）`[^N]: 内容`，
+//!   docx id → footnotes.xml 文档序重编号连续小号；多段脚注懒连续
+//!   形（单 `\n`——4 空格缩进会被 mdcore 行级解析误判代码块）；
+//! - **诚实边界**：脚注内非段落块（表/文本框）丢弃计数进
+//!   `footnote_blocks_dropped`（stats + warnings）；孤儿脚注（无
+//!   引用位）定义照发（内容保留）；尾注不在本轮（承载计数保留）。
 //!
 //! ## 已知边界（登记，非缺陷）
 //!
@@ -368,6 +381,7 @@ fn warning_severity(kind: &mdc_office_io::io::WarningKind) -> &'static str {
 fn import_lossy_warnings(
     fields_dropped: usize,
     images_skipped: usize,
+    footnote_blocks_dropped: usize,
     total: &BlockMapper,
 ) -> Vec<serde_json::Value> {
     [
@@ -377,6 +391,13 @@ fn import_lossy_warnings(
         ("list_numbering_dropped", total.list_numbering_dropped, "warn"),
         ("list_markers_normalized", total.list_markers_normalized, "info"),
         ("list_depth_clamped", total.list_depth_clamped, "info"),
+        // #485：脚注内非段落块（表/文本框）丢弃——GFM 定义块只承载
+        // 段文本，丢弃计数可见性（无静默纪律）。
+        (
+            "footnote_blocks_dropped",
+            footnote_blocks_dropped,
+            "warn",
+        ),
     ]
     .into_iter()
     .filter(|&(_, count, _)| count > 0)
@@ -514,6 +535,11 @@ struct BlockMapper {
     merged_ranges: usize,
     // #18：文本框计数（承载可见）。
     text_boxes: usize,
+    // #485：脚注引用位发射计数（`[^N]` marker 数——段落粒度）。
+    footnote_refs_emitted: usize,
+    /// #485：docx 脚注 id → GFM 标签（正文 BlockMapper 专用——
+    /// 页眉/页脚 mapper 恒空：读面引用位扫描只覆盖 word/document.xml）。
+    footnote_labels: std::collections::HashMap<i64, String>,
     counters: ListCounters,
 }
 
@@ -547,6 +573,26 @@ impl BlockMapper {
                 Block::Paragraph(p) => {
                     let (text, links) = render_runs(&p.runs);
                     self.hyperlinks += links;
+                    // #485：脚注引用位 → 段落尾接 ` [^N]`（GFM 脚注
+                    // marker）。run 级引用位引擎模型不承载（#19 段落
+                    // 粒度登记边界）——尾接是诚实近似而非位置保真。
+                    // 未知 id（引用无对应条目——致档防御面）跳过并
+                    // 不计数；标题/列表/普通段统一覆盖（后缀在 text
+                    // 上，各分支格式化路径全部承接）。
+                    let text = if p.footnote_refs.is_empty() {
+                        text
+                    } else {
+                        let mut suffixed = text;
+                        for id in &p.footnote_refs {
+                            if let Some(label) = self.footnote_labels.get(id) {
+                                suffixed.push_str(" [^");
+                                suffixed.push_str(label);
+                                suffixed.push(']');
+                                self.footnote_refs_emitted += 1;
+                            }
+                        }
+                        suffixed
+                    };
                     if let Some(level) = p.heading_level {
                         // 标题优先（r5-t1）：编号标题段（Word 多级编号标题）
                         // → 标题赢，编号丢弃（mdcore 标题非列表项；计数
@@ -633,6 +679,7 @@ impl BlockMapper {
         self.list_depth_clamped += other.list_depth_clamped;
         self.list_markers_normalized += other.list_markers_normalized;
         self.text_boxes += other.text_boxes;
+        self.footnote_refs_emitted += other.footnote_refs_emitted;
     }
 }
 
@@ -692,6 +739,17 @@ fn docx_to_markdown(doc: &DocxDocument) -> (String, serde_json::Value) {
     // P2-1：有可见内容的页眉/页脚部件数。
     let mut headers_imported = 0usize;
     let mut footers_imported = 0usize;
+    // #485：脚注 GFM 标签（docx id → 序号——footnotes.xml 文档序
+    // 重编号；docx id 可为任意 i64，GFM 标签用连续小号更可读且
+    // 引用位/定义双面共享同一映射）。孤儿脚注（无引用位）同样
+    // 发射定义——内容保留，可诊断性交 stats。脚注内非段落块
+    // （表/文本框）丢弃计数——无静默纪律。
+    let footnote_labels: std::collections::HashMap<i64, String> = doc
+        .footnotes
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.id, (i + 1).to_string()))
+        .collect();
     // 页眉 → 文档前导。
     for part in &doc.headers {
         let mut m = BlockMapper::default();
@@ -702,8 +760,46 @@ fn docx_to_markdown(doc: &DocxDocument) -> (String, serde_json::Value) {
         }
         total.absorb(m);
     }
-    // 正文。
+    // 正文（脚注标签仅正文 mapper 持有——读面引用位扫描只覆盖
+    // word/document.xml，页眉/页脚段不标注）。
+    total.footnote_labels = footnote_labels.clone();
     lines.extend(total.map_blocks(&doc.blocks));
+    // #485：脚注定义块（文档尾节——正文之后、页脚尾接之前；
+    // GFM 惯例定义在文档尾。多段脚注 = 懒连续形（单 \n——mdcore
+    // 行级解析不认 4 空格缩进为段落内客，会误判代码块））。
+    let mut footnote_blocks_dropped = 0usize;
+    if !doc.footnotes.is_empty() {
+        let mut defs: Vec<String> = Vec::with_capacity(doc.footnotes.len());
+        for f in &doc.footnotes {
+            let label = match footnote_labels.get(&f.id) {
+                Some(l) => l.as_str(),
+                None => continue, // 不可达（labels 由同源迭代构建）
+            };
+            let mut def_lines: Vec<String> = Vec::new();
+            for b in &f.blocks {
+                match b {
+                    Block::Paragraph(p) => {
+                        let (text, _) = render_runs(&p.runs);
+                        // 空段不进定义（脚注内空段无信息量）；
+                        // 引用位嵌套（脚注内再引脚注——致档防御面）
+                        // 不展开：尾接会制造假引用，直接以文本呈现。
+                        if !text.trim().is_empty() {
+                            def_lines.push(text);
+                        }
+                    }
+                    _ => {
+                        footnote_blocks_dropped += 1;
+                    }
+                }
+            }
+            if !def_lines.is_empty() {
+                defs.push(format!("[^{}]: {}", label, def_lines.join("\n")));
+            }
+        }
+        if !defs.is_empty() {
+            lines.extend(defs);
+        }
+    }
     // 页脚 → 文档尾接。
     for part in &doc.footers {
         let mut m = BlockMapper::default();
@@ -751,6 +847,7 @@ fn docx_to_markdown(doc: &DocxDocument) -> (String, serde_json::Value) {
     warnings.extend(import_lossy_warnings(
         fields_dropped,
         images_skipped,
+        footnote_blocks_dropped,
         &total,
     ));
     let stats = serde_json::json!({
@@ -769,11 +866,17 @@ fn docx_to_markdown(doc: &DocxDocument) -> (String, serde_json::Value) {
         "merged_ranges": total.merged_ranges,
         "images_skipped": images_skipped,
         "text_boxes": total.text_boxes,
-        // #19：批注/脚注/尾注读面承载量（内容不入 md 投影——结构面
-        // 经 DocxDocument 字段透出；计数 = 承载可见）。
+        // #19：批注/脚注/尾注读面承载量（结构面经 DocxDocument 字段
+        // 透出；计数 = 承载可见）。#485：脚注内容/引用位已进 md 投影
+        // （GFM 语法）——本键保留承载量口径，发射面见下两新键。
         "comments": doc.comments.len(),
         "footnotes": doc.footnotes.len(),
         "endnotes": doc.endnotes.len(),
+        // #485：脚注接入面（可诊断性）——引用位发射数（段落尾接
+        // `[^N]` marker 总数）与脚注内非段落块丢弃数（表/文本框——
+        // GFM 定义块只承载段文本）。
+        "footnote_refs": total.footnote_refs_emitted,
+        "footnote_blocks_dropped": footnote_blocks_dropped,
         "fields_dropped": fields_dropped,
         // P2-1 前语义 = 未消费槽位数；页眉/页脚全量接入后恒 0——键
         // 保留（stats 消费方兼容：web UI / e2e / 下游标书侧），可见
@@ -869,6 +972,23 @@ pub fn build_sample_docx() -> Vec<u8> {
     w.image(PNG_1X1, 1, 1).expect("image");
     w.header(&[RunSpec::text("Header Slot")]);
     w.footer(&[RunSpec::text("Footer Slot")]);
+    w.save_to_vec().expect("save")
+}
+
+/// #485：脚注 e2e 夹具（单一真源——example 生成器与原生漂移守卫
+/// 测试共用）。正文两段：首段带脚注引用（`RunSpec::footnote`——
+/// office-io 写面发射 `w:footnoteReference` + footnotes.xml 条目），
+/// 次段普通文本。预期导入：首段尾接 ` [^1]` + 文档尾节
+/// `[^1]: Fixture footnote content.` 定义块。
+pub fn build_footnote_sample_docx() -> Vec<u8> {
+    use mdc_office_io::docx::{DocxWriter, RunSpec};
+    let mut w = DocxWriter::new();
+    w.heading(1, "Footnote Fixture").expect("heading");
+    w.paragraph(&[
+        RunSpec::text("Body text with a footnote"),
+        RunSpec::footnote("Fixture footnote content."),
+    ]);
+    w.paragraph(&[RunSpec::text("Trailing paragraph")]);
     w.save_to_vec().expect("save")
 }
 
@@ -2168,5 +2288,131 @@ mod tests {
             },
         ));
         assert_eq!(prescan.code, "container_prescan", "读面既有码零漂移");
+    }
+
+    // ------------------------------------------------------------------
+    // #485：脚注接入（GFM 语法）——引用位尾接 + 定义块 + stats/警告
+    // ------------------------------------------------------------------
+
+    /// 带脚注引用位的段落（para 面 + footnote_refs——直构镜像读面
+    /// 文档级第二趟标注形态）。
+    fn footnote_para(text: &str, refs: Vec<i64>) -> Block {
+        Block::Paragraph(ParagraphData {
+            footnote_refs: refs,
+            ..match para(None, vec![run(text)]) {
+                Block::Paragraph(p) => p,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn footnote_doc() -> DocxDocument {
+        let mut doc = doc_of(vec![
+            footnote_para("First body paragraph", vec![1]),
+            footnote_para("Second with two refs", vec![2, 7]),
+            para(None, vec![run("No refs here")]),
+        ]);
+        doc.footnotes = vec![
+            mdc_office_io::docx::FootnoteData {
+                id: 1,
+                blocks: vec![para(None, vec![run("First note")])],
+            },
+            mdc_office_io::docx::FootnoteData {
+                id: 2,
+                blocks: vec![
+                    para(None, vec![run("Second note first para")]),
+                    para(None, vec![run("Second note second para")]),
+                ],
+            },
+            // 孤儿脚注（无引用位）——定义照发（内容保留纪律）。
+            mdc_office_io::docx::FootnoteData {
+                id: 7,
+                blocks: vec![para(None, vec![run("Orphan note")])],
+            },
+        ];
+        doc
+    }
+
+    #[test]
+    fn footnote_refs_emit_gfm_markers_and_definitions() {
+        let (md, stats) = docx_to_markdown(&footnote_doc());
+        // 引用位：段落尾接 [^N]（docx id → 文档序重编号：1→1、2→2、7→3）。
+        assert!(md.contains("First body paragraph [^1]"), "{md}");
+        assert!(md.contains("Second with two refs [^2] [^3]"), "{md}");
+        // 无引用位段落零变化。
+        assert!(md.contains("\nNo refs here") || md.contains("No refs here\n"), "{md}");
+        // 定义块：文档尾节，多段懒连续形。
+        assert!(md.contains("[^1]: First note"), "{md}");
+        assert!(md.contains("[^2]: Second note first para\nSecond note second para"), "{md}");
+        assert!(md.contains("[^3]: Orphan note"), "{md}");
+        // stats：发射数（3 个 marker）+ 承载量（3 条）。
+        assert_eq!(stats["footnote_refs"], 3, "{stats}");
+        assert_eq!(stats["footnotes"], 3, "{stats}");
+        assert_eq!(stats["footnote_blocks_dropped"], 0, "{stats}");
+    }
+
+    #[test]
+    fn footnote_non_paragraph_blocks_dropped_visible() {
+        let mut doc = footnote_doc();
+        // 脚注内塞表块（TableData 最小直构）。
+        doc.footnotes[0].blocks.push(Block::Table(TableData {
+            rows: vec![vec!["cell".to_string()]],
+            merges: vec![],
+            source: BlockSource::Body,
+            nested: false,
+        }));
+        let (md, stats) = docx_to_markdown(&doc);
+        assert_eq!(stats["footnote_blocks_dropped"], 1, "{stats}");
+        // 有损警告在场（无静默纪律——kind + severity）。
+        let warnings = stats["warnings"].as_array().expect("warnings");
+        let entry = warnings
+            .iter()
+            .find(|w| w["kind"] == "footnote_blocks_dropped")
+            .expect("lossy warning present");
+        assert_eq!(entry["count"], 1, "{entry}");
+        assert_eq!(entry["severity"], "warn", "{entry}");
+        // 段文本定义仍在（非段落块丢弃不影响其余内容）。
+        assert!(md.contains("[^1]: First note"), "{md}");
+    }
+
+    #[test]
+    fn footnote_unknown_ref_id_skipped_defensively() {
+        // 引用位指向不存在的脚注 id——防御面：跳过且不计数（不发射
+        // 悬空 [^N]，mdcore/GFM 渲染不产生假链接）。
+        let doc = doc_of(vec![footnote_para("Dangling ref", vec![99])]);
+        let (md, stats) = docx_to_markdown(&doc);
+        assert_eq!(md, "Dangling ref", "{md}");
+        assert_eq!(stats["footnote_refs"], 0, "{stats}");
+    }
+
+    #[test]
+    fn footnote_absent_output_byte_identical() {
+        // 无脚注文档：输出与既有路径零变化（回归锁——空 footnotes 分支
+        // 不发射任何额外行；既有 15+ 套件的逐字节期望面在此钉住）。
+        let doc = doc_of(vec![para(None, vec![run("Plain")])]);
+        let (md, stats) = docx_to_markdown(&doc);
+        assert_eq!(md, "Plain", "{md}");
+        assert_eq!(stats["footnote_refs"], 0, "{stats}");
+        assert_eq!(stats["footnote_blocks_dropped"], 0, "{stats}");
+    }
+
+    #[test]
+    fn footnote_fixture_roundtrip_through_read_face() {
+        // 真实 zip 往返（写面发射 → 读面标注 → GFM 投影）——漂移守卫：
+        // 例生成器夹具与原生直构测试同源（build_footnote_sample_docx
+        // 单一真源），读面 #19 标注链在此闭环验证。
+        let payload = import_json(&build_footnote_sample_docx());
+        let md = payload["markdown"].as_str().expect("markdown");
+        assert!(
+            md.contains("Body text with a footnote [^1]"),
+            "ref marker: {md}"
+        );
+        assert!(
+            md.contains("[^1]: Fixture footnote content."),
+            "definition: {md}"
+        );
+        assert!(md.contains("Trailing paragraph"), "{md}");
+        assert_eq!(payload["stats"]["footnotes"], 1, "{payload}");
+        assert_eq!(payload["stats"]["footnote_refs"], 1, "{payload}");
     }
 }
