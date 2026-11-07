@@ -6546,6 +6546,50 @@ impl DocxWriter {
         self.paragraph_layout(runs, None, Some(spacing));
     }
 
+    /// **缩进段**（#460 = #309 小件②收口片）：`w:ind` 三槽——
+    /// `left` → `w:left`、`right` → `w:right`、`special` →
+    /// `w:firstLine`/`w:hanging`（twips）。**读写对称复用读面
+    /// [`ParagraphIndent`] 类型**（[`PageGeometry`] 先例——同一类型
+    /// 双向消费；读面 r4-t3 归一已锁，此前写面仅经列表/引用抽象间接
+    /// 表达——本面补齐任意缩进）。
+    ///
+    /// 发射形态（docx-rs 构造面）：至少一槽 Some 才发射 `w:ind`；
+    /// `w:left`/`w:right` 两属性恒在场（None 槽以 0 发射——
+    /// 0 twips ≡ 无缩进，与 None 语义等价，往返判据按此归一——
+    /// 见 tests/docx_indent_write.rs）。全 None = 不发射（与
+    /// [`Self::paragraph`] 产物逐字节一致——零回归面）。
+    ///
+    /// 校验（V9 同族——正值域粘性拒）：left/right/FirstLine/Hanging
+    /// 任一 < 0 → 粘性错误（save 漏斗拒绝零产物；twips 缩进值域
+    /// 非负，Word UI 亦不产负值）。
+    /// r4-t2 计数：1 段 + run 面（与 `paragraph()` 同判据）。
+    pub fn paragraph_indented(&mut self, runs: &[RunSpec], indent: ParagraphIndent) {
+        // V13（正值域）：三槽任一负值 = 粘性拒（构造器人体工学签名，
+        // save 漏斗拒绝——与 paragraph_layout 的 line<0 同纪律）。
+        let negative = indent.left.is_some_and(|v| v < 0)
+            || indent.right.is_some_and(|v| v < 0)
+            || matches!(
+                indent.special,
+                Some(ParagraphIndentSpecial::FirstLine(v) | ParagraphIndentSpecial::Hanging(v))
+                    if v < 0
+            );
+        if negative && self.validation_error.is_none() {
+            self.validation_error = Some(format!(
+                "paragraph_indented 负值缩进：{indent:?}（twips 值域非负）"
+            ));
+        }
+        let mut p = specs_to_paragraph(runs);
+        if has_any_indent_slot(&indent) {
+            let special = indent.special.map(|s| match s {
+                ParagraphIndentSpecial::FirstLine(v) => docx_rs::SpecialIndentType::FirstLine(v),
+                ParagraphIndentSpecial::Hanging(v) => docx_rs::SpecialIndentType::Hanging(v),
+            });
+            p = p.indent(indent.left, special, indent.right, None);
+        }
+        self.docx = std::mem::take(&mut self.docx).add_paragraph(p);
+        self.count_specs(1, runs);
+    }
+
     /// **书签定义段**（office-g Phase 2——生产侧：被链接的目标）。
     /// 发射 `bookmarkStart(w:id, w:name)` … runs … `bookmarkEnd(w:id)`
     /// 对；`w:id` 由写器内部计数器唯一化（§8：仅单次导出会话内稳定，
@@ -7760,6 +7804,12 @@ fn validate_bookmark_name(
         )));
     }
     Ok(())
+}
+
+/// 缩进槽空判（#460：全 None = 不发射 `w:ind`——与无缩进段产物
+/// 逐字节一致，零回归面）。
+fn has_any_indent_slot(indent: &ParagraphIndent) -> bool {
+    indent.left.is_some() || indent.right.is_some() || indent.special.is_some()
 }
 
 /// S1 样式面：pub(crate)（style.rs `styled_paragraph` 复用——同构纯函数）。
