@@ -652,11 +652,8 @@ impl PdfPagesView {
             let controller = PdfAnnotateController::open((*self.bytes).clone())?;
             self.annotate = Some(controller);
         }
-        let controller = self.annotate.as_mut().expect("刚初始化");
-        // DPI：位图 px / 显示域 pt × 72（等比槽近似——异形页 letterbox
-        // 边界见模块文档 v1 登记）。
-        let transform = controller.page_transform(page)?;
-        let display_w = transform.display_size().width.max(1.0);
+        // #421：dpi 素材先算（zoomed_width_for 借 self 整体——须在
+        // 控制器可变借出之前完成，否则 E0502 借用冲突）。
         let (vw, _) = self.viewport_size;
         // #421：dpi 随 zoom（位图宽 = 量化(适宽×zoom)——拖框坐标在
         // 缩放后的槽内像素，与位图分辨率同口径）。
@@ -665,6 +662,11 @@ impl PdfPagesView {
         } else {
             WIDTH_MIN
         };
+        let controller = self.annotate.as_mut().expect("刚初始化");
+        // DPI：位图 px / 显示域 pt × 72（等比槽近似——异形页 letterbox
+        // 边界见模块文档 v1 登记）。
+        let transform = controller.page_transform(page)?;
+        let display_w = transform.display_size().width.max(1.0);
         let dpi = raster_w as f32 / display_w * 72.0;
         // 三手势派发（issue #302 验收 1：高亮/下划线/便签）。
         match self.annotate_tool {
