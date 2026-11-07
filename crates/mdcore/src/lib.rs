@@ -16,6 +16,7 @@
 pub mod anchor;
 pub mod chunk;
 pub mod debug;
+pub mod diff;
 pub mod document;
 pub mod external;
 pub mod fingerprint;
