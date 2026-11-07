@@ -311,10 +311,11 @@ export const en = {
   'cv.fitViewTitle': 'frame the object bounding box (5% padding, centered)',
   'cv.resetView': 'reset view',
   'cv.resetViewTitle': 'reset camera (100% + origin)',
-  // 步 3（#44）画笔样式选择器词条。
-  'cv.brushToolTitle': 'brush tool (pen / highlighter)',
+  // 步 3（#44）画笔样式选择器词条（#454 步4 增 eraser 态）。
+  'cv.brushToolTitle': 'brush tool (pen / highlighter / eraser)',
   'cv.brushPen': 'pen',
   'cv.brushHighlighter': 'highlighter',
+  'cv.brushEraser': 'eraser',
   'cv.brushColorTitle': 'stroke color',
   'cv.brushCustomTitle': 'custom color',
   'cv.brushWidthTitle': 'stroke width',

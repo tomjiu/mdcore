@@ -64,6 +64,10 @@ interface WasmCanvasFace {
   set_clock_ms(ms: bigint): void;
   /** 八命令单一调度入口（flat snake_case cmdJson）→ 回执 JSON。 */
   execute(actor: 'human' | 'ai', cmdJson: string): string;
+  /** 批量命令原子执行（#352——flat 命令对象数组 JSON）：整批全成
+   * 或全不成，整批 = 单一撤销单元；回执 {outcomes,undo_depth,
+   * undo_cleared}。 */
+  execute_batch(actor: 'human' | 'ai', cmdsJson: string): string;
   undo(actor: 'human' | 'ai'): boolean;
   redo(actor: 'human' | 'ai'): boolean;
   undo_depth(actor: 'human' | 'ai'): number;
@@ -145,6 +149,15 @@ type CvFail = { ok: false; code: string; message: string };
 type CvExec = { ok: true; receipt: CommandReceiptJ } | CvFail;
 type CvId = { ok: true; id: string; outcome: string } | CvFail;
 
+/** execute_batch 回执（#354 消费面——只读 undo 深度与整批成败，
+ * outcomes 逐条细节不消费）。 */
+type CvBatchExec = { ok: true; receipt: BatchReceiptJ } | CvFail;
+interface BatchReceiptJ {
+  outcomes: CommandReceiptJ[];
+  undo_depth: number;
+  undo_cleared: boolean;
+}
+
 /** 探针事件日志条目（__canvasEvents 面——轮询透传的只读投影）。 */
 interface EventLogEntry {
   seq: number;
@@ -208,6 +221,9 @@ const BRUSH_WIDTHS: readonly (readonly [number, DictKey])[] = [
 const BRUSH_SAMPLE_DIST = 1.0;
 /** 笔迹渲染半透明（highlighter——引擎存不透明值，渲染态分离）。 */
 const STROKE_HL_OPACITY = 0.4;
+/** #454 橡皮擦命中半径（世界坐标——笔迹 width/2 之外的容差带；
+ * 采样点级测试：点到擦除段距离 < width/2 + 本值即命中）。 */
+const ERASER_RADIUS = 10;
 
 /** perfect-freehand 选项（工具分化：pen 速度变细，highlighter 恒宽）。 */
 function pfOptions(tool: 'pen' | 'highlighter', width: number): {
@@ -233,6 +249,18 @@ function strokePathD(points: readonly (readonly [number, number])[], tool: 'pen'
     d += ` L ${outline[i][0].toFixed(2)} ${outline[i][1].toFixed(2)}`;
   }
   return `${d} Z`;
+}
+
+/** 点到线段距离平方（#454 橡皮擦命中——退化段 = 点距）。 */
+function segDistSq(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx - px;
+  const cy = ay + t * dy - py;
+  return cx * cx + cy * cy;
 }
 
 /** 撤销栈软上限（两实例同限——receipt undo_cleared 演示面）。 */
@@ -426,17 +454,22 @@ export class CanvasViewUI {
   private editingId: string | null = null;
 
   // #426 画笔态（步 2：固定色宽；步 3 选择器的前置）。
-  /** 画笔模式（互斥于连线模式——两模式共用「工具态」位）。 */
+  /** 画笔模式（互斥于连线模式——两模式共用「工具态」位；工具为
+   * eraser 时拖拽语义切换为擦除——#454）。 */
   private brushMode = false;
   /** 在笔采样（null = 非绘制中；预览 path 挂笔迹层，提交后由
-   * touched 渲染接管——预览元素即删）。 */
-  private brushLive: { pts: [number, number][]; el: SVGPathElement } | null = null;
+   * touched 渲染接管——预览元素即删。tool 落笔时捕获：笔迹身份
+   * 起笔即固定，#454 后工具位含 eraser 但在笔只能是笔工具）。 */
+  private brushLive: { pts: [number, number][]; el: SVGPathElement; tool: 'pen' | 'highlighter' } | null = null;
   // 步 3 画笔样式（选择器同源驱动预览与载荷；默认 = #426 固定值，
   // 存量视觉零漂移。引擎域校验：#RGB/#RRGGBB、width>0、finite——
   // 选择器面只产合法值，无二次防御）。
-  private brushTool: 'pen' | 'highlighter' = 'pen';
+  private brushTool: 'pen' | 'highlighter' | 'eraser' = 'pen';
   private brushColor: string = BRUSH_COLOR;
   private brushWidth: number = BRUSH_WIDTH;
+  /** #454 在擦预览集（null = 非擦除中；命中笔迹挂 .cv-eraser-hit
+   * 预览类，松手才单事务批删——Excalidraw 两段式纪律：拖动零命令）。 */
+  private eraserLive: { hits: Set<string>; last: [number, number] } | null = null;
 
   // 相机态（#367——视图层临时态，不入模型；同滚动位置语义）。
   // 卸载命题：applyCamera = 恰一次 setAttribute，零 renderObject、
@@ -522,6 +555,9 @@ export class CanvasViewUI {
     for (const [value, key] of [
       ['pen', 'cv.brushPen'],
       ['highlighter', 'cv.brushHighlighter'],
+      // #454（#44 步 4）：橡皮擦态——画笔模式内拖拽语义切换为
+      // 两段式擦除（拖过变预览色，松手单事务批删）。
+      ['eraser', 'cv.brushEraser'],
     ] as const) {
       const o = document.createElement('option');
       o.value = value;
@@ -530,7 +566,9 @@ export class CanvasViewUI {
       brushTool.appendChild(o);
     }
     brushTool.addEventListener('change', () => {
-      this.brushTool = brushTool.value as 'pen' | 'highlighter';
+      this.brushTool = brushTool.value as 'pen' | 'highlighter' | 'eraser';
+      // 模式内切工具：状态行跟随（擦除/绘制提示分叉）。
+      if (this.brushMode) this.showStatus(this.brushModeHint());
     });
 
     /** 自定义色（#44 原文「6-8 个预设色 + 自定义」——原生 color
@@ -775,6 +813,22 @@ export class CanvasViewUI {
   private exec(actor: 'human' | 'ai', cmdJson: string): CvExec {
     if (!this.main) return BRIDGE_ABSENT;
     const r = this.execRaw(this.main, actor, cmdJson);
+    this.pump();
+    return r;
+  }
+
+  /** 批量原子执行 + 泵（#352 execute_batch 消费面——#454 橡皮擦
+   * 松手单事务提交）：整批全成或全不成，整批 = 单一撤销单元。 */
+  private execBatch(actor: 'human' | 'ai', cmdsJson: string): CvBatchExec {
+    if (!this.main) return BRIDGE_ABSENT;
+    this.main.advance();
+    let r: CvBatchExec;
+    try {
+      const receipt = JSON.parse(this.main.face.execute_batch(actor, cmdsJson)) as BatchReceiptJ;
+      r = { ok: true, receipt };
+    } catch (e) {
+      r = wasmFail(e);
+    }
     this.pump();
     return r;
   }
@@ -1381,6 +1435,15 @@ export class CanvasViewUI {
       // #426 画笔模式：左键落笔即采样（墨迹居顶——不做节点/分组
       // 命中，覆盖节点上方也可画；中键 pan 已在前置分支收走）。
       if (this.brushMode && e.button === 0) {
+        // #454（#44 步 4）橡皮擦态：起拖只建预览集（零命令——
+        // 命中笔迹变暗；松手才单事务批删）。与画笔分支互斥于工具位。
+        if (this.brushTool === 'eraser') {
+          this.eraserLive = { hits: new Set(), last: [p.x, p.y] };
+          this.eraserHitTest(p.x, p.y, p.x, p.y);
+          svg.setPointerCapture(e.pointerId);
+          e.preventDefault();
+          return;
+        }
         const path = document.createElementNS(SVG_NS, 'path');
         path.classList.add('cv-brush-preview');
         // 步 3 预览同步：所见即所提交（色/宽/工具与载荷同源——
@@ -1389,7 +1452,7 @@ export class CanvasViewUI {
         path.setAttribute('fill-opacity',
           this.brushTool === 'highlighter' ? `${STROKE_HL_OPACITY}` : '1');
         this.layerStrokes?.appendChild(path);
-        this.brushLive = { pts: [[p.x, p.y]], el: path };
+        this.brushLive = { pts: [[p.x, p.y]], el: path, tool: this.brushTool };
         svg.setPointerCapture(e.pointerId);
         e.preventDefault();
         return;
@@ -1485,16 +1548,25 @@ export class CanvasViewUI {
       // #426 在笔采样（优先于 pan/drag——画笔态无 pan 起手[背景左键
       // 被画笔分支收走]，中键 pan 不进画笔态）。
       if (this.brushLive) {
+        const live = this.brushLive;
         const p = this.toSvgPoint(e);
-        const pts = this.brushLive.pts;
+        const pts = live.pts;
         const last = pts[pts.length - 1];
         const dx = p.x - last[0];
         const dy = p.y - last[1];
         if (dx * dx + dy * dy >= BRUSH_SAMPLE_DIST * BRUSH_SAMPLE_DIST) {
           pts.push([p.x, p.y]);
-          this.brushLive.el.setAttribute('d',
-            strokePathD(pts, this.brushTool, this.brushWidth));
+          live.el.setAttribute('d',
+            strokePathD(pts, live.tool, this.brushWidth));
         }
+        return;
+      }
+      // #454 在擦扫描（段级命中——prev→cur 线段扫过带；命中即入
+      // 预览集，零命令。与 pan/drag 互斥同在笔）。
+      if (this.eraserLive) {
+        const p = this.toSvgPoint(e);
+        this.eraserHitTest(this.eraserLive.last[0], this.eraserLive.last[1], p.x, p.y);
+        this.eraserLive.last = [p.x, p.y];
         return;
       }
       // #367 平移优先于拖拽（互斥态——pan 起手时无节点命中）。
@@ -1530,6 +1602,13 @@ export class CanvasViewUI {
       if (this.brushLive) {
         if (commit) this.commitBrushLive();
         else this.cancelBrushLive();
+        return;
+      }
+      // #454 在擦收尾：pointerup = 单事务批删（取消 = 预览集作废
+      // 零命令——与在笔同纪律）。
+      if (this.eraserLive) {
+        if (commit) this.commitEraserLive();
+        else this.cancelEraserLive();
         return;
       }
       const d = this.drag;
@@ -1659,7 +1738,11 @@ export class CanvasViewUI {
    * 零命令提交，同 ESC 语义）。 */
   private setBrushMode(on: boolean): void {
     this.brushMode = on;
-    if (!on) this.cancelBrushLive();
+    // off = 在笔/在擦双取消（零命令——同 ESC 语义）。
+    if (!on) {
+      this.cancelBrushLive();
+      this.cancelEraserLive();
+    }
     if (on && this.edgeMode) {
       this.edgeMode = false;
       this.edgeSource = null;
@@ -1668,8 +1751,15 @@ export class CanvasViewUI {
     }
     const btn = this.buttons.get('canvas-brush-btn');
     btn?.classList.toggle('active', on);
-    if (on) this.showStatus('brush mode: drag to draw a stroke (esc to cancel)');
+    if (on) this.showStatus(this.brushModeHint());
     else this.syncStatus();
+  }
+
+  /** #454 工具分叉的状态行提示（绘制/擦除——选择器切工具时同源）。 */
+  private brushModeHint(): string {
+    return this.brushTool === 'eraser'
+      ? 'eraser mode: drag over strokes to erase (esc to cancel)'
+      : 'brush mode: drag to draw a stroke (esc to cancel)';
   }
 
   /** 在笔取消（ESC/模式切换——预览元素撤除，零命令）。 */
@@ -1687,16 +1777,68 @@ export class CanvasViewUI {
     this.brushLive = null;
     live.el.remove();
     if (live.pts.length < 2 || !this.main) return;
-    // 步 3：色/宽/工具从选择器状态透传（预览同源——提交即所见）。
+    // 步 3：色/宽从选择器状态透传，工具用落笔捕获值（笔迹身份
+    // 起笔即固定——预览同源，提交即所见）。
     const r = this.exec('human', JSON.stringify({
       t: 'add_stroke', id: null,
       points: live.pts,
       color: this.brushColor,
       width: this.brushWidth,
-      tool: this.brushTool,
+      tool: live.tool,
     }));
     if (r.ok) this.showStatus(`stroke added (${r.receipt.id})`);
     else this.showStatus(`stroke rejected (${r.code}): ${r.message}`, true);
+  }
+
+  /** #454 在擦命中测试（段级——prev→cur 扫过带）：点到段距离 <
+   * 笔迹 width/2 + ERASER_RADIUS 即命中（采样密度 ≥1 世界单位，
+   * 点级测试充分）。命中即入预览集 + DOM 变暗（零命令）。 */
+  private eraserHitTest(ax: number, ay: number, bx: number, by: number): void {
+    const live = this.eraserLive;
+    if (!live) return;
+    for (const [id, obj] of this.objects) {
+      if (obj.kind !== 'stroke' || live.hits.has(id)) continue;
+      const half = (obj.width ?? BRUSH_WIDTH) / 2 + ERASER_RADIUS;
+      const r2 = half * half;
+      for (const [px, py] of obj.points) {
+        if (segDistSq(px, py, ax, ay, bx, by) <= r2) {
+          live.hits.add(id);
+          this.els.get(id)?.classList.add('cv-eraser-hit');
+          break;
+        }
+      }
+    }
+  }
+
+  /** #454 在擦批删（两段式第二段）：整拖 = 一次 execute_batch
+   * （#352 单事务——一次 Ctrl+Z 全恢复）；预览类防御性先行清除
+   * （正常路径由 touched 渲染接管——元素已删）。 */
+  private commitEraserLive(): void {
+    const live = this.eraserLive;
+    this.eraserLive = null;
+    if (!live) return;
+    for (const id of live.hits) this.els.get(id)?.classList.remove('cv-eraser-hit');
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    if (live.hits.size === 0) {
+      this.showStatus('eraser: no stroke under the drag');
+      return;
+    }
+    const cmds = [...live.hits].map((id) => ({ t: 'remove_object', id }));
+    const r = this.execBatch('human', JSON.stringify(cmds));
+    if (r.ok) {
+      this.showStatus(`erased ${live.hits.size} stroke(s) — one undo restores all`);
+    } else {
+      this.showStatus(`erase rejected (${r.code}): ${r.message}`, true);
+    }
+  }
+
+  /** #454 在擦取消（ESC/模式切换/pointercancel——预览类清除，
+   * 零命令：预览集作废，同在笔取消纪律）。 */
+  private cancelEraserLive(): void {
+    const live = this.eraserLive;
+    this.eraserLive = null;
+    if (!live) return;
+    for (const id of live.hits) this.els.get(id)?.classList.remove('cv-eraser-hit');
   }
 
   private deleteSelection(): void {

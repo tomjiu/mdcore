@@ -459,6 +459,8 @@
   /* #426 笔迹：outline 填充 path（fill 属性逐对象内联——此处只管指针面） */
   #canvas-svg .stroke { pointer-events: none; }
   #canvas-svg .cv-brush-preview { pointer-events: none; }
+  /* #454（#44 步4）橡皮擦两段式预览态：拖过变暗（松手才删）。 */
+  #canvas-svg .stroke.cv-eraser-hit { opacity: .25; }
   #canvas-svg .edge.dangling { stroke: #d97706; stroke-dasharray: 5 4; }
   #canvas-svg .group rect { fill: none; stroke: #9aa3af; stroke-dasharray: 6 4; }
   #canvas-svg .group.selected rect { stroke: #7c3aed; stroke-width: 2; }

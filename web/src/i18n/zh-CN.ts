@@ -307,10 +307,11 @@ export const zhCN: Dict = {
   'cv.fitViewTitle': '缩放平移至对象包围盒（外扩 5% 居中）',
   'cv.resetView': '复位',
   'cv.resetViewTitle': '相机复位（100% + 原点）',
-  // 步 3（#44）画笔样式选择器词条。
-  'cv.brushToolTitle': '画笔工具（钢笔/荧光笔）',
+  // 步 3（#44）画笔样式选择器词条（#454 步4 增 eraser 态）。
+  'cv.brushToolTitle': '画笔工具（钢笔/荧光笔/橡皮擦）',
   'cv.brushPen': '钢笔',
   'cv.brushHighlighter': '荧光笔',
+  'cv.brushEraser': '橡皮擦',
   'cv.brushColorTitle': '笔迹颜色',
   'cv.brushCustomTitle': '自定义颜色',
   'cv.brushWidthTitle': '笔迹粗细',
