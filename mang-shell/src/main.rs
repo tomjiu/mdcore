@@ -85,10 +85,15 @@ mod settings_panel;
 // UI 打磨（右键菜单 + 状态栏增强 + 命令面板分组）
 mod command_groups;
 mod context_menu;
+// #385 批 1：右键菜单构建/部署层——MenuItem 数据 → ui::ContextMenu
+// 实体（CustomEntry + handler 回派 shell），部署 deferred(anchored)。
 mod context_menu_view;
+// #385 批 1：菜单几何（menu_bar 批 4 前的过渡存续——右键菜单已
+// 迁 gpui Anchored，不再消费本模块）。
+mod menu_geometry;
 // #209：顶部菜单栏——模型层（menu_bar.rs，lib 树共享：纯数据 + 导航
-// 状态机 + 几何估算，带单测）+ 渲染层（menu_bar_view.rs，bin 专属：
-// 标题行/下拉/子菜单/遮罩，形态循 context_menu_view）。
+// 状态机，带单测；几何估算经 menu_geometry）+ 渲染层（menu_bar_view.rs，
+// bin 专属：标题行/下拉/子菜单/遮罩——批 4 迁 ui::DropdownMenu 组合）。
 mod menu_bar;
 mod menu_bar_view;
 // #217：键位表层（默认表 = 现状键位精确镜像 + 用户覆盖合并；纯逻辑

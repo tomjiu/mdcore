@@ -108,6 +108,11 @@
 ```
 批 1（真去重样板）：context_menu → ui::ContextMenu（自研 Point/Rect/height_units
                      几何退役——443+146 行与 ui 组件职责重叠的真去重面）
+                     ✅ 已交付（feat/385-b1-context-menu，PR 见 #385 认领评论）：
+                     右键菜单路径退役 146 行手写浮层 + 自研 layout 几何（gpui
+                     Anchored/SwitchAnchor 同构接管）；快捷键标签仍走 keymap
+                     单源（CustomEntry 自渲染）；几何函数迁 menu_geometry.rs
+                     由 menu_bar 批 4 前过渡消费、批 4 落地后整体退役。
 批 2：tab_bar → ui::TabBar/Tab
 批 3：settings_panel 外壳 → ui::Modal；palette → Popover 组合
 批 4：menu_bar → DropdownMenu/PopoverMenu 组合（键盘导航重构——最重）

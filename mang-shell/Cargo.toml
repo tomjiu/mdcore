@@ -63,6 +63,10 @@ gpui_platform = { path = "../third_party/zed/crates/gpui_platform", features = [
 ] }
 theme = { path = "../third_party/zed/crates/theme" }
 ui = { path = "../third_party/zed/crates/ui" }
+# #385 批 1：右键菜单迁 ui::ContextMenu——键盘导航（↑/↓/Enter）调实体
+# 方法（select_next/select_previous/confirm），动作类型来自 zed menu crate
+# （ui crate 的既有闭包依赖，闭包内 GPL-3.0-or-later，PROVENANCE 已录）。
+menu = { path = "../third_party/zed/crates/menu" }
 # 日志面（#68 批 5 前置）：zlog 读 ZED_LOG/RUST_LOG——激活 gpui_wgpu
 # 适配器枚举与 gpui_windows DirectX 设备选择的既有 log 调用（此前无
 # logger，RUST_LOG 无效）。Apache-2.0，闭包内 crate（PROVENANCE 已录）。

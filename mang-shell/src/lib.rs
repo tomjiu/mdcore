@@ -27,18 +27,27 @@ pub mod document;
 #[path = "editor/mod.rs"]
 pub mod editor;
 
-/// 右键菜单数据/几何面（#63 打磨项）：纯数据，零 GPUI 依赖——菜单摆放
-/// 算法（边缘翻转/夹紧）必须能脱离窗口单测，见模块文档。
+/// 右键菜单数据面（#63 打磨项 → #385 批 1 迁 ui::ContextMenu）：纯数据，
+/// 零 GPUI 依赖——菜单项集/灰显/快捷键标签（keymap 单一事实源）必须
+/// 能脱离窗口单测，见模块文档。构建/部署层 context_menu_view.rs
+/// （bin 专属）。
 #[path = "context_menu.rs"]
 pub mod context_menu;
+/// #385 批 1：菜单几何纯函数（place_menu/estimate_width 族）——右键
+/// 菜单路径已由 gpui `Anchored` 承担同一语义；存续消费者 = 批 4 未
+/// 迁移的顶部菜单栏（menu_bar），批 4 落地后整体退役。纯数据零 GPUI
+/// 依赖，可脱离窗口单测。
+#[path = "menu_geometry.rs"]
+pub mod menu_geometry;
 /// 外壳设置面（编辑器构造读缩进单位/面板宽度——src/settings.rs 同源）。
 #[path = "settings.rs"]
 pub mod settings;
 
-/// #209：顶部菜单栏模型层（菜单结构/Cmd 映射/键盘导航状态机/下拉几何
-/// 估算）——纯数据零 GPUI 依赖，与 context_menu 同分层进 lib 树（渲染层
-/// menu_bar_view.rs 是 bin 专属）。菜单项只映射既有动作（Cmd 枚举 /
-/// Editor 菜单方法 / ShellApp 既有方法），无既有命令的项置灰不绑动作。
+/// #209：顶部菜单栏模型层（菜单结构/Cmd 映射/键盘导航状态机）——纯
+/// 数据零 GPUI 依赖，与 context_menu 同分层进 lib 树（渲染层
+/// menu_bar_view.rs 是 bin 专属；下拉几何估算经 menu_geometry）。菜单
+/// 项只映射既有动作（Cmd 枚举 / Editor 菜单方法 / ShellApp 既有方法），
+/// 无既有命令的项置灰不绑动作。
 #[path = "menu_bar.rs"]
 pub mod menu_bar;
 

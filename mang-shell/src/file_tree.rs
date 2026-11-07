@@ -32,7 +32,6 @@ use gpui::{
 use ui::prelude::*;
 use ui::{Icon, IconName, IconSize, Label, LabelSize};
 
-use crate::context_menu;
 use crate::shell::ShellApp;
 
 /// 目录条目。
@@ -374,17 +373,20 @@ impl FileTree {
                     }
                 }),
             )
-            // 右键：上下文菜单（#166 接线——菜单在 shell 状态上，位置取
-            // 按下点的窗口坐标；动作派发回 shell 的 activate_context_menu_item）。
+            // 右键：上下文菜单（#166 接线 → #385 批 1：菜单 = shell 上的
+            // ui::ContextMenu 实体，位置取按下点窗口坐标；动作派发回
+            // shell 的 activate_context_menu_item——构建层经回调闭包携带）。
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    let pos = context_menu::Point::new(
-                        event.position.x.as_f32(),
-                        event.position.y.as_f32(),
-                    );
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     let _ = this.shell.update(cx, |shell, cx| {
-                        shell.open_file_tree_context_menu(pos, path_for_menu.clone(), is_dir, cx)
+                        shell.open_file_tree_context_menu(
+                            event.position,
+                            path_for_menu.clone(),
+                            is_dir,
+                            window,
+                            cx,
+                        )
                     });
                 }),
             )

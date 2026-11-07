@@ -26,18 +26,19 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, FocusHandle,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, Pixels, Render,
-    Window, canvas, px,
+    App, Bounds, Context, CursorStyle, DismissEvent, DispatchPhase, DragMoveEvent, Entity,
+    FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, Render, Subscription, Window, canvas, px,
 };
 use theme::Theme;
 use ui::prelude::*;
 
 use crate::activity_bar;
-use crate::context_menu::{self, ContextMenu, MenuItem, Rect as MenuRect};
+use crate::context_menu;
 use crate::context_menu_view;
 use crate::document::{self, OpenOutcome};
 use crate::editor::Editor;
+use crate::menu_geometry::Rect as MenuRect;
 // #182：设置面板的缩进单位状态（editor::buffer 的纯枚举——面板/标签共用）。
 use crate::editor::buffer::IndentUnit;
 use crate::file_tree::FileTree;
@@ -189,10 +190,13 @@ pub struct ShellApp {
     indent_unit: IndentUnit,
     /// F1：提示横幅（打开失败 / 类型不支持 / 对话框不可用等面向用户消息）。
     notice_board: NoticeBoard,
-    /// #63 打磨：右键菜单（None = 未打开）。位置是**触发时**的窗口坐标，
-    /// 摆放（边缘翻转/夹紧）在渲染期按当前窗口尺寸算——菜单开着时窗口被
-    /// 改变大小，位置依然合法。
-    context_menu: Option<ContextMenu>,
+    /// #63 打磨 → #385 批 1：右键菜单（None = 未打开）= ui::ContextMenu
+    /// 实体 + 触发点击点（窗口坐标）。摆放（边缘翻转/夹紧）由 gpui
+    /// `Anchored`（SwitchAnchor）在渲染期按当前窗口尺寸算——菜单开着时
+    /// 窗口被改变大小，位置依然合法。
+    context_menu: Option<(Entity<ui::ContextMenu>, Point<Pixels>)>,
+    /// DismissEvent 订阅（点外/Esc/动作执行 → 菜单自撤时同步清 shell 态）。
+    _context_menu_dismiss: Option<Subscription>,
     /// #63 打磨：右键菜单来源（决定动作 id 派发到哪套处理器）。
     context_menu_origin: MenuOrigin,
     /// #166：文件树右键目标（动作执行的路径面——新建/打开/重命名/删除/
@@ -398,6 +402,7 @@ impl ShellApp {
                 .unwrap_or_default(),
             notice_board: NoticeBoard::default(),
             context_menu: None,
+            _context_menu_dismiss: None,
             context_menu_origin: MenuOrigin::default(),
             context_menu_target: None,
             menu_bar: menu_bar::MenuBarState::default(),
@@ -774,42 +779,60 @@ impl ShellApp {
     /// 在窗口坐标 `pos` 处弹出编辑器右键菜单。
     ///
     /// `has_selection` / `read_only` 决定各项可用性（灰显而非消失）。
-    /// 位置只记录；真正的边缘翻转在渲染期按当前窗口尺寸算。
+    /// #385 批 1：菜单实体 = ui::ContextMenu（构建在 context_menu_view），
+    /// 位置只记点击点；真正的边缘翻转/夹紧在渲染期由 gpui `Anchored`
+    /// 按当前窗口尺寸算。DismissEvent 订阅同步清态（点外关闭）。
     pub fn open_editor_context_menu(
         &mut self,
-        pos: context_menu::Point,
+        pos: Point<Pixels>,
         has_selection: bool,
         read_only: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.context_menu = Some(ContextMenu::new(
-            context_menu::editor_menu(has_selection, read_only),
-            pos,
-        ));
+        let items = context_menu::editor_menu(has_selection, read_only);
+        let shell = cx.entity().downgrade();
+        let menu = context_menu_view::build_ui_menu(items, shell, window, cx);
+        let dismiss = cx.subscribe(&menu, |this, _menu, _evt: &DismissEvent, cx| {
+            this.close_context_menu(cx);
+        });
+        self.context_menu = Some((menu, pos));
         self.context_menu_origin = MenuOrigin::Editor;
+        self._context_menu_dismiss = Some(dismiss);
         cx.notify();
     }
 
     /// 在窗口坐标 `pos` 处弹出文件树右键菜单（#166：`target` = 右键的
     /// 行路径——动作执行面；目录本身 / 文件均可作目标）。
+    /// #385 批 1：同编辑器菜单——ui::ContextMenu 实体 + Anchored 部署。
     pub fn open_file_tree_context_menu(
         &mut self,
-        pos: context_menu::Point,
+        pos: Point<Pixels>,
         target: PathBuf,
         is_dir: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.context_menu = Some(ContextMenu::new(context_menu::file_tree_menu(is_dir), pos));
+        let items = context_menu::file_tree_menu(is_dir);
+        let shell = cx.entity().downgrade();
+        let menu = context_menu_view::build_ui_menu(items, shell, window, cx);
+        let dismiss = cx.subscribe(&menu, |this, _menu, _evt: &DismissEvent, cx| {
+            this.close_context_menu(cx);
+        });
+        self.context_menu = Some((menu, pos));
         self.context_menu_origin = MenuOrigin::FileTree;
         self.context_menu_target = Some(target);
+        self._context_menu_dismiss = Some(dismiss);
         cx.notify();
     }
 
-    /// 关闭右键菜单（Esc / 点空白 / 执行完动作）。目标随菜单一起清
-    ///（#166——菜单关了，目标路径不再有效）。
+    /// 关闭右键菜单（Esc / 点外部（DismissEvent）/ 执行完动作）。目标与
+    /// DismissEvent 订阅随菜单一起清（#166——菜单关了，目标路径不再
+    /// 有效；订阅不养僵尸）。
     pub fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
             self.context_menu_target = None;
+            self._context_menu_dismiss = None;
             cx.notify();
         }
     }
@@ -830,6 +853,7 @@ impl ShellApp {
         let target = self.context_menu_target.clone();
         self.context_menu = None;
         self.context_menu_target = None;
+        self._context_menu_dismiss = None;
         match (origin, id) {
             // 编辑器命令动作：统一走 run_command（键位 / 命令面板 / 图标条
             // 搜索钮同一分派路径）。#165 前经 exec_menu_command 的
@@ -2047,12 +2071,47 @@ impl Render for ShellApp {
                     return;
                 }
 
-                // #166：右键菜单 Esc 关闭（点空白由菜单遮罩承担；菜单与
-                // 确认框互斥——ft-delete 开确认时菜单已关）。放在确认框
-                // 模态拦截之前：两者不同时开，顺序无行为差，仅注释并归。
-                if key == "escape" && this.context_menu.is_some() {
-                    this.close_context_menu(cx);
-                    return;
+                // #166 → #385 批 1：右键菜单键面——Esc 关闭 + ↑/↓/Enter
+                // 键盘导航（调 ui::ContextMenu 实体方法；灰显项
+                // is_selectable=false 自动跳过）。点外关闭由菜单自带
+                // on_mouse_down_out → DismissEvent 承担（旧遮罩退役）。
+                // 菜单与确认框互斥——ft-delete 开确认时菜单已关；放在
+                // 确认框模态拦截之前：两者不同时开，顺序无行为差。
+                if this.context_menu.is_some() {
+                    match key.as_str() {
+                        "escape" => {
+                            this.close_context_menu(cx);
+                            // 焦点归位（菜单 hover 可能取走过焦点域）。
+                            this.focus_active(window, cx);
+                            return;
+                        }
+                        "up" => {
+                            if let Some((menu, _)) = &this.context_menu {
+                                menu.update(cx, |m, cx| {
+                                    m.select_previous(&menu::SelectPrevious, window, cx)
+                                });
+                            }
+                            return;
+                        }
+                        "down" => {
+                            if let Some((menu, _)) = &this.context_menu {
+                                menu.update(cx, |m, cx| {
+                                    m.select_next(&menu::SelectNext, window, cx)
+                                });
+                            }
+                            return;
+                        }
+                        "enter" => {
+                            if let Some((menu, _)) = &this.context_menu {
+                                // confirm → 选中项 handler →
+                                // activate_context_menu_item（派发体内部
+                                // 自会关菜单 + 聚焦目标区）。
+                                menu.update(cx, |m, cx| m.confirm(&menu::Confirm, window, cx));
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // #289-⑤：设置弹窗 Esc 关闭（与点遮罩/关闭钮同一条
@@ -2296,22 +2355,14 @@ impl Render for ShellApp {
                         },
                     )),
             )
-            // #166：右键菜单浮层——**链尾最上层**（后画的兄弟覆盖先画的：
-            // 若插在 status_bar 之前，弹向窗口底部的菜单会被状态栏盖住、
-            // 点击穿透成「关菜单」）。摆放几何按当前窗口尺寸算，窗口
-            // 改大小后仍合法；遮罩先画在菜单之下承接「点空白关闭」。
+            // #166 → #385 批 1：右键菜单浮层——ui::ContextMenu 实体经
+            // deferred(anchored) 部署（**链尾最上层**，同旧层序；若插在
+            // status_bar 之前，弹向窗口底部的菜单会被状态栏盖住）。摆放
+            // 几何（翻转/夹紧）由 gpui Anchored 按当前窗口尺寸算；点外
+            // 关闭由菜单自带 on_mouse_down_out → DismissEvent 承担（旧
+            // 全屏遮罩退役）。
             .map(|el| match &self.context_menu {
-                Some(menu) => {
-                    let bounds = window.bounds();
-                    let screen = MenuRect::new(
-                        0.,
-                        0.,
-                        bounds.size.width.as_f32(),
-                        bounds.size.height.as_f32(),
-                    );
-                    let rect = menu.layout(screen);
-                    el.child(context_menu_view::context_menu_overlay(menu, rect, cx))
-                }
+                Some((menu, pos)) => el.child(context_menu_view::context_menu_layer(menu, *pos)),
                 None => el,
             })
             // #209：菜单栏浮层——右键菜单浮层之后再挂（同为链尾最上层；
@@ -2353,15 +2404,15 @@ fn dir_for_new(target: &Path) -> PathBuf {
     }
 }
 
-/// #179（#188 接线）：编辑器右键菜单上抛回调的工厂——ShellApp 弱句柄
-/// 在**这里**捕获（editor 是 lib+bin 共用源码，lib 目标不含 shell
-/// 模块树，类型上不许直引；闭包做类型擦除的跨实体通道，#166
-/// file_tree 的弱句柄模式同款）。三个挂入口共用：
+/// #179（#188 接线）→ #385 批 1：编辑器右键菜单上抛回调的工厂——
+/// ShellApp 弱句柄在**这里**捕获（editor 是 lib+bin 共用源码，lib 目标
+/// 不含 shell 模块树，类型上不许直引；闭包做类型擦除的跨实体通道，
+/// #166 file_tree 的弱句柄模式同款）。三个挂入口共用：
 /// ShellApp::new / open_document_tab / open_readonly_tab。
 fn menu_opener_for(shell: gpui::WeakEntity<ShellApp>) -> crate::editor::MenuOpener {
-    Box::new(move |pos, has_selection, read_only, cx| {
+    Box::new(move |pos, has_selection, read_only, window, cx| {
         let _ = shell.update(cx, |shell, cx| {
-            shell.open_editor_context_menu(pos, has_selection, read_only, cx)
+            shell.open_editor_context_menu(pos, has_selection, read_only, window, cx)
         });
     })
 }

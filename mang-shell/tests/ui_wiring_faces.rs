@@ -73,10 +73,11 @@ fn chain(face: &str, links: &[(&str, &str, &str)]) {
 // 面 1：菜单栏项 → 命令分发
 // ---------------------------------------------------------------------------
 
-/// 菜单项从数据定义到执行的完整链路：
+/// 菜单项从数据定义到执行的完整链路（#385 批 1 迁 ui::ContextMenu）：
 /// `context_menu.rs`（MenuItem::action 数据面）→ `context_menu_view.rs`
-/// （点击回调）→ `shell.rs activate_context_menu_item`（分派体，按
-/// MenuOrigin 区分 Editor/FileTree 两源）。
+/// （build_ui_menu：CustomEntry handler 闭包）→ `shell.rs
+/// activate_context_menu_item`（分派体，按 MenuOrigin 区分
+/// Editor/FileTree 两源）。
 #[test]
 fn face1_menu_items_reach_command_dispatch() {
     let menu = src("context_menu.rs");
@@ -91,7 +92,7 @@ fn face1_menu_items_reach_command_dispatch() {
             (
                 "context_menu_view.rs",
                 "activate_context_menu_item",
-                "菜单点击回调 → shell 分派",
+                "菜单项 handler → shell 分派",
             ),
             (
                 "shell.rs",

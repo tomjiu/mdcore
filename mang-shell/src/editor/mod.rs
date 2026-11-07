@@ -89,8 +89,6 @@ use crate::canvas_view::{CanvasView, PAN_KEY_PX, PAN_PAGE_PX, WHEEL_LINE_PX};
 // 本接线接活）。RecentRing 会话态随 Editor 存续，不落盘。
 use crate::command_groups::RecentRing;
 use crate::palette_view;
-// #179（#188 接线）：编辑器区右键菜单——坐标类型 + 上抛回调。
-use crate::context_menu;
 // #217：键位表（编辑器键派发的单一事实源——默认表 = 原两处匹配臂的
 // 精确镜像；纯逻辑层，行为零变化红线）。
 use crate::keymap::{self, EditorAction, KeyQuery};
@@ -474,9 +472,11 @@ pub struct Editor {
 }
 
 /// #179：右键菜单上抛回调（shell 注入——闭包内持 ShellApp 弱句柄）。
-/// 参数：(窗口坐标, 是否有选区, 是否只读)；在编辑器的右键 listener
-/// 里同步调用，菜单状态落在 shell 上（ed-* 动作派发回 shell）。
-pub type MenuOpener = Box<dyn Fn(context_menu::Point, bool, bool, &mut App) + 'static>;
+/// 参数：(窗口坐标, 是否有选区, 是否只读, 窗口, 上下文)；在编辑器的
+/// 右键 listener 里同步调用，菜单状态落在 shell 上（ed-* 动作派发回
+/// shell）。#385 批 1：坐标改 gpui `Point<Pixels>`（构建 ui::ContextMenu
+/// 实体需要 Window——上抛面同步扩窗）。
+pub type MenuOpener = Box<dyn Fn(gpui::Point<Pixels>, bool, bool, &mut Window, &mut App) + 'static>;
 
 /// #178：锁定行拒改提示（状态栏消费）。
 ///
@@ -3312,12 +3312,11 @@ impl Editor {
             .selection()
             .is_some_and(|sel| sel.start < sel.end);
         let read_only = self.read_only;
-        let pos = context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
         // 无宿主（单测/独立构造）只移光标不弹菜单；有宿主经回调上抛
-        //（闭包里是 shell.open_editor_context_menu——菜单状态与
+        //（闭包里是 shell.open_editor_context_menu——菜单实体与
         // ed-* 动作派发面都在 shell）。
         if let Some(opener) = self.menu_opener.as_deref() {
-            opener(pos, has_selection, read_only, cx);
+            opener(event.position, has_selection, read_only, window, cx);
         } else {
             cx.notify();
         }

@@ -1,6 +1,6 @@
 //! 顶部菜单栏模型层（#209）——纯数据 / 纯状态机，零 GPUI 依赖。
 //!
-//! # 分层（与 context_menu ↔ context_menu_view 同构）
+//! # 分层（与 context_menu ↔ context_menu_view 同构；几何独占消费见下）
 //!
 //! - 本模块：**菜单结构**（四菜单 + 子菜单 + 动作映射）、**键盘导航状态机**、
 //!   **下拉几何估算**——全部纯函数/纯数据，单测钉定，不起窗口可验；
@@ -12,7 +12,7 @@
 //! 下拉摆放（边缘翻转/夹紧）与宽度估算**复用** `context_menu` 的
 //! [`place_menu`](crate::context_menu::place_menu) /
 //! [`place_submenu`](crate::context_menu::place_submenu) /
-//! [`menu_size`](crate::context_menu::menu_size)——那套几何对着屏幕边界
+//! [`menu_size`](crate::menu_geometry::menu_size)——那套几何对着屏幕边界
 //! 写过暴力扫描测试，不重写第二份。
 //!
 //! # 动作映射铁律（issue #209 层 2 / owner 指令）
@@ -36,8 +36,9 @@
 
 use std::path::PathBuf;
 
-use crate::context_menu::{self, MenuItem};
+use crate::context_menu::MenuItem;
 use crate::editor::commands::Cmd;
+use crate::menu_geometry;
 
 /// 主题模式串（settings.json `theme` 键的持久化契约值——与
 /// `theme_switch::MODE_*` 同值；本模块在 lib 树内取不到 bin 专属的
@@ -239,7 +240,7 @@ impl MenuEntry {
     ///（下拉高度估算/子菜单行定位共用）。
     pub fn height_units(&self) -> f32 {
         match self {
-            MenuEntry::Separator => context_menu::SEPARATOR_UNITS,
+            MenuEntry::Separator => menu_geometry::SEPARATOR_UNITS,
             _ => 1.0,
         }
     }
@@ -704,12 +705,12 @@ pub fn to_context_items(entries: &[MenuEntry]) -> Vec<MenuItem> {
 /// 条目 `idx` 顶部在菜单内的 y 偏移（含菜单上内边距——`place_submenu`
 /// 的 `row_y` 参数按「row 顶相对菜单顶」口径回扣 MENU_PADDING_Y）。
 pub fn row_y_offset(entries: &[MenuEntry], idx: usize) -> f32 {
-    let mut y = context_menu::MENU_PADDING_Y;
+    let mut y = menu_geometry::MENU_PADDING_Y;
     for (i, entry) in entries.iter().enumerate() {
         if i >= idx {
             break;
         }
-        y += context_menu::ITEM_HEIGHT * entry.height_units();
+        y += menu_geometry::ITEM_HEIGHT * entry.height_units();
     }
     y
 }
@@ -737,7 +738,7 @@ pub fn estimate_anchor_x(menus: &[TopMenu], idx: usize, _title_text: &str) -> f3
         if i >= idx {
             break;
         }
-        x += TITLE_BTN_PAD_X * 2. + context_menu::estimate_width(menu.label) + TITLES_GAP;
+        x += TITLE_BTN_PAD_X * 2. + menu_geometry::estimate_width(menu.label) + TITLES_GAP;
     }
     x
 }
@@ -1283,13 +1284,13 @@ mod tests {
     fn to_context_items_feeds_menu_size() {
         let menus = build_menus(&full_ctx());
         let items = to_context_items(&menus[0].entries);
-        let (w, h) = context_menu::menu_size(&items);
-        assert!(w >= context_menu::MENU_MIN_WIDTH, "宽度不小于最小宽");
-        let expected_h = context_menu::MENU_PADDING_Y * 2.
+        let (w, h) = menu_geometry::menu_size(&items);
+        assert!(w >= menu_geometry::MENU_MIN_WIDTH, "宽度不小于最小宽");
+        let expected_h = menu_geometry::MENU_PADDING_Y * 2.
             + menus[0]
                 .entries
                 .iter()
-                .map(|e| context_menu::ITEM_HEIGHT * e.height_units())
+                .map(|e| menu_geometry::ITEM_HEIGHT * e.height_units())
                 .sum::<f32>();
         assert_eq!(h, expected_h, "高度 = 内边距×2 + Σ(行高×占位)");
         // 全条目数（含子菜单标题）都被计入高度——子菜单标题占一行。
@@ -1301,12 +1302,12 @@ mod tests {
     fn row_y_offset_accounts_separators() {
         let menus = build_menus(&full_ctx());
         let entries = &menus[0].entries;
-        assert_eq!(row_y_offset(entries, 0), context_menu::MENU_PADDING_Y);
+        assert_eq!(row_y_offset(entries, 0), menu_geometry::MENU_PADDING_Y);
         // idx 8（最近打开）之前有七项普通条目（0..6，含导出PDF5/导出
         // DOCX6）+ 一条分隔线（7）——#384 菜单项后基线同步。
-        let expect = context_menu::MENU_PADDING_Y
-            + context_menu::ITEM_HEIGHT * 7.
-            + context_menu::ITEM_HEIGHT * context_menu::SEPARATOR_UNITS;
+        let expect = menu_geometry::MENU_PADDING_Y
+            + menu_geometry::ITEM_HEIGHT * 7.
+            + menu_geometry::ITEM_HEIGHT * menu_geometry::SEPARATOR_UNITS;
         assert_eq!(row_y_offset(entries, 8), expect);
     }
 

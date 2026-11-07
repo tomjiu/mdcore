@@ -1,64 +1,31 @@
-//! 右键菜单（#63 Lead 打磨项）。
+//! 右键菜单数据层（#63 Lead 打磨项 → #385 批 1 迁 `ui::ContextMenu`）。
 //!
-//! # 分层：数据 / 渲染 / 接线 三段分离
+//! # 分层（批 1 迁移后）
 //!
-//! - [`MenuItem`] / [`ContextMenu`]：**纯数据**，零 GPUI 依赖——可单测、
-//!   可在无窗口环境构造。菜单长什么样、点哪一项干什么，全在这一层定死。
-//! - [`menu_geometry`]：菜单**几何**（尺寸/边距/每项行高）纯函数——
-//!   屏幕边缘翻转、子菜单飞出方向这些「到底弹在哪」的判断必须可测，
-//!   不能埋在渲染闭包里。
-//! - 渲染与点击接线在 `shell.rs` / `file_tree.rs`（需要 `Window`）。
+//! - [`MenuItem`] / [`editor_menu`] / [`file_tree_menu`]：**纯数据**，零
+//!   GPUI 依赖——可单测、可在无窗口环境构造。菜单有哪些项、哪些灰显、
+//!   快捷键标签显示什么（keymap 单一事实源），全在这一层定死。
+//! - 构建/部署层在 `context_menu_view.rs`：把 [`MenuItem`] 集构建为
+//!   `ui::ContextMenu` 实体（CustomEntry + handler 回派 shell），部署用
+//!   gpui `Anchored`（边缘翻转/夹紧）——旧的手写渲染浮层（146 行）与
+//!   自研 `ContextMenu::layout` 几何已在批 1 退役。
+//! - 点击/键盘接线在 `shell.rs`（`activate_context_menu_item` 派发体 +
+//!   根 `on_key_down` 键盘导航）。
+//! - 菜单**几何**（place_menu/estimate_width 族）已迁 `menu_geometry.rs`
+//!   ——右键菜单路径不再消费（gpui Anchored 承担），存续消费者是批 4
+//!   未迁移的顶部菜单栏。
 //!
-//! # 为什么几何要单独抽出来
+//! # 灰显语义
 //!
-//! 右键菜单最容易出的 bug 不是「菜单不显示」，而是**在屏幕右下角弹到
-//! 屏幕外**——用户看不见但程序一切正常。这类问题只有把摆放算法做成
-//! 纯函数、对着边界写断言才抓得住（见本文件测试 `flip_at_edges` 一族）。
-
-/// 屏幕/窗口坐标点（逻辑像素，f32——与 gpui 的 `Point<Pixels>` 同域，
-/// 但本模块不依赖 gpui，故自带一份最小结构）。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Point {
-    pub x: f32,
-    pub y: f32,
-}
-
-impl Point {
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-}
-
-/// 矩形（左上角 + 宽高）。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
-
-impl Rect {
-    pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
-        Self { x, y, w, h }
-    }
-
-    pub fn right(&self) -> f32 {
-        self.x + self.w
-    }
-
-    pub fn bottom(&self) -> f32 {
-        self.y + self.h
-    }
-}
+//! `enabled: false` 用于「有菜单项但此刻不可用」——灰显而不是消失：
+//! 消失会让菜单长短跳变，用户刚瞄准的项会跑位。构建层把灰显项映射为
+//! 不可选 CustomEntry（无 hover/无点击/键盘导航跳过——`ui::ContextMenu`
+//! 的 `is_selectable` 语义）。
 
 /// 菜单项。
-///
-/// `enabled: false` 用于「有菜单项但此刻不可用」——灰显而不是消失：
-/// 消失会让菜单长短跳变，用户刚瞄准的项会跑位。
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuItem {
-    /// 可点击动作。`id` 是派发键（渲染层用它做 element id 与回调匹配）。
+    /// 可点击动作。`id` 是派发键（构建层用它匹配 shell 派发体）。
     Action {
         id: &'static str,
         label: String,
@@ -67,7 +34,8 @@ pub enum MenuItem {
     },
     /// 分隔线。
     Separator,
-    /// 子菜单（点开后横向飞出；本批只做一层）。
+    /// 子菜单（点开后横向飞出；现役预设未使用——构建层保守渲染为
+    /// 不可选提示行，与旧渲染层同口径，不假装支持）。
     Submenu { label: String, items: Vec<MenuItem> },
 }
 
@@ -108,149 +76,16 @@ impl MenuItem {
     }
 
     /// 占位高度（行）：动作/子菜单 1 行，分隔线按「半行+上下留白」占位。
+    /// （消费者 = `menu_geometry::menu_size`——menu_bar 下拉估算用。）
     pub fn height_units(&self) -> f32 {
         match self {
-            MenuItem::Separator => SEPARATOR_UNITS,
+            MenuItem::Separator => crate::menu_geometry::SEPARATOR_UNITS,
             _ => 1.0,
         }
     }
 
     pub fn is_action(&self) -> bool {
         matches!(self, MenuItem::Action { .. })
-    }
-}
-
-/// 单行高度（px）。
-pub const ITEM_HEIGHT: f32 = 26.;
-/// 分隔线占位（行高倍数）。
-pub const SEPARATOR_UNITS: f32 = 0.4;
-/// 菜单上下内边距（px）。
-pub const MENU_PADDING_Y: f32 = 4.;
-/// 菜单左右内边距（px）。
-pub const MENU_PADDING_X: f32 = 4.;
-/// 菜单最小宽度（px）——再窄标签会折行。
-pub const MENU_MIN_WIDTH: f32 = 160.;
-/// 宽度估算：每字符像素（中文按 1.5 倍算，见 [`estimate_width`]）。
-const CHAR_W: f32 = 7.5;
-
-/// 文本宽度粗估（不加载字体——菜单宽度只需要「够不够放」，不需要精确）。
-///
-/// CJK 字符按 1.6 倍宽度估：菜单标签大量是中文，按拉丁字符宽估会窄一半，
-/// 渲染时标签被截断。两侧各留 `PADDING` 余量。
-pub fn estimate_width(text: &str) -> f32 {
-    text.chars()
-        .map(|c| if c.is_ascii() { CHAR_W } else { CHAR_W * 1.6 })
-        .sum()
-}
-
-/// 菜单几何：给定项集，算出菜单自身应有尺寸。
-pub fn menu_size(items: &[MenuItem]) -> (f32, f32) {
-    let mut w = MENU_MIN_WIDTH;
-    let mut h = MENU_PADDING_Y * 2.;
-    for item in items {
-        h += ITEM_HEIGHT * item.height_units();
-        let need = match item {
-            MenuItem::Action {
-                label, shortcut, ..
-            } => {
-                // 标签 + 间隔 + 快捷键 + 左右内边距
-                let sc = shortcut.as_deref().unwrap_or("");
-                estimate_width(label)
-                    + if sc.is_empty() {
-                        0.
-                    } else {
-                        32. + estimate_width(sc)
-                    }
-                    + MENU_PADDING_X * 2.
-                    + 24.
-            }
-            MenuItem::Submenu { label, .. } => estimate_width(label) + 40. + MENU_PADDING_X * 2.,
-            MenuItem::Separator => 0.,
-        };
-        w = w.max(need);
-    }
-    (w, h)
-}
-
-/// 把菜单摆到屏幕内：优先在点击点右下方向展开；越界则翻转/夹紧。
-///
-/// `anchor` = 点击点（屏幕坐标），`size` = 菜单尺寸，`screen` = 可用区域
-/// （窗口客户区）。返回菜单左上角坐标。
-///
-/// 规则（顺序有讲究）：
-/// 1. 默认左上角 = 点击点；
-/// 2. 右边越界 → 左翻（菜单右边缘对齐点击点）；
-/// 3. 下边越界 → 上翻；
-/// 4. 翻转后仍越界（菜单比屏幕还大）→ 夹紧到 [0, screen - size]，
-///    保证菜单**至少完整可见地贴在屏幕内**，不会一半在屏幕外。
-pub fn place_menu(anchor: Point, size: (f32, f32), screen: Rect) -> Point {
-    let (w, h) = size;
-    let mut x = anchor.x;
-    let mut y = anchor.y;
-
-    // 右越界 → 左翻
-    if x + w > screen.right() {
-        x = anchor.x - w;
-    }
-    // 下越界 → 上翻
-    if y + h > screen.bottom() {
-        y = anchor.y - h;
-    }
-    // 翻转后仍越界 → 夹紧
-    x = x.clamp(screen.x, (screen.right() - w).max(screen.x));
-    y = y.clamp(screen.y, (screen.bottom() - h).max(screen.y));
-    Point::new(x, y)
-}
-
-/// 子菜单飞出方向：默认右飞；右侧放不下则左飞。
-///
-/// 返回子菜单左上角。`parent` = 父菜单矩形（已摆放好）。
-pub fn place_submenu(parent: Rect, row_y: f32, size: (f32, f32), screen: Rect) -> Point {
-    let (w, h) = size;
-    // 与父项左/上边对齐，再向右飞一个菜单宽。
-    let mut x = parent.right();
-    let mut y = parent.y + row_y - MENU_PADDING_Y;
-    if x + w > screen.right() {
-        x = parent.x - w;
-    }
-    y = y.clamp(screen.y, (screen.bottom() - h).max(screen.y));
-    x = x.clamp(screen.x, (screen.right() - w).max(screen.x));
-    Point::new(x, y)
-}
-
-/// 已打开的右键菜单（位置 + 项集）。
-#[derive(Clone, Debug, PartialEq)]
-pub struct ContextMenu {
-    pub items: Vec<MenuItem>,
-    /// 请求的展开点（点击处，屏幕坐标）。实际摆放由 [`Self::layout`] 算。
-    pub pos: Point,
-}
-
-impl ContextMenu {
-    pub fn new(items: Vec<MenuItem>, pos: Point) -> Self {
-        Self { items, pos }
-    }
-
-    /// 算出菜单在 `screen` 内的最终矩形（含边缘翻转）。
-    pub fn layout(&self, screen: Rect) -> Rect {
-        let (w, h) = menu_size(&self.items);
-        let p = place_menu(self.pos, (w, h), screen);
-        Rect::new(p.x, p.y, w, h)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// 所有动作项 id（接线层批绑定用；顺序 = 菜单顺序）。
-    pub fn action_ids(&self) -> Vec<&'static str> {
-        self.items
-            .iter()
-            .filter_map(|i| match i {
-                MenuItem::Action { id, .. } => Some(*id),
-                _ => None,
-            })
-            .collect()
     }
 }
 
@@ -301,65 +136,6 @@ pub fn file_tree_menu(is_dir: bool) -> Vec<MenuItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn screen() -> Rect {
-        Rect::new(0., 0., 1200., 800.)
-    }
-
-    #[test]
-    fn menu_size_grows_with_item_count() {
-        let a = menu_size(&editor_menu(false, false));
-        let b = menu_size(&editor_menu(false, false)[..2]);
-        assert!(a.1 > b.1, "项多则高，{} vs {}", a.1, b.1);
-    }
-
-    #[test]
-    fn menu_width_fits_cjk_labels() {
-        // 中文标签不能被按拉丁字符宽估成 160 最小宽就完事。
-        let items = vec![MenuItem::action("x", "在资源管理器中显示").with_shortcut("Ctrl+Shift+E")];
-        let (w, _) = menu_size(&items);
-        assert!(w > MENU_MIN_WIDTH + 40., "CJK 长标签应把菜单撑宽，实际 {w}");
-    }
-
-    #[test]
-    fn place_menu_default_down_right() {
-        let p = place_menu(Point::new(100., 100.), (200., 300.), screen());
-        assert_eq!(p, Point::new(100., 100.), "有空间时就在点击点右下");
-    }
-
-    #[test]
-    fn place_menu_flips_left_at_right_edge() {
-        let p = place_menu(Point::new(1150., 100.), (200., 300.), screen());
-        assert!(p.x + 200. <= 1200., "右越界必须左翻，实际 x={}", p.x);
-        assert!(p.x >= 0.);
-    }
-
-    #[test]
-    fn place_menu_flips_up_at_bottom_edge() {
-        let p = place_menu(Point::new(100., 750.), (200., 300.), screen());
-        assert!(p.y + 300. <= 800., "下越界必须上翻，实际 y={}", p.y);
-    }
-
-    #[test]
-    fn place_menu_clamps_when_larger_than_screen() {
-        // 菜单比屏幕还大：翻不动，只能夹紧到左上角。
-        let p = place_menu(Point::new(600., 400.), (2000., 1000.), screen());
-        assert_eq!(p, Point::new(0., 0.));
-    }
-
-    #[test]
-    fn submenu_flyout_right_by_default() {
-        let parent = Rect::new(100., 100., 200., 300.);
-        let p = place_submenu(parent, 26., (180., 120.), screen());
-        assert!((p.x - 300.).abs() < 0.01, "子菜单默认贴父菜单右侧飞出");
-    }
-
-    #[test]
-    fn submenu_flips_left_when_no_room() {
-        let parent = Rect::new(1100., 100., 90., 300.);
-        let p = place_submenu(parent, 26., (180., 120.), screen());
-        assert!(p.x < parent.x, "右侧放不下时左翻，实际 x={}", p.x);
-    }
 
     #[test]
     fn editor_menu_disables_cut_without_selection() {
@@ -424,20 +200,19 @@ mod tests {
         }
     }
 
+    /// #385 批 1 迁移断言：快捷键标签继续走 keymap 单一事实源（#217），
+    /// 用户换绑后菜单标签跟随。
     #[test]
-    fn layout_never_leaves_screen() {
-        // 暴力扫一圈展开点：任何位置算出的菜单矩形都必须在屏幕内。
-        let menu = ContextMenu::new(editor_menu(false, false), Point::new(0., 0.));
-        let (w, h) = menu_size(&menu.items);
-        for x in (0..1200).step_by(37) {
-            for y in (0..800).step_by(41) {
-                let m = ContextMenu::new(menu.items.clone(), Point::new(x as f32, y as f32));
-                let r = m.layout(screen());
-                assert!(r.x >= -0.01, "x 越界 {r:?}");
-                assert!(r.y >= -0.01, "y 越界 {r:?}");
-                assert!(r.right() <= 1200.01, "右边越界 {r:?}（宽 {w}）");
-                assert!(r.bottom() <= 800.01, "下边越界 {r:?}（高 {h}）");
-            }
-        }
+    fn shortcut_labels_come_from_keymap_store() {
+        let items = editor_menu(true, false);
+        let cut = items.iter().find_map(|i| match i {
+            MenuItem::Action { id, shortcut, .. } if *id == "ed-cut" => shortcut.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            cut.as_deref(),
+            crate::keymap::store().label("cut").as_deref(),
+            "剪切快捷键标签应与 keymap store 同源"
+        );
     }
 }

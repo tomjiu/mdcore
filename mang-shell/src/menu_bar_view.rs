@@ -10,7 +10,7 @@
 //!   （enabled 才挂 on_click——「点不到不算死按钮」，右键菜单/设置面板
 //!   步进钮同口径）；
 //! - **子菜单**：右侧「›」箭头 + 点击/Enter 展开，摆放复用
-//!   `context_menu::place_submenu`（边缘翻转/夹紧——那套几何有暴力扫描
+//!   `menu_geometry::place_submenu`（边缘翻转/夹紧——那套几何有暴力扫描
 //!   测试，不重写第二份）。
 //!
 //! 本模块零状态：菜单开合/选中/锚点全部在 `ShellApp.menu_bar`
@@ -21,10 +21,10 @@ use gpui::{AnyElement, Context, FocusHandle, MouseButton, px};
 use theme::ThemeColors;
 use ui::prelude::*;
 
-use crate::context_menu::{self, Rect as MenuRect};
 use crate::menu_bar::{
     MenuBarState, MenuEntry, MenuItemSpec, TopMenu, row_y_offset, to_context_items,
 };
+use crate::menu_geometry::{self, Rect as MenuRect};
 use crate::shell::ShellApp;
 use crate::title_bar::TITLE_BAR_HEIGHT;
 
@@ -62,7 +62,7 @@ pub fn menu_titles(
                 .hover(move |el| el.bg(hover))
                 .child(div().text_color(colors.text).child(menu.label))
                 // on_mouse_down（非 on_click）：按下瞬间捕获 event.position.x
-                // 作下拉锚点（context_menu 右键定位同源——panel_drag 的
+                // 作下拉锚点（menu_geometry 下拉定位同源——panel_drag 的
                 // 命中取 x 同款用法）；已开同菜单 = 关闭，未开/别的菜单 =
                 // 打开（一键切换，遮罩从标题栏下缘起、不挡标题按钮）。
                 // 开关判定走 is_menu_bar_open_at 访问器（menu_bar 状态
@@ -124,14 +124,14 @@ pub fn menu_bar_overlay(
             cx.listener(|this, _, window, cx| this.close_menu_bar(window, cx)),
         );
 
-    // 下拉摆放：复用 context_menu 的 place_menu（右越界左翻 / 下越界上翻
+    // 下拉摆放：复用 menu_geometry 的 place_menu（右越界左翻 / 下越界上翻
     // / 夹紧），锚点 = 标题点击 x（键盘切换时为估算重锚值），y = 标题栏
     // 下缘。宽度按 menu_size 估算（右键菜单同一口径）。
     let items = &menu.entries;
-    let (w, h) = context_menu::menu_size(&to_context_items(items));
-    let anchor = context_menu::Point::new(state.anchor_x, f32::from(TITLE_BAR_HEIGHT));
-    let pos = context_menu::place_menu(anchor, (w, h), screen);
-    let menu_rect = context_menu::Rect::new(pos.x, pos.y, w, h);
+    let (w, h) = menu_geometry::menu_size(&to_context_items(items));
+    let anchor = menu_geometry::Point::new(state.anchor_x, f32::from(TITLE_BAR_HEIGHT));
+    let pos = menu_geometry::place_menu(anchor, (w, h), screen);
+    let menu_rect = menu_geometry::Rect::new(pos.x, pos.y, w, h);
 
     let mut list = div()
         .id(SharedString::from(format!("menu-drop-{}", menu.id)))
@@ -144,7 +144,7 @@ pub fn menu_bar_overlay(
         .border_color(colors.border)
         .bg(colors.background)
         .shadow_lg()
-        .py(px(context_menu::MENU_PADDING_Y))
+        .py(px(menu_geometry::MENU_PADDING_Y))
         .flex()
         .flex_col()
         .text_size(px(13.));
@@ -184,9 +184,9 @@ pub fn menu_bar_overlay(
                 if state.open_submenu == Some(idx) {
                     // 子菜单摆放：place_submenu（右飞/左翻/夹紧），row_y =
                     // 父行在菜单内的偏移（含上内边距——见 menu_bar::row_y_offset）。
-                    let (sw, sh) = context_menu::menu_size(&to_context_items(sub_items));
+                    let (sw, sh) = menu_geometry::menu_size(&to_context_items(sub_items));
                     let row_y = row_y_offset(items, idx);
-                    let sub_pos = context_menu::place_submenu(menu_rect, row_y, (sw, sh), screen);
+                    let sub_pos = menu_geometry::place_submenu(menu_rect, row_y, (sw, sh), screen);
                     let mut sub = div()
                         .id(SharedString::from(format!("menu-sub-{}-{idx}", menu.id)))
                         .absolute()
@@ -198,7 +198,7 @@ pub fn menu_bar_overlay(
                         .border_color(colors.border)
                         .bg(colors.background)
                         .shadow_lg()
-                        .py(px(context_menu::MENU_PADDING_Y))
+                        .py(px(menu_geometry::MENU_PADDING_Y))
                         .flex()
                         .flex_col()
                         .text_size(px(13.));
@@ -263,7 +263,7 @@ fn action_row(
         .flex()
         .items_center()
         .gap_2()
-        .h(px(context_menu::ITEM_HEIGHT - 2.))
+        .h(px(menu_geometry::ITEM_HEIGHT - 2.))
         .px_2()
         .mx_1()
         .rounded_sm()
@@ -317,7 +317,7 @@ fn submenu_parent_row(
         .flex()
         .items_center()
         .gap_2()
-        .h(px(context_menu::ITEM_HEIGHT - 2.))
+        .h(px(menu_geometry::ITEM_HEIGHT - 2.))
         .px_2()
         .mx_1()
         .rounded_sm()

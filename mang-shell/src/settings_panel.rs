@@ -322,7 +322,8 @@ fn choice_button(
 }
 
 /// 步进钮（−/+——`enabled = false`（域界）时灰显且不挂 on_click：
-/// 点不到不算死按钮，与 context_menu_view 灰显项同口径）。
+/// 点不到不算死按钮，与右键菜单灰显项同口径（#385 批 1 迁
+/// ui::ContextMenu 后 = CustomEntry `selectable(false)` 语义）。
 fn step_button(
     id: &'static str,
     icon: IconName,
