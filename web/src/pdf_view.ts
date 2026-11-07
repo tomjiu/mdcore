@@ -46,6 +46,9 @@
 import { wasmBoot } from './wasm_boot.js';
 import { mount_surface_guide } from './empty_state.js';
 import { t } from './i18n/index.js';
+// #475(长尾⑨缩小版):注释列表面板——会话 AnnotListed 数据可视化
+// (新模块:行形状 + DOM 纯函数;pdf_view 只做接线)。
+import { renderAnnotListDom, type AnnotRowLike } from './pdf_annot_list.js';
 import type {
   PageViewport,
   PDFDocumentProxy,
@@ -428,6 +431,13 @@ declare global {
     /** #240 层③：打印准备（全页渲染——打印按钮同一路径；返回渲染
      * 完成数，不调 window.print()——测试面/宿主可单独驱动）。 */
     __pdfPrintPrepare: () => Promise<number>;
+    /** #475：注释列表面观测（行数/页序/开态——e2e 断言面）。 */
+    __pdfAnnotsUi: () => {
+      count: number;
+      ids: number[];
+      pages: number[];
+      drawerOpen: boolean;
+    };
   }
 }
 
@@ -508,10 +518,18 @@ export class PdfViewUI {
   private readonly evidenceRegions: { page: number; rect: RectJson }[] = [];
   private readonly jumpLog: number[] = [];
 
+  // 注释列表面状态（#475——数据源 = this.annotations 会话真源）
+  private annotsBtn: HTMLButtonElement | null = null;
+  private annotsDrawer: HTMLDivElement | null = null;
+  private annotsBody: HTMLDivElement | null = null;
+  private annotsEmptyEl: HTMLDivElement | null = null;
+
   // DOM 句柄
   private panel!: HTMLElement;
   private viewportEl!: HTMLDivElement;
   private contentEl!: HTMLElement;
+  /** #475：工具栏句柄（抽屉 top 动态锚——wrap 到两行时不叠盖）。 */
+  private toolbarEl!: HTMLDivElement;
   /** #3 UI 批 E：空态引导卡片层（文档在场 = hidden）。 */
   private guideEl!: HTMLDivElement;
   private pageLabel!: HTMLElement;
@@ -658,11 +676,14 @@ export class PdfViewUI {
     // 屏幕，打印需要每页位图在场；与探针 __pdfPrintPrepare 同一路径）。
     const printBtn = mkBtn('pdf-print-btn', t('pdf.print'), t('pdf.printTitle'));
 
+    // #475：注释列表按钮（文档开 = 使能；零批注 = 空态文案）。
+    const annotsBtn = mkBtn('pdf-annots-btn', t('pdf.annots'), t('pdf.annotsTitle'));
+
     toolbar.append(
       openBtn, fileInput, pageLabel,
       zoomOut, zoomLabel, zoomIn, zoomFit,
       searchInput, searchPrev, searchNext, searchCount,
-      modeSelect, inkColor, inkWidth, saveBtn, printBtn,
+      modeSelect, inkColor, inkWidth, saveBtn, printBtn, annotsBtn,
     );
 
     const viewport = document.createElement('div');
@@ -678,11 +699,27 @@ export class PdfViewUI {
     status.textContent =
       'open a .pdf to start (display: pdf.js · model: mdc-pdf wasm session)';
 
-    panel.append(toolbar, viewport, status);
+    // #475：注释列表抽屉（面板内浮层;top 动态随工具栏高度;打印态不进纸面）。
+    const annotsDrawer = document.createElement('div');
+    annotsDrawer.id = 'pdf-annots-drawer';
+    annotsDrawer.hidden = true;
+    const annotsHead = document.createElement('div');
+    annotsHead.className = 'pdf-annots-head';
+    annotsHead.textContent = t('pdf.annots');
+    const annotsBody = document.createElement('div');
+    annotsBody.className = 'pdf-annots-body';
+    const annotsEmpty = document.createElement('div');
+    annotsEmpty.className = 'pdf-annots-empty';
+    annotsEmpty.textContent = t('pdf.annotsEmpty');
+    annotsEmpty.hidden = true;
+    annotsDrawer.append(annotsHead, annotsBody, annotsEmpty);
+
+    panel.append(toolbar, viewport, status, annotsDrawer);
 
     this.panel = panel;
     this.viewportEl = viewport;
     this.contentEl = content;
+    this.toolbarEl = toolbar;
     // #3 UI 批 E：空态引导卡片（文档打开成功前——纯色块改引导）。
     this.guideEl = mount_surface_guide(viewport, 'pdf-guide', {
       icon: 'M7 2.5h7.5L19.5 7v14.5h-13V2.5z M14 2.5V7h5 M9.5 12.5h5 M9.5 16h5',
@@ -702,6 +739,10 @@ export class PdfViewUI {
     this.inkColorSelect = inkColor;
     this.inkWidthSelect = inkWidth;
     this.saveBtn = saveBtn;
+    this.annotsBtn = annotsBtn;
+    this.annotsDrawer = annotsDrawer;
+    this.annotsBody = annotsBody;
+    this.annotsEmptyEl = annotsEmpty;
     this.syncButtons();
   }
 
@@ -746,6 +787,12 @@ export class PdfViewUI {
     // #240 层③：打印按钮（全页渲染 → window.print()）。
     document.getElementById('pdf-print-btn')?.addEventListener('click', () => {
       void this.printDocument();
+    });
+
+    // #475：注释抽屉开合（文档开 = 可用;开合 = 用户选择）。
+    this.annotsBtn?.addEventListener('click', () => {
+      if (!this.annotsDrawer) return;
+      this.annotsDrawer.hidden = !this.annotsDrawer.hidden;
     });
 
     // #240 层③：Ctrl+P 路径（beforeprint）——best-effort 启动全页渲染
@@ -986,6 +1033,44 @@ export class PdfViewUI {
     return { ok: true, value: { pages: doc.numPages } };
   }
 
+  /** #475：注释列表面同步（按钮态 + 行渲染 + 抽屉 top 动态锚；数据源
+   * = this.annotations 会话真源——refreshAnnotations/增删后调用）。 */
+  private syncAnnotsPanel(): void {
+    if (!this.annotsBtn || !this.annotsBody || !this.annotsEmptyEl) return;
+    this.annotsBtn.disabled = this.doc === null;
+    if (this.annotsDrawer && this.toolbarEl) {
+      this.annotsDrawer.style.top = `${this.toolbarEl.offsetHeight + 8}px`;
+    }
+    const has = this.annotations.length > 0;
+    this.annotsEmptyEl.hidden = has;
+    if (this.doc) {
+      renderAnnotListDom(
+        this.annotsBody,
+        this.annotations as AnnotRowLike[],
+        (page) => this.jumpToListPage(page),
+        {
+          kind: {
+            Highlight: t('pdf.annotKHighlight'),
+            Note: t('pdf.annotKNote'),
+            FreeText: t('pdf.annotKFreeText'),
+            Ink: t('pdf.annotKInk'),
+          },
+          page: (n) => t('pdf.annotsPageN', { n }),
+        },
+      );
+    } else {
+      this.annotsBody.replaceChildren();
+    }
+  }
+
+  /** #475：清单行跳页（复用大纲/链接同语义——目标页滚到视口顶）。 */
+  private jumpToListPage(idx: number): void {
+    const st = this.pages[idx];
+    if (!st) return;
+    st.el.scrollIntoView({ block: 'start', behavior: 'auto' });
+    this.updatePageLabel();
+  }
+
   /** #3 UI 批 E：空态引导同步（文档在场 = 隐藏；打开失败/拆卸后回显）。 */
   private syncGuide(): void {
     this.guideEl.hidden = this.doc !== null;
@@ -1021,6 +1106,8 @@ export class PdfViewUI {
       this.loadingTask = null;
     }
     this.doc = null;
+    // #475：注释列表面拆卸（层随页元素移除;开合保留用户选择）。
+    this.syncAnnotsPanel();
     // #3 UI 批 E：拆卸后表面归零——引导卡片回显（打开失败/换开路径）。
     this.syncGuide();
   }
@@ -1089,6 +1176,7 @@ export class PdfViewUI {
       this.annotations = [];
     }
     this.renderAllAnnotOverlays();
+    this.syncAnnotsPanel(); // #475：会话清单变化 → 列表面同步
   }
 
   private listAnnotations(filter: AnnotFilterJson): AnnotationJson[] | PdfFail {
@@ -1115,6 +1203,7 @@ export class PdfViewUI {
     const annot = r.value.AnnotAdded;
     this.annotations.push(annot);
     this.renderAnnotOverlay(page);
+    this.syncAnnotsPanel(); // #475：增批注 → 列表面同步
     this.syncButtons();
     return { ok: true, value: { id: annot.id, annotation: annot } };
   }
@@ -2181,6 +2270,13 @@ export class PdfViewUI {
       if (!this.doc) return 0;
       return this.renderAllPages();
     };
+    // #475：注释列表面探针（行数/页序/开态——e2e 断言面）。
+    window.__pdfAnnotsUi = () => ({
+      count: this.annotations.length,
+      ids: this.annotations.map((a) => a.id),
+      pages: this.annotations.map((a) => a.page),
+      drawerOpen: this.annotsDrawer !== null && !this.annotsDrawer.hidden,
+    });
 
     // 证据跳转钩子（evidence_panel 的 evidence-jump 事件——后续阶段接真
     // 数据；本阶段记录 + 状态行提示）。

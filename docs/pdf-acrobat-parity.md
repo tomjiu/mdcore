@@ -63,7 +63,7 @@
 | ⑥ | 验签/签署 | P3 | 结构验签在（`signature.rs`）；密码学校验（链/时间戳/摘要复算）与签署域不在 v1——pdfi_signature 头注如实登记 |
 | ⑦ | /Info/XMP 元数据 | P3 | 仅 id/文件名/页数；Acrobat 有完整属性面板 |
 | ⑧ | /Name 标准图章图形/动态图章/骑缝章 | P4 | `/Approved` 等标准图形映射不做（`docs/pdf-annotate.md` 边界）；公章内容流盖章已在 |
-| ⑨ | 注释透明度 /Popup/回复流/列表面板 | P4 | 11 kind 公共面在；Acrobat 的注释管理（排序/筛选/导出）不在 |
+| ⑨ | 注释透明度 /Popup/回复流/列表面板 | P4 | 11 kind 公共面在；**列表面板最小面已接**（#475：AnnotListed 可视化 + 点击跳页，e2e `pdf_annot_list.py` 6 锁）；排序/筛选/导出仍不在 |
 | ⑩ | OCR 识别结果写回可搜索 PDF | P4 | 当前只出文本（`ocr.rs`）；无扫描页自动检测 |
 
 ## 维护纪律
