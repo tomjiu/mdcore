@@ -228,7 +228,9 @@ pub fn export_json_canvas(objects: &[CanvasObject]) -> String {
                 }
                 nodes.push(Value::Object(n));
             }
-            ObjectKind::Node => {
+            // #404：frame 无 JSON Canvas 原语——按 group 语义降级导出
+            // （几何 + 成员 id 保留；命名入 label）。损失面登记在模块文档。
+            ObjectKind::Frame | ObjectKind::Node => {
                 let mut n = base_node_json(o);
                 match o.props.get(P_TYPE).map(String::as_str) {
                     Some("file") => {
