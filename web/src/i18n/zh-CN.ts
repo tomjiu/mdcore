@@ -199,6 +199,8 @@ export const zhCN: Dict = {
   'pdf.annotKNote': '便签',
   'pdf.annotKFreeText': '自由文本',
   'pdf.annotKInk': '墨迹',
+  // #466（长尾①）：链接面（内链 title——外链 title = URL 本身）
+  'pdf.linkToPage': '跳到第 {n} 页',
   'pdf.zoomOutTitle': '缩小',
   'pdf.zoomInTitle': '放大',
   'pdf.fitWidth': '适应宽度',

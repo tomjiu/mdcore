@@ -203,6 +203,8 @@ export const en = {
   'pdf.annotKNote': 'note',
   'pdf.annotKFreeText': 'freetext',
   'pdf.annotKInk': 'ink',
+  // #466（长尾①）：链接面（内链 title——外链 title = URL 本身）
+  'pdf.linkToPage': 'go to page {n}',
   'pdf.zoomOutTitle': 'zoom out',
   'pdf.zoomInTitle': 'zoom in',
   'pdf.fitWidth': 'fit width',
