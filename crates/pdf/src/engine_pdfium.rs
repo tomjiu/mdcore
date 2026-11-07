@@ -336,6 +336,57 @@ impl DocumentEngine for PdfiumEngine {
         }
         Ok(out)
     }
+
+    /// 长尾②：单页文本几何。`text` 与 `extract_text` 同源
+    /// （`PdfPageText::all()`——GetBoundedText 全页）；`char_rects`
+    /// 逐字符 `FPDFText_GetCharBox`（tight box——与 all() 的
+    /// GetBoundedText 同一 pdfium 文本页 char 空间，1:1 对齐：
+    /// 6 夹具 10+ 页实证 bounded 文本 == 逐字符 GetUnicode 拼接，
+    /// 见 issue 验收；无盒字符/无效 Unicode = 零面积退化盒，占位
+    /// 保对齐）。坐标 = PDF 用户空间（未旋转——消费方经
+    /// `PageGeometry` 的 /Rotate 归一，SearchRect 文档同口径）。
+    fn page_text_geometry(
+        &self,
+        idx: PageIndex,
+    ) -> Result<crate::command::PageTextGeometry, CommandError> {
+        let pages = self.document.pages();
+        let count = pages.len();
+        if idx.0 as i64 >= i64::from(count) {
+            // 引擎层防御（与 extract_text 同口径）。
+            return Err(CommandError::InvalidPage(idx));
+        }
+        let page = pages.get(idx.0 as i32).map_err(CommandError::engine)?;
+        let text_page = page.text().map_err(CommandError::engine)?;
+        let chars = text_page.chars();
+        let char_count = chars.len();
+        let mut char_rects = Vec::with_capacity(char_count);
+        for i in 0..char_count {
+            let rect = chars
+                .get(i)
+                .map_err(CommandError::engine)
+                .and_then(|c| c.tight_bounds().map_err(CommandError::engine))
+                .map(|b| crate::command::SearchRect {
+                    left: b.left().value,
+                    bottom: b.bottom().value,
+                    right: b.right().value,
+                    top: b.top().value,
+                })
+                // 无盒字符（tight_bounds 失败——生成字符/退化形态）：
+                // 零面积退化盒占位保对齐（hit_rects 分组面零面积并入
+                // 当前组，不产出空组）。
+                .unwrap_or(crate::command::SearchRect {
+                    left: 0.0,
+                    bottom: 0.0,
+                    right: 0.0,
+                    top: 0.0,
+                });
+            char_rects.push(rect);
+        }
+        Ok(crate::command::PageTextGeometry {
+            text: text_page.all(),
+            char_rects,
+        })
+    }
 }
 
 /// 书签 → 大纲节点（目标解析失败/越界 → None（丢弃子树）；标题缺失
