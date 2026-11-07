@@ -1778,6 +1778,7 @@ version = "0.1.0"
 dependencies = [
  "mdc-collab",
  "mdc-evidence",
+ "serde_json",
  "yrs",
 ]
 
