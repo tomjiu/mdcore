@@ -279,9 +279,18 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             })?;
             Ok(CanvasCommand::Reorder { id: s("id")?, op })
         }
+        // #405：标签命令（add_tag / remove_tag——集语义幂等）。
+        "add_tag" => Ok(CanvasCommand::AddTag {
+            id: s("id")?,
+            tag: s("tag")?,
+        }),
+        "remove_tag" => Ok(CanvasCommand::RemoveTag {
+            id: s("id")?,
+            tag: s("tag")?,
+        }),
         other => Err(bad_json(
             "command",
-            format!("unknown command `{other}` (11 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder)"),
+            format!("unknown command `{other}` (13 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder/add_tag/remove_tag)"),
         )),
     }
 }
@@ -331,8 +340,14 @@ pub fn object_json(o: &CanvasObject) -> String {
         Some(StrokeTool::Highlighter) => "\"highlighter\"".to_string(),
         None => "null".to_string(),
     };
+    // #405：标签集（排序 Vec → JSON 数组）。
+    let tags: Vec<String> = o
+        .tags
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect();
     format!(
-        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"props\":{{{}}}}}",
+        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"tags\":[{}],\"props\":{{{}}}}}",
         serde_json::to_string(&o.id).unwrap(),
         kind_wire(o.kind),
         o.x,
@@ -347,6 +362,7 @@ pub fn object_json(o: &CanvasObject) -> String {
         width,
         tool,
         serde_json::to_string(&o.z_index).unwrap(),
+        tags.join(","),
         props.join(","),
     )
 }
@@ -365,6 +381,9 @@ pub fn receipt_json(outcome: &CommandOutcome, undo_depth: usize, undo_cleared: b
         CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
         CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
         CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
+        // #405：标签回执（幂等无变化也回此回执——同 reordered 纪律）。
+        CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),
+        CommandOutcome::TagRemoved { id } => ("tag_removed", "id", id.clone()),
     };
     format!(
         "{{\"outcome\":\"{kind}\",\"{key}\":{},\"undo_depth\":{undo_depth},\"undo_cleared\":{undo_cleared}}}",
@@ -425,6 +444,12 @@ fn parse_actor(s: &str) -> Result<Actor, CvError> {
         "ai" => Ok(Actor::Ai),
         other => Err(bad_json("actor", format!("unknown `{other}` (human|ai)"))),
     }
+}
+
+/// #405：按标签检索（纯内核——wasm 方法薄委托，原生 cargo test 面）。
+pub fn list_by_tag_json_core(session: &CanvasSession, tag: &str) -> String {
+    let objs: Vec<String> = session.list_by_tag(tag).iter().map(object_json).collect();
+    format!("[{}]", objs.join(","))
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +578,11 @@ impl WasmCanvas {
     /// 与宿主侧 `raw === null` 检查契约直配）。
     pub fn object_json(&self, id: &str) -> Option<String> {
         self.session.find_object(id).map(|o| object_json(&o))
+    }
+
+    /// #405：按标签检索（读模型 JSON——ID 字典序；AI 检索/过滤面）。
+    pub fn list_by_tag_json(&self, tag: &str) -> String {
+        list_by_tag_json_core(&self.session, tag)
     }
 
     /// 对象语义指纹（证据关联锚——"fnv64:{:016x}"）。

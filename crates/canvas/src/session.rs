@@ -42,6 +42,9 @@ const F_TOOL: &str = "tool";
 /// #402：z 序键（fractional index 字符串——字典序即 z 序；缺省
 /// `zorder::DEFAULT_KEY`，存量对象读侧兼容）。
 const F_ZINDEX: &str = "zindex";
+/// #405：标签集（嵌套 Map：tag → true——集字段的 CRDT 自然形状，
+/// 并发加不同 tag 联合合并；对比 members 整值替换的丢失面）。
+const F_TAGS: &str = "tags";
 
 /// 画布对象种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,6 +137,11 @@ pub struct CanvasObject {
     /// Group 对象的 z 不影响成员渲染（成员各自成图元），字段统一
     /// 仅为模型一致性。
     pub z_index: String,
+    /// #405：跨区分类标签（props 之外的一等公民——AI 检索/过滤面）。
+    /// 集语义：读侧排序去重（确定性读模型）；不塞 props 的理由：
+    /// props 是 string→string 自由字典，无法索引、无法区分业务 tag
+    /// 与样式属性（研究仓 canvas/mdcore-mapping.md §6 裁决）。
+    pub tags: Vec<String>,
     /// 开放属性（label/color/…；字符串值面）。
     pub props: BTreeMap<String, String>,
 }
@@ -158,6 +166,7 @@ impl Default for CanvasObject {
             width: None,
             tool: None,
             z_index: crate::zorder::DEFAULT_KEY.to_string(),
+            tags: vec![],
             props: BTreeMap::new(),
         }
     }
@@ -389,6 +398,17 @@ pub enum CanvasCommand {
         id: String,
         op: ReorderOp,
     },
+    /// #405：加分类标签（幂等——已有该 tag = 零写入零事件，同
+    /// reorder 幂等纪律）。
+    AddTag {
+        id: String,
+        tag: String,
+    },
+    /// #405：移除分类标签（幂等——无该 tag = 零写入零事件）。
+    RemoveTag {
+        id: String,
+        tag: String,
+    },
 }
 
 /// 命令回执。
@@ -433,6 +453,14 @@ pub enum CommandOutcome {
         id: String,
     },
     StrokeStyled {
+        id: String,
+    },
+    /// #405：标签已加（幂等无变化也回此回执）。
+    TagAdded {
+        id: String,
+    },
+    /// #405：标签已移除（幂等无变化也回此回执）。
+    TagRemoved {
         id: String,
     },
 }
@@ -789,6 +817,15 @@ impl CanvasSession {
         out
     }
 
+    /// #405：按标签检索（读模型——ID 字典序，同 [`Self::objects`]
+    /// 确定性面；AI 检索/过滤消费面）。
+    pub fn list_by_tag(&self, tag: &str) -> Vec<CanvasObject> {
+        self.objects()
+            .into_iter()
+            .filter(|o| o.tags.iter().any(|t| t == tag))
+            .collect()
+    }
+
     pub fn find_object(&self, id: &str) -> Option<CanvasObject> {
         let root = self.root();
         let txn = self.doc.transact();
@@ -921,6 +958,14 @@ impl CanvasSession {
             CanvasCommand::Reorder { id, op } => {
                 self.reorder_object(actor, &id, op)?;
                 CommandOutcome::Reordered { id }
+            }
+            CanvasCommand::AddTag { id, tag } => {
+                self.add_tag(actor, &id, &tag)?;
+                CommandOutcome::TagAdded { id }
+            }
+            CanvasCommand::RemoveTag { id, tag } => {
+                self.remove_tag(actor, &id, &tag)?;
+                CommandOutcome::TagRemoved { id }
             }
         };
         Ok(CommandReceipt {
@@ -1127,6 +1172,10 @@ impl CanvasSession {
             obj.insert(F_H.into(), In::Any(Any::Number(Number::Float(h))));
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(Self::props_prelim(props)));
+            // #405：预建空标签 Map（props 同款先例）——并发首笔
+            // add_tag 成为既有 Map 内的键级操作（联合合并），而非
+            // F_TAGS 键上的整值 Map 插入（键级 LWW 互相覆盖丢 tag）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, id.clone(), In::Map(obj));
@@ -1242,6 +1291,8 @@ impl CanvasSession {
             obj.insert(F_TO.into(), In::Any(Any::String(to.into())));
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(Self::props_prelim(props)));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, id.clone(), In::Map(obj));
@@ -1358,6 +1409,8 @@ impl CanvasSession {
             );
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, gid.clone(), In::Map(obj));
@@ -1472,6 +1525,8 @@ impl CanvasSession {
             obj.insert(F_TOOL.into(), In::Any(Any::String(tool.wire().into())));
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, id.clone(), In::Map(obj));
@@ -1479,6 +1534,90 @@ impl CanvasSession {
         }
         self.enforce_undo_limit(actor);
         Ok(id)
+    }
+
+    // ── 标签面（#405）────────────────────────────────────────────
+
+    /// 标签合法性：非空（空串 = 无语义分类，拒收；敌意长度走
+    /// check_inbound 入站面）。
+    fn check_tag(tag: &str) -> Result<(), CanvasError> {
+        if tag.is_empty() {
+            return Err(CanvasError::InvalidInput("标签不可为空".into()));
+        }
+        Ok(())
+    }
+
+    /// #405：加标签（幂等——已有该 tag 零写入零事件，同 reorder 纪律）。
+    ///
+    /// 载体为嵌套 Map（tag → true）：并发加不同 tag → 键集联合合并
+    /// （两笔都活）；并发加同 tag → 键级幂等。对比 Any::Array 整值
+    /// 替换（后写覆盖前写——并发丢 tag，members 的 P2-2 已知丢失面）。
+    fn add_tag(&mut self, actor: Actor, id: &str, tag: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + tag.len() + 64)?;
+        Self::check_tag(tag)?;
+        let m = self.object_map(id)?;
+        // 读域：已有该 tag → 幂等短路（零 CRDT 字节 = 零事件）；
+        // 同时取嵌套 tags Map 句柄（yrs 读写事务同锁，遮蔽持有 =
+        // 死锁 p18 纪律——句柄在读域取，写在写域做）。
+        let tags_map = {
+            let txn = self.doc.transact();
+            match m.get(&txn, F_TAGS) {
+                Some(Out::YMap(t)) => {
+                    if t.get(&txn, tag).is_some() {
+                        return Ok(()); // 幂等：零写入零事件
+                    }
+                    Some(t)
+                }
+                _ => None,
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            match tags_map {
+                Some(t) => {
+                    t.insert(&mut txn, tag, In::Any(Any::Bool(true)));
+                }
+                None => {
+                    // 首写建 Map（单键 Prelim）。
+                    let prelim: MapPrelim =
+                        std::iter::once((tag, In::Any(Any::Bool(true)))).collect();
+                    m.insert(&mut txn, F_TAGS, In::Map(prelim));
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    /// #405：移除标签（幂等——无该 tag 零写入零事件）。
+    fn remove_tag(&mut self, actor: Actor, id: &str, tag: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + tag.len() + 64)?;
+        Self::check_tag(tag)?;
+        let m = self.object_map(id)?;
+        let tags_map = {
+            let txn = self.doc.transact();
+            match m.get(&txn, F_TAGS) {
+                Some(Out::YMap(t)) => {
+                    if t.get(&txn, tag).is_none() {
+                        return Ok(()); // 幂等：零写入零事件
+                    }
+                    Some(t)
+                }
+                // 无标签面 = 必无该 tag → 幂等。
+                _ => None,
+            }
+        };
+        let Some(t) = tags_map else {
+            return Ok(());
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            t.remove(&mut txn, tag);
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
     }
 
     fn set_stroke_style(
@@ -1601,6 +1740,15 @@ fn read_object(root: &yrs::MapRef, txn: &yrs::Transaction, id: &str) -> Option<C
     // #402：z 序键（缺省 DEFAULT_KEY——存量对象/敌意缺字段兼容；
     // 不在此校验键型：排序面只做字典序比较，重排命令面才校验）。
     let z_index = str_field(F_ZINDEX).unwrap_or_else(|| crate::zorder::DEFAULT_KEY.to_string());
+    // #405：标签集（嵌套 Map keys → 排序 Vec；缺省/敌意形状 = 空集）。
+    let mut tags = match m.get(txn, F_TAGS) {
+        Some(Out::YMap(t)) => t
+            .iter(txn)
+            .map(|(k, _)| k.to_string())
+            .collect::<Vec<String>>(),
+        _ => vec![],
+    };
+    tags.sort();
     let mut props = BTreeMap::new();
     if let Some(Out::YMap(p)) = m.get(txn, F_PROPS) {
         for (k, v) in p.iter(txn) {
@@ -1624,6 +1772,7 @@ fn read_object(root: &yrs::MapRef, txn: &yrs::Transaction, id: &str) -> Option<C
         width,
         tool,
         z_index,
+        tags,
         props,
     })
 }
@@ -1673,6 +1822,11 @@ pub fn fingerprint_object(o: &CanvasObject) -> String {
     // #402：z 序键入指纹（重排 = 语义变更 → 证据失效——与「位置漂移
     // 即语义变更」同粒度：遮挡关系是视觉语义面）。
     acc.push_str(&format!("|z={}", o.z_index));
+    // #405：标签集入指纹（分类变更 = 语义变更 → 证据失效——与 props
+    // 同粒度；集语义排序后指纹，同集不同序同指纹）。
+    let mut ts = o.tags.clone();
+    ts.sort();
+    acc.push_str(&format!("|t={}", ts.join(",")));
     mdc_evidence::Fnv64.fingerprint(acc.as_bytes()).0
 }
 
