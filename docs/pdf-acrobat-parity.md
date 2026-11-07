@@ -57,7 +57,7 @@
 |---|---|---|---|
 | ① | 链接点击导航未接宿主 | P2 | 数据面就绪（`links.rs` 读全 /Dest/命名树/URI），壳/web 未接 click→page 路由与外链策略——接线即可闭环 |
 | ③ | 壳侧无位图渲染 | P2 | mang-shell `pdf_doc.rs` 走文本行模型；web 面有完整 canvas 渲染（`pdf_view.ts` LRU 64MB）——壳侧渲染待 #68 阅读面 |
-| ④ | 书签编辑/命名目标 | P3 | 仅页目标读面（`outline.rs`）；web `buildOutlineJson` 恒空树（`pdf_view.ts:192` 登记） |
+| ④ | 书签编辑/命名目标 | P3 | 读面（`outline.rs`）；**web 大纲树已接**（#463：`pdf.js getOutline` → 树 UI + 点击跳页 + 会话 ctor 实数据注入，e2e `pdf_outline.py` 10 锁）；书签**编辑**/命名目标仍不在 |
 | ⑤ | 加密档解密/权限位模型 | P3 | 曾解密档只读放行写拒（S5 策略）；无口令输入 UI、无 /Encrypt P 位遵从 |
 | ⑥ | 验签/签署 | P3 | 结构验签在（`signature.rs`）；密码学校验（链/时间戳/摘要复算）与签署域不在 v1——pdfi_signature 头注如实登记 |
 | ⑦ | /Info/XMP 元数据 | P3 | 仅 id/文件名/页数；Acrobat 有完整属性面板 |

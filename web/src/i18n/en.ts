@@ -203,6 +203,10 @@ export const en = {
   'pdf.annotKNote': 'note',
   'pdf.annotKFreeText': 'freetext',
   'pdf.annotKInk': 'ink',
+  // #463（长尾④）：大纲面（pdf.js getOutline → 树 + 点击跳页）
+  'pdf.outline': 'outline',
+  'pdf.outlineTitle': 'Document outline (bookmarks) panel',
+  'pdf.outlineEmpty': 'no outline in this document',
   'pdf.zoomOutTitle': 'zoom out',
   'pdf.zoomInTitle': 'zoom in',
   'pdf.fitWidth': 'fit width',
