@@ -6835,6 +6835,16 @@ impl DocxWriter {
         }
     }
 
+    /// #413（docx_revision.rs impl 桥的计数面）：非 RunSpec 发射
+    /// （修订段——`insert_run_revised`/`delete_run_revised` 直构
+    /// docx-rs run）的段/run 落账。pub(crate) 单点纪律与
+    /// [`Self::count_specs`] 同源（分文件 impl 桥访问计数器——
+    /// [`crate::style`]/[`crate::numbering`] 先例同款）。
+    pub(crate) fn count_raw_emission(&mut self, paras: u64, runs: u64) {
+        self.paragraphs += paras;
+        self.runs += runs;
+    }
+
     /// 默认页眉（单段 run 序——run 级加粗/斜体/链接/脚注/域）。
     /// **default 槽位，重复调用 = 原位替换**（引擎公开 `Docx::header` 按调用
     /// 次数递增 rels 计数——重复调用会发射 rIdHeader{n+1} 关系而无

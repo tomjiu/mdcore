@@ -116,6 +116,10 @@ pub mod docx_edit;
 // #226 R2：docx-rs 读层 panic 预检防御（私有 seam——docx 读面内部消费，
 // 模块文档含位点清单与修复策略）。
 mod docx_panic_guard;
+// #413：DOCX 修订标记写面（w:ins/w:del 输出——redline 硬前提）。
+// RevisionMark + DocxWriter 修订段发射（对 DocxWriter 的分文件 impl
+// 桥——style/numbering 先例同款）。
+pub mod docx_revision;
 // #307 阶段①：DOCX → PDF 导出桥（LibreOffice headless 通道——探测/
 // 独立 profile/超时/分类错误含无 LO 安装指引）。
 pub mod convert;
