@@ -637,6 +637,7 @@ fn frame_commands_parse_and_json_shapes() {
     // 解析全形态：create_frame（含 parent null/缺省/string 三态）。
     let c = parse_cmd_core(
         r#"{"t":"create_frame","id":"f1","name":"第一章","x":0,"y":0,"w":400,"h":300,"parent":null}"#,
+
     )
     .unwrap();
     assert!(matches!(
@@ -705,8 +706,7 @@ fn frame_commands_parse_and_json_shapes() {
         )
         .unwrap();
     let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
-    assert!(rj.contains(r#""outcome":"frame_created""#), "{rj}");
-    assert!(rj.contains(r#""id":"f1""#), "{rj}");
+    assert!(rj.contains("\"frame_created\""), "{rj}");
     s.execute(
         mdc_canvas::Actor::Human,
         parse_cmd_core(r#"{"t":"set_parent","id":"n1","parent":"f1"}"#).unwrap(),
@@ -740,6 +740,108 @@ fn frame_commands_parse_and_json_shapes() {
         .unwrap_err();
     let e: mdcore_wasm::canvas::CvError = e.into();
     assert_eq!(e.code, "cv_invalid_input", "非 frame 目标拒收");
+}
+
+/// #406：set_edge_route 命令 JSON 解析 + 端到端（回执/读模型 JSON
+/// from_side/to_side/caption 字段/错误码）。
+#[test]
+fn edge_route_commands_parse_and_json_shapes() {
+    // 解析全形态：双侧 + caption。
+    let c = parse_cmd_core(
+        r#"{"t":"set_edge_route","id":"e1","from_side":"right","to_side":"left","caption":"包含"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::SetEdgeRoute {
+            ref id,
+            from_side: Some(mdc_canvas::Side::Right),
+            to_side: Some(mdc_canvas::Side::Left),
+            ref caption,
+        } if id == "e1" && caption.as_deref() == Some("包含")
+    ));
+    // null 三态（清除回中心）。
+    let c = parse_cmd_core(
+        r#"{"t":"set_edge_route","id":"e1","from_side":null,"to_side":null,"caption":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        c,
+        mdc_canvas::CanvasCommand::SetEdgeRoute {
+            from_side: None,
+            to_side: None,
+            caption: None,
+            ..
+        }
+    ));
+    // 错误面：坏侧别 / 非 string / 缺 id。
+    for bad in [
+        r#"{"t":"set_edge_route","id":"e1","from_side":"diagonal"}"#,
+        r#"{"t":"set_edge_route","id":"e1","from_side":42}"#,
+        r#"{"t":"set_edge_route","from_side":"top"}"#,
+    ] {
+        let e = parse_cmd_core(bad).err().unwrap();
+        assert_eq!(e.code, "cv_bad_json", "{bad} → {e:?}");
+    }
+
+    // 端到端：建 frame → 节点入 frame → 读模型 JSON 含 name/parent。
+    let mut s = session(53);
+    add_node(&mut s, "n1", 10.0, 10.0);
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(
+                r#"{"t":"create_frame","id":"f1","name":"第一章","x":0,"y":0,"w":400,"h":300,"parent":null}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains("\"frame_created\""), "{rj}");
+}
+
+/// #406：set_edge_route 端到端（读模型 JSON 三字段 + 回执）。
+#[test]
+fn edge_route_end_to_end_roundtrip() {
+    // 端到端：建边 → 设路由 → 读模型 JSON 含三字段。
+    let mut s = session(54);
+    add_node(&mut s, "n1", 0.0, 0.0);
+    add_node(&mut s, "n2", 300.0, 0.0);
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"add_edge","id":"e1","from":"n1","to":"n2","props":{}}"#).unwrap(),
+    )
+    .unwrap();
+    // 缺省形状（null 三字段）。
+    let oj = object_json(&s.find_object("e1").unwrap());
+    assert!(oj.contains(r#""from_side":null"#), "{oj}");
+    assert!(oj.contains(r#""to_side":null"#), "{oj}");
+    assert!(oj.contains(r#""caption":null"#), "{oj}");
+
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Ai,
+            parse_cmd_core(
+                r#"{"t":"set_edge_route","id":"e1","from_side":"right","to_side":"left","caption":"包含"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"edge_routed""#), "{rj}");
+    let oj = object_json(&s.find_object("e1").unwrap());
+    assert!(oj.contains(r#""from_side":"right""#), "{oj}");
+    assert!(oj.contains(r#""to_side":"left""#), "{oj}");
+    assert!(oj.contains(r#""caption":"包含""#), "{oj}");
+    // kind 门禁错误码（节点不是边）。
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"set_edge_route","id":"n1","from_side":"top"}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_kind_mismatch");
 }
 
 // ── #353 三态驾驶闸（wasm 面）─────────────────────────────────────

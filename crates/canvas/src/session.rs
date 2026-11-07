@@ -32,6 +32,11 @@ const F_W: &str = "w";
 const F_H: &str = "h";
 const F_FROM: &str = "from";
 const F_TO: &str = "to";
+/// #406：边锚侧字段（Top/Right/Bottom/Left 线名）。
+const F_FROM_SIDE: &str = "from_side";
+const F_TO_SIDE: &str = "to_side";
+/// #406：边标题字段。
+const F_CAPTION: &str = "caption";
 const F_MEMBERS: &str = "members";
 const F_PROPS: &str = "props";
 /// 笔迹专有四键（#350——非 Stroke 对象不写不读）。
@@ -130,6 +135,12 @@ pub struct CanvasObject {
     /// Edge 端点（节点 ID；非 Edge = None）。
     pub from: Option<String>,
     pub to: Option<String>,
+    /// #406：边锚侧（渲染锚点 = 指定边中点；缺省 None = 中心——
+    /// 既有行为。双侧同时指定时渲染为直角折线路由）。
+    pub from_side: Option<Side>,
+    pub to_side: Option<Side>,
+    /// #406：边标题（渲染在路径中点；关系语义的可见载体）。
+    pub caption: Option<String>,
     /// Group 成员（对象 ID 集；非 Group = 空）。
     pub members: Vec<String>,
     /// 笔迹采样点（(x, y) 原始序列；非 Stroke = 空）——**不存
@@ -177,6 +188,9 @@ impl Default for CanvasObject {
             h: 0.0,
             from: None,
             to: None,
+            from_side: None,
+            to_side: None,
+            caption: None,
             members: vec![],
             points: vec![],
             color: None,
@@ -474,6 +488,14 @@ pub enum CanvasCommand {
         width: f64,
         tool: StrokeTool,
     },
+    /// #406：边路由/标题终态替换（锚侧 ×2 + caption——循 SetStrokeStyle
+    /// 先例；None = 清除该面，双侧 None + None caption = 回中心直线）。
+    SetEdgeRoute {
+        id: String,
+        from_side: Option<Side>,
+        to_side: Option<Side>,
+        caption: Option<String>,
+    },
     /// #402：z 序重排（fractional index 改写——单对象原子属性，
     /// O(1) 无写放大）。
     Reorder {
@@ -519,6 +541,45 @@ pub enum CanvasCommand {
     SetDriveMode {
         mode: DriveMode,
     },
+}
+
+/// #406：边锚侧（连接到节点的哪条边——JSON Canvas fromSide/toSide
+/// 规范级）。渲染锚点 = 该边中点；缺省 None = 中心（既有行为，
+/// 向后兼容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl Side {
+    /// 线名（JSON Canvas fromSide/toSide 取值）。
+    pub fn wire(self) -> &'static str {
+        match self {
+            Side::Top => "top",
+            Side::Right => "right",
+            Side::Bottom => "bottom",
+            Side::Left => "left",
+        }
+    }
+
+    /// 线名 → Side（未知值 = None；`from_wire` 命名别名，与 ObjectKind 同名口径）。
+    pub fn from_wire(s: &str) -> Option<Side> {
+        Self::parse(s)
+    }
+
+    /// 线名 → Side（未知值 = None）。
+    pub fn parse(s: &str) -> Option<Side> {
+        match s {
+            "top" => Some(Side::Top),
+            "right" => Some(Side::Right),
+            "bottom" => Some(Side::Bottom),
+            "left" => Some(Side::Left),
+            _ => None,
+        }
+    }
 }
 
 /// 命令回执。
@@ -574,6 +635,10 @@ pub enum CommandOutcome {
         id: String,
     },
     StrokeStyled {
+        id: String,
+    },
+    /// #406：边路由/标题已设（终态替换）。
+    EdgeRouted {
         id: String,
     },
     /// #405：标签已加（幂等无变化也回此回执）。
@@ -1139,6 +1204,15 @@ impl CanvasSession {
             } => {
                 self.set_stroke_style(actor, &id, &color, width, tool)?;
                 CommandOutcome::StrokeStyled { id }
+            }
+            CanvasCommand::SetEdgeRoute {
+                id,
+                from_side,
+                to_side,
+                caption,
+            } => {
+                self.set_edge_route(actor, &id, from_side, to_side, caption)?;
+                CommandOutcome::EdgeRouted { id }
             }
             CanvasCommand::Reorder { id, op } => {
                 self.reorder_object(actor, &id, op)?;
@@ -2144,6 +2218,75 @@ impl CanvasSession {
         Ok(())
     }
 
+    /// #406：边路由/标题终态替换（锚侧 + caption；None = 删键清除——
+    /// 读模型不留旧值）。Edge kind 门禁（同 set_stroke_style 纪律：
+    /// 读域取引用，出域再写——yrs 读写同锁 p18）。
+    fn set_edge_route(
+        &mut self,
+        actor: Actor,
+        id: &str,
+        from_side: Option<Side>,
+        to_side: Option<Side>,
+        caption: Option<String>,
+    ) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + caption.as_deref().map(|c| c.len()).unwrap_or(0) + 64)?;
+        if let Some(c) = &caption {
+            if c.is_empty() {
+                return Err(CanvasError::InvalidInput(
+                    "边标题不可为空串（清除用 None）".into(),
+                ));
+            }
+        }
+        let m = {
+            let root = self.root();
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                Some(Out::YMap(m)) => {
+                    let is_edge = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Edge.wire()
+                    );
+                    if !is_edge {
+                        return Err(CanvasError::KindMismatch {
+                            object_id: id.to_string(),
+                            op: "set_edge_route",
+                        });
+                    }
+                    m
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            let side_in = |txn: &mut yrs::TransactionMut, key: &str, v: Option<Side>| match v {
+                Some(s) => {
+                    m.insert(txn, key, In::Any(Any::String(s.wire().into())));
+                }
+                None => {
+                    m.remove(txn, key);
+                }
+            };
+            side_in(&mut txn, F_FROM_SIDE, from_side);
+            side_in(&mut txn, F_TO_SIDE, to_side);
+            match &caption {
+                Some(c) => {
+                    m.insert(&mut txn, F_CAPTION, In::Any(Any::String(c.clone().into())));
+                }
+                None => {
+                    m.remove(&mut txn, F_CAPTION);
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
     /// #404：reparent（ID 恒不变——树结构重挂；parent = None 提顶层）。
     ///
     /// 对象种类不限（节点/边/分组/笔迹/frame 皆可入 frame）；parent
@@ -2325,6 +2468,9 @@ fn read_object(root: &yrs::MapRef, txn: &yrs::Transaction, id: &str) -> Option<C
         h: num(F_H),
         from: str_field(F_FROM),
         to: str_field(F_TO),
+        from_side: str_field(F_FROM_SIDE).and_then(|s| Side::parse(&s)),
+        to_side: str_field(F_TO_SIDE).and_then(|s| Side::parse(&s)),
+        caption: str_field(F_CAPTION),
         members,
         points,
         color,
@@ -2354,6 +2500,16 @@ pub fn fingerprint_object(o: &CanvasObject) -> String {
             o.from.as_deref().unwrap_or(""),
             o.to.as_deref().unwrap_or("")
         ));
+        // #406：锚侧 + 标题入指纹（路由/标题变更 = 语义变更）。
+        acc.push_str(&format!(
+            "|fs={}",
+            o.from_side.map(|s| s.wire()).unwrap_or("")
+        ));
+        acc.push_str(&format!(
+            "|ts={}",
+            o.to_side.map(|s| s.wire()).unwrap_or("")
+        ));
+        acc.push_str(&format!("|cap={}", o.caption.as_deref().unwrap_or("")));
     }
     if o.kind == ObjectKind::Group {
         let mut ms = o.members.clone();
