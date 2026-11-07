@@ -53,7 +53,7 @@
 type WasmModule = typeof import('../pkg/mdcore_wasm.js');
 import { wasmBoot } from './wasm_boot.js';
 import { mount_surface_guide } from './empty_state.js';
-import { t } from './i18n/index.js';
+import { t, type DictKey } from './i18n/index.js';
 // #426（#44 步 2）：perfect-freehand（MIT）——引擎存原始采样点不存
 // outline（#44 裁决），平滑/加粗消费侧重算：渲染与预览共用本库。
 import { getStroke } from 'perfect-freehand';
@@ -182,6 +182,27 @@ const GROUP_PAD = 12;
 /** #426 画笔默认（步 3 选择器的前置固定值——引擎域：#RRGGBB / width>0）。 */
 const BRUSH_COLOR = '#1f1f1f';
 const BRUSH_WIDTH = 4;
+/** 步 3 预设色板（8 色——前 6 色值与 PDF 墨迹面 #45 对齐：红/黄/绿/
+ * 蓝/紫 + 白板默认墨黑；灰/橙为白板增量。共享组件抽取留待第三消费方
+ * 出现时再议——本面独立定义，值级对齐即互通）。 */
+const BRUSH_PALETTE: readonly (readonly [string, DictKey])[] = [
+  ['#1f1f1f', 'cv.colorInk'],
+  ['#6e6e6e', 'cv.colorGray'],
+  ['#e03131', 'cv.colorRed'],
+  ['#f08c00', 'cv.colorOrange'],
+  ['#ffd400', 'cv.colorYellow'],
+  ['#30a46c', 'cv.colorGreen'],
+  ['#1a73e8', 'cv.colorBlue'],
+  ['#8e4ec6', 'cv.colorPurple'],
+];
+/** 步 3 粗细档位（#44 原文「细/中/粗/特粗」4 档；中档 = #426 固定值
+ * 4——默认态视觉零漂移）。 */
+const BRUSH_WIDTHS: readonly (readonly [number, DictKey])[] = [
+  [2, 'cv.brushThin'],
+  [4, 'cv.brushMedium'],
+  [8, 'cv.brushThick'],
+  [14, 'cv.brushXThick'],
+];
 /** 采样阈值（世界坐标——相邻点距低于此不入点列；微抖不入核，
  * 与引擎「重复点无害」语义的输入侧配合）。 */
 const BRUSH_SAMPLE_DIST = 1.0;
@@ -410,6 +431,12 @@ export class CanvasViewUI {
   /** 在笔采样（null = 非绘制中；预览 path 挂笔迹层，提交后由
    * touched 渲染接管——预览元素即删）。 */
   private brushLive: { pts: [number, number][]; el: SVGPathElement } | null = null;
+  // 步 3 画笔样式（选择器同源驱动预览与载荷；默认 = #426 固定值，
+  // 存量视觉零漂移。引擎域校验：#RGB/#RRGGBB、width>0、finite——
+  // 选择器面只产合法值，无二次防御）。
+  private brushTool: 'pen' | 'highlighter' = 'pen';
+  private brushColor: string = BRUSH_COLOR;
+  private brushWidth: number = BRUSH_WIDTH;
 
   // 相机态（#367——视图层临时态，不入模型；同滚动位置语义）。
   // 卸载命题：applyCamera = 恰一次 setAttribute，零 renderObject、
@@ -485,6 +512,77 @@ export class CanvasViewUI {
     const restoreBtn = mkBtn('canvas-restore-btn', t('cv.restore'), t('cv.restoreTitle'));
     const clearBtn = mkBtn('canvas-clear-btn', t('cv.clear'), t('cv.clearTitle'));
 
+    // 步 3 画笔样式选择器（工具/颜色/粗细——与载荷同源：change 即改
+    // this.brush*，预览与提交直接消费；id 面 = canvas-brush-tool /
+    // -color / -width / -custom。pdf_view #45 同形态，色板值级对齐）。
+    const brushTool = document.createElement('select');
+    brushTool.id = 'canvas-brush-tool';
+    brushTool.className = 'cv-sel';
+    brushTool.title = t('cv.brushToolTitle');
+    for (const [value, key] of [
+      ['pen', 'cv.brushPen'],
+      ['highlighter', 'cv.brushHighlighter'],
+    ] as const) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = t(key);
+      if (value === this.brushTool) o.selected = true;
+      brushTool.appendChild(o);
+    }
+    brushTool.addEventListener('change', () => {
+      this.brushTool = brushTool.value as 'pen' | 'highlighter';
+    });
+
+    /** 自定义色（#44 原文「6-8 个预设色 + 自定义」——原生 color
+     * 输入；值域 #RRGGBB 与引擎校验口径天然一致）。 */
+    const brushCustom = document.createElement('input');
+    brushCustom.type = 'color';
+    brushCustom.id = 'canvas-brush-custom';
+    brushCustom.className = 'cv-color';
+    brushCustom.title = t('cv.brushCustomTitle');
+    brushCustom.value = this.brushColor;
+
+    const brushColor = document.createElement('select');
+    brushColor.id = 'canvas-brush-color';
+    brushColor.className = 'cv-sel';
+    brushColor.title = t('cv.brushColorTitle');
+    for (const [value, key] of BRUSH_PALETTE) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = t(key);
+      if (value === this.brushColor) o.selected = true;
+      brushColor.appendChild(o);
+    }
+
+    // 双向单源同步：任一控件改态，另一控件跟随（在预设面板内的值才
+    // 联动 select 选中；面板外保持显示上次预设）——状态真源始终是
+    // this.brushColor。
+    brushCustom.addEventListener('input', () => {
+      this.brushColor = brushCustom.value;
+      if (BRUSH_PALETTE.some(([v]) => v === brushCustom.value)) {
+        brushColor.value = brushCustom.value;
+      }
+    });
+    brushColor.addEventListener('change', () => {
+      this.brushColor = brushColor.value;
+      brushCustom.value = this.brushColor;
+    });
+
+    const brushWidth = document.createElement('select');
+    brushWidth.id = 'canvas-brush-width';
+    brushWidth.className = 'cv-sel';
+    brushWidth.title = t('cv.brushWidthTitle');
+    for (const [w, key] of BRUSH_WIDTHS) {
+      const o = document.createElement('option');
+      o.value = String(w);
+      o.textContent = t(key);
+      if (w === this.brushWidth) o.selected = true;
+      brushWidth.appendChild(o);
+    }
+    brushWidth.addEventListener('change', () => {
+      this.brushWidth = Number(brushWidth.value);
+    });
+
     // #367 相机按钮组：缩小 / 百分比指示 / 放大 / 适配 / 复位。
     const zoomOutBtn = mkBtn('canvas-zoom-out-btn', t('cv.zoomOut'), t('cv.zoomOutTitle'));
     const zoomInBtn = mkBtn('canvas-zoom-in-btn', t('cv.zoomIn'), t('cv.zoomInTitle'));
@@ -499,7 +597,8 @@ export class CanvasViewUI {
     status.id = 'canvas-status';
 
     toolbar.append(
-      addNodeBtn, edgeModeBtn, brushBtn, groupBtn, ungroupBtn, undoBtn, redoBtn,
+      addNodeBtn, edgeModeBtn, brushBtn, brushTool, brushColor, brushCustom, brushWidth,
+      groupBtn, ungroupBtn, undoBtn, redoBtn,
       aiAddBtn, saveBtn, restoreBtn, clearBtn,
       zoomOutBtn, zoomLabel, zoomInBtn, fitBtn, camResetBtn, status,
     );
@@ -1284,6 +1383,11 @@ export class CanvasViewUI {
       if (this.brushMode && e.button === 0) {
         const path = document.createElementNS(SVG_NS, 'path');
         path.classList.add('cv-brush-preview');
+        // 步 3 预览同步：所见即所提交（色/宽/工具与载荷同源——
+        // 荧光笔预览即半透明，消除 #426 预览黑/成品深灰的视觉错位）。
+        path.setAttribute('fill', this.brushColor);
+        path.setAttribute('fill-opacity',
+          this.brushTool === 'highlighter' ? `${STROKE_HL_OPACITY}` : '1');
         this.layerStrokes?.appendChild(path);
         this.brushLive = { pts: [[p.x, p.y]], el: path };
         svg.setPointerCapture(e.pointerId);
@@ -1389,7 +1493,7 @@ export class CanvasViewUI {
         if (dx * dx + dy * dy >= BRUSH_SAMPLE_DIST * BRUSH_SAMPLE_DIST) {
           pts.push([p.x, p.y]);
           this.brushLive.el.setAttribute('d',
-            strokePathD(pts, 'pen', BRUSH_WIDTH));
+            strokePathD(pts, this.brushTool, this.brushWidth));
         }
         return;
       }
@@ -1583,12 +1687,13 @@ export class CanvasViewUI {
     this.brushLive = null;
     live.el.remove();
     if (live.pts.length < 2 || !this.main) return;
+    // 步 3：色/宽/工具从选择器状态透传（预览同源——提交即所见）。
     const r = this.exec('human', JSON.stringify({
       t: 'add_stroke', id: null,
       points: live.pts,
-      color: BRUSH_COLOR,
-      width: BRUSH_WIDTH,
-      tool: 'pen',
+      color: this.brushColor,
+      width: this.brushWidth,
+      tool: this.brushTool,
     }));
     if (r.ok) this.showStatus(`stroke added (${r.receipt.id})`);
     else this.showStatus(`stroke rejected (${r.code}): ${r.message}`, true);
