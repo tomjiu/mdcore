@@ -24,6 +24,9 @@
 //! 判定面三路分支（SigFlags / /FT /Sig / /Perms /DocMDP）的确定性单测
 //! 在 stamp.rs 内联 tests（构造目录标记，不依赖夹具）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
+
 use std::path::PathBuf;
 
 use mdc_pdf::security::Limits;

@@ -41,6 +41,9 @@
 //! 15. `mount_preserves_existing_page_annots`——既有 /Annots 挂载面：
 //!     form_probe.pdf（/AcroForm widget）上追加不破坏既有标注。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
+
 #![cfg(all(feature = "engine-lopdf", feature = "engine-pdfium"))]
 
 use std::path::{Path, PathBuf};

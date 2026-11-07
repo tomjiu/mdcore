@@ -13,6 +13,9 @@
 //! **环境合同**：仅需 feature `engine-lopdf`（无 pdfium 依赖——
 //! 三写面全是 lopdf 面）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
+
 #![cfg(feature = "engine-lopdf")]
 
 use std::path::PathBuf;

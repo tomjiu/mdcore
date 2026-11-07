@@ -8,6 +8,9 @@
 //!
 //! 交叉验证：外观与跨页同步用 pypdf 独立复核（见 PR 记录）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
+
 use std::path::PathBuf;
 
 use mdc_pdf::forms::{Alignment, ErrorKind, FieldAppearance, FormError, PdfForm, ValidationResult};

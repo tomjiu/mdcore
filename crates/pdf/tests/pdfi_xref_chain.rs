@@ -38,6 +38,9 @@
 //! 环境合同同 pdff2_annotate：fixtures 仓内随包；测试内**只在内存**
 //! 构造篡改形态（盘上夹具永不落污染字节）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
+
 #![cfg(feature = "engine-lopdf")]
 
 use std::path::Path;

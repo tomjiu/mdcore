@@ -44,3 +44,11 @@ engine-pdfium = ["dep:pdfium-render"]
 # 测试环境需 fixtures（spike 取件位，同 engine-pdfium 面）。sha2 随本门
 # 启用（signature.rs 摘要一致性，#308——依赖树已在，零编译单元增量）。
 engine-lopdf = ["dep:lopdf", "dep:sha2"]
+
+# #469:q31 消费 engine-lopdf 门后 API(generate)——裸 crate 调用
+# (cargo check -p mdc-pdf --all-targets)曾 E0432 基线红(pdf-organize §6
+# 登记)。required-features 门后:默认特性构建跳过本 example,特性开启
+# (CI 同款)照常在场——零行为变化,只补调用面纪律。
+[[example]]
+name = "q31_acceptance"
+required-features = ["engine-lopdf"]

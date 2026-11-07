@@ -25,6 +25,9 @@
 //! fixtures 缺失 = 本文件明确 panic 并打印全部已尝试位置。门禁
 //! 环境必须可诊断，静默跳过 = 测试面造假。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-pdfium")]
+
 // feature 门（默认构建零引擎依赖——本文件整体退化为空目标，跨环境
 // 可构建纪律保持）。
 #![cfg(feature = "engine-pdfium")]
