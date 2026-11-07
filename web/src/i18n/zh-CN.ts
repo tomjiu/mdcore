@@ -112,6 +112,8 @@ export const zhCN: Dict = {
   'status.exported': '已导出：{parts}',
   'status.importFailed': '导入失败（{code}）：{message}',
   'status.exportFailed': '导出失败（{code}）：{message}',
+  'docx.footnoteRef.one': '{n} 个脚注引用',
+  'docx.footnoteRef.many': '{n} 个脚注引用',
   'status.gridSuffix': ' · 工作簿已载入「表格」页（{n} 个工作表）',
   'docx.heading.one': '{n} 个标题',
   'docx.heading.many': '{n} 个标题',
