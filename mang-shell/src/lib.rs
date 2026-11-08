@@ -35,10 +35,10 @@ pub mod context_menu;
 #[path = "settings.rs"]
 pub mod settings;
 
-/// #209：顶部菜单栏模型层（菜单结构/Cmd 映射/键盘导航状态机/下拉几何
-/// 估算）——纯数据零 GPUI 依赖，与 context_menu 同分层进 lib 树（渲染层
-/// menu_bar_view.rs 是 bin 专属）。菜单项只映射既有动作（Cmd 枚举 /
-/// Editor 菜单方法 / ShellApp 既有方法），无既有命令的项置灰不绑动作。
+/// #209：顶部菜单栏模型层（菜单结构/Cmd 映射/灰显与勾选快照）——纯数据
+/// 零 GPUI 依赖，与 context_menu 同分层进 lib 树（桥接层 menu_bar_view.rs
+/// 是 bin 专属）。菜单项只映射既有动作（Cmd 枚举 / Editor 菜单方法 /
+/// ShellApp 既有方法），无既有命令的项置灰不绑动作。
 #[path = "menu_bar.rs"]
 pub mod menu_bar;
 
