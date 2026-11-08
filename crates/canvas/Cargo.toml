@@ -32,6 +32,8 @@ publish = false
 [dependencies]
 yrs = { version = "0.28", features = ["sync"] }
 mdc-evidence = { path = "../evidence" }
+# #419：JSON Canvas 互通（serde_json 单源化继承——T1 依赖卫生）。
+serde_json.workspace = true
 
 [dev-dependencies]
 # 端到端演示（examples/e2e_demo.rs）：文档域（mdc-collab）+ 画布域
