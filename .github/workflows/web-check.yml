@@ -81,9 +81,12 @@ jobs:
         # build-pdf-wasm.sh 对 crate 缺席优雅降级（exit 0 + 说明）——
         # mdc-pdf-wasm 未在场时 pkg_pdf 缺席，pdf_view e2e 走 SKIP 门
         #（不假绿——evidence_panel.py 同款纪律）。
+        # bash ./ 显式调用：build-pdf-wasm.sh 在 git 无执行位（644），
+        # ./ 直调 Permission denied（exit 126，首跑实测）——对两个脚本
+        # 统一 bash 形态，免疫执行位漂移。
         run: |
-          ./build-wasm.sh
-          ./build-pdf-wasm.sh
+          bash ./build-wasm.sh
+          bash ./build-pdf-wasm.sh
 
       - name: Setup Node
         uses: actions/setup-node@v4
