@@ -86,11 +86,12 @@ jobs:
       # 才暴露，#358 红①）；hc_docx4j 六维门回归同理（红②）。
       # native target 跑全目标（lib + 集成——红②恰在集成面，只跑 lib
       # 会再漏）；wasm32 面维持 windows-check.yml 的编译 check 不变。
-      # 两个已知红显式 skip（在修工单：红① → #361/PR #372；红② →
-      # #365 失败二 Agent-ix4l）——**两单合并后必须移除对应 --skip**，
-      # 否则覆盖缺口复现。
+      # 两个红①/红②修复均已合并（PR #372 · PR #388）——对应显式
+      # --skip 已移除（#358 收口增量：skip 不移除 = 覆盖缺口复现，
+      # dd748e1 注释的合并后义务）。w1_toc 断言与 hc_docx4j 六维门
+      # 回归进入 CI 常跑面（语料在库 git 跟踪，纯 Rust 零外部工具）。
       - name: Test mdcore-wasm (wasm bridge - lib + integration)
-        run: cargo test -p mdcore-wasm -- --skip w1_toc_field_five_part_emission_and_position --skip hc_docx4j_six_dimensions_gate
+        run: cargo test -p mdcore-wasm
 
       - name: Fetch xlsx-structural-corpus (#265 结构面语料 28 件, Apache-2.0)
         # #265 语料门 CI 化：语料二进制不入库（.gitignore），CI 在
