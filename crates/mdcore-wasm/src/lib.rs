@@ -28,6 +28,7 @@
 
 pub mod canvas;
 pub mod collab;
+pub mod dark_scan;
 pub mod docx_export;
 pub mod docx_import;
 pub mod workbench;
