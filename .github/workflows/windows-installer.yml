@@ -57,13 +57,22 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
+      - name: Cache pdfium
+        # 与 windows-test.yml 的 Cache pdfium 同款（key 相同 → 两 job 共享缓存）。
+        id: pdfium-cache
+        uses: actions/cache@v4
+        with:
+          path: bin/lib/pdfium.dll
+          key: pdfium-win-x64-chromium-8086-v1
+
       - name: Fetch pdfium (win-x64, pinned chromium/8086)
+        if: steps.pdfium-cache.outputs.cache-hit != 'true'
         # 与 windows-test.yml 的 Fetch pdfium 步骤同源同 pin（版本/SHA
         # 升级 = 两处同步改）；win 包顶层布局 = bin/pdfium.dll。
         shell: bash
         run: |
           mkdir -p bin/lib
-          curl -fL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8086/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
+          curl -fL "https://github.com/mmqz/mdcore/releases/download/ci-deps-v1/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
           echo "1fd8af952832dbb0eb16d9249f68fe09e5f5ebf7c3dd9f6066ea2720cc28487d  /tmp/pdfium-win-x64.tgz" | sha256sum -c -
           rm -rf /tmp/pdfium-x && mkdir -p /tmp/pdfium-x
           tar -xzf /tmp/pdfium-win-x64.tgz -C /tmp/pdfium-x

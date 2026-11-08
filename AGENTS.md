@@ -906,6 +906,87 @@ git push --force
 
 ---
 
+## 0.0.15 `rebase -X theirs` 会静默删掉 main 上的功能——禁用
+
+**2026-11-08 实测：`git rebase origin/main -X theirs` 报「成功、零冲突」，但把 main 上已合入的整块功能删了。**
+
+## 事故经过
+
+```
+PR #433（fix/386-pdf-annotate-save）冲突在 pdf_pages.rs + shell.rs
+
+用了 rebase -X theirs：
+  → 零冲突，rebase「成功」
+  → 编译报 14 个错误：
+      cannot find type BTreeMap
+      no method named jump_search / close_search / open_search
+      no associated function dispatch_view_key / dispatch_search_key
+  → 根因：#386 分支的 pdf_pages.rs 整体覆盖了 main 版本
+      main 已合的 #422「页内查找」整套功能被删
+      而 shell.rs 还在调这些函数 → 编译炸
+```
+
+**这是「rebase 成功」假象下的功能静默删除——比冲突更危险，因为它不报错。**
+
+## 规则
+
+```
+❌ 禁用：git rebase origin/main -X theirs
+❌ 禁用：git rebase origin/main -X ours
+✅ 必须：git rebase origin/main，然后逐块人工解
+```
+
+## 唯一例外
+
+```
+分支确实「完全包含 main 的所有改动」时才能用 -X theirs。
+
+判定方法：
+  git diff origin/main...<your-branch> -- <冲突文件> | grep "^-"
+  如果输出里有 main 独有的删除行 → 不能用
+
+实际情况：几乎所有场景都不满足这个条件。
+```
+
+## 正确姿势：开 diff3 三方视图
+
+```bash
+git config merge.conflictStyle diff3
+git rebase origin/main
+# 冲突块会变成：
+#   <<<<<<< HEAD              ← main 侧
+#   ||||||| merged common ancestors
+#   =======
+#   >>>>>>> <commit>          ← 分支侧
+# 三方一对比，谁加了什么一目了然
+```
+
+## 解完必做三查
+
+```bash
+# 1. 扫残留标记
+git grep -n "^<<<<<<<" -- "*.rs" "*.md" "*.ts" "*.py"
+
+# 2. 确认 main 的功能还在（拿冲突文件对比 main）
+git diff origin/main -- <冲突文件> | grep "^-" | head -20
+# 看到大量 main 独有的函数被删 → 合并错了
+
+# 3. 全量编译
+cargo check --workspace --all-targets
+```
+
+## 一句话
+
+```
+冲突是显性的，编译器会拦住你；
+-X theirs 造成的功能删除是隐性的，rebase 报成功，测试可能也过，
+直到某天用户发现功能没了。
+
+宁可多花 20 分钟手工解冲突，不要用 -X 走捷径。
+```
+
+---
+
 ## 0.0.14 拆子 issue 开工前，先扫母 issue——认领评论与 open PR 双查
 
 **这条是 2026-11-07 #395/#396 撞车的教训（当日第 5 组重复 PR）。**

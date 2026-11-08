@@ -235,6 +235,11 @@ export const zhCN: Dict = {
   'pdf.propsWarnings': '警告数',
   'pdf.propsYes': '是',
   'pdf.propsNo': '否',
+||||||| eadb47e
+  // #463（长尾④）：大纲面（pdf.js getOutline → 树 + 点击跳页）
+  'pdf.outline': '大纲',
+  'pdf.outlineTitle': '文档大纲（书签）面板',
+  'pdf.outlineEmpty': '本文档无大纲',
   'pdf.zoomOutTitle': '缩小',
   'pdf.zoomInTitle': '放大',
   'pdf.fitWidth': '适应宽度',

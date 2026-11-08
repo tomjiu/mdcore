@@ -104,17 +104,30 @@ jobs:
       - name: Test mdc-office-io (docx/xlsx/pptx)
         run: cargo test -p mdc-office-io
 
+      - name: Cache pdfium
+        # 缓存 pdfium 二进制（3.87 MB）——避免每次 CI 重复下载：
+        # 2026-11-08 实测 GitHub release CDN 返回 504 导致 engine tests 恒红，
+        # 命中缓存后不再依赖外部下载（本步骤仅在缓存未命中时执行）。
+        id: pdfium-cache
+        uses: actions/cache@v4
+        with:
+          path: bin/lib/pdfium.dll
+          key: pdfium-win-x64-chromium-8086-v1
+
       - name: Fetch pdfium (win-x64, pinned chromium/8086)
-        # #210 真实环境验证（#222 Lead 指派）：按 INSTALL.md 的取件源
-        # （bblanchon/pdfium-binaries，non-V8——与安全策略 §JS 面一致
-        # 不取 v8 变体）下载到定位序取件位（仓根 bin/lib）。
+        if: steps.pdfium-cache.outputs.cache-hit != 'true'
+        # #210 真实环境验证（#222 Lead 指派）：下载到定位序取件位（仓根 bin/lib）。
+        # 2026-11-08 改从本仓 release ci-deps-v1 取件——上游
+        # bblanchon/pdfium-binaries CDN 持续 504（GitHub 状态页显示正常但
+        # 实际下载失败），导致 engine tests/installer 恒红。
+        # SHA256 与上游一致（non-V8，安全策略 §JS 面不变）。
         # 版本 pin + SHA256 与分析仓 fetch-pdfium.sh 同轨
         # （chromium/8086 = pdfium-render pdfium_7881 绑定面的兼容二进制）；
         # 升级 = 两处同步改 + 全 pdf 测试面复验。
         shell: bash
         run: |
           mkdir -p bin/lib
-          curl -fL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8086/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
+          curl -fL "https://github.com/mmqz/mdcore/releases/download/ci-deps-v1/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
           echo "1fd8af952832dbb0eb16d9249f68fe09e5f5ebf7c3dd9f6066ea2720cc28487d  /tmp/pdfium-win-x64.tgz" | sha256sum -c -
           # win 包顶层结构 = bin/pdfium.dll（linux 包是 lib/libpdfium.so——
           # 两平台包内布局不同）：解压到临时目录后显式放置到定位序

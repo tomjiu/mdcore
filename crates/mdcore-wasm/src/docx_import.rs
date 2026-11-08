@@ -2387,6 +2387,7 @@ mod tests {
             merges: vec![],
             source: BlockSource::Body,
             nested: false,
+            footnote_refs: vec![],
         }));
         let (md, stats) = docx_to_markdown(&doc);
         assert_eq!(stats["footnote_blocks_dropped"], 1, "{stats}");

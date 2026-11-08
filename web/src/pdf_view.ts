@@ -57,6 +57,17 @@ import {
   type DocProps,
   type PdfInfoLike,
 } from './pdf_props.js';
+
+
+// #463（长尾④）：大纲树——pdf.js getOutline → 引擎形状 + 树 DOM（新模块，
+// pdf_view 只做接线：取数/解析回调/跳页回调/会话 ctor 注入）。
+import {
+  buildOutlineTree,
+  flattenOutline,
+  outlineTreeJson,
+  renderOutlineDom,
+  type OutlineNodeJson,
+} from './pdf_outline.js';
 import type {
   PageViewport,
   PDFDocumentProxy,
@@ -212,9 +223,8 @@ function buildPagesJson(
   );
 }
 
-function buildOutlineJson(): string {
-  return '{"roots":[]}'; // v0 无大纲注入面（pdf.js 大纲 → Outline 命令留后续）
-}
+// （#463 后：大纲 JSON 注入面迁至 pdf_outline.ts outlineTreeJson——
+// 　原恒空树函数移除，会话 ctor 与树 UI 同一数据源。）
 
 function buildCmdExtractTextAll(): string {
   return JSON.stringify({ ExtractText: { target: 'All', source: OP_SOURCE } });
@@ -473,6 +483,20 @@ declare global {
       } | null;
       drawerOpen: boolean;
     };
+
+
+    /** #463：大纲面观测（树在场性/先序平铺计数与标题/跳过数/抽屉开态）。 */
+    __pdfOutline: () => {
+      present: boolean;
+      count: number;
+      titles: string[];
+      skipped: number;
+      drawerOpen: boolean;
+    };
+    /** #463：会话 Outline 命令透传（模型面验证——ctor 注入的同源树）。 */
+    __pdfOutlineSession: () =>
+      | PdfOk<{ count: number; titles: string[] }>
+      | PdfFail;
   }
 }
 
@@ -601,6 +625,14 @@ export class PdfViewUI {
   private propsBtn: HTMLButtonElement | null = null;
   private propsDrawer: HTMLDivElement | null = null;
   private propsBody: HTMLDivElement | null = null;
+
+  // 大纲状态（#463——显示面数据源 pdf.js，会话 ctor 注入同一棵树）
+  private outlineTree: OutlineNodeJson[] = [];
+  private outlineSkipped = 0;
+  private outlineBtn: HTMLButtonElement | null = null;
+  private outlineDrawer: HTMLDivElement | null = null;
+  private outlineBody: HTMLDivElement | null = null;
+  private outlineEmptyEl: HTMLDivElement | null = null;
 
   // DOM 句柄
   private panel!: HTMLElement;
@@ -761,9 +793,13 @@ export class PdfViewUI {
     const propsBtn = mkBtn('pdf-props-btn', t('pdf.props'), t('pdf.propsTitle'));
     propsBtn.disabled = true;
 
+    // #463（长尾④）：大纲切换按钮（无大纲档禁用——syncOutlinePanel 维护）。
+    const outlineBtn = mkBtn('pdf-outline-btn', t('pdf.outline'), t('pdf.outlineTitle'));
+    outlineBtn.disabled = true;
+
     toolbar.append(
       openBtn, fileInput, pageLabel,
-      zoomOut, zoomLabel, zoomIn, zoomFit,
+      zoomOut, zoomLabel, zoomIn, zoomFit, outlineBtn,
       searchInput, searchPrev, searchNext, searchCount,
       modeSelect, inkColor, inkWidth, saveBtn, printBtn, annotsBtn,
       modeSelect, inkColor, inkWidth, saveBtn, printBtn, propsBtn,
@@ -811,6 +847,24 @@ export class PdfViewUI {
 
     panel.append(toolbar, viewport, status, propsDrawer);
 
+    // #463：大纲抽屉（面板内绝对定位——#pdf-panel 需 position:relative；
+    // 打印态 CSS 隐藏，不进纸面）。
+    const drawer = document.createElement('div');
+    drawer.id = 'pdf-outline-drawer';
+    drawer.hidden = true;
+    const drawerHead = document.createElement('div');
+    drawerHead.className = 'pdf-outline-head';
+    drawerHead.textContent = t('pdf.outline');
+    const drawerBody = document.createElement('div');
+    drawerBody.className = 'pdf-outline-body';
+    const drawerEmpty = document.createElement('div');
+    drawerEmpty.className = 'pdf-outline-empty';
+    drawerEmpty.textContent = t('pdf.outlineEmpty');
+    drawerEmpty.hidden = true;
+    drawer.append(drawerHead, drawerBody, drawerEmpty);
+
+    panel.append(toolbar, viewport, status, drawer);
+
     this.panel = panel;
     this.viewportEl = viewport;
     this.contentEl = content;
@@ -841,6 +895,12 @@ export class PdfViewUI {
     this.propsBtn = propsBtn;
     this.propsDrawer = propsDrawer;
     this.propsBody = propsBody;
+
+
+    this.outlineBtn = outlineBtn;
+    this.outlineDrawer = drawer;
+    this.outlineBody = drawerBody;
+    this.outlineEmptyEl = drawerEmpty;
     this.syncButtons();
   }
 
@@ -899,6 +959,12 @@ export class PdfViewUI {
       this.propsDrawer.hidden = !this.propsDrawer.hidden;
     });
 
+
+    // #463：大纲抽屉开合（按钮态由 syncOutlinePanel 维护——禁用 = 无大纲）。
+    this.outlineBtn?.addEventListener('click', () => {
+      if (!this.outlineDrawer) return;
+      this.outlineDrawer.hidden = !this.outlineDrawer.hidden;
+    });
     // #240 层③：Ctrl+P 路径（beforeprint）——best-effort 启动全页渲染
     // （无法 await：浏览器同步进入预览快照——未完成的页可能空白；
     // 打印按钮路径无此限制，诚实登记见模块文档）。afterprint 恢复
@@ -1178,6 +1244,21 @@ export class PdfViewUI {
       this.pageLinks.push(links);
     }
 
+    // ③-bis #463：大纲读面（pdf.js getOutline → 解析为 0 基页目标的
+    // 引擎形状——会话 ctor 与树 UI 同一数据源；解析失败面 = 恒空树不阻断）。
+    this.outlineTree = [];
+    this.outlineSkipped = 0;
+    try {
+      const items = await doc.getOutline();
+      const built = await buildOutlineTree(items, (dest) =>
+        this.resolveOutlineDest(doc, dest),
+      );
+      this.outlineTree = built.tree;
+      this.outlineSkipped = built.skipped;
+    } catch {
+      // 显示面无大纲（getOutline 异常形态）——空树，不阻断打开主流程
+    }
+
     // ④ 会话模型面（pkg_pdf 缺位 → display-only 降级）
     this.sessionInitFail = null;
     if (this.sessionCtor) {
@@ -1192,7 +1273,7 @@ export class PdfViewUI {
               rotation: `Deg${g.rotationDeg}`,
             })),
           ),
-          buildOutlineJson(),
+          outlineTreeJson(this.outlineTree), // #463：实数据（原恒 {"roots":[]}）
         );
         session.set_clock_ms(BigInt(Date.now()));
         this.session = session;
@@ -1227,6 +1308,8 @@ export class PdfViewUI {
     this.syncButtons();
     this.syncGuide();
     this.syncPropsPanel(); // #472：属性面板（按钮态 + 字段表重渲染）
+
+    this.syncOutlinePanel(); // #463：树 DOM + 按钮态 + 抽屉开合
     return { ok: true, value: { pages: doc.numPages } };
   }
 
@@ -1268,6 +1351,56 @@ export class PdfViewUI {
     this.updatePageLabel();
   }
 
+  /** #463：pdf.js dest（数组/命名目标）→ 0 基页号；不可解析 = null
+   * （悬空命名目标/远程目标——pdf-render-ext §4 登记的合法 Unresolved 面）。 */
+  private async resolveOutlineDest(
+    doc: PDFDocumentProxy,
+    dest: unknown,
+  ): Promise<number | null> {
+    try {
+      let d: unknown = dest;
+      if (typeof d === 'string') d = await doc.getDestination(d);
+      if (!Array.isArray(d) || d.length === 0) return null;
+      const idx = await doc.getPageIndex(d[0] as Parameters<
+        typeof doc.getPageIndex
+      >[0]);
+      return idx;
+    } catch {
+      return null;
+    }
+  }
+
+  /** #463：大纲节点跳页（树 UI 点击 → 目标页滚到视口顶 + 页码行同步）。 */
+  private jumpToOutlinePage(idx: number): void {
+    const st = this.pages[idx];
+    if (!st) return;
+    st.el.scrollIntoView({ block: 'start', behavior: 'auto' });
+    this.updatePageLabel();
+  }
+
+  /** #463：大纲面板同步（树渲染 + 按钮态 + 抽屉开合——有大纲档自动展开，
+   * Acrobat 同款；无大纲/拆卸态 = 抽屉隐藏 + 按钮禁用；抽屉 top 随
+   * 工具栏实际高度动态锚定——wrap 两行不叠盖）。 */
+  private syncOutlinePanel(): void {
+    if (
+      !this.outlineBtn ||
+      !this.outlineDrawer ||
+      !this.outlineBody ||
+      !this.outlineEmptyEl
+    ) {
+      return;
+    }
+    if (this.toolbarEl) {
+      this.outlineDrawer.style.top = `${this.toolbarEl.offsetHeight + 8}px`;
+    }
+    const has = this.outlineTree.length > 0;
+    this.outlineBtn.disabled = !has;
+    this.outlineEmptyEl.hidden = has;
+    renderOutlineDom(this.outlineBody, this.outlineTree, (idx) =>
+      this.jumpToOutlinePage(idx),
+    );
+    this.outlineDrawer.hidden = !has;
+  }
   /** #3 UI 批 E：空态引导同步（文档在场 = 隐藏；打开失败/拆卸后回显）。 */
   private syncGuide(): void {
     this.guideEl.hidden = this.doc !== null;
@@ -1414,8 +1547,16 @@ export class PdfViewUI {
     if (this.propsBody) this.propsBody.replaceChildren();
     if (this.propsDrawer) this.propsDrawer.hidden = true;
     this.syncPropsPanel();
+
+
+    // #463：大纲面拆卸（树/跳过数归零 + 抽屉隐藏——按钮态随 syncOutlinePanel）。
+    this.outlineTree = [];
+    this.outlineSkipped = 0;
+    if (this.outlineBody) this.outlineBody.replaceChildren();
+    if (this.outlineDrawer) this.outlineDrawer.hidden = true;
     // #3 UI 批 E：拆卸后表面归零——引导卡片回显（打开失败/换开路径）。
     this.syncGuide();
+    this.syncOutlinePanel();
   }
 
   /**
@@ -2623,6 +2764,37 @@ export class PdfViewUI {
       drawerOpen: this.propsDrawer !== null && !this.propsDrawer.hidden,
     });
 
+
+    // #463：大纲面探针（先序平铺 = 树 DOM 同一序——文档序单一出口纪律）。
+    window.__pdfOutline = () => {
+      const flat = flattenOutline(this.outlineTree);
+      return {
+        present: flat.length > 0,
+        count: flat.length,
+        titles: flat.map((n) => n.title),
+        skipped: this.outlineSkipped,
+        drawerOpen: this.outlineDrawer !== null && !this.outlineDrawer.hidden,
+      };
+    };
+    // #463：会话模型面探针（Outline 命令——ctor 注入实数据的回读验证；
+    // 与显示面探针同构的先序平铺口径）。
+    window.__pdfOutlineSession = () => {
+      if (!this.session) return BRIDGE_ABSENT;
+      const r = this.sessionExec(
+        JSON.stringify({ Outline: { source: OP_SOURCE } }),
+      );
+      if (!r.ok) return r;
+      if (!('Outline' in r.value)) {
+        return {
+          ok: false,
+          code: 'outcome_shape',
+          message: 'unexpected outcome',
+        };
+      }
+      const tree = (r.value as { Outline: { roots: OutlineNodeJson[] } }).Outline;
+      const flat = flattenOutline(tree.roots ?? []);
+      return { ok: true, value: { count: flat.length, titles: flat.map((n) => n.title) } };
+    };
     // 证据跳转钩子（evidence_panel 的 evidence-jump 事件——后续阶段接真
     // 数据；本阶段记录 + 状态行提示）。
     document.addEventListener('evidence-jump', (e) => {
