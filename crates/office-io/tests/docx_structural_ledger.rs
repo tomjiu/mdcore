@@ -14,17 +14,17 @@
 //!
 //! | 面 | GT 语义（原始 XML） | 模型面 | 平价公式 |
 //! |---|---|---|---|
-//! | 节 | 有效 `w:sectPr`（排 sectPrChange 内/sdt 内；#348 修复后空串数值属性经读前归一化不再致丢） | `sections` | `max(1, GT)` |
-//! | 表（含嵌套/文本框内） | `w:tbl` 全量 − body 级 sdt 内 + body 级 AC 内 | 递归 `Block::Table` | 相等 |
+//! | 节 | 有效 `w:sectPr`（排 sectPrChange 内/sdt 内/MCE 非选中分支；#348 修复后空串数值属性经读前归一化不再致丢） | `sections` | `max(1, GT)` |
+//! | 表（含嵌套/文本框内） | `w:tbl` 全量（#344 后 MCE 非选中分支剥除）− body 级 sdt 内 + body 级 AC 内 | 递归 `Block::Table` | 相等 |
 //! | 嵌套表 | `w:tc` 祖先的 `w:tbl` − sdt 内 | `TableData::nested` | 相等 |
-//! | 文本框 | 最外层 `w:txbxContent`（排 Fallback）− sdt 内 − tc 内 − 组损失 | 递归 `Block::TextBox` | 相等 |
-//! | 顶层段 | body 直接 `w:p` + body 级 AC 扁平段 | 顶层 `Block::Paragraph` | 相等 |
+//! | 文本框 | 最外层 `w:txbxContent`（排 MCE 非选中分支）− sdt 内 − tc 内 − 组损失 | 递归 `Block::TextBox` | 相等 |
+//! | 顶层段 | body 直接 `w:p` + body 级 AC 选中分支段（#344 后：首 Choice / 无 Choice 兜 Fallback——非选中分支剥除） | 顶层 `Block::Paragraph` | 相等 |
 //! | 页眉页脚槽位 | 有效引用（排 odd 型/strict 文档）r:id 经 rels 解析且部件在场 | Σ 各节挂接槽位 | 相等 |
 //! | 脚注条目 | footnotes.xml `w:footnote`（id≥1，排分隔符） | `footnotes` | 相等 |
 //! | 尾注条目 | endnotes.xml `w:endnote`（同上） | `endnotes` | 相等 |
 //! | 批注条目 | comments.xml `w:comment` | `comments` | 相等 |
-//! | 脚注引用位 | body 直接段内 `w:footnoteReference`（排 txbx/Fallback） | Σ `footnote_refs` | 相等 |
-//! | 修订插入 run | `w:ins` 内 `w:r`（排 tc/sdt/del/Fallback/move 容器；#343 修复后 hyperlink 容器计入） | Σ `revision_inserted` run | 相等 |
+//! | 脚注引用位 | body 直接段内 `w:footnoteReference`（排 txbx/MCE 非选中分支） | Σ `footnote_refs` | 相等 |
+//! | 修订插入 run | `w:ins` 内 `w:r`（排 tc/sdt/del/move 容器 + MCE 非选中分支；#343 修复后 hyperlink 容器计入） | Σ `revision_inserted` run | 相等 |
 //!
 //! # 已知损失清单（GT 公式扣除项——每条机制背书 + 可见性计数）
 //!
@@ -43,19 +43,31 @@
 //! 3. **组内文本框每组只留 1**：`wgp`（DrawingML 组）内多个 `wsp:txbx`
 //!    引擎只解析一个。语料 2 件（60316 组 2 留 1、shapes-with-text
 //!    组 2 留 1）。
-//! 4. **AC 多 Choice 全展开**（内容重复缺陷）：`mc:AlternateContent`
-//!    的全部 Choice + Fallback 段落都进块流（mc-fun 族 5 件——
-//!    mc-block 单件 10 Choice + 1 Fallback = 11 段重复面）。钉定现
-//!    行为防退化（p_in_ac 计入平价），缺陷登记待 MCE 选择面裁决。
-//! 5. **`w:type="odd"` 引用丢**：ECMA-376 合法值 default/first/even，
-//!    Word 容忍旧值 odd；docx-rs 词汇表外丢弃。语料 1 件（60293）。
+//! 4. **AC 多 Choice 全展开**（内容重复缺陷）：**#344（#318 D1）
+//!    已修复**——读面 MCE 选择重写（docx_mce：首 Choice 选中 / 无
+//!    Choice 兜底 Fallback，非选中分支剥除）；本账本 GT 同步实现独立
+//!    选择语义（ac 栈：首 Choice / 无 Choice 兜 Fallback——与引擎
+//!    过滤器独立同构，保持第二意见性质），p_in_ac / txbx / ins /
+//!    脚注引用 / 节各面均只计选中分支。历史口径（全分支计入钉现行
+//!    为）已随修复收紧。
+//! 5. **`w:type="odd"` 引用丢（已修 #347——#318 D5 闭项）**：
+//!    ECMA-376 合法值 default/first/even，Word 容忍旧值 odd；
+//!    docx-rs 词汇表外丢弃 → 自有 sectPr 第二趟补挂
+//!    （`parse_legacy_odd_refs`——odd 按 default 语义挂接 + Warning
+//!    可见性）。语料 1 件（60293；可见性计数保留；平价公式已重钉：
+//!    `refs_odd` 计入挂接面，tests/tr33_odd_header_ref.rs 锚）。
 //! 6. **空串属性 sectPr 整体丢**：**#348（#318 D6）已修复**——
 //!    `w:pgMar`/`w:pgSz` 数值属性空串经 docx_panic_guard 读前归一化
 //!    为 `"0"`（Word 零值语义），sectPr 不再静默丢；GT 的
 //!    `sect_pr_dropped_attr` 扣除项已移除（cr065 7 节全量重钉）。
-//! 7. **strict OOXML 页眉页脚引用丢**：purl.oclc.org 命名空间文档的
-//!    sectPr 引用引擎不解析（段落内容不受影响）。语料 1 件
-//!    （strict-sample）。
+//! 7. **strict OOXML 页眉页脚引用丢（已修 #349——#318 D7 闭项）**：
+//!    purl.oclc.org 命名空间文档的引用——typed 引用在场而 docx-rs
+//!    联接面按过渡期关系 Type 锁定不联内容 → 末节槽丢。
+//!    修复 = `extract_headers_footers` 引用-在-内容-未联接分支的
+//!    部件直解析恢复（mid_section_slots 同构）+ 第二趟防御纵深
+//!    （`attach_unresolved_refs`——typed 未承载引用兑底）。语料 1
+//!    件（strict-sample；可见性计数保留；平价公式已重钉：
+//!    `refs_strict_dropped` 计入挂接面，tests/tr34_strict_refs.rs 锚）。
 //! 8. **修订面排除容器**（非损失——语义正确面）：`w:del` 内
 //!    delText 不提取（#17）；moveFrom/moveTo 容器内 ins 不标记
 //!    （Tika-792）。（历史：hyperlink 内嵌 `w:ins` 的 run 整体丢
@@ -137,7 +149,6 @@ struct Gt {
     tbl_in_sdt: usize,
     tbl_nested: usize,
     tbl_nested_in_sdt: usize,
-    tbl_in_ac: usize,
     txbx_outermost: usize,
     txbx_in_sdt: usize,
     txbx_in_tc: usize,
@@ -156,17 +167,27 @@ struct Ctx {
     in_tc: bool,
     in_bsdt: bool,
     in_change: bool,
-    in_fallback: bool,
     in_ins: bool,
     in_del: bool,
     in_move: bool,
     in_ac: bool,
+    /// #344：在 MCE 非选中分支内（AC 内且非首 Choice / 非「无
+    /// Choice 兜底」的 Fallback——引擎读前重写已剥除，GT 各面不计）。
+    /// 默认 false = 不在 AC 或在选中分支（derive(Default) 极性选择）。
+    ac_branch_dropped: bool,
     in_wgp: bool,
     group_id: usize,
     txbx_depth: usize,
     body_scope: bool,
     is_body_ctx: bool,
     in_body_p: bool,
+}
+
+/// #344：AC 帧态（每层 AlternateContent 一帧——首 Choice 消费选择权；
+/// 与引擎 docx_mce 过滤器**独立同构**实现，保持 GT 第二意见性质）。
+#[derive(Default)]
+struct AcFrame {
+    saw_choice: bool,
 }
 
 /// sectPr 流式解析状态（直子属性校验 + 引用采集）。
@@ -308,6 +329,9 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
     let mut buf = Vec::new();
     let mut stack: Vec<Ctx> = vec![Ctx::default()];
     let mut sects: Vec<SectParse> = Vec::new();
+    // #344：AC 帧栈（AlternateContent 开/闭同步 push/pop；Choice 直子
+    // 消费首选择权）。
+    let mut ac_stack: Vec<AcFrame> = Vec::new();
     let mut next_group = 0usize;
     let mut groups_seen: BTreeSet<usize> = BTreeSet::new();
 
@@ -345,19 +369,25 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                             && top.body_scope
                             && !top.in_tc
                             && top.txbx_depth == 0
-                            && !top.in_bsdt;
+                            && !top.in_bsdt
+                            && !top.ac_branch_dropped;
                         if direct {
                             gt.p_direct += 1;
                         } else if in_ac_para {
                             gt.p_in_ac += 1;
-                        } else if top.in_bsdt && top.body_scope && !top.in_tc && top.txbx_depth == 0
+                        } else if top.in_bsdt
+                            && top.body_scope
+                            && !top.in_tc
+                            && top.txbx_depth == 0
+                            && !top.ac_branch_dropped
                         {
                             gt.p_in_sdt += 1;
                         }
                         let mut c = top.clone();
-                        // 脚注引用位标注域：body 直接段（非 sdt/AC 扁平段
-                        // ——与 scan_note_references 的 XML 侧索引口径一致）。
-                        c.in_body_p = direct;
+                        // 脚注引用位标注域：body 直接段 + body 级 AC 选中
+                        // 分支段（#344 后过滤视图即 body 直接段——与
+                        // scan_note_references 的 XML 侧索引口径一致）。
+                        c.in_body_p = direct || in_ac_para;
                         // 段不是 body 元素——is_body_ctx 清（run 级 sdt
                         // 判定依赖此位，见上下文置位区注释）。
                         c.is_body_ctx = false;
@@ -366,21 +396,21 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                         continue;
                     }
                     b"tbl" => {
-                        gt.tbl_total += 1;
-                        if top.in_bsdt {
-                            gt.tbl_in_sdt += 1;
-                            if top.in_tc {
-                                gt.tbl_nested_in_sdt += 1;
+                        if !top.ac_branch_dropped {
+                            gt.tbl_total += 1;
+                            if top.in_bsdt {
+                                gt.tbl_in_sdt += 1;
+                                if top.in_tc {
+                                    gt.tbl_nested_in_sdt += 1;
+                                }
                             }
-                        } else if top.in_ac && top.body_scope && !top.in_tc && top.txbx_depth == 0 {
-                            gt.tbl_in_ac += 1;
                         }
-                        if top.in_tc {
+                        if top.in_tc && !top.ac_branch_dropped {
                             gt.tbl_nested += 1;
                         }
                     }
                     b"txbxContent" => {
-                        if !top.in_fallback && top.txbx_depth == 0 {
+                        if !top.ac_branch_dropped && top.txbx_depth == 0 {
                             gt.txbx_outermost += 1;
                             if top.in_bsdt {
                                 gt.txbx_in_sdt += 1;
@@ -395,7 +425,7 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                     b"sectPr" => {
                         // 进入 sectPr（计态在 sects 栈——上下文不变）。
                         sects.push(SectParse {
-                            counted: !top.in_change && !top.in_bsdt,
+                            counted: !top.in_change && !top.in_bsdt && !top.ac_branch_dropped,
                             depth: 0,
                             refs: Vec::new(),
                         });
@@ -410,13 +440,13 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                             && !top.in_bsdt
                             && !top.in_del
                             && !top.in_move
-                            && !top.in_fallback
+                            && !top.ac_branch_dropped
                         {
                             gt.ins_runs += 1;
                         }
                     }
                     b"footnoteReference" => {
-                        if top.in_body_p && !top.in_fallback && top.txbx_depth == 0 {
+                        if top.in_body_p && !top.ac_branch_dropped && top.txbx_depth == 0 {
                             gt.footnote_ref_body += 1;
                         }
                     }
@@ -447,10 +477,26 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                         }
                     }
                     b"sectPrChange" => c.in_change = true,
-                    b"Fallback" => c.in_fallback = true,
+                    // #344：MCE 分支帧——首 Choice 消费选择权（无 Choice
+                    // 时 Fallback 兑底）；非选中分支置 ac_branch_dropped
+                    //（引擎读前重写已剥除，GT 各面不计）。嵌套 AC 继承
+                    // 外层选中态（AND 语义）。
                     b"AlternateContent" => {
+                        ac_stack.push(AcFrame::default());
                         if top.body_scope && !top.in_tc && top.txbx_depth == 0 && !top.in_bsdt {
                             c.in_ac = true;
+                        }
+                    }
+                    b"Choice" => {
+                        if let Some(f) = ac_stack.last_mut() {
+                            let first = !f.saw_choice;
+                            f.saw_choice = true;
+                            c.ac_branch_dropped = top.ac_branch_dropped || !first;
+                        }
+                    }
+                    b"Fallback" => {
+                        if let Some(f) = ac_stack.last_mut() {
+                            c.ac_branch_dropped = top.ac_branch_dropped || f.saw_choice;
                         }
                     }
                     b"ins" => c.in_ins = true,
@@ -497,24 +543,29 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                             && !top.in_tc
                             && top.txbx_depth == 0
                             && !top.in_bsdt
+                            && !top.ac_branch_dropped
                         {
                             gt.p_in_ac += 1;
-                        } else if top.in_bsdt && top.body_scope && !top.in_tc && top.txbx_depth == 0
+                        } else if top.in_bsdt
+                            && top.body_scope
+                            && !top.in_tc
+                            && top.txbx_depth == 0
+                            && !top.ac_branch_dropped
                         {
                             gt.p_in_sdt += 1;
                         }
                     }
                     b"tbl" => {
-                        gt.tbl_total += 1;
-                        if top.in_bsdt {
-                            gt.tbl_in_sdt += 1;
-                            if top.in_tc {
-                                gt.tbl_nested_in_sdt += 1;
+                        if !top.ac_branch_dropped {
+                            gt.tbl_total += 1;
+                            if top.in_bsdt {
+                                gt.tbl_in_sdt += 1;
+                                if top.in_tc {
+                                    gt.tbl_nested_in_sdt += 1;
+                                }
                             }
-                        } else if top.in_ac && top.body_scope && !top.in_tc && top.txbx_depth == 0 {
-                            gt.tbl_in_ac += 1;
                         }
-                        if top.in_tc {
+                        if top.in_tc && !top.ac_branch_dropped {
                             gt.tbl_nested += 1;
                         }
                     }
@@ -523,9 +574,9 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                         // vml_textbox_regions 同口径），GT 同样不计。
                     }
                     b"sectPr" => {
-                        // 自闭合 sectPr：无直子——即时结算（#348 修复
-                        // 后空串属性经读前归一化不再致丢）。
-                        if !top.in_change && !top.in_bsdt {
+                        // 自闭合 sectPr：无直子——即时结算（#348 修复后空串属性
+                        // 经读前归一化不再致丢）。
+                        if !top.in_change && !top.in_bsdt && !top.ac_branch_dropped {
                             gt.sect_pr += 1;
                         }
                     }
@@ -536,13 +587,13 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                             && !top.in_bsdt
                             && !top.in_del
                             && !top.in_move
-                            && !top.in_fallback
+                            && !top.ac_branch_dropped
                         {
                             gt.ins_runs += 1;
                         }
                     }
                     b"footnoteReference" => {
-                        if top.in_body_p && !top.in_fallback && top.txbx_depth == 0 {
+                        if top.in_body_p && !top.ac_branch_dropped && top.txbx_depth == 0 {
                             gt.footnote_ref_body += 1;
                         }
                     }
@@ -577,6 +628,10 @@ fn scan_document(xml: &str, is_strict: bool) -> Option<Gt> {
                     stack.pop();
                     buf.clear();
                     continue;
+                }
+                // #344：AC 帧同步弹出（与 AlternateContent Start 对偶）。
+                if name.as_slice() == b"AlternateContent" {
+                    ac_stack.pop();
                 }
                 if let Some(sp) = sects.last_mut() {
                     sp.depth = sp.depth.saturating_sub(1);
@@ -898,11 +953,11 @@ fn parity_violations(file: &str, gt: &Gt, m: &Mc) -> Vec<String> {
         }
     };
     chk("sections", gt.sect_pr.max(1), m.sections);
-    chk(
-        "tables",
-        gt.tbl_total - gt.tbl_in_sdt + gt.tbl_in_ac,
-        m.all_table,
-    );
+    // #344 基线收紧：AC 内表格经 MCE 选择后按选中分支单份计（历史
+    // 公式的 `+ tbl_in_ac` 项补偿的是修复前 Choice+Fallback 双份展开
+    // 面；语料零样本，合成件行为钉定于 docx_mce 单测
+    // table_in_body_level_ac_single_copy）。
+    chk("tables", gt.tbl_total - gt.tbl_in_sdt, m.all_table);
     chk(
         "nested_tables",
         gt.tbl_nested - gt.tbl_nested_in_sdt,
@@ -919,7 +974,14 @@ fn parity_violations(file: &str, gt: &Gt, m: &Mc) -> Vec<String> {
         m.all_textbox,
     );
     chk("top_para", gt.p_direct + gt.p_in_ac, m.top_para);
-    chk("hf_slots", gt.refs_resolved, m.section_slots);
+    // #347（D5）+ #349（D7）：odd / strict 两损失面均已修——计入
+    // 挂接面（strict 件的 refs_resolved 归零转记 refs_strict_dropped，
+    // 恢复面在 extract_headers_footers 的部件直解析分支）。
+    chk(
+        "hf_slots",
+        gt.refs_resolved + gt.refs_odd + gt.refs_strict_dropped,
+        m.section_slots,
+    );
     chk("footnote_entries", gt.footnote_entries, m.footnotes);
     chk("endnote_entries", gt.endnote_entries, m.endnotes);
     chk("comment_entries", gt.comment_entries, m.comments);
@@ -948,9 +1010,9 @@ fn full_corpus_structural_parity() {
     let mut gt_fails: Vec<String> = Vec::new();
     let mut violations: Vec<String> = Vec::new();
     // 已知损失可见性聚合（不静默——汇总打印）。
-    let (mut sdt_loss, mut txbx_tc_fixed, mut group_txbx_fixed, mut odd_ref_files) =
+    let (mut sdt_loss, mut txbx_tc_fixed, mut group_txbx_fixed, mut odd_ref_fixed) =
         (0usize, 0usize, 0usize, 0usize);
-    let (mut ac_flatten_files, mut strict_files) = (0usize, 0usize);
+    let (mut mce_selected_files, mut strict_fixed) = (0usize, 0usize);
     let (
         mut nested_files,
         mut txbx_files,
@@ -1029,13 +1091,13 @@ fn full_corpus_structural_parity() {
             group_txbx_fixed += 1;
         }
         if gt.refs_odd > 0 {
-            odd_ref_files += 1;
+            odd_ref_fixed += 1;
         }
         if gt.p_in_ac > 0 {
-            ac_flatten_files += 1;
+            mce_selected_files += 1;
         }
         if gt.refs_strict_dropped > 0 {
-            strict_files += 1;
+            strict_fixed += 1;
         }
     }
 
@@ -1077,7 +1139,8 @@ fn full_corpus_structural_parity() {
     // ---- 可见性汇总（已知损失不静默——#260 账本面）----
     eprintln!("[structural-ledger] 630 件：ok {ok} / 容器拒绝 {reject_container} / 解析拒绝 {reject_parse} / panic 0");
     eprintln!("[structural-ledger] 五类覆盖：嵌套表 {nested_files} / 文本框 {txbx_files} / 修订 {ins_files} / 页眉页脚 {hf_files} / 脚注 {fn_files} / 批注 {cm_files} / 多节 {multi_sect}");
-    eprintln!("[structural-ledger] 已知损失（登记缺陷，非平价门内）：sdt 内容丢 {sdt_loss} 件 / odd 型引用丢 {odd_ref_files} 件 / strict 引用丢 {strict_files} 件 / AC 扁平重复 {ac_flatten_files} 件；表内文本框已修（#345 D2——第二趟补提取）{txbx_tc_fixed} 件 / 组内文本框已修（#346 D4——第二趟补发射）{group_txbx_fixed} 件");
+    eprintln!("[structural-ledger] 已知损失（登记缺陷，非平价门内）：sdt 内容丢 {sdt_loss} 件；表内文本框已修（#345 D2——第二趟补提取）{txbx_tc_fixed} 件 / 组内文本框已修（#346 D4——第二趟补发射）{group_txbx_fixed} 件 / odd 型引用已修（#347 D5——Default 语义容错挂接）{odd_ref_fixed} 件 / strict 引用已修（#349 D7——部件直解析恢复）{strict_fixed} 件");
+    eprintln!("[structural-ledger] MCE 选择生效（#344 D1 修复——选中分支单份，非重复）：{mce_selected_files} 件");
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,23 +1184,32 @@ fn five_category_pinned_anchors() {
     assert_eq!(m.ins_runs, 13, "cr043-tracked ins run 数");
     assert_eq!(m.endnotes, 3, "cr043-tracked 尾注条目");
 
-    // ③ 文本框：extraction-probe（11 框——#345（#318 D2）修复后表内框
-    //    TBX25_IN_CELL 已补：第二趟补提取 + 平价重钉，基线 10 → 11）。
+    // ③ 文本框：extraction-probe（#344+#345 叠加重钉：GT 选中分支外层框
+    //    10——FALLBACK_BETA_456 双写副本随 MCE 选择剥除、CHOICE_ALPHA_123
+    //    主选在场；表内框 TBX25_IN_CELL 由 D2 第二趟补提取，模型面全量
+    //    含表内框。历史值 11 为全分支口径、9 为 D1 未叠 D2 的口径）。
     let m = model_counts(&read_one("docx4j/text-extraction_extraction-probe.docx"));
     assert_eq!(
-        m.all_textbox, 11,
-        "extraction-probe 文本框数（D2 修复后含表内框）"
+        m.all_textbox, 10,
+        "extraction-probe 文本框数（D1 选择 + D2 表内框）"
     );
     let g = gt_one("docx4j/text-extraction_extraction-probe.docx");
-    assert_eq!(g.txbx_outermost, 11, "GT 原始最外层框数");
+    assert_eq!(g.txbx_outermost, 10, "GT 选中分支最外层框数");
     assert_eq!(g.txbx_in_tc, 1, "表内框计数（D2 已修——GT 计数保留对账面）");
 
-    // ④ 页眉页脚：60293（5 槽 = 6 引用 − 1 odd 型丢[已知损失 #5]）
-    //    + headers_footers_sections_multiple（多节 7 槽全挂）。
+    // ④ 页眉页脚：60293（6 槽 = 6 引用全挂——#347（#318 D5）修复后
+    //    odd 型引用补挂：5 → 6）+ headers_footers_sections_multiple
+    //    （多节 7 槽全挂）。
     let m = model_counts(&read_one("poi-docx/60293.docx"));
-    assert_eq!(m.section_slots, 5, "60293 挂接槽位数");
+    assert_eq!(
+        m.section_slots, 6,
+        "60293 挂接槽位数（D5 修复后含 odd 补挂）"
+    );
     let g = gt_one("poi-docx/60293.docx");
-    assert_eq!(g.refs_odd, 1, "60293 odd 型引用（已知损失可见性）");
+    assert_eq!(
+        g.refs_odd, 1,
+        "60293 odd 型引用（D5 已修——GT 计数保留对账面）"
+    );
     let m = model_counts(&read_one("docx4j/headers_footers_sections_multiple.docx"));
     assert_eq!(m.sections, 2, "多节件节数");
     assert_eq!(m.section_slots, 7, "多节件挂接槽位");
@@ -1207,15 +1279,22 @@ fn five_category_pinned_anchors() {
         "shapes-with-text 幸存成员（组末位）文本在场：{texts:?}"
     );
     // AC 扁平（内容重复缺陷钉定）：mc-block 2 直段 + 11 AC 段 = 13。
+    // #344（#318 D1）修复重钉：MCE 选择面生效——mc-block 10 Choice +
+    // 1 Fallback = 11 份重复 → 首 Choice 单份（2 直段 + 1 = 3 顶层段；
+    // 历史值 13 = 修复前全展开钉定现行為，见 #260 首钉轮）。
     let m = model_counts(&read_one("docx4j/mc-fun_mc-block.docx"));
-    assert_eq!(m.top_para, 13, "mc-block AC 全展开段数（钉现行為）");
+    assert_eq!(m.top_para, 3, "mc-block 修复后顶层段数（首 Choice 单份）");
     let g = gt_one("docx4j/mc-fun_mc-block.docx");
     assert_eq!(g.p_direct, 2, "mc-block GT 直段");
-    assert_eq!(g.p_in_ac, 11, "mc-block GT AC 内段");
-    // strict OOXML：段落照常（63），引用丢（slots=0）。
+    assert_eq!(g.p_in_ac, 1, "mc-block GT AC 选中分支段");
+    // strict OOXML：段落照常（63），引用恢复挂接（#349 D7 修复——
+    // slots=1：typed 引用在、内容未联接的部件直解析恢复）。
     let m = model_counts(&read_one("docx4j/strict_strict-sample-docx.docx"));
     assert_eq!(m.top_para, 63, "strict-sample 段数（内容不受影响）");
-    assert_eq!(m.section_slots, 0, "strict-sample 引用全丢（已知损失 #7）");
+    assert_eq!(
+        m.section_slots, 1,
+        "strict-sample 引用恢复挂接（D7 修复后：部件直解析恢复）"
+    );
     // 非常规主件名：HelloWordOnline（document22.xml 经 [Content_Types]
     // 解析）。
     let m = model_counts(&read_one("docx4j/HelloWordOnline.docx"));

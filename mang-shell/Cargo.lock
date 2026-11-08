@@ -3236,6 +3236,7 @@ dependencies = [
  "mdc-canvas",
  "mdc-office-io",
  "mdc-pdf",
+ "menu",
  "regex",
  "serde",
  "serde_json",

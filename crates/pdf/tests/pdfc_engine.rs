@@ -300,6 +300,124 @@ fn session_engine_data_source_end_to_end() {
     assert_eq!(hits[0].page, PageIndex(0), "命中页关联");
 }
 
+// ---------------------------------------------------------------------------
+// 8：长尾②——Search 命中几何（rect 面）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_hit_rects_geometry_aligned_and_sane() {
+    // 引擎路径 Search：每命中携带 PDF 用户空间矩形（char 对齐契约
+    // 成立时）。断言面：rect 非零面积、落在页 MediaBox 内、大小与
+    // 文本视觉量级一致（非整页包围盒——行分组生效）。
+    let placeholder = PageGeometry::simple(612.0, 792.0, Rotation::Deg0);
+    let mut session = session_with_engine(open_small(), placeholder);
+    let outcome = session
+        .execute(Command::Search {
+            query: "Spike fixture".into(),
+            opts: SearchOptions {
+                case_insensitive: false,
+                max_hits: 100,
+            },
+            source: Source::View,
+        })
+        .expect("Search 成功");
+    let mdc_pdf::command::Outcome::SearchResults { hits, .. } = outcome else {
+        panic!("Search 载荷形状");
+    };
+    assert_eq!(hits.len(), 3);
+    for hit in &hits {
+        assert!(
+            !hit.rects.is_empty(),
+            "引擎路径几何在场（page {:?}）",
+            hit.page
+        );
+        for r in &hit.rects {
+            // 非零面积。
+            assert!(r.right > r.left && r.top > r.bottom, "rect {r:?}");
+            // MediaBox (0,0,612,792) 内（页边距留白合理容差）。
+            assert!(r.left >= -1.0 && r.bottom >= -1.0, "rect {r:?}");
+            assert!(r.right <= 612.0 + 1.0 && r.top <= 792.0 + 1.0, "rect {r:?}");
+            // 行级量级：宽高是「一行文本」而非整页（行分组断组生效
+            // ——"Spike fixture" 12 字符同行 = 单 rect，宽 < 半页）。
+            assert!(r.right - r.left < 300.0, "行级宽度 {r:?}");
+            assert!(r.top - r.bottom < 40.0, "行级高度 {r:?}");
+        }
+    }
+}
+
+#[test]
+fn search_hit_rects_case_insensitive_fold_aligned() {
+    // 大小写不敏感命中：折叠路径（İ 型多字符折叠位）与 char 对齐
+    // 兼容——rect 与精确命中同域（同文本同位置）。
+    let placeholder = PageGeometry::simple(612.0, 792.0, Rotation::Deg0);
+    let mut session = session_with_engine(open_small(), placeholder);
+    let exact = session
+        .execute(Command::Search {
+            query: "Spike".into(),
+            opts: SearchOptions {
+                case_insensitive: false,
+                max_hits: 10,
+            },
+            source: Source::View,
+        })
+        .expect("Search 成功");
+    let folded = session
+        .execute(Command::Search {
+            query: "sPIKE".into(),
+            opts: SearchOptions {
+                case_insensitive: true,
+                max_hits: 10,
+            },
+            source: Source::View,
+        })
+        .expect("Search 成功");
+    let (
+        mdc_pdf::command::Outcome::SearchResults { hits: a, .. },
+        mdc_pdf::command::Outcome::SearchResults { hits: b, .. },
+    ) = (exact, folded)
+    else {
+        panic!("Search 载荷形状");
+    };
+    assert_eq!(a.len(), b.len(), "命中数同（折叠不改命中集）");
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.page, y.page);
+        assert_eq!(x.rects.len(), y.rects.len(), "rect 数同");
+        for (rx, ry) in x.rects.iter().zip(y.rects.iter()) {
+            let close = |p: f32, q: f32| (p - q).abs() < 0.5;
+            assert!(
+                close(rx.left, ry.left)
+                    && close(rx.right, ry.right)
+                    && close(rx.top, ry.top)
+                    && close(rx.bottom, ry.bottom),
+                "折叠命中 rect 同域：{rx:?} vs {ry:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn page_text_geometry_alignment_contract() {
+    // 引擎几何对齐契约：char_rects.len() == text.chars().count()，
+    // text 与 extract_text 同值（单一文本真源——all() 同源）。
+    let engine = open_small();
+    let idx = PageIndex(0);
+    let geom = engine.page_text_geometry(idx).expect("几何可用");
+    let span = PageSpan::new(idx, idx).expect("单页区间");
+    let text = engine
+        .extract_text(span)
+        .expect("抽取")
+        .into_iter()
+        .next()
+        .map(|(_, t)| t)
+        .unwrap_or_default();
+    assert_eq!(geom.text, text, "两 API 同源同值");
+    assert_eq!(
+        geom.char_rects.len(),
+        geom.text.chars().count(),
+        "char 对齐契约（对齐失败 = Search 面诚实降级无 rect）"
+    );
+}
+
 #[test]
 fn session_search_limit_semantics_unchanged() {
     // 限额语义单一出口：引擎路径 max_hits 钳制 → truncated 告知、空

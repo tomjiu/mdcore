@@ -133,6 +133,17 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             )),
         }
     };
+    // #404：可选父 frame 引用（string | null——null/缺省 = 顶层）。
+    let opt_parent = |field: &str| -> Result<Option<String>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
+            )),
+        }
+    };
     let f = |field: &str| -> Result<f64, CvError> {
         v.get(field)
             .and_then(|x| x.as_f64())
@@ -279,11 +290,111 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             })?;
             Ok(CanvasCommand::Reorder { id: s("id")?, op })
         }
+        // #405：标签命令（add_tag / remove_tag——集语义幂等）。
+        "add_tag" => Ok(CanvasCommand::AddTag {
+            id: s("id")?,
+            tag: s("tag")?,
+        }),
+        "remove_tag" => Ok(CanvasCommand::RemoveTag {
+            id: s("id")?,
+            tag: s("tag")?,
+        }),
+        // #404：frame 命令（create_frame / rename_frame / set_parent）。
+        "create_frame" => Ok(CanvasCommand::CreateFrame {
+            id: opt_id()?,
+            name: s("name")?,
+            x: f("x")?,
+            y: f("y")?,
+            w: f("w")?,
+            h: f("h")?,
+            parent: opt_parent("parent")?,
+        }),
+        "rename_frame" => Ok(CanvasCommand::RenameFrame {
+            id: s("id")?,
+            name: s("name")?,
+        }),
+        "set_parent" => Ok(CanvasCommand::SetParent {
+            id: s("id")?,
+            parent: opt_parent("parent")?,
+        }),
         other => Err(bad_json(
             "command",
-            format!("unknown command `{other}` (11 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder)"),
+            format!("unknown command `{other}` (16 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder/add_tag/remove_tag/create_frame/rename_frame/set_parent)"),
         )),
     }
+}
+
+/// 批量命令 JSON（flat 命令对象数组）→ `Vec<CanvasCommand>`（#352）。
+/// 逐条复用 [`parse_cmd_core`]（单/批解析面同源——不另造语法）；
+/// 非数组/空数组拒收（空批在引擎层也有门，这里提前给出更近的错误）。
+pub fn parse_cmds_core(json: &str) -> Result<Vec<CanvasCommand>, CvError> {
+    let arr: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| bad_json("commands", e.to_string()))?;
+    let arr = match arr {
+        serde_json::Value::Array(a) => a,
+        other => {
+            return Err(bad_json(
+                "commands",
+                format!("expected JSON array of command objects, got {other}"),
+            ))
+        }
+    };
+    if arr.is_empty() {
+        return Err(bad_json("commands", "empty batch".into()));
+    }
+    arr.iter()
+        .map(|v| {
+            parse_cmd_core(
+                &serde_json::to_string(v).map_err(|e| bad_json("commands", e.to_string()))?,
+            )
+        })
+        .collect()
+}
+
+/// 批量回执 → JSON（#352）：逐命令 outcome 扁平化 + 批级撤销面。
+/// outcome 字段面与单命令 [`receipt_json`] 同构（kind + 键值对）。
+pub fn batch_receipt_json(r: &mdc_canvas::BatchReceipt) -> String {
+    let outs: Vec<String> = r
+        .outcomes
+        .iter()
+        .map(|o| {
+            let (kind, key, val) = match o {
+                CommandOutcome::NodeAdded { id } => ("node_added", "id", id.clone()),
+                CommandOutcome::NodeMoved { id } => ("node_moved", "id", id.clone()),
+                CommandOutcome::NodeResized { id } => ("node_resized", "id", id.clone()),
+                CommandOutcome::EdgeAdded { id } => ("edge_added", "id", id.clone()),
+                CommandOutcome::PropsSet { id } => ("props_set", "id", id.clone()),
+                CommandOutcome::ObjectRemoved { id } => ("object_removed", "id", id.clone()),
+                CommandOutcome::Grouped { group_id } => ("grouped", "group_id", group_id.clone()),
+                CommandOutcome::Ungrouped { group_id } => {
+                    ("ungrouped", "group_id", group_id.clone())
+                }
+                // #350 笔迹面：与单命令 receipt_json 同构
+                CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
+                CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+                // #402 z 序面：与单命令 receipt_json 同构
+                CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
+                // #405 标签面 + #404 frame 面：与单命令 receipt_json 同构
+                //（rebase 到新 main 后补——#352 母分支同样缺这五支，
+                // 本栈先行补齐，#369 rebase 时可直接取用）。
+                CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),
+                CommandOutcome::TagRemoved { id } => ("tag_removed", "id", id.clone()),
+                CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
+                CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
+                CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
+            };
+            format!(
+                "{{\"outcome\":\"{kind}\",\"{key}\":{}}}",
+                serde_json::to_string(&val).unwrap()
+            )
+        })
+        .collect();
+    format!(
+        "{{\"outcomes\":[{}],\"undo_depth\":{},\"undo_cleared\":{}}}",
+        outs.join(","),
+        r.undo_depth,
+        r.undo_cleared
+    )
 }
 
 fn kind_wire(k: ObjectKind) -> &'static str {
@@ -292,6 +403,7 @@ fn kind_wire(k: ObjectKind) -> &'static str {
         ObjectKind::Edge => "edge",
         ObjectKind::Group => "group",
         ObjectKind::Stroke => "stroke",
+        ObjectKind::Frame => "frame",
     }
 }
 
@@ -331,8 +443,23 @@ pub fn object_json(o: &CanvasObject) -> String {
         Some(StrokeTool::Highlighter) => "\"highlighter\"".to_string(),
         None => "null".to_string(),
     };
+    // #405：标签集（排序 Vec → JSON 数组）。
+    let tags: Vec<String> = o
+        .tags
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect();
+    // #404：命名 + 父引用（null 缺省——同 from/to null 纪律）。
+    let opt_str_field = |v: &Option<String>| -> String {
+        match v {
+            Some(x) => serde_json::to_string(x).unwrap(),
+            None => "null".into(),
+        }
+    };
+    let name = opt_str_field(&o.name);
+    let parent = opt_str_field(&o.parent);
     format!(
-        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"props\":{{{}}}}}",
+        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"tags\":[{}],\"name\":{},\"parent\":{},\"props\":{{{}}}}}",
         serde_json::to_string(&o.id).unwrap(),
         kind_wire(o.kind),
         o.x,
@@ -347,6 +474,9 @@ pub fn object_json(o: &CanvasObject) -> String {
         width,
         tool,
         serde_json::to_string(&o.z_index).unwrap(),
+        tags.join(","),
+        name,
+        parent,
         props.join(","),
     )
 }
@@ -365,6 +495,13 @@ pub fn receipt_json(outcome: &CommandOutcome, undo_depth: usize, undo_cleared: b
         CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
         CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
         CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
+        // #405：标签回执（幂等无变化也回此回执——同 reordered 纪律）。
+        CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),
+        CommandOutcome::TagRemoved { id } => ("tag_removed", "id", id.clone()),
+        // #404：frame 回执。
+        CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
+        CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
+        CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
     };
     format!(
         "{{\"outcome\":\"{kind}\",\"{key}\":{},\"undo_depth\":{undo_depth},\"undo_cleared\":{undo_cleared}}}",
@@ -425,6 +562,12 @@ fn parse_actor(s: &str) -> Result<Actor, CvError> {
         "ai" => Ok(Actor::Ai),
         other => Err(bad_json("actor", format!("unknown `{other}` (human|ai)"))),
     }
+}
+
+/// #405：按标签检索（纯内核——wasm 方法薄委托，原生 cargo test 面）。
+pub fn list_by_tag_json_core(session: &CanvasSession, tag: &str) -> String {
+    let objs: Vec<String> = session.list_by_tag(tag).iter().map(object_json).collect();
+    format!("[{}]", objs.join(","))
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +662,19 @@ impl WasmCanvas {
         ))
     }
 
+    /// 批量命令原子执行（#352）：flat 命令对象数组 JSON；整批全成
+    /// 或全不成；整批 = 一个撤销单元。回执：
+    /// `{"outcomes":[{outcome,...},...],"undo_depth":N,"undo_cleared":B}`。
+    pub fn execute_batch(&mut self, actor: &str, cmds_json: &str) -> Result<String, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        let cmds = parse_cmds_core(cmds_json).map_err(|e| e.to_js())?;
+        let receipt = self
+            .session
+            .execute_batch(actor, cmds)
+            .map_err(|e| CvError::from(e).to_js())?;
+        Ok(batch_receipt_json(&receipt))
+    }
+
     /// 撤销（按 origin 分栈）。
     pub fn undo(&mut self, actor: &str) -> Result<bool, JsValue> {
         let actor = parse_actor(actor).map_err(|e| e.to_js())?;
@@ -553,6 +709,11 @@ impl WasmCanvas {
     /// 与宿主侧 `raw === null` 检查契约直配）。
     pub fn object_json(&self, id: &str) -> Option<String> {
         self.session.find_object(id).map(|o| object_json(&o))
+    }
+
+    /// #405：按标签检索（读模型 JSON——ID 字典序；AI 检索/过滤面）。
+    pub fn list_by_tag_json(&self, tag: &str) -> String {
+        list_by_tag_json_core(&self.session, tag)
     }
 
     /// 对象语义指纹（证据关联锚——"fnv64:{:016x}"）。

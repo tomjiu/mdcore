@@ -4795,7 +4795,7 @@ fn merge_highlight(mut base: HighlightStyle, over: HighlightStyle) -> HighlightS
 }
 
 /// shape 单段文本取像素宽（光标竖线定位）。
-fn shape_text_width(window: &mut Window, text: &str, style: &TextStyle) -> Pixels {
+pub(crate) fn shape_text_width(window: &mut Window, text: &str, style: &TextStyle) -> Pixels {
     if text.is_empty() {
         return px(0.);
     }

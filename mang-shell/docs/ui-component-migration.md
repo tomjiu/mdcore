@@ -112,6 +112,10 @@
 批 3：settings_panel 外壳 → ui::Modal；palette → Popover 组合
 批 4：menu_bar → DropdownMenu/PopoverMenu 组合（键盘导航重构——最重）
 批 5：panels/file_tree/git_panel → ui::List 族（虚拟化/多选桥接）
+                     ✅ 批 5c 已交付（feat/385-b5c-git-panel-list，PR 见 #385 认领评论）：
+                     git_panel 改动/历史行迁 ListItem + 状态码 Chip + 计数 CountBadge +
+                     空态 List::empty_message；视图切换 tab 钮不在行 13 映射内未动。
+                     批 5b（file_tree）待接。
 批 6+：Tooltip 统一化 / Chip / CountBadge 等细节件按需
 每批验收：既有单测全绿 + 新增交互测试（不是只测函数返回值）+ 截图对比
 （迁移前/后——沙箱无 GUI 时登记待真机，AGENTS 诚实边界纪律）

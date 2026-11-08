@@ -70,6 +70,20 @@ pub struct LopdfWriter {
 }
 
 impl LopdfWriter {
+    /// #411 DocMDP 写前门（标注面共享）：P=1/P=2 拒标注增删改，P=3
+    /// 放行（spec §12.8.2.2 P 值语义）。**写器构造不拒**——只读打开
+    /// + list 在受限档上合法（[`PdfAnnotator::open_with_limits`] 复用
+    /// 写器装载），拒的是第一个写手势（增/删同门）。
+    fn docmdp_annotation_gate(&self) -> Result<(), CommandError> {
+        crate::docmdp::ensure_write_allowed(
+            self.inc.get_prev_documents(),
+            crate::docmdp::WriteOp::Annotation,
+        )
+        .map_err(|v| CommandError::SecurityDeny {
+            reason: v.reason_code(),
+        })
+    }
+
     /// 从 PDF 字节构造（全内存；限额 = [`Limits::default`]——自定义
     /// 限额用 [`LopdfWriter::from_bytes_with_limits`]）。失败面：
     /// - S3-L7 输入字节超限 / S3-L4 打开预算超限 → `SecurityDeny`
@@ -260,6 +274,8 @@ impl AnnotationWriter for LopdfWriter {
         page: PageIndex,
         annot: &Annotation,
     ) -> Result<(), CommandError> {
+        // #411 DocMDP 门（标注增）：P=1/P=2 拒（P=3 放行）。
+        self.docmdp_annotation_gate()?;
         let page_id = self.page_object_id(page)?;
         let dict = annot_object(annot)?;
         // 装载：新对象 or 原位替换（同 id 重写 = 编辑路径——同对象号在新
@@ -656,6 +672,9 @@ impl LopdfWriter {
         page: PageIndex,
         annot_obj: ObjectId,
     ) -> Result<(), CommandError> {
+        // #411 DocMDP 门（标注删——与增同门：P=3 的放行面覆盖
+        // 「标注创建、删除与修改」三者）。
+        self.docmdp_annotation_gate()?;
         // 页对象 id（1 基换算——write_annotation 的 page_object_id 私有
         // 面同款逻辑[增量文档视图差异：remove 须在 prev 视图取页表]）。
         let key = page

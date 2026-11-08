@@ -42,6 +42,13 @@ const F_TOOL: &str = "tool";
 /// #402：z 序键（fractional index 字符串——字典序即 z 序；缺省
 /// `zorder::DEFAULT_KEY`，存量对象读侧兼容）。
 const F_ZINDEX: &str = "zindex";
+/// #405：标签集（嵌套 Map：tag → true——集字段的 CRDT 自然形状，
+/// 并发加不同 tag 联合合并；对比 members 整值替换的丢失面）。
+const F_TAGS: &str = "tags";
+/// #404：frame 命名（命名区——搜索/导出/演示支点）。
+const F_NAME: &str = "name";
+/// #404：父 frame 引用（树结构——reparent 不换 ID；指向 Frame kind）。
+const F_PARENT: &str = "parent";
 
 /// 画布对象种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,6 +59,10 @@ pub enum ObjectKind {
     /// 笔迹（#44 第 1 步）：原始采样点列 + 笔色/线宽/工具——存点不存
     /// outline（换平滑算法/改粗细不迁移数据；outline 体积 = 点列 5-10 倍）。
     Stroke,
+    /// #404：命名区（frame）——文档结构的空间对应物（section 类比）。
+    /// 容器语义：成员经 parent 属性挂接（对比 Group 的 members 数组）；
+    /// 渲染面恒在内容层之下（背景框 + 标题，见 render 容器分层）。
+    Frame,
 }
 
 impl ObjectKind {
@@ -61,6 +72,7 @@ impl ObjectKind {
             ObjectKind::Edge => "edge",
             ObjectKind::Group => "group",
             ObjectKind::Stroke => "stroke",
+            ObjectKind::Frame => "frame",
         }
     }
 
@@ -70,6 +82,7 @@ impl ObjectKind {
             "edge" => Some(ObjectKind::Edge),
             "group" => Some(ObjectKind::Group),
             "stroke" => Some(ObjectKind::Stroke),
+            "frame" => Some(ObjectKind::Frame),
             _ => None,
         }
     }
@@ -134,6 +147,18 @@ pub struct CanvasObject {
     /// Group 对象的 z 不影响成员渲染（成员各自成图元），字段统一
     /// 仅为模型一致性。
     pub z_index: String,
+    /// #405：跨区分类标签（props 之外的一等公民——AI 检索/过滤面）。
+    /// 集语义：读侧排序去重（确定性读模型）；不塞 props 的理由：
+    /// props 是 string→string 自由字典，无法索引、无法区分业务 tag
+    /// 与样式属性（研究仓 canvas/mdcore-mapping.md §6 裁决）。
+    pub tags: Vec<String>,
+    /// #404：对象命名（frame 命名区——搜索/导出/演示支点）。开放面：
+    /// 引擎不禁止其他 kind 携带；渲染面仅 Frame 消费（标题）。
+    pub name: Option<String>,
+    /// #404：父 frame 引用（树结构——reparent 不换 ID）。写入侧校验：
+    /// 指向存在的 Frame kind 对象且无环；并发删除可留悬空引用（读模型
+    /// 如实暴露，消费侧按顶层处理——同 Edge 悬空端点纪律）。
+    pub parent: Option<String>,
     /// 开放属性（label/color/…；字符串值面）。
     pub props: BTreeMap<String, String>,
 }
@@ -158,6 +183,9 @@ impl Default for CanvasObject {
             width: None,
             tool: None,
             z_index: crate::zorder::DEFAULT_KEY.to_string(),
+            tags: vec![],
+            name: None,
+            parent: None,
             props: BTreeMap::new(),
         }
     }
@@ -389,12 +417,55 @@ pub enum CanvasCommand {
         id: String,
         op: ReorderOp,
     },
+    /// #405：加分类标签（幂等——已有该 tag = 零写入零事件，同
+    /// reorder 幂等纪律）。
+    AddTag {
+        id: String,
+        tag: String,
+    },
+    /// #405：移除分类标签（幂等——无该 tag = 零写入零事件）。
+    RemoveTag {
+        id: String,
+        tag: String,
+    },
+    /// #404：创建命名区（frame）——几何 + 名称 + 可选父 frame。
+    CreateFrame {
+        id: Option<String>,
+        name: String,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        parent: Option<String>,
+    },
+    /// #404：重命名 frame。
+    RenameFrame {
+        id: String,
+        name: String,
+    },
+    /// #404：reparent（parent = None 提为顶层；写入侧无环 + 目标必须是
+    /// Frame——ID 恒不变，reparent 不换 ID 是本命令的存在理由）。
+    SetParent {
+        id: String,
+        parent: Option<String>,
+    },
 }
 
 /// 命令回执。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandReceipt {
     pub outcome: CommandOutcome,
+    pub undo_depth: usize,
+    pub undo_cleared: bool,
+}
+
+/// 批量回执（#352/#44 步6）：逐命令 outcome + 批级撤销面（整批 = 单
+/// 事务 = 一个撤销单元——一次 undo 全撤）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchReceipt {
+    /// 逐命令回执（含批内自动分配的对象 ID——消费方据此接线）。
+    pub outcomes: Vec<CommandOutcome>,
+    /// 批级撤销深度（应用后）。
     pub undo_depth: usize,
     pub undo_cleared: bool,
 }
@@ -433,6 +504,26 @@ pub enum CommandOutcome {
         id: String,
     },
     StrokeStyled {
+        id: String,
+    },
+    /// #405：标签已加（幂等无变化也回此回执）。
+    TagAdded {
+        id: String,
+    },
+    /// #405：标签已移除（幂等无变化也回此回执）。
+    TagRemoved {
+        id: String,
+    },
+    /// #404：frame 已建。
+    FrameCreated {
+        id: String,
+    },
+    /// #404：frame 已重命名。
+    FrameRenamed {
+        id: String,
+    },
+    /// #404：parent 已设（含提顶层）。
+    ParentSet {
         id: String,
     },
 }
@@ -789,6 +880,15 @@ impl CanvasSession {
         out
     }
 
+    /// #405：按标签检索（读模型——ID 字典序，同 [`Self::objects`]
+    /// 确定性面；AI 检索/过滤消费面）。
+    pub fn list_by_tag(&self, tag: &str) -> Vec<CanvasObject> {
+        self.objects()
+            .into_iter()
+            .filter(|o| o.tags.iter().any(|t| t == tag))
+            .collect()
+    }
+
     pub fn find_object(&self, id: &str) -> Option<CanvasObject> {
         let root = self.root();
         let txn = self.doc.transact();
@@ -922,9 +1022,144 @@ impl CanvasSession {
                 self.reorder_object(actor, &id, op)?;
                 CommandOutcome::Reordered { id }
             }
+            CanvasCommand::AddTag { id, tag } => {
+                self.add_tag(actor, &id, &tag)?;
+                CommandOutcome::TagAdded { id }
+            }
+            CanvasCommand::RemoveTag { id, tag } => {
+                self.remove_tag(actor, &id, &tag)?;
+                CommandOutcome::TagRemoved { id }
+            }
+            CanvasCommand::CreateFrame {
+                id,
+                name,
+                x,
+                y,
+                w,
+                h,
+                parent,
+            } => {
+                let fid = self.create_frame(actor, id, &name, x, y, w, h, parent)?;
+                CommandOutcome::FrameCreated { id: fid }
+            }
+            CanvasCommand::RenameFrame { id, name } => {
+                self.rename_frame(actor, &id, &name)?;
+                CommandOutcome::FrameRenamed { id }
+            }
+            CanvasCommand::SetParent { id, parent } => {
+                self.set_parent(actor, &id, parent)?;
+                CommandOutcome::ParentSet { id }
+            }
         };
         Ok(CommandReceipt {
             outcome,
+            undo_depth: self.undo_depth(actor),
+            undo_cleared: self.take_undo_cleared(),
+        })
+    }
+
+    // ── 批量命令面（#352/#44 步6）─────────────────────────
+
+    /// 派生沙箱 client_id（确定性，与自身 client_id 错开命名空间——
+    /// 批内自动分配的对象 ID 落在 `{sandbox_client}-{seq}` 前缀下，
+    /// 天然不与本地计数器序列撞号）。越 (0, 2^53) 域时回落取模
+    /// （残余撞号由 `next_id` 的占用跳过环兜底）。
+    fn sandbox_client_id(&self) -> u64 {
+        const OFFSET: u64 = 4_000_000_000_000;
+        let id = self.options.client_id.wrapping_add(OFFSET);
+        if id == 0 || id & (u64::MAX << 53) != 0 {
+            OFFSET + self.options.client_id % 1_000_000_000_000
+        } else {
+            id
+        }
+    }
+
+    /// 批量命令原子执行（#352/#44 步6）：**整批全成或全不成；整批 =
+    /// 单事务 = 一个撤销单元**（一次 undo 全撤、一次 redo 全恢复）。
+    ///
+    /// 实现路线（yrs 0.28 无 Transaction rollback——`Drop for
+    /// TransactionMut` 无条件 `commit()`，单事务回滚不可行）：
+    /// **沙箱校验 + 差量转移**。
+    /// ① 沙箱 = 状态等价副本（独立 client_id 的 `CanvasSession`）；
+    ///    顺序执行全批——cmd N 可见 cmd N-1 的效果（依赖序列合法）；
+    ///    任一失败即返回错误，**真实 doc 零接触**（原子性；沙箱即弃）。
+    /// ② 全批通过 → `encode_diff(批前 SV)` 取批效果差量 → 真实 doc
+    ///    单事务 + actor origin 落地（撤销单元化 + 恰一个 Command 事件）。
+    /// 成本：O(state) 状态副本——批是命令级稀有路径（用户/AI 显式
+    /// 批操作），换零回滚依赖与零既有路径改动。
+    ///
+    /// 语义注：
+    /// · 批内自动分配 ID 落在沙箱命名空间（回执如实返回实际 ID）；
+    ///   后续单命令自动分配不受影响（`next_id` 占用跳过环兜底）。
+    /// · 差量字节数计入真实入向限额（批效果聚合计——单命令逐条计
+    ///   之外的批级门）。
+    /// · 失败路径零事件、零撤销入栈、读模型/指纹不变。
+    pub fn execute_batch(
+        &mut self,
+        actor: Actor,
+        cmds: Vec<CanvasCommand>,
+    ) -> Result<BatchReceipt, CanvasError> {
+        if cmds.is_empty() {
+            return Err(CanvasError::InvalidInput(
+                "空批不可执行（无意义的撤销单元）".into(),
+            ));
+        }
+        // 批前基线：全量状态（沙箱种子）+ 真实 SV（差量基准）。
+        let full = self.doc.transact().encode_diff_v1(&StateVector::default());
+        let sv_real = self.state_vector();
+        // 沙箱限额放宽到能容纳状态副本（自身数据非敌意入向；批效果
+        // 聚合计走 ② 的真实入向门）。
+        let mut sandbox_opts = self.options.clone();
+        sandbox_opts.client_id = self.sandbox_client_id();
+        sandbox_opts.input_byte_limit = self.options.input_byte_limit.max(full.len());
+        let mut sandbox = CanvasSession::open(sandbox_opts)?;
+        sandbox.apply_update(&full)?;
+        // ① 沙箱顺序执行全批。
+        let mut outcomes = Vec::with_capacity(cmds.len());
+        for cmd in &cmds {
+            let receipt = sandbox.execute(actor, cmd.clone())?;
+            outcomes.push(receipt.outcome);
+        }
+        // ② 批效果差量 → 真实 doc 单事务落地。
+        let diff = sandbox.encode_diff(&sv_real)?;
+        self.check_inbound(diff.len())?;
+        self.collector.begin();
+        self.touched.begin();
+        let doc = &self.doc;
+        let applied = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let update =
+                Update::decode_v1(&diff).map_err(|e| CanvasError::Decode(e.to_string()))?;
+            let mut txn = doc.transact_mut_with(actor.wire());
+            txn.apply_update(update)
+                .map_err(|e| CanvasError::Decode(e.to_string()))?;
+            txn.commit();
+            Ok(())
+        }));
+        match applied {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = self.collector.drain();
+                let _ = self.touched.drain();
+                return Err(e);
+            }
+            Err(p) => {
+                let _ = self.collector.drain();
+                let _ = self.touched.drain();
+                return Err(CanvasError::Panic(panic_message(&p)));
+            }
+        }
+        let updates = self.collector.drain();
+        let touched = self.touched.drain();
+        if !updates.is_empty() {
+            self.hub.dispatch(&CanvasEvent {
+                source: CanvasChangeSource::Command { actor },
+                updates,
+                touched,
+            });
+        }
+        self.enforce_undo_limit(actor);
+        Ok(BatchReceipt {
+            outcomes,
             undo_depth: self.undo_depth(actor),
             undo_cleared: self.take_undo_cleared(),
         })
@@ -1127,6 +1362,10 @@ impl CanvasSession {
             obj.insert(F_H.into(), In::Any(Any::Number(Number::Float(h))));
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(Self::props_prelim(props)));
+            // #405：预建空标签 Map（props 同款先例）——并发首笔
+            // add_tag 成为既有 Map 内的键级操作（联合合并），而非
+            // F_TAGS 键上的整值 Map 插入（键级 LWW 互相覆盖丢 tag）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, id.clone(), In::Map(obj));
@@ -1242,6 +1481,8 @@ impl CanvasSession {
             obj.insert(F_TO.into(), In::Any(Any::String(to.into())));
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(Self::props_prelim(props)));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, id.clone(), In::Map(obj));
@@ -1292,17 +1533,54 @@ impl CanvasSession {
     fn remove_object(&mut self, actor: Actor, id: &str) -> Result<(), CanvasError> {
         self.check_inbound(id.len())?;
         let root = self.root();
-        {
+        // #404：frame 删除级联——直系子对象提顶层（同事务原子，撤销
+        // 单元恢复）。仅显式删除面清理；并发副本上的 frame 删除仍可留
+        // 悬空 parent（读模型如实暴露，消费侧按顶层处理——同 Edge
+        // 悬空端点纪律）。
+        let children: Vec<(String, yrs::MapRef)> = {
             let txn = self.doc.transact();
-            if root.get(&txn, id).is_none() {
-                return Err(CanvasError::ObjectNotFound {
-                    object_id: id.to_string(),
-                });
+            match root.get(&txn, id) {
+                None => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+                Some(Out::YMap(m)) => {
+                    let is_frame = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Frame.wire()
+                    );
+                    if !is_frame {
+                        vec![]
+                    } else {
+                        root.keys(&txn)
+                            .filter_map(|k| {
+                                let km = match root.get(&txn, k) {
+                                    Some(Out::YMap(km)) => km,
+                                    _ => return None,
+                                };
+                                let is_child = matches!(
+                                    km.get(&txn, F_PARENT),
+                                    Some(Out::Any(Any::String(p))) if p.as_ref() == id
+                                );
+                                is_child.then(|| (k.to_string(), km))
+                            })
+                            .collect()
+                    }
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
             }
-        }
+        };
         {
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.remove(&mut txn, id);
+            for (_, cm) in &children {
+                cm.remove(&mut txn, F_PARENT);
+            }
             txn.commit();
         }
         self.enforce_undo_limit(actor);
@@ -1358,6 +1636,8 @@ impl CanvasSession {
             );
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, gid.clone(), In::Map(obj));
@@ -1472,6 +1752,8 @@ impl CanvasSession {
             obj.insert(F_TOOL.into(), In::Any(Any::String(tool.wire().into())));
             obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
             obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
             let root = self.root();
             let mut txn = self.doc.transact_mut_with(actor.wire());
             root.insert(&mut txn, id.clone(), In::Map(obj));
@@ -1479,6 +1761,278 @@ impl CanvasSession {
         }
         self.enforce_undo_limit(actor);
         Ok(id)
+    }
+
+    // ── 标签面（#405）────────────────────────────────────────────
+
+    /// 标签合法性：非空（空串 = 无语义分类，拒收；敌意长度走
+    /// check_inbound 入站面）。
+    fn check_tag(tag: &str) -> Result<(), CanvasError> {
+        if tag.is_empty() {
+            return Err(CanvasError::InvalidInput("标签不可为空".into()));
+        }
+        Ok(())
+    }
+
+    /// #405：加标签（幂等——已有该 tag 零写入零事件，同 reorder 纪律）。
+    ///
+    /// 载体为嵌套 Map（tag → true）：并发加不同 tag → 键集联合合并
+    /// （两笔都活）；并发加同 tag → 键级幂等。对比 Any::Array 整值
+    /// 替换（后写覆盖前写——并发丢 tag，members 的 P2-2 已知丢失面）。
+    fn add_tag(&mut self, actor: Actor, id: &str, tag: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + tag.len() + 64)?;
+        Self::check_tag(tag)?;
+        let m = self.object_map(id)?;
+        // 读域：已有该 tag → 幂等短路（零 CRDT 字节 = 零事件）；
+        // 同时取嵌套 tags Map 句柄（yrs 读写事务同锁，遮蔽持有 =
+        // 死锁 p18 纪律——句柄在读域取，写在写域做）。
+        let tags_map = {
+            let txn = self.doc.transact();
+            match m.get(&txn, F_TAGS) {
+                Some(Out::YMap(t)) => {
+                    if t.get(&txn, tag).is_some() {
+                        return Ok(()); // 幂等：零写入零事件
+                    }
+                    Some(t)
+                }
+                _ => None,
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            match tags_map {
+                Some(t) => {
+                    t.insert(&mut txn, tag, In::Any(Any::Bool(true)));
+                }
+                None => {
+                    // 首写建 Map（单键 Prelim）。
+                    let prelim: MapPrelim =
+                        std::iter::once((tag, In::Any(Any::Bool(true)))).collect();
+                    m.insert(&mut txn, F_TAGS, In::Map(prelim));
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    /// #405：移除标签（幂等——无该 tag 零写入零事件）。
+    fn remove_tag(&mut self, actor: Actor, id: &str, tag: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + tag.len() + 64)?;
+        Self::check_tag(tag)?;
+        let m = self.object_map(id)?;
+        let tags_map = {
+            let txn = self.doc.transact();
+            match m.get(&txn, F_TAGS) {
+                Some(Out::YMap(t)) => {
+                    if t.get(&txn, tag).is_none() {
+                        return Ok(()); // 幂等：零写入零事件
+                    }
+                    Some(t)
+                }
+                // 无标签面 = 必无该 tag → 幂等。
+                _ => None,
+            }
+        };
+        let Some(t) = tags_map else {
+            return Ok(());
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            t.remove(&mut txn, tag);
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    // ── frame 面（#404——命名区 + parent 树）──────────────────────
+
+    /// frame 名称合法性：非空（命名区——空名 = 无语义区域，拒收）。
+    fn check_frame_name(name: &str) -> Result<(), CanvasError> {
+        if name.is_empty() {
+            return Err(CanvasError::InvalidInput("frame 名称不可为空".into()));
+        }
+        Ok(())
+    }
+
+    /// parent 目标校验 + 无环检测（CreateFrame/SetParent 共用）。
+    ///
+    /// - 目标存在且为 Frame kind（命名区是唯一容器语义面）；
+    /// - 不自指（id == parent 即自环）；
+    /// - 无环：从目标沿 parent 链上溯，途中出现 id 即成环（visited
+    ///   集防御敌意载体中的既有环——上溯遇已访问节点即止，不 panic）。
+    fn check_parent_target(&self, id: &str, parent: &str) -> Result<(), CanvasError> {
+        if parent == id {
+            return Err(CanvasError::InvalidInput(
+                "parent 不可自指（对象不能是自己的父 frame）".into(),
+            ));
+        }
+        let target = self
+            .find_object(parent)
+            .ok_or_else(|| CanvasError::ObjectNotFound {
+                object_id: parent.to_string(),
+            })?;
+        if target.kind != ObjectKind::Frame {
+            return Err(CanvasError::InvalidInput(format!(
+                "父对象 {parent:?} 不是 frame（parent 目标必须是 Frame kind）"
+            )));
+        }
+        // 无环：从目标上溯，出现 id = 环。
+        let mut cur = Some(parent.to_string());
+        let mut visited = std::collections::HashSet::new();
+        while let Some(p) = cur {
+            if p == id {
+                return Err(CanvasError::InvalidInput(format!(
+                    "环路 parent 被拒：{parent} 的祖先链包含 {id}"
+                )));
+            }
+            if !visited.insert(p.clone()) {
+                break; // 敌意载体既有环——上溯终止（不 panic，拒绝写入面不变）
+            }
+            cur = self.find_object(&p).and_then(|o| o.parent);
+        }
+        Ok(())
+    }
+
+    /// #404：创建命名区（几何 + 名称 + 可选父 frame）。
+    #[allow(clippy::too_many_arguments)] // 命令域字段直传（同 add_node 纪律）
+    fn create_frame(
+        &mut self,
+        actor: Actor,
+        id: Option<String>,
+        name: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        parent: Option<String>,
+    ) -> Result<String, CanvasError> {
+        let inbound = x.to_string().len() * 4
+            + name.len()
+            + parent.as_deref().map(|p| p.len()).unwrap_or(0)
+            + id.as_deref().map(|i| i.len()).unwrap_or(0)
+            + 128;
+        self.check_inbound(inbound)?;
+        Self::check_frame_name(name)?;
+        Self::check_finite(x, "x")?;
+        Self::check_finite(y, "y")?;
+        Self::check_finite(w, "w")?;
+        Self::check_finite(h, "h")?;
+        if w < 0.0 || h < 0.0 {
+            return Err(CanvasError::InvalidInput("尺寸不可为负".into()));
+        }
+        let id = match id {
+            Some(given) => {
+                if given.is_empty() {
+                    return Err(CanvasError::InvalidInput("对象 ID 不可为空".into()));
+                }
+                self.ensure_absent(&given)?;
+                given
+            }
+            None => self.next_id(),
+        };
+        // 父目标校验（新 frame 无子——环只能来自敌意载体的既有环，
+        // check_parent_target 的 visited 集防御）。
+        if let Some(p) = &parent {
+            self.check_parent_target(&id, p)?;
+        }
+        {
+            let z = self.next_top_z();
+            let mut obj: MapPrelim = Vec::<(&'static str, In)>::new().into_iter().collect();
+            obj.insert(
+                F_KIND.into(),
+                In::Any(Any::String(ObjectKind::Frame.wire().into())),
+            );
+            obj.insert(F_X.into(), In::Any(Any::Number(Number::Float(x))));
+            obj.insert(F_Y.into(), In::Any(Any::Number(Number::Float(y))));
+            obj.insert(F_W.into(), In::Any(Any::Number(Number::Float(w))));
+            obj.insert(F_H.into(), In::Any(Any::Number(Number::Float(h))));
+            obj.insert(F_NAME.into(), In::Any(Any::String(name.into())));
+            if let Some(p) = &parent {
+                obj.insert(F_PARENT.into(), In::Any(Any::String(p.clone().into())));
+            }
+            obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
+            obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
+            let root = self.root();
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.insert(&mut txn, id.clone(), In::Map(obj));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(id)
+    }
+
+    /// #404：重命名 frame（Frame kind 门禁——重命名是命名区语义）。
+    fn rename_frame(&mut self, actor: Actor, id: &str, name: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + name.len() + 64)?;
+        Self::check_frame_name(name)?;
+        let m = {
+            let root = self.root();
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                Some(Out::YMap(m)) => {
+                    let is_frame = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Frame.wire()
+                    );
+                    if !is_frame {
+                        return Err(CanvasError::KindMismatch {
+                            object_id: id.to_string(),
+                            op: "rename_frame",
+                        });
+                    }
+                    m
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            m.insert(&mut txn, F_NAME, In::Any(Any::String(name.into())));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    /// #404：reparent（ID 恒不变——树结构重挂；parent = None 提顶层）。
+    ///
+    /// 对象种类不限（节点/边/分组/笔迹/frame 皆可入 frame）；parent
+    /// 目标必须是 Frame kind 且无环（见 [`Self::check_parent_target`]）。
+    fn set_parent(
+        &mut self,
+        actor: Actor,
+        id: &str,
+        parent: Option<String>,
+    ) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + parent.as_deref().map(|p| p.len()).unwrap_or(0) + 64)?;
+        let m = self.object_map(id)?;
+        if let Some(p) = &parent {
+            self.check_parent_target(id, p)?;
+        }
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            match &parent {
+                Some(p) => {
+                    m.insert(&mut txn, F_PARENT, In::Any(Any::String(p.clone().into())));
+                }
+                None => {
+                    // 提顶层：显式删键（残留旧值会让读模型继续暴露父引用）。
+                    m.remove(&mut txn, F_PARENT);
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
     }
 
     fn set_stroke_style(
@@ -1601,6 +2155,18 @@ fn read_object(root: &yrs::MapRef, txn: &yrs::Transaction, id: &str) -> Option<C
     // #402：z 序键（缺省 DEFAULT_KEY——存量对象/敌意缺字段兼容；
     // 不在此校验键型：排序面只做字典序比较，重排命令面才校验）。
     let z_index = str_field(F_ZINDEX).unwrap_or_else(|| crate::zorder::DEFAULT_KEY.to_string());
+    // #405：标签集（嵌套 Map keys → 排序 Vec；缺省/敌意形状 = 空集）。
+    let mut tags = match m.get(txn, F_TAGS) {
+        Some(Out::YMap(t)) => t
+            .iter(txn)
+            .map(|(k, _)| k.to_string())
+            .collect::<Vec<String>>(),
+        _ => vec![],
+    };
+    tags.sort();
+    // #404：frame 命名 + 父引用（缺省/敌意形状 = None）。
+    let name = str_field(F_NAME);
+    let parent = str_field(F_PARENT);
     let mut props = BTreeMap::new();
     if let Some(Out::YMap(p)) = m.get(txn, F_PROPS) {
         for (k, v) in p.iter(txn) {
@@ -1624,6 +2190,9 @@ fn read_object(root: &yrs::MapRef, txn: &yrs::Transaction, id: &str) -> Option<C
         width,
         tool,
         z_index,
+        tags,
+        name,
+        parent,
         props,
     })
 }
@@ -1673,6 +2242,19 @@ pub fn fingerprint_object(o: &CanvasObject) -> String {
     // #402：z 序键入指纹（重排 = 语义变更 → 证据失效——与「位置漂移
     // 即语义变更」同粒度：遮挡关系是视觉语义面）。
     acc.push_str(&format!("|z={}", o.z_index));
+    // #405：标签集入指纹（分类变更 = 语义变更 → 证据失效——与 props
+    // 同粒度；集语义排序后指纹，同集不同序同指纹）。
+    let mut ts = o.tags.clone();
+    ts.sort();
+    acc.push_str(&format!("|t={}", ts.join(",")));
+    // #404：命名 + 父引用入指纹（重命名/reparent = 语义变更 → 证据
+    // 失效——树位置与命名都是检索/导出语义面）。
+    if let Some(n) = &o.name {
+        acc.push_str(&format!("|n={n}"));
+    }
+    if let Some(p) = &o.parent {
+        acc.push_str(&format!("|pa={p}"));
+    }
     mdc_evidence::Fnv64.fingerprint(acc.as_bytes()).0
 }
 

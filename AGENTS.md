@@ -63,8 +63,11 @@ gh api "repos/mmqz/<repo>/pulls?state=closed&per_page=100" --jq '.[] | select(.m
 # 第 3 步：这个 issue 有没有对应的分支？
 gh api "repos/mmqz/<repo>/branches?per_page=100" --jq '.[].name' | grep -i "<N>"
 
-# 第 4 步：任务池里有没有人登记了
-gh api repos/mmqz/<repo>/issues/<pool> --jq '.body' | grep "<N>"
+# 第 4 步：全局同题搜——有没有别处已登记同一问题（防同题撞车，详见 0.0.12）
+gh api "search/issues?q=repo:mmqz/<repo>+<核心词>&state=open" --jq '.items[] | "#\(.number) \(.title)"'
+
+# （原第 4 步「查任务池」已废弃：#272/#310 任务池已作废，
+#   任务状态以 label + milestone + 认领评论为准，见 0.0.11）
 ```
 
 **判定规则：**
@@ -1037,6 +1040,53 @@ gh api repos/mmqz/<repo>/issues/<N>/comments -X POST -f body="认领：<身份>
 
 ---
 
+## 0.0.13 认领→开 PR 之间有窗口——开 PR 前最后一查（#408 84 秒平行事故）
+
+**四查是「时点判定」，不是「区间判定」——查完到动手之间，别人可能已经认领或交付。**
+
+## 事故（2026-11-07 #408 实测）
+
+```
+10:06:14  Agent-v65o 发认领评论（时点四查干净）
+10:07:38  Agent-3ivu 的 PR #424 创建（其四查完成于上述认领评论
+          可见之前——晚于此就不该是干净的；且未先发认领评论，
+          先 PR 后补认领）
+10:22:01  Agent-v65o 让位：本地实现不推送，转 review #424
+
+窗口 = 84 秒。双方四查都做了、都没查错——错的是
+「查完之后世界静止」的假设。
+```
+
+## 三条缓解（缺一不可）
+
+```
+① 认领评论必须真实发出后再开工（0.0.2 / 0.1 的重申）
+   「先 PR 后认领」是窗口事故的直接成因：你的开工没有落点公示，
+   后来者无从避让。
+
+② 开 PR 前最后一查（一条命令，< 5 秒）
+   认领到 PR 之间可能隔几小时，世界没有静止：
+
+     gh api "repos/mmqz/<repo>/pulls?state=open&per_page=100" \
+       --jq '.[] | select(.title | test("#<N>\\b")) | "#\(.number) \(.title)"'
+
+   出现新 PR → 让位（0.0.1），不重复开。
+
+③ 平行已成事实 → 后到让位，转 review
+   #408 的处置是范本：平行实现不推送（白做认赔），转为独立实测
+   对方 PR + 把发现列成 review 意见（v65o 对 #424 的 review 抓出
+   三条实质问题——让位不等于白干）。
+```
+
+## 为什么「后到」以 PR 时点判，不以认领时点判
+
+```
+认领是意图声明，PR 是事实交付。0.0.1 的裁决基准是「谁先有 open PR」；
+认领了但 12h 无产出（0.0.6）同样要让位给已交付者。
+```
+
+---
+
 ## 0.0.12 开新 issue 前必查重——认领前全局搜同题
 
 **0.0 清单查的是「这个 issue 有没有人认领」；本节补查的是「这个问题有没有人登记过」。两查都要做。**
@@ -1140,9 +1190,10 @@ gh issue comment <number> --repo mmqz/<repo> --body "认领：<你的身份> 承
 **避免重复**：
 
 ```
-生成后先查一下有没有被占用：
-  在任务面板 #229 看已有的名字列表
-  或 gh api repos/mmqz/<repo>/issues?state=all --jq 筛选
+生成后先查一下有没有被占用（任务面板 #229 已废弃、不再维护名字列表，改用搜索）：
+  gh api "search/commits?q=repo:mmqz/<repo>+%22Agent-<后缀>%22" --jq '.total_count'
+  gh api "search/issues?q=repo:mmqz/<repo>+%22Agent-<后缀>%22" --jq '.total_count'
+  两处都为 0 = 未被占用（issues 搜索含评论，commits 搜索含 Co-Authored-By 尾注）
 
 重复了 → 重新生成一个
 ```
@@ -1875,6 +1926,11 @@ ai-bid 依赖 mdcore（通过 crates.io 或 git rev）
 [ ] 涉及真实语料/外部工具 → 加了 skip_if_env_missing / skip_if_fixture_missing
 [ ] SKIP 有横幅和原因（用仓里的工具函数，不手写 return）
 [ ] 本地能跑的必须真跑，跑不了的如实报告
+```
+
+**开 PR 前**：
+```
+[ ] 最后一次查同题 open PR（认领→PR 之间有窗口，见 0.0.13）
 ```
 
 **开 PR 后**：

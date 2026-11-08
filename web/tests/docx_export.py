@@ -545,12 +545,20 @@ def main() -> int:
                                    "word/document.xml")
             except Exception:  # noqa: BLE001
                 pass
+            # #489：断言随 #309③（PR #338）域缓存写入翻转——begin 不置
+            # dirty（打开即显缓存零弹窗），docx-rs 恒显式写 false（与
+            # native 断言族 docx_export.rs L3028 同口径：dirty="true" 零
+            # 出现 + dirty="false" 显式在场）。
             check("w2_toc_field_emission_and_position",
                   r_toc.get("ok") is True
-                  and '<w:fldChar w:fldCharType="begin" w:dirty="true" />' in doc_toc
+                  and '<w:fldChar w:fldCharType="begin" w:dirty="false" />' in doc_toc
+                  and 'w:dirty="true"' not in doc_toc
                   and '<w:instrText>TOC \\o &quot;1-3&quot;</w:instrText>' in doc_toc
                   and 'w:fldCharType="separate"' in doc_toc
-                  and "（目录域——打开后全选再按 F9 更新生成）" in doc_toc
+                  # #196 任务 2（同根因一并翻转）：占位提示文本已升级为
+                  # 静态目录项（hyperlink + PAGEREF 页码域）——断言锚
+                  # 换为静态项面。
+                  and '<w:instrText>PAGEREF toc_0 \\h</w:instrText>' in doc_toc
                   and 'w:fldCharType="end"' in doc_toc
                   and doc_toc.find("TOC \\o") < doc_toc.find("Export Test"),
                   "TOC 五连 + 居首内容块（Export Test）之前")

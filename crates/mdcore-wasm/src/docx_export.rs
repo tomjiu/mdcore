@@ -66,10 +66,23 @@
 //!   本模块测试 = 导出 XML 面直断言 + 既有文本面回归（文本零损）；
 //! - 导出的 heading 样式读回 = `Heading1`..`Heading9`（office-io 读面
 //!   样式 ID 透传）——全环断言见本模块测试；
-//! - 不暴露面（DocxWriter 能力中本切片未接线）：脚注——**例外**：
-//!   W-1 目录域（TOC）经 options 开关接线（见下）；页眉/页脚槽位、
-//!   页码域（PAGE/NUMPAGES）与 PNG 图片经 P1 #190 options 接线
-//!   （见下节）；正文域仍不暴露（无页面装置语义面）。
+//! - 不暴露面（DocxWriter 能力中本切片未接线）：正文域仍不暴露
+//!   （无页面装置语义面）——页眉/页脚槽位、页码域（PAGE/NUMPAGES）
+//!   与 PNG 图片经 P1 #190 options 接线（见下节）；**脚注已接**
+//!   （#488，见下节「脚注导出」）。
+//!
+//! ## 脚注导出（#488：GFM 语法消费）
+//!
+//! - **定义块**：首行 `[^label]: ` 形的 Paragraph 整块消费（lazy 连续
+//!   行空格连接——RunSpec::footnote 单段面，段落边界合并是登记边界）；
+//! - **引用位**：runs_from 产物后处理——`[^label]` 切分为
+//!   [`RunSpec::footnote`]，标记前后文本保留原五样式标志；
+//! - **字面保留面**（GFM 语义对齐）：等宽 run（行内代码域）内标记、
+//!   未知 label 标记、Heading 内标记（纯文本 API）——均不消费；
+//! - **登记边界**：同 label 多引用 = 各发一条脚注副本（docx-rs 简单
+//!   路径无共享 id 面）；孤儿定义（无引用位）不发射（与 GFM 渲染
+//!   语义一致）；收集与消费同一谓词（任意深度 Paragraph——mdcore
+//!   模型无位置语义，宽面确定性优于 GFM 顶层面收窄）。
 //!
 //! ## W-1/W-2 增量（2026-10-28，issue #29 阶段 A0）：options 两新键
 //!
@@ -294,6 +307,168 @@ pub(crate) fn text_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// #488：MD 脚注 → DOCX 脚注导出（GFM 语法消费——发射层文本扫描）
+//
+// 模型无脚注概念（mdcore 行级解析把 `[^1]` 当普通文本——与 #15 行内
+// marks 派生同款「发射层消费」先例）。两侧：
+//   · 定义块：首行匹配 `[^label]: ` 的 Paragraph 整块消费（不进正文），
+//     内容（首行余文 + 后续行空格连接——RunSpec::footnote 单段面）
+//     进脚注表；
+//   · 引用位：runs_from 产物后处理——`[^label]` 切分为
+//     RunSpec::footnote(内容)，标记前后文本保留原五样式标志。
+// 字面保留面（GFM 语义对齐）：等宽 run（行内代码域）内标记不消费；
+// 未知 label（无定义）标记不消费；Heading 内标记不消费（纯文本 API）。
+// ---------------------------------------------------------------------------
+
+/// 脚注定义表：GFM label → 单段内容。
+///
+/// 收集（[`collect_footnote_defs`]）与消费（发射期 `is_definition`
+/// 跳过 + [`FootnoteDefs::splice_runs`] 拼接）用同一谓词
+/// [`footnote_def_line`]——两侧判定恒一致（收集到的块必被消费，
+/// 消费的块必已收集）。
+#[derive(Default)]
+struct FootnoteDefs {
+    map: std::collections::HashMap<String, String>,
+}
+
+/// 单行定义形识别：`[^label]: 内容`（label 非空、无空白/`[`/`]`）。
+/// 返回 (label, 首行内容)。GFM 惯例 label 容忍除空白与方括号外的
+/// 任意字符——本面收窄为「无空白无方括号」的保守子集（导入面
+/// #485 只发数字 label，互通面零损）。
+fn footnote_def_line(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("[^")?;
+    let close = rest.find(']')?;
+    let label = &rest[..close];
+    if label.is_empty()
+        || label
+            .chars()
+            .any(|c| c.is_whitespace() || c == '[' || c == ']')
+    {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    let content = after.strip_prefix(':')?;
+    // `: ` 与 `:` 单独形态都收（`[^1]:x` 合法 GFM）；内容原样（不 trim
+    // ——尾随空格保真；首空格剥一个对齐导入面发射形）。
+    let content = content.strip_prefix(' ').unwrap_or(content);
+    Some((label, content))
+}
+
+/// 块级定义判定：首行是定义行 → 整块 = 定义（lazy 连续语义——与
+/// 导入面 #485 的发射形态对称）。
+fn footnote_def_block(text: &str) -> bool {
+    text.split('\n')
+        .next()
+        .and_then(footnote_def_line)
+        .is_some()
+}
+
+/// 文档级收集：任意深度 Paragraph 块的定义面（与消费谓词一致——
+/// 引用块/列表内的定义段同样消费，GFM 顶层面收窄不在此做：mdcore
+/// 模型无位置语义，宽面确定性优于规范面）。
+fn collect_footnote_defs(tree: &BlockTree, id: NodeId, defs: &mut FootnoteDefs) {
+    let node = tree.node(id);
+    match node.kind {
+        BlockKind::Document | BlockKind::Blockquote | BlockKind::ListItem => {
+            for &c in &node.children {
+                collect_footnote_defs(tree, c, defs);
+            }
+        }
+        BlockKind::Paragraph => {
+            let text = node.text.to_string();
+            if let Some((label, first)) = text.split('\n').next().and_then(footnote_def_line) {
+                // 多行块：lazy 连续行空格连接（RunSpec::footnote 单段
+                // 纯文本面——段落边界合并是登记边界）。
+                let mut content = first.to_string();
+                for line in text.split('\n').skip(1) {
+                    content.push(' ');
+                    content.push_str(line);
+                }
+                defs.map.insert(label.to_string(), content);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `[^label]` 引用位扫描：从 `start`（字节位）起找第一个**已知
+/// label** 的标记；无效/未知 label 的标记跳过（字面保留——GFM 同
+/// 语义：未定义引用不渲染为脚注）。返回 (标记起点, label, 标记后
+/// 字节位)。找不到 → None。
+fn find_known_marker(
+    text: &str,
+    start: usize,
+    defs: &FootnoteDefs,
+) -> Option<(usize, String, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    while i + 1 < bytes.len() {
+        // "[^" 起点扫描（字节面安全：'[' 与 '^' 均 ASCII，多字节 UTF-8
+        // 序的续字节 ≥ 0x80 不会误命中）。
+        if bytes[i] == b'[' && bytes[i + 1] == b'^' {
+            if let Some(close_rel) = text[i + 2..].find(']') {
+                let label = &text[i + 2..i + 2 + close_rel];
+                let after = i + 2 + close_rel + 1;
+                let valid = !label.is_empty()
+                    && !label
+                        .chars()
+                        .any(|c| c.is_whitespace() || c == '[' || c == ']');
+                if valid && defs.map.contains_key(label) {
+                    return Some((i, label.to_string(), after));
+                }
+                // 无效/未知标记：跳过该 ']' 继续扫（字面保留）。
+                i = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+impl FootnoteDefs {
+    /// 引用位拼接：runs_from 产物后处理。**前置条件**：入参 runs 由
+    /// [`runs_from`] 产出（五样式标志 + 纯文本——link/anchor/field/
+    /// char_style 恒缺省，重建经 `RunSpec::styled_full` 无损）。
+    /// 等宽 run（行内代码域）整段跳过（GFM：代码域内非引用）。
+    fn splice_runs(&self, runs: Vec<RunSpec>) -> Vec<RunSpec> {
+        if self.map.is_empty() {
+            return runs; // 快路径：无定义表 = 全字面（零分配零扫描）
+        }
+        let mut out: Vec<RunSpec> = Vec::with_capacity(runs.len());
+        for run in runs {
+            if run.mono || !run.text.contains("[^") {
+                out.push(run);
+                continue;
+            }
+            let (b, i, m, s, u) = (run.bold, run.italic, run.mono, run.strike, run.underline);
+            let text = run.text;
+            let mut pos = 0usize; // 已消费到的字节位
+            while let Some((start, label, after)) = find_known_marker(&text, pos, self) {
+                if start > pos {
+                    out.push(RunSpec::styled_full(
+                        text[pos..start].to_string(),
+                        b,
+                        i,
+                        m,
+                        s,
+                        u,
+                    ));
+                }
+                // 同 label 多引用 = 各发一条脚注副本（docx-rs 简单路径
+                // ——无共享 id 面；登记边界）。
+                out.push(RunSpec::footnote(self.map[&label].clone()));
+                pos = after;
+            }
+            if pos < text.len() {
+                out.push(RunSpec::styled_full(text[pos..].to_string(), b, i, m, s, u));
+            }
+        }
+        out
+    }
+}
+
 /// 富文本（可多行）→ (行, 行内 marks) 序列：'\n' 分行 + 行尾 '\r'
 /// 仅在发射面剥除 + mark char 偏移按行区间裁剪平移（多行切分不丢
 /// 格式）。行切分 + mark 平移的单一真源（ListItem 首行/余行分道与
@@ -341,9 +516,16 @@ fn rich_lines(text: &str, marks: &[MarkSpan]) -> Vec<(String, Vec<MarkSpan>)> {
 
 /// 富文本（可多行）→ 每行一个 docx 段落；`quote_depth > 0` 时走引用面
 ///（ind + 左边框，嵌套步进语义由调用方传深度）。
-fn emit_rich_paragraphs(w: &mut DocxWriter, text: &str, marks: &[MarkSpan], quote_depth: usize) {
+fn emit_rich_paragraphs(
+    w: &mut DocxWriter,
+    text: &str,
+    marks: &[MarkSpan],
+    quote_depth: usize,
+    notes: &FootnoteDefs,
+) {
     for (line, line_marks) in rich_lines(text, marks) {
-        let runs = runs_from(&line, &line_marks);
+        // #488：引用位拼接（无定义表 = 零开销快路径原样透传）。
+        let runs = notes.splice_runs(runs_from(&line, &line_marks));
         if quote_depth > 0 {
             w.quote_paragraph(&runs, quote_depth);
         } else {
@@ -578,6 +760,7 @@ fn emit_block(
     images: &ImageTable,
     toc_marks: &TocMarkMap,
     list_nums: &ListNumMap,
+    notes: &FootnoteDefs,
 ) -> Result<(), ExportError> {
     let node = tree.node(id);
     let text = node.text.to_string();
@@ -585,7 +768,7 @@ fn emit_block(
         // 虚根透明递归（top_level 已绕过；op 面禁止 Document 子块——防御）
         BlockKind::Document => {
             for &c in &node.children {
-                emit_block(tree, c, w, quote_depth, images, toc_marks, list_nums)?;
+                emit_block(tree, c, w, quote_depth, images, toc_marks, list_nums, notes)?;
             }
         }
         BlockKind::Heading => {
@@ -609,6 +792,11 @@ fn emit_block(
             }
         }
         BlockKind::Paragraph => {
+            // #488：脚注定义块消费（首行 `[^label]: ` 形——lazy 连续
+            // 整块归定义）：不进正文（内容已在收集面进脚注表）。
+            if footnote_def_block(&text) {
+                return Ok(());
+            }
             // P1 #190：图片行直通——整块单行 + `![alt](src)` 形 + src
             // 命中资源表 → [`DocxWriter::image`]（内嵌 PNG，显式尺寸）。
             // 识别在 `effective_inline` 之前（原始字面量——图片是块级
@@ -628,7 +816,7 @@ fn emit_block(
             }
             if !emitted_image {
                 let (clean, marks) = effective_inline(&text, &node.marks);
-                emit_rich_paragraphs(w, &clean, &marks, quote_depth);
+                emit_rich_paragraphs(w, &clean, &marks, quote_depth, notes);
             }
         }
         BlockKind::CodeBlock => {
@@ -658,10 +846,10 @@ fn emit_block(
             let d = quote_depth + 1;
             if node.children.is_empty() {
                 let (clean, marks) = effective_inline(&text, &node.marks);
-                emit_rich_paragraphs(w, &clean, &marks, d);
+                emit_rich_paragraphs(w, &clean, &marks, d, notes);
             }
             for &c in &node.children {
-                emit_block(tree, c, w, d, images, toc_marks, list_nums)?;
+                emit_block(tree, c, w, d, images, toc_marks, list_nums, notes)?;
             }
         }
         BlockKind::ListItem => {
@@ -676,9 +864,11 @@ fn emit_block(
             let (kind, ilvl) = list_shape(&node.attrs);
             let (clean, eff_marks) = effective_inline(&text, &node.marks);
             let lines = rich_lines(&clean, &eff_marks);
+            // #488：列表项行 run 同过引用位拼接（列表项内脚注 = 词法
+            // 域内标记——GFM 允许）。
             let line_runs: Vec<Vec<RunSpec>> = lines
                 .iter()
-                .map(|(line, line_marks)| runs_from(line, line_marks))
+                .map(|(line, line_marks)| notes.splice_runs(runs_from(line, line_marks)))
                 .collect();
             let instance_num = (kind == ListKind::Ordered)
                 .then(|| list_nums.get(&id).copied())
@@ -709,7 +899,7 @@ fn emit_block(
                 }
             }
             for &c in &node.children {
-                emit_block(tree, c, w, quote_depth, images, toc_marks, list_nums)?;
+                emit_block(tree, c, w, quote_depth, images, toc_marks, list_nums, notes)?;
             }
         }
         BlockKind::ThematicBreak => {
@@ -732,8 +922,15 @@ pub fn export_docx_core(tree: &BlockTree) -> Result<Vec<u8>, ExportError> {
     // #365：有序列表实例预分配（先于发射——分配序 = 发射序，第 1
     // 实例 = 100 兼容面）。
     let list_nums = assign_ordered_num_ids(tree, &mut w);
+    // #488：裸导出面同过脚注（styled 面同构——定义收集 + 引用拼接）。
+    let mut footnotes = FootnoteDefs::default();
     for &child in tree.top_level() {
-        emit_block(tree, child, &mut w, 0, &empty, &no_toc, &list_nums)?;
+        collect_footnote_defs(tree, child, &mut footnotes);
+    }
+    for &child in tree.top_level() {
+        emit_block(
+            tree, child, &mut w, 0, &empty, &no_toc, &list_nums, &footnotes,
+        )?;
     }
     w.save_to_vec().map_err(|e| map_error(&e))
 }
@@ -1456,8 +1653,23 @@ pub fn export_docx_styled_core(
     // #365：有序列表实例预分配（先于发射——分配序 = 发射序，第 1
     // 实例 = 100 兼容面）。
     let list_nums = assign_ordered_num_ids(tree, &mut w);
+    // #488：脚注定义收集（先于发射——引用位拼接需要全文档定义面；
+    // 与消费谓词同源 footnote_def_line，见 FootnoteDefs 文档）。
+    let mut footnotes = FootnoteDefs::default();
     for &child in tree.top_level() {
-        emit_block(tree, child, &mut w, 0, &opts.images, &toc_marks, &list_nums)?;
+        collect_footnote_defs(tree, child, &mut footnotes);
+    }
+    for &child in tree.top_level() {
+        emit_block(
+            tree,
+            child,
+            &mut w,
+            0,
+            &opts.images,
+            &toc_marks,
+            &list_nums,
+            &footnotes,
+        )?;
     }
     let bytes = w.save_to_vec().map_err(|e| map_error(&e))?;
     // W-2：匿名化后处理（暗标 G3/R-11——docProps 元数据清零，正文
@@ -3780,5 +3992,157 @@ mod tests {
         );
         let ps = paras(&roundtrip(&tree));
         assert_eq!(ps[0].text(), "a b c");
+    }
+
+    // ------------------------------------------------------------------
+    // #488：MD 脚注 → DOCX 脚注导出（GFM 语法消费）
+    // ------------------------------------------------------------------
+
+    /// 两块树：正文段（含引用位）+ 定义段。
+    fn footnote_tree(body: &str, def: &str) -> BlockTree {
+        let mut tree = BlockTree::new();
+        let root = tree.root();
+        for (kind, text) in [(BlockKind::Paragraph, body), (BlockKind::Paragraph, def)] {
+            let id = tree.create_node(kind, text, Attrs::new(), Vec::new());
+            let len = tree.node(root).children.len();
+            tree.insert_child(root, len, id).expect("attach");
+        }
+        tree
+    }
+
+    /// 写→读全环（脚注面）：返回完整 DocxDocument（blocks + footnotes）。
+    fn roundtrip_full(tree: &BlockTree) -> mdc_office_io::docx::DocxDocument {
+        let bytes = export_docx_core(tree).expect("export");
+        read_docx_from_bytes(&bytes).expect("read back")
+    }
+
+    #[test]
+    fn footnote_marker_and_definition_export() {
+        let tree = footnote_tree(
+            "Body text with a note[^1] and more",
+            "[^1]: The note content.",
+        );
+        let doc = roundtrip_full(&tree);
+        // 正文段：字面标记剥离 + 引用位标注（读面 #19 段落粒度）。
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps.len(), 1, "定义块被消费——正文只 1 段");
+        assert_eq!(ps[0].text(), "Body text with a note and more",);
+        assert_eq!(ps[0].footnote_refs.len(), 1, "footnoteReference 在场");
+        // 脚注内容面。
+        assert_eq!(doc.footnotes.len(), 1, "{:?}", doc.footnotes);
+        let note_text = doc.footnotes[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(note_text, "The note content.", "{note_text}");
+    }
+
+    #[test]
+    fn footnote_multiline_definition_joined_single_paragraph() {
+        // lazy 连续形（导入面 #485 发射形态）：定义块多行 → 单段内容
+        // 空格连接（RunSpec::footnote 单段面——登记边界）。
+        let tree = footnote_tree("Ref[^2]", "[^2]: first line\nsecond line");
+        let doc = roundtrip_full(&tree);
+        assert_eq!(doc.footnotes.len(), 1);
+        let note_text = doc.footnotes[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(note_text, "first line second line", "{note_text}");
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps[0].text(), "Ref");
+    }
+
+    #[test]
+    fn footnote_marker_inside_code_span_stays_literal() {
+        // GFM：行内代码域内非引用——等宽 run 不拼接，标记字面保留。
+        let tree = footnote_tree("code `not a ref [^1]` here", "[^1]: note");
+        let doc = roundtrip_full(&tree);
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps[0].text(), "code not a ref [^1] here",);
+        // 定义块仍被消费（它是定义——与引用位是否存在无关）。
+        assert_eq!(ps.len(), 1);
+    }
+
+    #[test]
+    fn footnote_unknown_label_stays_literal() {
+        // 未知 label（无定义）：字面保留（GFM 同语义——不渲染假脚注）。
+        let tree = footnote_tree("dangling [^99] marker", "[^1]: defined note");
+        let doc = roundtrip_full(&tree);
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].text(), "dangling [^99] marker");
+        assert!(ps[0].footnote_refs.is_empty());
+    }
+
+    #[test]
+    fn footnote_multiple_markers_each_emit_note() {
+        // 同 label 双引用 = 两条脚注副本（docx-rs 简单路径——登记边界）。
+        let tree = footnote_tree("first[^1] then second[^1]", "[^1]: shared note");
+        let doc = roundtrip_full(&tree);
+        assert_eq!(doc.footnotes.len(), 2, "{:?}", doc.footnotes.len());
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps[0].footnote_refs.len(), 2);
+        assert_eq!(ps[0].text(), "first then second");
+    }
+
+    #[test]
+    fn footnote_styled_text_around_marker_preserved() {
+        // 标记前后样式段保留（**bold** 段内标记 → 脚注切分后加粗仍在）。
+        let tree = footnote_tree("**bold before** mid[^1] *after*", "[^1]: styled note");
+        let doc = roundtrip_full(&tree);
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps[0].text(), "bold before mid after");
+        // 样式面：首 run 加粗（run 级断言经读面 RunData）。
+        assert!(
+            ps[0]
+                .runs
+                .iter()
+                .any(|r| r.bold && r.text.contains("bold before")),
+            "{:?}",
+            ps[0].runs
+        );
+        assert_eq!(ps[0].footnote_refs.len(), 1);
+    }
+
+    #[test]
+    fn footnote_definition_only_doc_consumes_all() {
+        // 纯定义文档（孤儿定义——无引用位）：定义块消费，正文零段；
+        // 脚注内容**不发射**（docx 脚注无引用位 = 不存在于文档——
+        // 与 GFM 孤儿定义渲染语义一致）。
+        let tree = footnote_tree("only a definition", "[^1]: orphan note");
+        let doc = roundtrip_full(&tree);
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps.len(), 1, "非定义段正常发射");
+        assert!(ps[0].footnote_refs.is_empty());
+        assert!(doc.footnotes.is_empty(), "无引用位 = 无 footnotes.xml 条目");
+    }
+
+    #[test]
+    fn footnote_absent_export_byte_stable() {
+        // 无脚注文档：splice 快路径原样透传（零分配）+ 无定义块消费
+        // ——输出与既有路径零变化（既有 100+ 测试为回归锁，此处钉
+        // 语义面：标记语法缺失时 footnote_refs 恒空）。
+        let tree = single(
+            BlockKind::Paragraph,
+            "plain **bold** text",
+            Attrs::new(),
+            vec![],
+        );
+        let doc = roundtrip_full(&tree);
+        let ps = paras(&doc.blocks);
+        assert_eq!(ps[0].text(), "plain bold text");
+        assert!(ps[0].footnote_refs.is_empty());
+        assert!(doc.footnotes.is_empty());
     }
 }

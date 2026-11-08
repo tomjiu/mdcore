@@ -17,6 +17,9 @@ import { en, type Dict, type DictKey } from './en.js';
 import { zhCN } from './zh-CN.js';
 
 export type Lang = 'en' | 'zh-CN';
+// 步 3（#44）：键类型再导出——色板/档位表引用字面量键（canvas_view
+// 选择器面），保持键封闭集的类型约束。
+export type { DictKey } from './en.js';
 
 const DICTS: Record<Lang, Dict> = { en, 'zh-CN': zhCN };
 
