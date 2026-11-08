@@ -112,24 +112,24 @@
 批 3：settings_panel 外壳 → ui::Modal；palette → Popover 组合
 批 4：menu_bar → DropdownMenu/PopoverMenu 组合（键盘导航重构——最重）
 批 5：panels/file_tree/git_panel → ui::List 族（虚拟化/多选桥接）
-                     ✅ 批 5c 已交付（feat/385-b5c-git-panel-list，PR 见 #385 认领评论）：
-                     git_panel 改动/历史行迁 ListItem + 状态码 Chip + 计数 CountBadge +
-                     空态 List::empty_message；视图切换 tab 钮不在行 13 映射内未动。
-                     ✅ 批 5b 已交付（feat/385-b5b-file-tree-list，PR 见 #385 认领评论）：
-                     file_tree 行渲染迁 ListItem（indent_level 深度缩进 14px 步进 +
-                     start_slot 折叠箭头 + on_click/on_secondary_mouse_down 左右键 +
-                     toggle_state 活动高亮 + aria_role(TreeItem) 无障碍升级）。
-                     **两处实最偏离**（对对照表行 11 原映射）：① TreeViewItem 不适用
-                     ——非根行仅单级缩进线、无图标位、非根目录无折叠箭头、固定
-                     28px 行高，深度嵌套文件树可读性回归（tree_view_item.rs 实证）；
-                     ② uniform_list 虚拟化保留——ui::List 为非虚拟化容器（v_flex +
-                     全量 children），替换即破坏「1000+ 文件只布局可视行」模块不变
-                     量（file_tree.rs 模块文档钉定）。锚点同步：wiring_integrity
-                     `file_tree_row_clicks_wired` + ui_wiring_faces `face4`（MouseButton
-                     字面量随交互迁入组件内部，锚点改钉 .on_click/.on_secondary_
-                     mouse_down + 通道名——语义不变）。
-                     批 5a（panels）PR #482 在审；批 5 三件套仅剩 5a 合并。
-批 6+：Tooltip 统一化 / Chip / CountBadge 等细节件按需
+                     ✅ 批 5a 已交付（PR #482 在审）：panels.rs 行渲染迁
+                     List/ListHeader/ListItem（hover/选中/缩进语义统一）；
+                     键盘导航（Navigable）坦白未接——panels 无状态渲染架构
+                     需先立焦点/选中状态面，挂后续批次。
+                     ✅ 批 5b 已合并（PR #498）：file_tree 行渲染迁 ListItem
+                     （indent_level×14px 深度缩进 + start_slot 折叠箭头 +
+                     on_click/on_secondary_mouse_down 左右键 + toggle_state
+                     活动高亮 + aria_role(TreeItem)）。两处实最偏离（对行
+                     11 原映射）：① TreeViewItem 不适用（单级缩进线/无图标
+                     位/28px 行高）；② uniform_list 虚拟化保留（ui::List 非
+                     虚拟化容器——「1000+ 文件只布局可视行」不变量不动）。
+                     锚点同步：wiring_integrity `file_tree_row_clicks_wired`
+                     + ui_wiring_faces `face4`（MouseButton 字面量迁组件内，
+                     锚点改钉 .on_click/.on_secondary_mouse_down）。
+                     ✅ 批 5c 已合并（PR #483）：git_panel 改动/历史行迁
+                     ListItem + 状态码 Chip + 计数 CountBadge + 空态
+                     List::empty_message；视图切换 tab 钮不在行 13 映射内未动。
+                     批 5 三件套仅剩 5a（本 PR）待合并。批 6+：Tooltip 统一化 / Chip / CountBadge 等细节件按需
 每批验收：既有单测全绿 + 新增交互测试（不是只测函数返回值）+ 截图对比
 （迁移前/后——沙箱无 GUI 时登记待真机，AGENTS 诚实边界纪律）
 不迁清单：按钮族（bar_button/choice_button/step_button 语系）、
