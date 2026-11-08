@@ -237,11 +237,14 @@ impl DocxWriter {
         self.count_specs(1, runs);
     }
 
-    /// V13 边界检查（私有——两富文本发射面共用）：修订容器不能合法
-    /// 承载的 RunSpec 载荷登记粘性错误（首错留存，save 漏斗拒）。
+    /// V13 边界检查（私有——两富文本发射面共用）：修订容器不能
+    /// 合法承载的 RunSpec 载荷登记粘性错误（首错留存，save 漏斗拒）。
     /// anchor 优先于 link 报告（V8 优先序镜像——同 Some 时 anchor 赢）。
+    ///
+    /// V12 字符样式统一由发射后的 `count_specs` 校验，不复制合法域。
     fn note_unshippable_revision_payloads(&mut self, runs: &[RunSpec], face: &str) {
         for (i, spec) in runs.iter().enumerate() {
+            // V13：容器不能承载的载荷形态。
             let kind = if spec.anchor.is_some() {
                 "anchor"
             } else if spec.link.is_some() {

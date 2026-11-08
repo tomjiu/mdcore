@@ -786,3 +786,65 @@ fn empty_date_rejected_and_sticky_error_survives_valid_emission() {
     // 对照：全新写器 + 合法 mark 正常产出（重建 = 唯一解，非全局禁写）。
     mixed_revision_docx();
 }
+
+#[test]
+fn v12_revision_char_style_same_domain_as_paragraphs() {
+    // #580 审核补丁验收：修订路径的字符样式引用与普通段落同一 V12
+    // 合法性域（count_raw_emission 不得绕过 count_specs 的校验漏斗）
+    // ——审核负例：char_styled("x","NoSuchStyle")。
+    // ① 悬空引用：ins/del 两面同拒（save 漏斗零产物，错误信息带 V12）。
+    for face in ["ins", "del"] {
+        let mut w = DocxWriter::new();
+        let spec = RunSpec::char_styled("审核负例", "NoSuchStyle");
+        if face == "ins" {
+            w.insert_runs_revised(&[spec], &mark());
+        } else {
+            w.delete_runs_revised(&[spec], &mark());
+        }
+        let err = w
+            .save_to_vec()
+            .expect_err("悬空 rStyle 在修订路径应被 V12 拒（与普通段落同域）");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("V12") && msg.contains("NoSuchStyle"),
+            "{face} 面错误信息应带 V12 与样式 id: {msg}"
+        );
+    }
+    // ② 空串引用同拒。
+    let mut w = DocxWriter::new();
+    w.insert_runs_revised(&[RunSpec::char_styled("空串", "")], &mark());
+    assert!(
+        w.save_to_vec()
+            .expect_err("空串字符样式应拒")
+            .to_string()
+            .contains("V12"),
+        "空串引用 → V12"
+    );
+    // ③ 控制组 A：预置 Strong → 合法通过（rStyle 正常发射）。
+    let mut w = DocxWriter::new();
+    w.insert_runs_revised(&[RunSpec::char_styled("预置样式控制组", "Strong")], &mark());
+    let bytes = w.save_to_vec().expect("预置 Strong 在修订路径合法");
+    let xml = document_xml(&bytes);
+    assert!(
+        xml.contains("<w:rStyle w:val=\"Strong\""),
+        "合法预置 rStyle 正常发射（同域不误伤）"
+    );
+    // ④ 控制组 B：先 define_style 的自定义 id → 合法通过。
+    let mut w = DocxWriter::new();
+    w.define_style(mdc_office_io::style::StyleDef::new(
+        "RevMark",
+        mdc_office_io::style::StyleType::Character,
+    ))
+    .expect("自定义样式定义应成功");
+    w.insert_runs_revised(
+        &[RunSpec::char_styled("自定义样式控制组", "RevMark")],
+        &mark(),
+    );
+    let bytes = w
+        .save_to_vec()
+        .expect("define_style 后自定义 id 在修订路径合法");
+    assert!(
+        document_xml(&bytes).contains("<w:rStyle w:val=\"RevMark\""),
+        "账本内自定义 rStyle 正常发射"
+    );
+}
