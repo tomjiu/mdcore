@@ -23,14 +23,13 @@
 //! （ghost_element_hover / ghost_element_selected / 12px 缩进步进
 //! ——与旧手写值同值）。属性行迁 `ListItem`（selectable=false 静态）。
 
-use gpui::{App, Entity, Pixels, WeakEntity, px};
+use gpui::{App, Entity, Pixels, px};
 use ui::prelude::*;
 use ui::{Icon, IconName, IconSize, Label, LabelSize, List, ListHeader, ListItem};
 
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
 use crate::git_panel::GitPanel;
-use crate::shell::ShellApp;
 
 /// 左栏缺省宽度（px）——G4 起实际宽度是 ShellApp 状态（可拖拽，
 /// settings `panel_widths` 键持久化；域 [`LEFT_PANEL_MIN`]-[`LEFT_PANEL_MAX`]）。
@@ -82,7 +81,9 @@ pub fn left_panel(
     git_panel: Option<&Entity<GitPanel>>,
     git_view: bool,
     width: Pixels,
-    shell: Option<WeakEntity<ShellApp>>,
+    // #571：大纲面板实体（批 7——键盘导航结构树；空态不渲染分组
+    // 沿用批 5a 前语义）。None = 无激活文档。
+    outline: Option<&Entity<crate::outline_panel::OutlinePanel>>,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -91,18 +92,12 @@ pub fn left_panel(
         None => vec![],
     };
     let open_docs: Vec<(&str, bool)> = open_docs.iter().map(|(n, a)| (n.as_str(), *a)).collect();
-    // 结构树（docx = 标题树 / pdf = 书签树；标签带 Hn/页号前缀，
-    // 点击跳转锚点携带行号）。
-    let headings: Vec<(String, usize, usize)> = match editor {
-        Some(ed) => {
-            let e = ed.read(cx);
-            e.headings()
-                .iter()
-                .map(|h| (e.heading_label(h), h.level, h.line))
-                .collect()
-        }
-        None => vec![],
-    };
+    // #571：结构树挂 OutlinePanel 实体（heading_tree 无状态内联渲染
+    // 退役——键盘导航 + md 大纲补齐在实体内；空行集不渲染分组 = 批
+    // 5a 前语义）。
+    let outline_present = outline
+        .map(|panel| !panel.read(cx).is_empty())
+        .unwrap_or(false);
     v_flex()
         .id("left-panel")
         .w(width)
@@ -143,67 +138,10 @@ pub fn left_panel(
         .when(!git_view, |el| {
             el.when_some(workspace, |el, tree| el.child(tree.clone()))
                 .child(tree_group("tg-docs", "打开的文档", true, &open_docs))
-                .when_some((!headings.is_empty()).then_some(()), |el, _| {
-                    el.child(heading_tree("tg-outline", &headings, editor, shell))
+                .when(outline_present, |el| {
+                    el.when_some(outline, |el, panel| el.child(panel.clone()))
                 })
         })
-}
-
-/// 结构树（批 3 docx 标题树 + 批 4 pdf 书签树）：层级缩进 +
-/// 点击跳转（光标落条目行首 + 滚入可视区顶部；pdf 页面视图下
-/// 书签随页滚动——#289-④）。
-///
-/// #385 批 5a：行迁 `ListItem`——hover/圆角/缩进（步进 12px 与旧手写
-/// 同值）/ARIA listitem 语义，点击走 ListItem::on_click；分组头迁
-/// `ListHeader`（静态展开箭头 + 类型图标）。手写 hover 闭包与 pl
-/// 缩进退役。
-fn heading_tree(
-    id: &'static str,
-    headings: &[(String, usize, usize)],
-    editor: Option<&Entity<Editor>>,
-    shell: Option<WeakEntity<ShellApp>>,
-) -> impl IntoElement {
-    List::new()
-        .header(
-            ListHeader::new("文档结构").toggle(true).start_slot(
-                Icon::new(IconName::ListTree)
-                    .size(IconSize::XSmall)
-                    .color(ui::Color::Muted),
-            ),
-        )
-        .children(
-            headings
-                .iter()
-                .enumerate()
-                .map(|(i, (label, level, line))| {
-                    let editor = editor.cloned();
-                    let shell = shell.clone();
-                    let line = *line;
-                    ListItem::new(SharedString::from(format!("{id}-item-{i}")))
-                        .inset(true)
-                        // 层级缩进：每级 12px（1 级不缩进——条目已带 Hn/页号
-                        // 前缀；ListItem 缺省步进即 12px，与旧手写同值）。
-                        .indent_level(level.saturating_sub(1))
-                        .child(Label::new(label.as_str()).size(LabelSize::Small))
-                        .when_some(editor, |el, ed| {
-                            el.on_click(move |_, window, cx| {
-                                ed.update(cx, |ed, _| ed.jump_to_line(line));
-                                // #289-④：pdf 页面视图下书签随页滚动
-                                //（行号 → 页号 → scroll_pdf_to_page；
-                                // 文本模式/非 pdf 态该方法自为无操作）。
-                                if let Some(page) = ed.read(cx).pdf_page_for_line(line) {
-                                    if let Some(shell) = shell.as_ref() {
-                                        let _ = shell.update(cx, |shell, cx| {
-                                            shell.scroll_pdf_to_page(page, cx)
-                                        });
-                                    }
-                                }
-                                // 点击后面板焦点不影响编辑区键盘域；防窗口默认行为。
-                                window.prevent_default();
-                            })
-                        })
-                }),
-        )
 }
 
 /// 右栏：属性 / 来源（md 态：文件名/字数联动；docx 态：引擎实测

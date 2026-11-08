@@ -121,3 +121,11 @@ pub mod button_ext;
 /// （Theme 进出），lib 树零额外依赖。
 #[path = "theme_switch.rs"]
 pub mod theme_switch;
+
+/// #571（#385 批 7）：大纲面板键盘导航——OutlinePanel 实体（行焦点
+/// 句柄按行号差量复用 + ui::Navigable 接线 + menu::Confirm 激活）。
+/// lib 树纪律：#289-④ pdf 页滚等 bin 面副作用经 ActivateHook 注入
+/// （不引用 shell——palette_view 同型）；#[gpui::test] 三面测试挂
+/// bin 目标 = CI 永不运行（假绿）。
+#[path = "outline_panel.rs"]
+pub mod outline_panel;
