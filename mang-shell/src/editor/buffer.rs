@@ -2288,46 +2288,56 @@ mod g1_find_replace_tests {
     }
 
     #[test]
-    fn replace_batch_thousand_matches_under_200ms() {
-        // #91 G1 验收线：1000 处全部替换 < 200ms（构建不计时——只卡
-        // 批量替换本体；单事务口径下实测应为数十 ms 量级）。
-        // #547：100ms → 200ms——原线在多进程编译负载下假红（实测
-        // 117-130ms vs 100ms，与代码改动无关）。200ms 是容忍负载
-        // 抖动的线：真实算法退化是 10 倍级（数十 ms → 数百 ms），
-        // 抓退化能力不因放宽而丢失。
-        let lines: Vec<String> = (0..1000).map(|i| format!("第{i}行 foo 内容")).collect();
-        let mut b = Buffer::from_plain_text(&lines.join("\n"));
-        let edits: Vec<(Point, Point, String)> = b
-            .find_matches_opts("foo", false, false)
-            .into_iter()
-            .scan((0usize, 0usize), |(prev_line, prev_end_col), m| {
-                // 非重叠过滤（与 find_bar::replace_all 同口径：跨行必然
-                // 不重叠——query 不含换行、命中不跨行）
-                let ok = m.line > *prev_line || m.col >= *prev_end_col;
-                if ok {
-                    *prev_line = m.line;
-                    *prev_end_col = m.col + 3;
-                }
-                ok.then(|| (m, Point::new(m.line, m.col + 3), "FOO".to_string()))
-            })
-            .collect();
-        assert_eq!(edits.len(), 1000, "千行千处");
-        let t = std::time::Instant::now();
-        let n = b.replace_batch(edits);
-        let elapsed = t.elapsed();
-        assert_eq!(n, 1000);
-        println!("perf(千处批量替换) = {elapsed:?}  (验收线 <200ms，#547 负载容忍线)");
+    fn replace_batch_thousand_matches_under_100ms() {
+        // #91 G1 原验收线保持 100ms；#547 方案 B 用三个独立、等价样本
+        // 排除单次调度抖动。构建与匹配不计时，每轮真实替换及撤销均验证。
+        // 不复用已经修改的 Buffer 或旧 edits，避免后续样本变成空操作。
+        let source = (0..1000)
+            .map(|i| format!("第{i}行 foo 内容"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let replaced = source.replace("foo", "FOO");
+        let mut replace_samples = Vec::with_capacity(3);
+        let mut undo_samples = Vec::with_capacity(3);
+        for sample in 0..3 {
+            let mut b = Buffer::from_plain_text(&source);
+            let edits: Vec<(Point, Point, String)> = b
+                .find_matches_opts("foo", false, false)
+                .into_iter()
+                .scan((0usize, 0usize), |(prev_line, prev_end_col), m| {
+                    // 非重叠过滤与 find_bar::replace_all 同口径。
+                    let ok = m.line > *prev_line || m.col >= *prev_end_col;
+                    if ok {
+                        *prev_line = m.line;
+                        *prev_end_col = m.col + 3;
+                    }
+                    ok.then(|| (m, Point::new(m.line, m.col + 3), "FOO".to_string()))
+                })
+                .collect();
+            assert_eq!(edits.len(), 1000, "样本{sample}：千行千处");
+            let t = std::time::Instant::now();
+            let n = b.replace_batch(edits);
+            let elapsed = t.elapsed();
+            assert_eq!(n, 1000, "样本{sample}：全部替换");
+            assert_eq!(b.to_plain_text(), replaced, "样本{sample}：正文全部替换");
+            replace_samples.push(elapsed);
+
+            // 每轮独立计量撤销，功能断言不因最小耗时采样而减弱。
+            let t = std::time::Instant::now();
+            assert!(b.undo(), "样本{sample}：一次撤销全部替换");
+            let undo_elapsed = t.elapsed();
+            undo_samples.push(undo_elapsed);
+            assert_eq!(b.to_plain_text(), source, "样本{sample}：撤销恢复原文");
+            println!("perf(千处批量替换，样本{sample}) = {elapsed:?}");
+            println!("perf(千处批量撤销，样本{sample}) = {undo_elapsed:?}");
+        }
+        let best = *replace_samples.iter().min().expect("固定三个独立样本");
+        println!("perf(千处批量替换) = {replace_samples:?}; best = {best:?}（原验收线<100ms）");
+        println!("perf(千处批量撤销) = {undo_samples:?}");
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "千处批量替换超验收线（负载敏感，200ms 容忍抖动，真实退化为 10 倍级）：{elapsed:?}"
+            best < std::time::Duration::from_millis(100),
+            "千处批量替换超原验收线：best={best:?}, samples={replace_samples:?}"
         );
-        // 一次撤销整批回滚同样在验收量级
-        let t = std::time::Instant::now();
-        assert!(b.undo());
-        let undo_elapsed = t.elapsed();
-        println!("perf(千处批量撤销) = {undo_elapsed:?}");
-        assert_eq!(b.to_plain_text(), lines.join("\n"));
-        // G3 缩进单位——专项单测
     }
 }
 
