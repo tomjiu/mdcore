@@ -87,7 +87,8 @@ use mdc_office_io::xlsx_edit::{CellEdit, XlsxEditor};
 use ui::prelude::*;
 
 use crate::xlsx_merge_geometry::{
-    MergeSpan, canonical_cell, intersects_window, is_covered, span_edges, span_px, spans_in_row,
+    MergeSpan, canonical_cell, intersects_window, is_covered, span_anchor_abs, span_edges, span_px,
+    spans_in_row,
 };
 
 // ---------------------------------------------------------------------------
@@ -290,8 +291,12 @@ fn parse_cell_input(raw: &str) -> CellEdit {
 ///
 /// - 值走 [`XlsxEditor::set_cell`]（公式格/不可编辑表/非法字符 =
 ///   `Err`——错误文案原样上浮到面板 notice）；
+/// - #584 返工：合并区编辑锚**原始绝对左上**（`span_anchor_abs`——
+///   左上可在数据包围盒外[空合并格场景]，锚不随可见裁剪漂移），
+///   非合并格走显示坐标换算；
 /// - 落账成功 → `GridSheet::cells` 即时改写为输入原文（pending 视觉
-///   ——与重开读面口径一致：Number 显示输入文本）。
+///   ——与重开读面口径一致：Number 显示输入文本；锚在盒外时
+///   显示面无槽位可写，跳过无害——读面以引擎为准）。
 fn commit_cell_edit(
     editor: &mut XlsxEditor,
     model: &mut XlsxGridModel,
@@ -304,7 +309,11 @@ fn commit_cell_edit(
         .sheets
         .get(sheet_idx)
         .ok_or_else(|| format!("表下标越界: {sheet_idx}"))?;
-    let cell_ref = cell_ref_for(sheet, row, col);
+    // #584 返工：合并区 → 原始绝对锚（不裁剪）；非合并 → 显示坐标换算。
+    let cell_ref = match span_anchor_abs(&sheet.merge_spans, row, col) {
+        Some((abs_row, abs_col)) => format!("{}{}", col_letter(abs_col), abs_row + 1),
+        None => cell_ref_for(sheet, row, col),
+    };
     let value = parse_cell_input(buffer);
     editor
         .set_cell(sheet_idx, &cell_ref, value)
@@ -715,11 +724,16 @@ impl XlsxGridView {
         self.selected
     }
 
-    /// 选中格的绝对 A1 引用（如 `B3`——显示坐标 → 绝对列字母 + 1 基
-    /// 行号；无选中 = None）。
+    /// 选中格的绝对 A1 引用（如 `B3`——无选中 = None）。
+    /// #584 返工：合并区选中 → **原始绝对锚**（左上可在可见盒外
+    /// ——空合并格场景锚 E5 而包围盒从 F6 起，不随裁剪漂移）；
+    /// 非合并格显示坐标换算不变。
     pub fn selected_a1(&self) -> Option<String> {
         let sheet = self.sheet();
         let (r, c) = self.selected?;
+        if let Some((abs_row, abs_col)) = span_anchor_abs(&sheet.merge_spans, r, c) {
+            return Some(format!("{}{}", col_letter(abs_col), abs_row + 1));
+        }
         Some(format!(
             "{}{}",
             col_letter(sheet.start_col + c as u32),
@@ -1347,74 +1361,80 @@ impl Render for XlsxGridView {
             .id("xlsx-grid-overlay")
             .absolute()
             .size_full()
-            .child(gpui::canvas(
-                move |bounds, _window, _cx| bounds,
-                move |bounds: gpui::Bounds<Pixels>, _t, window: &mut Window, _cx: &mut App| {
-                    // 视口宽回写（本帧 bounds——render 期消费）。
-                    viewport_cell.set(Some(f32::from(bounds.size.width)));
-                    let ent_wheel = ent.clone();
-                    let ent_click = ent.clone();
-                    // 滚轮横扫：deltaX / Shift+deltaY → scroll_x（纯纵向
-                    // 不动作——uniform_list 原生滚动不受扰）。
-                    window.on_mouse_event(
-                        move |ev: &ScrollEvent,
-                              phase: DispatchPhase,
-                              _w: &mut Window,
-                              cx: &mut App| {
-                            if phase != DispatchPhase::Bubble {
-                                return;
-                            }
-                            let dx = wheel_delta_x(ev);
-                            if dx.abs() < f32::EPSILON {
-                                return;
-                            }
-                            let _ = ent_wheel.update(cx, |view, cx| {
-                                view.scroll_horizontal(dx, cx);
-                            });
-                        },
-                    );
-                    // 点击命中：局部坐标 → (行, 列) 选中（bounds 内才动作）。
-                    // #389 阶段 2：双击（click_count >= 2）→ 内联编辑；
-                    // 单击在编辑态 → 先提交再选新格（select_at 内收口）。
-                    window.on_mouse_event(
-                        move |ev: &gpui::MouseDownEvent,
-                              phase: DispatchPhase,
-                              _w: &mut Window,
-                              cx: &mut App| {
-                            if phase != DispatchPhase::Bubble
-                                || ev.button != gpui::MouseButton::Left
-                            {
-                                return;
-                            }
-                            let in_x = ev.position.x >= bounds.origin.x
-                                && ev.position.x <= bounds.origin.x + bounds.size.width;
-                            let in_y = ev.position.y >= bounds.origin.y
-                                && ev.position.y <= bounds.origin.y + bounds.size.height;
-                            if !(in_x && in_y) {
-                                return;
-                            }
-                            let x = f32::from(ev.position.x - bounds.origin.x);
-                            let y = f32::from(ev.position.y - bounds.origin.y);
-                            let double_click = ev.click_count >= 2;
-                            // 点击即落焦（编辑键位面激活——pdf_pages 点击
-                            // 同款纪律；handle 经实体 update 取出后在
-                            // 观察器 window 域落焦，F7 教训同源）。
-                            let focus = ent_click.update(cx, |view, cx| {
-                                let handle = view.focus_handle(cx).clone();
-                                if double_click {
-                                    view.begin_edit_at(x, y, cx);
-                                } else {
-                                    view.select_at(x, y, cx);
+            // #584 返工：canvas 自身 .size_full()——Canvas 默认 auto 尺寸
+            //（flex 列容器内主轴高度塌缩为 0，观察器 in_y 边界过滤必然
+            // 失败——真实点击全被吞）；铺满才承载命中面。
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| bounds,
+                    move |bounds: gpui::Bounds<Pixels>, _t, window: &mut Window, _cx: &mut App| {
+                        // 视口宽回写（本帧 bounds——render 期消费）。
+                        viewport_cell.set(Some(f32::from(bounds.size.width)));
+                        let ent_wheel = ent.clone();
+                        let ent_click = ent.clone();
+                        // 滚轮横扫：deltaX / Shift+deltaY → scroll_x（纯纵向
+                        // 不动作——uniform_list 原生滚动不受扰）。
+                        window.on_mouse_event(
+                            move |ev: &ScrollEvent,
+                                  phase: DispatchPhase,
+                                  _w: &mut Window,
+                                  cx: &mut App| {
+                                if phase != DispatchPhase::Bubble {
+                                    return;
                                 }
-                                handle
-                            });
-                            if let Ok(handle) = focus {
-                                _w.focus(&handle, cx);
-                            }
-                        },
-                    );
-                },
-            ));
+                                let dx = wheel_delta_x(ev);
+                                if dx.abs() < f32::EPSILON {
+                                    return;
+                                }
+                                let _ = ent_wheel.update(cx, |view, cx| {
+                                    view.scroll_horizontal(dx, cx);
+                                });
+                            },
+                        );
+                        // 点击命中：局部坐标 → (行, 列) 选中（bounds 内才动作）。
+                        // #389 阶段 2：双击（click_count >= 2）→ 内联编辑；
+                        // 单击在编辑态 → 先提交再选新格（select_at 内收口）。
+                        window.on_mouse_event(
+                            move |ev: &gpui::MouseDownEvent,
+                                  phase: DispatchPhase,
+                                  _w: &mut Window,
+                                  cx: &mut App| {
+                                if phase != DispatchPhase::Bubble
+                                    || ev.button != gpui::MouseButton::Left
+                                {
+                                    return;
+                                }
+                                let in_x = ev.position.x >= bounds.origin.x
+                                    && ev.position.x <= bounds.origin.x + bounds.size.width;
+                                let in_y = ev.position.y >= bounds.origin.y
+                                    && ev.position.y <= bounds.origin.y + bounds.size.height;
+                                if !(in_x && in_y) {
+                                    return;
+                                }
+                                let x = f32::from(ev.position.x - bounds.origin.x);
+                                let y = f32::from(ev.position.y - bounds.origin.y);
+                                let double_click = ev.click_count >= 2;
+                                // 点击即落焦（编辑键位面激活——pdf_pages 点击
+                                // 同款纪律；handle 经实体 update 取出后在
+                                // 观察器 window 域落焦，F7 教训同源）。
+                                let focus = ent_click.update(cx, |view, cx| {
+                                    let handle = view.focus_handle(cx).clone();
+                                    if double_click {
+                                        view.begin_edit_at(x, y, cx);
+                                    } else {
+                                        view.select_at(x, y, cx);
+                                    }
+                                    handle
+                                });
+                                if let Ok(handle) = focus {
+                                    _w.focus(&handle, cx);
+                                }
+                            },
+                        );
+                    },
+                )
+                .size_full(),
+            );
         // #389 阶段 2：状态条（脏标记 / 编辑会话拒因 / 提交与保存错误
         // ——非静默纪律：每个失败面都有可见文案）。
         let dirty_chip = self.dirty.then(|| {
@@ -1717,6 +1737,7 @@ mod tests {
             row_end: 4,
             col_start: 1,
             col_end: 2,
+            abs_anchor: (4, 1),
         }
     }
 
@@ -1801,13 +1822,48 @@ mod tests {
         );
     }
 
-    /// 测试宿主（pdf_pages SearchHost 同模式——add_window 带出实体）。
+    /// #584 返工：测试宿主——视图进**真实渲染树**（空 div 宿主证明
+    /// 不了渲染/事件注册——审核要求：真实视图点击/双击/按键回归）。
     struct GridHost(gpui::Entity<XlsxGridView>);
 
     impl Render for GridHost {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            gpui::div()
+            gpui::div().size_full().child(self.0.clone())
         }
+    }
+
+    /// #584 返工：真实鼠标事件派发（MouseDown + MouseUp——完整命中
+    /// 测试管线，走覆盖 canvas 注册的窗口级观察器 → select_at /
+    /// begin_edit_at；main.rs 烟雾 + 批 11 同款 update_window 口径）。
+    fn grid_click_at(
+        window: &gpui::WindowHandle<GridHost>,
+        cx: &mut gpui::TestAppContext,
+        x: f32,
+        y: f32,
+        click_count: usize,
+    ) {
+        use gpui::{
+            Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, point, px,
+        };
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let down = PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count,
+            first_mouse: false,
+        });
+        let up = PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count,
+        });
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(down, cx);
+            window.dispatch_event(up, cx);
+        })
+        .expect("鼠标派发");
     }
 
     /// 合成按键（pdf_pages key_event 同构）。
@@ -1826,9 +1882,34 @@ mod tests {
         }
     }
 
-    /// #555 验收 3（视图接线面）：真视图实体上驱动「点覆盖格 → 选整区 →
-    /// 双击进入编辑（左上原值起步）→ 键入 → Enter 提交 → Ctrl+S 落盘」
-    /// 全链，再重读文件断言（左上改 / 范围在 / 覆盖格零写入）。
+    /// #584 返工：真实键盘事件派发（焦点路径——点击后视图持焦，
+    /// KeyDown 经 track_focus 节点到达 handle_key；#422 同款）。
+    fn grid_key_down(
+        window: &gpui::WindowHandle<GridHost>,
+        cx: &mut gpui::TestAppContext,
+        ev: KeyDownEvent,
+    ) {
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(gpui::PlatformInput::KeyDown(ev), cx);
+        })
+        .expect("键盘派发");
+    }
+
+    /// #584 返工：重绘一帧（命中盒/焦点节点随最新状态注册）。
+    fn grid_redraw(window: &gpui::WindowHandle<GridHost>, cx: &mut gpui::TestAppContext) {
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("重绘");
+    }
+
+    /// #555 验收 3（#584 返工重写——真实渲染树 + 真实事件全链）：
+    /// 挂载真实 XlsxGridView（渲染树内）→ **真实点击**覆盖格 C5 →
+    /// 选中整区（锚 B5）→ **真实双击**进入编辑（左上原值起步）→
+    /// **真实键入** → Enter 提交 → Ctrl+S 落盘 → 重读文件断言
+    /// （左上改 / 范围在 / 覆盖格零写入）。
     /// 夹具复制到临时目录——save() 写回源路径，不许污染仓内黄金夹具。
     #[gpui::test]
     fn merge_covered_click_selects_edits_and_saves(cx: &mut gpui::TestAppContext) {
@@ -1842,6 +1923,16 @@ mod tests {
             "临时夹具合并范围在档（前置）"
         );
 
+        // #584 返工：真实渲染树挂载需要主题全局（视图 render 读
+        // cx.theme()——theme 是 workspace 依赖 crate；渲染期派生还要
+        // settings provider 全局，#422 WiringHost 同款双注册）。
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+
+        // 真实渲染树挂载（GridHost = size_full + child 视图——渲染/
+        // 命中盒/焦点节点全部注册，非空 div 直调可比）。
         let mut slot: Option<gpui::Entity<XlsxGridView>> = None;
         let window = cx.add_window(|_window, cx| {
             let v = cx.new(|cx| XlsxGridView::new(model, tmp.clone(), cx));
@@ -1850,67 +1941,85 @@ mod tests {
         });
         let view = slot.expect("宿主构造即置");
 
-        // 覆盖格 C5（显示 (4,2)）的点击坐标：行 4 中部、列 2 起点 + 5px。
-        window
+        // 覆盖格 C5（显示 (4,2)）的窗口坐标：x = 行号槽 + 列 2 偏移
+        //（Host 全幅 → 视图原点 = (0,0)，canvas 局部 = 窗口坐标）；
+        // y = 行 4 中部（y/ROW_H 整除命中行 4——表格头/表签只遮影行
+        // 0-2，行 4 起精确）。
+        let (click_x, click_y) = window
             .update(cx, |_host, _window, cx| {
-                view.update(cx, |v, cx| {
+                view.update(cx, |v, _| {
                     let (off2, w2) = (v.col_offsets[2], v.col_widths[2]);
-                    let x = GUTTER_W + off2 + (w2 / 2.0).min(5.0);
-                    let y = 4.0 * ROW_H + ROW_H / 2.0;
-                    v.select_at(x, y, cx);
-                });
+                    (
+                        GUTTER_W + off2 + (w2 / 2.0).min(5.0),
+                        4.0 * ROW_H + ROW_H / 2.0,
+                    )
+                })
             })
-            .expect("点覆盖格");
+            .expect("读坐标");
+
+        // ① 真实单击覆盖格 C5 → 选中整区（锚 B5）+ 落焦（点击即焦）。
+        grid_redraw(&window, cx);
+        grid_click_at(&window, cx, click_x, click_y, 1);
+
         window
             .update(cx, |_host, _window, cx| {
-                view.update(cx, |v, cx| {
-                    // 选中 = 合并区左上 B5（覆盖格点击选中整区的锚点语义）。
+                view.update(cx, |v, _| {
                     assert_eq!(
                         v.selected_cell(),
                         Some((4, 1)),
-                        "点 C5 选中锚 B5（整区选择）"
+                        "真实点击 C5 → 选中锚 B5（整区选择）"
                     );
                     assert_eq!(v.selected_a1().as_deref(), Some("B5"));
-                    // 双击覆盖格进入编辑：锚左上，缓冲 = 左上原值。
-                    let (off2, w2) = (v.col_offsets[2], v.col_widths[2]);
-                    let x = GUTTER_W + off2 + (w2 / 2.0).min(5.0);
-                    let y = 4.0 * ROW_H + ROW_H / 2.0;
-                    v.begin_edit_at(x, y, cx);
-                    let ed = v.editing.as_ref().expect("编辑态进入");
+                });
+            })
+            .expect("断言选中");
+
+        // ② 真实双击覆盖格 C5 → 进入编辑（锚左上，缓冲 = 左上原值）。
+        grid_redraw(&window, cx);
+        grid_click_at(&window, cx, click_x, click_y, 2);
+        window
+            .update(cx, |_host, _window, cx| {
+                view.update(cx, |v, _| {
+                    let ed = v.editing.as_ref().expect("真实双击进入编辑态");
                     assert_eq!((ed.row, ed.col), (4, 1), "编辑锚 = 左上 B5");
                     assert_eq!(ed.buffer, "外部资料区", "缓冲以左上原值起步");
                 });
             })
-            .expect("双击覆盖格");
-        // 键入「新」（真实 key_char 路径）→ Enter 提交 → Ctrl+S 落盘。
+            .expect("断言编辑态");
+
+        // ③ 真实键入「新」→ Enter 提交（焦点路径——handle_key 全链）。
+        grid_redraw(&window, cx);
+        grid_key_down(&window, cx, grid_key_event("新", Some("新"), false));
         window
-            .update(cx, |_host, window, cx| {
-                view.update(cx, |v, cx| {
-                    v.handle_key(&grid_key_event("新", Some("新"), false), window, cx);
+            .update(cx, |_host, _window, cx| {
+                view.update(cx, |v, _| {
                     let ed = v.editing.as_ref().expect("编辑态保持");
-                    assert!(ed.buffer.contains("新"), "键入进缓冲：{}", ed.buffer);
+                    assert!(ed.buffer.contains("新"), "真实键入进缓冲：{}", ed.buffer);
                 });
             })
-            .expect("键入");
+            .expect("断言键入");
+        grid_key_down(&window, cx, grid_key_event("enter", None, false));
         window
-            .update(cx, |_host, window, cx| {
-                view.update(cx, |v, cx| {
-                    v.handle_key(&grid_key_event("enter", None, false), window, cx);
+            .update(cx, |_host, _window, cx| {
+                view.update(cx, |v, _| {
                     assert!(v.editing.is_none(), "Enter 提交退出编辑态");
                     assert!(v.is_modified(), "提交后脏标记");
                 });
             })
-            .expect("Enter 提交");
+            .expect("断言提交");
+
+        // ④ 真实 Ctrl+S 落盘。
+        grid_redraw(&window, cx);
+        grid_key_down(&window, cx, grid_key_event("s", None, true));
         window
-            .update(cx, |_host, window, cx| {
-                view.update(cx, |v, cx| {
-                    v.handle_key(&grid_key_event("s", None, true), window, cx);
+            .update(cx, |_host, _window, cx| {
+                view.update(cx, |v, _| {
                     assert!(!v.is_modified(), "Ctrl+S 落盘后脏清除");
                 });
             })
-            .expect("Ctrl+S 保存");
+            .expect("断言保存");
 
-        // 重读落盘文件：左上新值 + 范围保留 + 覆盖格零写入。
+        // ⑤ 重读落盘文件：左上新值 + 范围保留 + 覆盖格零写入。
         let saved_bytes = std::fs::read(&tmp).expect("落盘文件可读");
         let mut reopened = XlsxEditor::open(&saved_bytes).expect("重开会话");
         let info = reopened.cell_info(0, "B5").expect("B5 可查").expect("非空");
@@ -1939,7 +2048,87 @@ mod tests {
         assert_eq!(
             (dm.start.0, dm.start.1, dm.end.0, dm.end.1),
             (4, 1, 4, 2),
-            "merge 范围原样保留（B5:C5）"
+            "merge 范围原样保留（B5:C5 绝对端点）"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// #584 返工：合并区左上在数据包围盒**外**（审核复现场景——
+    /// 空合并格 E5:G7 + 数据 F6/G7 → 包围盒从 F6 起）——真实写面
+    /// 构造夹具 → 模型装载（锚 E5 不漂移）→ 编辑覆盖格落账 E5 →
+    /// 保存重读（E5 新值 / 覆盖格零写入 / merge 原样）。
+    #[test]
+    fn anchor_outside_box_edit_writes_original_e5() {
+        use mdc_office_io::write::{CellValue, WorkbookWriter};
+
+        // 构造：合并 E5:G7（绝对 (4,4)-(6,6)，文本空——锚在包围盒外）
+        // + 数据 F6=1、G7=2（包围盒 (5,5)-(6,6)）。顺序关键：先 merge
+        // 后 write——rust_xlsxwriter merge_range 擦除范围内既有写入
+        //（先写后合并 = 数据被清空）；先合并后写入 = 覆盖格带值
+        //（真实场景：被合并覆盖但仍有值的格——typed 网格过滤空格后
+        // 包围盒从 F6 起，与审核复现场景一致）。
+        let mut w = WorkbookWriter::new();
+        let mut s = w.add_sheet("锚外").expect("建表");
+        s.merge(4, 4, 6, 6, "", None).expect("合并 E5:G7（空文本）");
+        s.write(5, 5, CellValue::Number(1.), None).expect("F6=1");
+        s.write(6, 6, CellValue::Number(2.), None).expect("G7=2");
+        let bytes = w.save_to_vec().expect("写盘");
+        let tmp = std::env::temp_dir().join(format!("mang-anchor-out-{}.xlsx", std::process::id()));
+        std::fs::write(&tmp, &bytes).expect("临时落盘");
+
+        // 模型装载：包围盒 F6 起 + 可见段 (0,0)-(1,1) + 锚 E5 (4,4)。
+        let model = XlsxGridModel::load(&tmp).expect("模型装载");
+        let sheet = &model.sheets[0];
+        assert_eq!(
+            (sheet.start_row, sheet.start_col),
+            (5, 5),
+            "包围盒从 F6 起（merge 空文本不扩盒）"
+        );
+        let span = sheet.merge_spans.first().expect("合并范围在档");
+        assert_eq!((span.row_start, span.col_start), (0, 0), "可见段起点 = F6");
+        assert_eq!((span.row_end, span.col_end), (1, 1), "可见段末点 = G7");
+        assert_eq!(span.abs_anchor, (4, 4), "原始绝对锚 = E5（不随裁剪漂移）");
+
+        // 编辑覆盖格（可见 (1,1) = G7 位——canonical → 可见锚 (0,0)）：
+        // 提交必须落账 **E5**（绝对锚），不是 F6（显示坐标换算的错值）。
+        let mut editor = XlsxEditor::open(&bytes).expect("编辑会话");
+        let mut model2 = model.clone();
+        let (r, c) =
+            canonical_cell(&model2.sheets[0].merge_spans, 1, 1).expect("覆盖格有可见锚映射");
+        assert_eq!((r, c), (0, 0), "可见锚 = F6 显示坐标");
+        // selected_a1 面（A1 引用锚 E5）。
+        let a1 = format!("{}{}", col_letter(span.abs_anchor.1), span.abs_anchor.0 + 1);
+        assert_eq!(a1, "E5", "A1 引用 = 原始绝对锚");
+        commit_cell_edit(&mut editor, &mut model2, 0, r, c, "锚外新值")
+            .expect("覆盖格编辑落账（锚 E5）");
+
+        // 保存 → 重读：E5 有新值；F6/G7（覆盖格）保持原值不重写；
+        // merge 范围原样。
+        let saved = editor.save_to_vec().expect("保存");
+        let mut reopened = XlsxEditor::open(&saved).expect("重开");
+        let e5 = reopened.cell_info(0, "E5").expect("E5 可查").expect("非空");
+        assert_eq!(e5.text, "锚外新值", "落账在原始绝对锚 E5（非 F6）");
+        let f6 = reopened.cell_info(0, "F6").expect("F6 可查").expect("非空");
+        assert_eq!(f6.text, "1", "覆盖格 F6 保持原值（零写入）");
+        let g7 = reopened.cell_info(0, "G7").expect("G7 可查").expect("非空");
+        assert_eq!(g7.text, "2", "覆盖格 G7 保持原值（零写入）");
+        let book = {
+            let tmp2 = std::env::temp_dir()
+                .join(format!("mang-anchor-verify-{}.xlsx", std::process::id()));
+            std::fs::write(&tmp2, &saved).expect("验证落盘");
+            let b = mdc_office_io::io::read_book_with_options(
+                &tmp2.to_string_lossy(),
+                &ReadOptions { compat: true },
+            )
+            .expect("读面");
+            let _ = std::fs::remove_file(&tmp2);
+            b
+        };
+        let dm = book.sheets[0].merges[0];
+        assert_eq!(
+            (dm.start.0, dm.start.1, dm.end.0, dm.end.1),
+            (4, 4, 6, 6),
+            "merge 范围原样保留（E5:G7）"
         );
         let _ = std::fs::remove_file(&tmp);
     }

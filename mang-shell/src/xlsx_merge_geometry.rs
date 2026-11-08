@@ -35,21 +35,33 @@
 // 数据（纯显示坐标——无 calamine/gpui 依赖）
 // ---------------------------------------------------------------------------
 
-/// 合并范围（显示坐标，含端点——行/列均为模型包围盒相对 0 基）。
+/// 合并范围（可见段 = 显示坐标含端点 + 原始绝对锚）。
 ///
 /// 由绝对 `Dimensions` 经 [`MergeSpan::clip_to_box`] 换算 + guard 盒
-/// 裁剪而来；越出渲染护栏（行 ≤1000 / 列 ≤64）的部分被裁掉，整段
-/// 在护栏外的直接丢弃（`None`）。
+/// 裁剪而来；越出渲染护栏（行 ≤1000 / 列 ≤64）的可见部分被裁掉，
+/// 整段在护栏外的直接丢弃（`None`）。
+///
+/// # #584 返工：锚与可见范围分离（两套坐标不同源）
+///
+/// - **可见范围**（`row_start`/`col_start` 起）——渲染/命中/高亮用
+///   （guard 盒内显示坐标）；
+/// - **`abs_anchor`**（原始绝对左上，**不裁剪**）——值存储位/
+///   编辑提交/A1 引用用（Excel 语义：合并区左上可在数据包围盒
+///   之外[空合并格场景：值锚在 E5 而包围盒从 F6 起]，此时可见
+///   起点与值锚不同格——锚一律指原始绝对左上，不随裁剪漂移）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MergeSpan {
-    /// 首行（含——值所在行，即「左上」的行分量）。
+    /// 可见段首行（含——显示坐标，guard 盒内）。
     pub row_start: usize,
-    /// 末行（含）。
+    /// 可见段末行（含）。
     pub row_end: usize,
-    /// 首列（含——值所在列，即「左上」的列分量）。
+    /// 可见段首列（含——显示坐标，guard 盒内）。
     pub col_start: usize,
-    /// 末列（含）。
+    /// 可见段末列（含）。
     pub col_end: usize,
+    /// 原始绝对左上（0 基工作表坐标，不裁剪——见类型文档；
+    /// 可见范围被裁剪时与可见起点不同格）。
+    pub abs_anchor: (u32, u32),
 }
 
 impl MergeSpan {
@@ -91,6 +103,9 @@ impl MergeSpan {
         let r1c = r1.clamp(0, rows - 1);
         let c0c = c0.clamp(0, cols - 1);
         let c1c = c1.clamp(0, cols - 1);
+        // #584 返工：可见段裁剪 + 原始绝对锚分离——锚不随裁剪漂移
+        //（空合并格场景：值锚在 E5 而包围盒从 F6 起，编辑/A1 引用
+        // 一律锚 E5——不能把裁剪后可见起点当锚，否则错指 F6）。
         if r0c > r1 || r1c < r0 || c0c > c1 || c1c < c0 {
             return None; // 原始区间与盒不相交（钳制值越原始端点 = 无交集）
         }
@@ -99,6 +114,7 @@ impl MergeSpan {
             row_end: r1c as usize,
             col_start: c0c as usize,
             col_end: c1c as usize,
+            abs_anchor: (abs_start.0, abs_start.1),
         })
     }
 
@@ -128,10 +144,17 @@ pub fn is_covered(merges: &[MergeSpan], row: usize, col: usize) -> bool {
     merges.iter().any(|m| m.contains(row, col))
 }
 
-/// 命中映射：坐标 → 合并区左上（**Excel 语义**——点击覆盖格选中/
-/// 编辑的都是左上原值）。非覆盖格返回 `None`（调用方保持原坐标）。
+/// 命中映射：坐标 → 合并区可见锚（显示坐标——渲染/高亮链；**编辑
+/// 提交/A1 引用走 [`span_anchor_abs` 的原始绝对锚**，两链分源）。
 pub fn canonical_cell(merges: &[MergeSpan], row: usize, col: usize) -> Option<(usize, usize)> {
     span_at(merges, row, col).map(|m| (m.row_start, m.col_start))
+}
+
+/// 命中映射 → 原始绝对锚（0 基工作表坐标，不裁剪——值存储位）。
+/// #584 返工新增：合并区左上可在数据包围盒外（空合并格场景），
+/// 编辑提交/`selected_a1` 一律锚此（Excel 语义），不随可见裁剪漂移。
+pub fn span_anchor_abs(merges: &[MergeSpan], row: usize, col: usize) -> Option<(u32, u32)> {
+    span_at(merges, row, col).map(|m| m.abs_anchor)
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +194,13 @@ pub fn span_px(
 /// 视窗相交：span 列区间与可见列窗口 `[first, end)` 是否有公共部分
 /// （**横跨视窗**的 span——左端滚出窗外/右端未入窗，任一部分可见即
 /// 需绘制；绝对定位天然承载部分可见，无需拆分）。
+/// #584 返工：空窗口（`first >= end`，含 `[3,3)` 形态）恒 false
+/// ——空窗口零相交（裁剪后 span 起点也可能落在窗口内例：span
+/// (2,5) vs [3,3)——旧实现 `2 < 3 && 5 >= 3` 误判 true）。
 pub fn intersects_window(col_start: usize, col_end: usize, first: usize, end: usize) -> bool {
+    if first >= end {
+        return false; // 空窗口零相交
+    }
     col_start < end && col_end >= first
 }
 
@@ -218,14 +247,43 @@ mod tests {
                 row_start: 0,
                 row_end: 2,
                 col_start: 0,
-                col_end: 2
+                col_end: 2,
+                abs_anchor: (3, 2),
             },
-            "绝对 → 显示坐标 = 减包围盒起点"
+            "绝对 → 显示坐标 = 减包围盒起点（锚 = 原始绝对左上）"
         );
-        // 左上判定锚（值/选择锚点）。
+        // 左上判定锚（可见面——渲染/高亮链）。
         assert!(s.is_top_left(0, 0));
         assert!(!s.is_top_left(1, 0), "覆盖行不是左上");
         assert!(!s.is_top_left(0, 1), "覆盖列不是左上");
+    }
+
+    /// #584 返工：合并区左上在数据包围盒**外**（空合并格场景）——
+    /// 可见段被裁剪，但原始绝对锚不漂移（编辑/A1 引用一律锚原点）。
+    #[test]
+    fn anchor_outside_box_keeps_absolute_origin() {
+        // 审核复现场景：合并区 E5:G7（绝对 (4,4)-(6,6)），包围盒从
+        // F6（(5,5)）起、护栏 10×10 → 可见段 (0,0)-(1,1)，
+        // 锚 = E5 (4,4)——不能把可见起点 (0,0)（=F6）当锚。
+        let s = MergeSpan::clip_to_box((4, 4), (6, 6), 5, 5, 10, 10).expect("部分在盒内");
+        assert_eq!(
+            (s.row_start, s.col_start),
+            (0, 0),
+            "可见段起点 = F6 显示坐标"
+        );
+        assert_eq!((s.row_end, s.col_end), (1, 1), "可见段末点 = G7 显示坐标");
+        assert_eq!(s.abs_anchor, (4, 4), "原始绝对锚 = E5（不随裁剪漂移）");
+        let merges = [s];
+        // 可见锚（渲染/高亮链）：覆盖格 → 可见左上 (0,0)。
+        assert_eq!(canonical_cell(&merges, 1, 1), Some((0, 0)));
+        // 绝对锚（编辑/A1 链）：覆盖格 → 原始左上 E5——两链分源。
+        assert_eq!(span_anchor_abs(&merges, 1, 1), Some((4, 4)));
+        assert_eq!(
+            span_anchor_abs(&merges, 0, 0),
+            Some((4, 4)),
+            "可见起点也锚 E5"
+        );
+        assert_eq!(span_anchor_abs(&merges, 2, 0), None, "span 外无锚");
     }
 
     #[test]
@@ -284,6 +342,7 @@ mod tests {
             row_end: 4,
             col_start: 1,
             col_end: 3,
+            abs_anchor: (2, 1),
         }];
         // 覆盖格（含右下角）→ 左上。
         assert_eq!(canonical_cell(&merges, 2, 1), Some((2, 1)), "左上映射自身");
@@ -305,6 +364,7 @@ mod tests {
             row_end: 1,
             col_start: 1,
             col_end: 2,
+            abs_anchor: (1, 1),
         }];
         // is_covered 含左上——列宽计算把整个 span 区排除（左上文本由
         // span 宽格承载，不撑单列）。
@@ -322,6 +382,7 @@ mod tests {
             row_end: 0,
             col_start: 0,
             col_end: 2,
+            abs_anchor: (0, 0),
         }];
         assert_eq!(canonical_cell(&merges, 0, 2), Some((0, 0)));
     }
@@ -336,12 +397,14 @@ mod tests {
                 row_end: 3,
                 col_start: 0,
                 col_end: 1,
+                abs_anchor: (1, 0),
             },
             MergeSpan {
                 row_start: 5,
                 row_end: 5,
                 col_start: 2,
                 col_end: 3,
+                abs_anchor: (5, 2),
             },
         ];
         // 行 0：无。
@@ -390,8 +453,15 @@ mod tests {
         assert!(!intersects_window(5, 9, 3, 5), "span 起点在窗口右缘外");
         // span 0..2 与窗口 [3,5)：col_end=2 < first=3 → 不相交。
         assert!(!intersects_window(0, 2, 3, 5), "span 整段在窗口左侧");
-        // 空窗口。
-        assert!(!intersects_window(0, 2, 3, 3));
+        // 空窗口（零宽 [3,3)）——#584 返工：旧实现 span(2,5) 例
+        // `2 < 3 && 5 >= 3` 误判 true（覆盖格起点在窗口内例）。
+        assert!(!intersects_window(0, 2, 3, 3), "空窗口零相交（左侧例）");
+        assert!(
+            !intersects_window(2, 5, 3, 3),
+            "空窗口零相交（横跨例——返工红例）"
+        );
+        assert!(!intersects_window(3, 5, 3, 3), "空窗口零相交（起点重合例）");
+        assert!(!intersects_window(9, 9, 3, 3), "退化 span + 空窗口");
     }
 
     #[test]
@@ -401,6 +471,7 @@ mod tests {
             row_end: 4,
             col_start: 0,
             col_end: 1,
+            abs_anchor: (2, 0),
         };
         // 首行：top 有 bottom 无。
         assert_eq!(
@@ -432,6 +503,7 @@ mod tests {
             row_end: 1,
             col_start: 0,
             col_end: 0,
+            abs_anchor: (1, 0),
         };
         assert_eq!(
             span_edges(&single, 1),
