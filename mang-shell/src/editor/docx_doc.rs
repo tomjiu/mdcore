@@ -1707,8 +1707,11 @@ mod tests {
             "typed"
         );
 
+        // #523：panic 载荷取 3.15（任意非字符串 f64 均可测「未知载荷转
+        // Err」通道——3.14 会触发 clippy::approx_constant 对 PI 近似值
+        // 的误报，本值非 PI 计算）。
         let unknown = panic_guard("x", || -> Result<(), String> {
-            std::panic::panic_any(3.14f64)
+            std::panic::panic_any(3.15f64)
         })
         .expect_err("非字符串载荷转 Err");
         assert!(unknown.contains("未知"), "{unknown}");
