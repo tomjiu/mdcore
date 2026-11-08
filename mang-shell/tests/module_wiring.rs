@@ -223,7 +223,8 @@ const WIRED_MODULES: &[(&str, &str, &[&str])] = &[
     ("status_bar.rs（状态栏壳）", "shell.rs", &["status_bar::"]),
     // 标题栏：窗口控制钮 + 拖拽区。
     ("title_bar.rs（标题栏）", "shell.rs", &["title_bar::"]),
-    // #209：顶部菜单栏——模型（纯数据 + 键盘导航状态机）与渲染两层，
+    // #209（#385 批 4）：顶部菜单栏——模型（纯数据：结构/灰显/勾选
+    // 快照）与桥接层（ui::ContextMenu 实体构建 + anchored 部署）两层，
     // 均由 shell 挂载消费（标题行经 title_bar 转发、浮层在渲染链尾；
     // 模型同时经 lib 树供单测）。
     ("menu_bar.rs（菜单栏模型）", "shell.rs", &["menu_bar::"]),
