@@ -97,7 +97,7 @@ use crate::keymap::{self, EditorAction, KeyQuery};
 use mouse::ClickKind;
 use theme::ThemeColors;
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, Tooltip};
 
 use buffer::{Buffer, FenceDirty, IndentUnit, Point};
 use docx_doc::{DocxPayload, DocxProps, EditablePayload, HeadingEntry};
@@ -3690,6 +3690,10 @@ impl Editor {
                                     .justify_center()
                                     .rounded_sm()
                                     .hover(|el| el.bg(colors.element_hover))
+                                    // #385 批 6：icon-only 钮 tooltip 统一化
+                                    // （×无文字——补关闭语义与 Esc 同源提示；
+                                    // div 挂 tooltip 与 bar_button 同款用法）。
+                                    .tooltip(Tooltip::text("关闭查找栏（Esc）"))
                                     .child(
                                         Icon::new(IconName::Close)
                                             .size(IconSize::XSmall)
