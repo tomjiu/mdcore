@@ -173,7 +173,7 @@ impl LopdfWriter {
         // 损坏（修复源文件后重试）。
         if let Some(kind) = xref_chain_untrusted_reason(&doc) {
             return Err(CommandError::engine(format!(
-                "xref 链不可信：{kind}，增量写产物将丢失 /Prev 链导致页树不可达。\
+                "xref 链不可信：{kind}，前序链经修复，增量写安全性未验证，按保守策略拒绝。\
                  常见成因：二进制被行尾转换污染（如 Windows git autocrlf）或 xref \
                  损坏。请重取未污染原件或修复源文件后重试"
             )));
