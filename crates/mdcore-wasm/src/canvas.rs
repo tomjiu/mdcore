@@ -31,7 +31,7 @@ use wasm_bindgen::prelude::*;
 
 use mdc_canvas::{
     Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, DriveMode,
-    ObjectKind, ReorderOp, SessionOptions, StrokeTool,
+    ObjectKind, ReorderOp, SessionOptions, Side, StrokeTool,
 };
 
 // ---------------------------------------------------------------------------
@@ -222,6 +222,17 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             _ => Err(bad_json("command", format!("missing/invalid `{field}`"))),
         }
     };
+    // #406：可选 caption（string | null——null/缺省 = 清除）。
+    let opt_caption = |field: &str| -> Result<Option<String>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(sv)) => Ok(Some(sv.clone())),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
+            )),
+        }
+    };
     let tool = |field: &str| -> Result<StrokeTool, CvError> {
         match s(field)?.as_str() {
             "pen" => Ok(StrokeTool::Pen),
@@ -229,6 +240,22 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             other => Err(bad_json(
                 "command",
                 format!("`{field}` must be pen/highlighter, got {other}"),
+            )),
+        }
+    };
+    // #406：锚侧（top/right/bottom/left——null/缺省 = 清除回中心）。
+    let opt_side = |field: &str| -> Result<Option<Side>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Side::from_wire(s).map(Some).ok_or_else(|| {
+                bad_json(
+                    "command",
+                    format!("`{field}` must be top/right/bottom/left or null, got {s}"),
+                )
+            }),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
             )),
         }
     };
@@ -282,6 +309,13 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             width: f("width")?,
             tool: tool("tool")?,
         }),
+        // #406：边路由/标题终态替换（锚侧 ×2 + caption——null/缺省 = 清除）。
+        "set_edge_route" => Ok(CanvasCommand::SetEdgeRoute {
+            id: s("id")?,
+            from_side: opt_side("from_side")?,
+            to_side: opt_side("to_side")?,
+            caption: opt_caption("caption")?,
+        }),
         "reorder" => {
             // #402：z 序重排（op = front/back/forward/backward）。
             let op = ReorderOp::from_wire(&s("op")?).ok_or_else(|| {
@@ -331,7 +365,7 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
         }
         other => Err(bad_json(
             "command",
-            format!("unknown command `{other}` (17 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder/add_tag/remove_tag/create_frame/rename_frame/set_parent/set_drive_mode)"),
+            format!("unknown command `{other}` (18 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/set_edge_route/reorder/add_tag/remove_tag/create_frame/rename_frame/set_parent/set_drive_mode)"),
         )),
     }
 }
@@ -384,6 +418,8 @@ pub fn batch_receipt_json(r: &mdc_canvas::BatchReceipt) -> String {
                 // #350 笔迹面：与单命令 receipt_json 同构
                 CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
                 CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+                // #406 边路由面：与单命令 receipt_json 同构
+                CommandOutcome::EdgeRouted { id } => ("edge_routed", "id", id.clone()),
                 // #402 z 序面：与单命令 receipt_json 同构
                 CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
                 // #405 标签面 + #404 frame 面：与单命令 receipt_json 同构
@@ -476,8 +512,18 @@ pub fn object_json(o: &CanvasObject) -> String {
     };
     let name = opt_str_field(&o.name);
     let parent = opt_str_field(&o.parent);
+    // #406：锚侧 + 标题（null 缺省——同 from/to null 纪律）。
+    let opt_side_str = |v: &Option<Side>| -> String {
+        match v {
+            Some(sv) => format!("\"{}\"", sv.wire()),
+            None => "null".to_string(),
+        }
+    };
+    let from_side = opt_side_str(&o.from_side);
+    let to_side = opt_side_str(&o.to_side);
+    let caption = opt_str(&o.caption);
     format!(
-        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"tags\":[{}],\"name\":{},\"parent\":{},\"props\":{{{}}}}}",
+        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"from_side\":{},\"to_side\":{},\"caption\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"tags\":[{}],\"name\":{},\"parent\":{},\"props\":{{{}}}}}",
         serde_json::to_string(&o.id).unwrap(),
         kind_wire(o.kind),
         o.x,
@@ -486,6 +532,9 @@ pub fn object_json(o: &CanvasObject) -> String {
         o.h,
         opt_str(&o.from),
         opt_str(&o.to),
+        from_side,
+        to_side,
+        caption,
         members.join(","),
         points.join(","),
         opt_str(&o.color),
@@ -512,6 +561,8 @@ pub fn receipt_json(outcome: &CommandOutcome, undo_depth: usize, undo_cleared: b
         CommandOutcome::Ungrouped { group_id } => ("ungrouped", "group_id", group_id.clone()),
         CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
         CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+        // #406：边路由/标题已设。
+        CommandOutcome::EdgeRouted { id } => ("edge_routed", "id", id.clone()),
         CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
         // #405：标签回执（幂等无变化也回此回执——同 reordered 纪律）。
         CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),

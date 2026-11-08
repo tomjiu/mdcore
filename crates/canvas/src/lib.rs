@@ -39,5 +39,5 @@ pub use render::{
 };
 pub use session::{
     Actor, BatchReceipt, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome,
-    CommandReceipt, DriveMode, ObjectKind, ReorderOp, SessionOptions, StrokeTool,
+    CommandReceipt, DriveMode, ObjectKind, ReorderOp, SessionOptions, Side, StrokeTool,
 };
