@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""#466 web PDF 链接点击导航 e2e——内链跳页 + 外链安全策略。
+"""#466 web PDF 链接点击导航 e2e + #557 外链输入策略面。
 
-夹具 web/tests/fixtures/sample_links.pdf（gen_pdf_links_fixture.py：3 页 +
-第 1 页 3 条 Link——内链→第 3 页 / 白名单外链 / javascript: 恶意 scheme）。
+夹具 web/tests/fixtures/sample_links.pdf（gen_pdf_links_fixture.py：3 页；
+第 1 页 3 条 Link——内链→第 3 页 / 白名单外链 / javascript: 恶意 scheme；
+第 2 页 5 条 #557 策略探针——2049 超限 / 恰 2048 / %E2%80%8B 编码零宽 /
+%25E2%80%8B 双重编码 / mailto。原始控制码形态不经夹具——pdf.js
+bytesToString 对 /URI 无 BOM 解码，由 __pdfLinkPolicy 探针单测直测）。
 
 驱动面：__pdfOpenBytes / __pdfState / __pdfLinks（逐页计数 + 策略拒绝面）
++ __pdfLinkPolicy（#557 策略纯函数单测——不经夹具直测 reason 语义）
 + 手势级 page.click('.pdf-link-hotspot')（真实 <a> 热区）。
 
 结果 -> tests/results/results_pdf_links.json
@@ -43,7 +47,6 @@ class QuietServer(Handler):
 
 
 socketserver.TCPServer.allow_reuse_address = True
-
 CHECKS: list[dict] = []
 
 
@@ -55,6 +58,59 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
 
 def b64(p: Path) -> str:
     return base64.b64encode(p.read_bytes()).decode()
+
+
+# ---- #557 策略纯函数单测（__pdfLinkPolicy 探针——不经夹具）----
+BASE = "https://example.com/"
+POLICY_CASES: list[tuple[str, str, str]] = [
+    # (raw, expect_ok, expect_reason|url 判定串)
+    ("https://example.com/x", "ok", "url=https://example.com/x"),
+    ("http://a.b/c?d=e#f", "ok", "url=http://a.b/c?d=e#f"),
+    ("mailto:user@example.com", "ok", "url=mailto:user@example.com"),
+    ("HTTPS://EXAMPLE.COM/X", "ok", "url=https://example.com/X"),  # 规范化大小写
+    ("https://例え.jp/パス", "ok", "url~xn--"),  # 中文 IDN → punycode 规范化
+    (BASE + "b" * (2048 - len(BASE)), "ok", "len=2048"),  # 预算边界恰好通过
+    ("https://x/%25E2%80%8Bp", "ok", "url=https://x/%25E2%80%8Bp"),  # 双重编码不二次解码
+    ("https://x/%E2%80", "ok", "url=https://x/%E2%80"),  # 截断序列字面保留不抛异常
+    (BASE + "a" * (2049 - len(BASE)), "rej", "url-over-budget"),  # 原始 2049 超限
+    ("https://x/" + "あ" * 700, "rej", "url-over-budget"),  # 原始 720≤2048 但规范化膨胀超限
+    ("javascript:alert(1)", "rej", "javascript"),
+    ("ftp://host/x", "rej", "ftp"),
+    ("example.com/x", "rej", "relative-url"),  # 相对串无基准
+    ("", "rej", "relative-url"),  # 空串不抛异常
+    ("https://x/‌p", "rej", "zero-width-bidi"),  # 原始 U+200B
+    ("https://x/‮evil", "rej", "zero-width-bidi"),  # 原始 U+202E Bidi 覆盖
+    ("https://x/⁦abc", "rej", "zero-width-bidi"),  # 原始 U+2066 Bidi 隔离
+    ("https://x/﻿p", "rej", "zero-width-bidi"),  # 原始 U+FEFF BOM
+    ("https://x/%E2%80%8Bp", "rej", "zero-width-bidi-encoded"),  # 编码零宽
+    ("https://x/%E2%80%AEevil", "rej", "zero-width-bidi-encoded"),  # 编码 Bidi 覆盖
+    ("https://x/%ZZ%E2%80%8B", "rej", "zero-width-bidi-encoded"),  # 无效段字面+有效段仍捕获
+]
+
+
+def run_policy_units(page) -> bool:
+    raws = [c[0] for c in POLICY_CASES]
+    results = page.evaluate(
+        "(raws) => raws.map((r) => window.__pdfLinkPolicy(r))", raws
+    )
+    all_ok = True
+    for (raw, expect, want), got in zip(POLICY_CASES, results):
+        if expect == "ok":
+            if want.startswith("url="):
+                ok = got["ok"] is True and got["url"] == want[4:] and got["reason"] is None
+            elif want.startswith("url~"):
+                ok = got["ok"] is True and want[4:] in (got["url"] or "")
+            elif want.startswith("len="):
+                ok = got["ok"] is True and len(got["url"] or "") == int(want[4:])
+            else:
+                ok = False
+        else:
+            ok = got["ok"] is False and got["url"] is None and got["reason"] == want
+        if not ok:
+            all_ok = False
+            check(f"policy_unit[{raw[:28]!r}]", False, f"expect={want} got={json.dumps(got, ensure_ascii=False)[:160]}")
+    check("policy_units", all_ok, f"{len(POLICY_CASES)} 例")
+    return all_ok
 
 
 def main() -> int:
@@ -72,22 +128,30 @@ def main() -> int:
         page.click("#tab-pdf")
         page.wait_for_selector("#pdf-panel:not([hidden])", state="visible")
 
+        # 0. #557 策略纯函数单测（探针直测——21 例）
+        run_policy_units(page)
+
         r = page.evaluate("window.__pdfOpenBytes('%s')" % b64(FIXTURE))
         check("links_open", r.get("ok") is True and r.get("value", {}).get("pages") == 3,
               json.dumps(r))
         page.wait_for_function("window.__pdfState().open === true", timeout=10000)
 
-        # 1. 链接面计数：第 1 页内 1 外 1（恶意 scheme 不渲染）；策略拒绝 1 条
+        # 1. 链接面计数：第 1 页内 1 外 1（恶意 scheme 不渲染）；策略拒绝面
+        #    （第 1 页 javascript + 第 2 页 2 项 #557 拒绝）
         links = page.evaluate("window.__pdfLinks()")
         p1 = links["perPage"][0] if links["perPage"] else {}
         check(
             "links_counts",
             p1.get("total") == 2 and p1.get("internal") == 1 and p1.get("external") == 1
-            and links["policySkipped"] == ["javascript"],
+            and links["policySkipped"] == [
+                "javascript",
+                "url-over-budget",
+                "zero-width-bidi-encoded",
+            ],
             json.dumps(links),
         )
 
-        # 2. 热区 DOM：恰 2 个 <a>（恶意 scheme 不在场）
+        # 2. 热区 DOM：第 1 页恰 2 个 <a>（恶意 scheme 不在场）
         hotspots = page.query_selector_all('.pdf-page[data-page="0"] .pdf-link-hotspot')
         check("links_dom_two_hotspots", len(hotspots) == 2, f"count={len(hotspots)}")
 
@@ -121,7 +185,44 @@ def main() -> int:
         bad = page.query_selector_all('.pdf-page[data-page="0"] a[href^="javascript"]')
         check("links_malicious_not_rendered", len(bad) == 0, f"count={len(bad)}")
 
-        # 6. 缩放后热区重投影（relayout——热区仍在场且计数不变）
+        # 6. #557 策略面 e2e（第 2 页=data-page"1"：5 条注释 → 3 热区 + 2 拒绝）
+        p2 = links["perPage"][1] if len(links["perPage"]) > 1 else {}
+        check("policy_page2_counts",
+              p2.get("total") == 3 and p2.get("internal") == 0 and p2.get("external") == 3,
+              json.dumps(links["perPage"]))
+
+        spots2 = page.query_selector_all('.pdf-page[data-page="1"] .pdf-link-hotspot')
+        check("policy_page2_three_hotspots", len(spots2) == 3, f"count={len(spots2)}")
+
+        hrefs2 = [s.get_attribute("href") or "" for s in spots2]
+        # 6a. 恰 2048 边界热区在场（href 长恰 2048 + noopener 合同）
+        at_budget = [h for h in hrefs2 if len(h) == 2048]
+        rels2 = [s.get_attribute("rel") or "" for s in spots2]
+        check("policy_budget_edge_hotspot",
+              len(at_budget) == 1 and all("noopener" in r for r in rels2),
+              f"at_budget={len(at_budget)} rels={rels2}")
+
+        # 6b. 超预算热区不渲染（无 href 超 2048）
+        check("policy_over_budget_not_rendered",
+              all(len(h) <= 2048 for h in hrefs2),
+              f"max={max((len(h) for h in hrefs2), default=0)}")
+
+        # 6c. 编码零宽被拒（%E2%80%8B 单编形态不在 href；双编 %25 形态在场）
+        check("policy_encoded_zw_split",
+              all("%E2%80%8Bpath" not in h or "%25E2%80%8Bpath" in h for h in hrefs2)
+              and any(h == "https://example.com/%25E2%80%8Bpath" for h in hrefs2),
+              f"hrefs2={[h[:60] for h in hrefs2]}")
+
+        # 6d. mailto 白名单热区（href + noopener）
+        mailto = [h for h in hrefs2 if h.startswith("mailto:")]
+        check("policy_mailto_hotspot", len(mailto) == 1, f"mailto={mailto}")
+
+        # 6e. 全部 href 无控制码残留（含允许面——双编/边界/mailto 均洁净）
+        check("policy_raw_controls_not_rendered",
+              all("\u202e" not in h and "\u200b" not in h for h in hrefs2),
+              f"hrefs2={[h[:40] for h in hrefs2]}")
+
+        # 7. 缩放后热区重投影（relayout——热区仍在场且计数不变）
         page.click("#pdf-zoom-in")
         page.wait_for_timeout(300)
         links2 = page.evaluate("window.__pdfLinks()")
@@ -130,7 +231,7 @@ def main() -> int:
               links2["perPage"][0]["total"] == 2 and len(hotspots2) == 2,
               f"links={json.dumps(links2['perPage'])} dom={len(hotspots2)}")
 
-        # 7. 空态：无链接件 → 全零 + 空层（sample.pdf 复用 gen_pdf_fixture）
+        # 8. 空态：无链接件 → 全零 + 空层（sample.pdf 复用 gen_pdf_fixture）
         plain = WEB / "tests" / "fixtures" / "sample.pdf"
         if not plain.exists():
             subprocess.run(["python3", "tests/gen_pdf_fixture.py"], check=True, cwd=str(WEB))
@@ -151,7 +252,7 @@ def main() -> int:
     passed = sum(1 for c in CHECKS if c["ok"])
     OUT.write_text(json.dumps({
         "meta": {
-            "gate": "#466 web pdf links e2e",
+            "gate": "#466+#557 web pdf links e2e",
             "dist": str(WEB / "dist"),
             "fixture": str(FIXTURE),
         },

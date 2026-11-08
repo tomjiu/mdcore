@@ -46,6 +46,9 @@
 import { wasmBoot } from './wasm_boot.js';
 import { mount_surface_guide } from './empty_state.js';
 import { t } from './i18n/index.js';
+
+// #557：外链输入策略单一模块（2048 预算 + 零宽/Bidi 拒绝 + #466 白名单语义）。
+import { policyExternalUrl } from './pdf_link_policy.js';
 // #475(长尾⑨缩小版):注释列表面板——会话 AnnotListed 数据可视化
 // (新模块:行形状 + DOM 纯函数;pdf_view 只做接线)。
 import { renderAnnotListDom, type AnnotRowLike } from './pdf_annot_list.js';
@@ -462,6 +465,9 @@ declare global {
       policySkipped: string[];
     };
 
+    /** #557：外链输入策略探针（纯函数直测——策略单测断言面，不经夹具）。 */
+    __pdfLinkPolicy: (raw: string) => { ok: boolean; url: string | null; reason: string | null };
+
     /** #472：文档属性面观测（DocProps 镜像 + 抽屉开态——e2e 断言面）。 */
     __pdfProps: () => {
       open: boolean;
@@ -523,7 +529,7 @@ interface PageState {
   textLayerActive: { cancel: () => void } | null;
 }
 
-/** #466：链接热区（内链 target = 0 基页号；外链 url = scheme 白名单后串）。 */
+/** #466→#557：链接热区（内链 target = 0 基页号；外链 url = 策略通过后的规范化串）。 */
 interface PageLinkBox {
   target: number | null;
   url: string | null;
@@ -540,19 +546,8 @@ interface PdfAnnotLike {
   action?: string;
 }
 
-/** #466：外链 scheme 白名单（http/https/mailto——阅读器惯例；
- * javascript:/data:/file: 等一律不渲染，策略拒绝面入探针计数不静默）。 */
-const URL_SCHEME_ALLOW = new Set(['http:', 'https:', 'mailto:']);
-
-function allowExternalUrl(raw: string): string | null {
-  try {
-    // 仅绝对 URL（相对串在 PDF 注释上下文无基准——拒绝并计数）
-    const u = new URL(raw);
-    return URL_SCHEME_ALLOW.has(u.protocol) ? u.href : null;
-  } catch {
-    return null;
-  }
-}
+// （外链判定逻辑已迁 pdf_link_policy.ts 单一策略模块——#557；本文件不再
+// 持有 scheme 白名单/URL 解析，只消费 policyExternalUrl 的裁决。）
 
 export class PdfViewUI {
   private readonly pdfjs: PdfjsModule;
@@ -1225,11 +1220,13 @@ export class PdfViewUI {
               ? a.unsafeUrl
               : null;
           if (raw) {
-            const safe = allowExternalUrl(raw);
-            if (safe) {
-              links.push({ target: null, url: safe, rect });
+            // #557：输入策略单一模块裁决（预算/零宽 Bidi/白名单——每步显式
+            // reason；拒绝不生成热区，原因进 linkPolicySkipped 可观察计数）
+            const verdict = policyExternalUrl(raw);
+            if (verdict.ok && verdict.url) {
+              links.push({ target: null, url: verdict.url, rect });
             } else {
-              this.linkPolicySkipped.push(raw.split(':')[0] ?? 'bad-url');
+              this.linkPolicySkipped.push(verdict.reason ?? 'bad-url');
             }
             continue;
           }
@@ -2739,6 +2736,9 @@ export class PdfViewUI {
       })),
       policySkipped: [...this.linkPolicySkipped],
     });
+
+    // #557：策略纯函数探针（单测直测——不经夹具，断言 reason 语义）。
+    window.__pdfLinkPolicy = (raw: string) => policyExternalUrl(raw);
 
     // #472：属性面探针（DocProps 镜像——字段级断言 + 开态）。
     window.__pdfProps = () => ({
