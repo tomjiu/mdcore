@@ -604,6 +604,32 @@ impl ShellApp {
     }
 
     /// F7：git 面板实体（烟雾钩子/内部访问）。
+    /// #577：GitPanel 的 ShellApp 面收口（lib 化钩子注入——行为零变化：
+    /// open_readonly = 原 open_readonly_tab + 焦点落位原链）。
+    fn git_panel_hooks(shell: gpui::WeakEntity<Self>) -> crate::git_panel::GitPanelHooks {
+        use std::sync::Arc;
+        let open_shell = shell.clone();
+        crate::git_panel::GitPanelHooks {
+            open_readonly: Arc::new(move |title, text, window, cx| {
+                let focus = open_shell
+                    .update(cx, |shell, cx| shell.open_readonly_tab(title, text, cx))
+                    .ok()
+                    .flatten();
+                if let Some(focus) = focus {
+                    window.focus(&focus, cx);
+                }
+            }),
+            escape: Arc::new(move |window, cx| {
+                let _ = shell.update(cx, |shell, cx| {
+                    if let Some(ed) = shell.editor() {
+                        let focus = ed.read(cx).focus_handle().clone();
+                        window.focus(&focus, cx);
+                    }
+                });
+            }),
+        }
+    }
+
     pub fn git_panel(&self) -> Option<Entity<GitPanel>> {
         self.git_panel.clone()
     }
@@ -2282,7 +2308,7 @@ impl ShellApp {
         self.workspace = Some(tree);
         // F7：git 面板（工作区打开即建——非 git 目录/缺 git 走提示态，
         // 不崩溃不拦截）。
-        let git = cx.new(|_| GitPanel::new(root.clone(), shell));
+        let git = cx.new(|cx| GitPanel::new(root.clone(), Self::git_panel_hooks(shell), cx));
         self.git_panel = Some(git);
         crate::settings::remember_workspace(&root);
         self.recent.record_workspace(&root);
