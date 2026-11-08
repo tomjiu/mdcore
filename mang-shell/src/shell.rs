@@ -474,13 +474,11 @@ impl ShellApp {
     /// #386：pdf 标签的批注脏（页视图未落盘）计入——标题栏脏标/
     /// 关闭确认/RPC 拦截同源。
     pub fn tab_is_modified(&self, idx: usize, cx: &App) -> Option<bool> {
-        self.tabs
-            .get(idx)
-            .map(|tab| {
-                tab.editor.read(cx).is_modified()
-                    || self.xlsx_dirty_at(&tab.path, cx)
-                    || self.pdf_view_dirty(cx, &tab.path)
-            })
+        self.tabs.get(idx).map(|tab| {
+            tab.editor.read(cx).is_modified()
+                || self.xlsx_dirty_at(&tab.path, cx)
+                || self.pdf_view_dirty(cx, &tab.path)
+        })
     }
 
     /// #386：指定路径的 pdf 页视图是否有未落盘批注（Shell 持有的
@@ -3834,7 +3832,6 @@ mod menu_bar_lifecycle_tests {
         });
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // #386：pdf 批注落盘——Shell 分流运行时面（手势 → 脏标签 → 关闭确认

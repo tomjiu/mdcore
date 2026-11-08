@@ -1375,7 +1375,6 @@ impl PdfPagesView {
         }
     }
 
-
     /// #386：是否有未落盘批注（Shell 据此驱动关闭确认与标题栏脏标；
     /// e2e 断言面）。
     pub fn is_dirty(&self) -> bool {
@@ -2572,7 +2571,6 @@ mod tests {
         assert!((PDF_ZOOM_WHEEL_STEP - 1.1).abs() < 1e-6, "issue 步进 10%");
         assert!((PDF_ZOOM_STEP - 1.25).abs() < 1e-6, "canvas ZOOM_STEP 同款");
     }
-
 
     // -----------------------------------------------------------------------
     // #386：批注落盘——手势级 e2e（从用户手势开始，不跳过视图层）
