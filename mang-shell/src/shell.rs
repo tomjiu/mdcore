@@ -4283,3 +4283,304 @@ mod pdf_annot_save_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #385 批 11：status_bar 视图切换钮交互测试（issue #585）——pdf/xlsx
+// 双态翻转 + md 态零占位。
+//
+// 与既有面的分工（不重复钉定）：
+// - `ui_wiring_faces` face 5：源码扫描（静态包含检查——测不出
+//   「点了没反应」）；本模块补运行时面。
+// - `pdf_annot_save_tests` / 批 2 PR #569：视图级；本模块钉
+//   **状态栏入口**（文档形态切换钮）。
+//
+// 点击路径：**真实鼠标派发**（MouseDown + MouseUp 同点，完整命中
+// 测试管线——与 main.rs run_panel_resize_script 烟雾同构）。按钮坐标
+// 不硬编码（跨平台字体度量不可移植）：**状态反馈扫描**——从状态栏
+// 右缘向左步进单击，目标态翻转即命中（右区其余成员均为无 hitbox
+// 纯标签，点击零效果；pdf/xlsx 两钮按活动文档形态互斥在场，先中者
+// 必为当前形态的切换钮）。
+//
+// 文案断言边界（如实登记）：钮标签是 `pdf_view_mode` /
+// `xlsx_grid_view_mode` 的 1:1 纯函数（status_bar.rs 渲染期组串，
+// 两文案等宽不位移）——本层断言状态翻转（= 文案翻转的判据源），
+// 像素级文本呈现归 #554 真机走查，不冒充。
+//
+// 条件占位断言边界：md 态「双钮零渲染」与 toggle 守卫
+// （`active_is_pdf`/`active_is_xlsx`）共享同一谓词（doc_kind 判据，
+// 源码级同源）——本层运行时证据为「全扫零翻转」（用户可见行为：
+// 点了没反应）；「渲染了但被守卫拦」与「未渲染」在该层不可区分，
+// 属已知边界（如需像素级占位断言归 #554 截图回归）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod statusbar_view_toggle_tests {
+    use super::*;
+    use gpui::{
+        AnyWindowHandle, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
+        point, px,
+    };
+
+    /// 宿主：shell 进渲染树（鼠标命中测试需要整树 + 命中盒——
+    /// pdf_search_wiring_tests WiringHost 同款；空 div 宿主会把状态栏
+    /// 挡在派发树外，点击无法路由）。
+    struct StatusHost(Entity<ShellApp>);
+
+    impl gpui::Render for StatusHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// 整树宿主 + 窗口（theme provider 双注册——#422 同款：整树鼠标
+    /// 派发需要 provider 在位）。
+    fn host_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<ShellApp>, gpui::WindowHandle<StatusHost>) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            StatusHost(shell)
+        });
+        (slot.expect("宿主构造即置"), window)
+    }
+
+    /// 双视图态快照（pdf_view_mode, xlsx_grid_view_mode——私有字段
+    /// 同文件测试面直读）。
+    fn view_modes(shell: &Entity<ShellApp>, cx: &mut gpui::TestAppContext) -> (bool, bool) {
+        cx.read(|app| {
+            let s = shell.read(app);
+            (s.pdf_view_mode, s.xlsx_grid_view_mode)
+        })
+    }
+
+    /// 重绘一帧（命中盒随最新状态重注册——update_window 口径）。
+    fn redraw(window: &gpui::WindowHandle<StatusHost>, cx: &mut gpui::TestAppContext) {
+        let any: AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("重绘一帧");
+    }
+
+    /// 真实单击：MouseDown + MouseUp 同点派发（update_window 口径——
+    /// 不包根视图 update，shell 级监听器不重入；main.rs 烟雾同构）。
+    fn click_at(
+        window: &gpui::WindowHandle<StatusHost>,
+        cx: &mut gpui::TestAppContext,
+        x: f32,
+        y: f32,
+    ) {
+        let any: AnyWindowHandle = window.clone().into();
+        let down = PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        let up = PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(down, cx);
+            window.dispatch_event(up, cx);
+        })
+        .expect("单击派发");
+    }
+
+    /// 状态栏右区命中扫描：从右缘（viewport 宽 - px_3 内边距）向左
+    /// 步进 8px 单击至中线，直到**任一**视图态翻转。返回 (命中 x, 翻转后
+    /// 双态)；扫完零翻转 = None（该形态无交互钮——md 态零占位的
+    /// 运行时证据）。
+    ///
+    /// y = 状态栏中线（viewport 高 - 12：状态栏 = 底部 24px——
+    /// 垂直方向只可能与状态栏命中盒相交，编辑区/面板/标签栏均在其上；
+    /// 测试平台 display 为 1920×1080——坐标从 viewport_size 动态推
+    /// 导，不硬编码）。
+    fn sweep_statusbar_right(
+        shell: &Entity<ShellApp>,
+        window: &gpui::WindowHandle<StatusHost>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Option<(f32, (bool, bool))> {
+        let (right_edge, mid_x, status_y) = window
+            .update(cx, |_host, window, _cx| {
+                let size = window.viewport_size();
+                (
+                    f32::from(size.width) - 12.0,
+                    f32::from(size.width) / 2.0,
+                    f32::from(size.height) - 12.0,
+                )
+            })
+            .expect("读 viewport 尺寸");
+        redraw(window, cx);
+        let mut x = right_edge;
+        while x >= mid_x {
+            let before = view_modes(shell, cx);
+            click_at(window, cx, x, status_y);
+            let after = view_modes(shell, cx);
+            if after != before {
+                return Some((x, after));
+            }
+            x -= 8.0;
+        }
+        None
+    }
+
+    /// smoke.xlsx 夹具路径（只读打开——本测试面不保存，零污染）。
+    fn smoke_xlsx() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.xlsx")
+    }
+
+    /// 状态栏中线 y（viewport 高 - 12——底部 24px 状态栏的垂直中心；
+    /// 回切重击前的坐标重取）。
+    fn statusbar_y(window: &gpui::WindowHandle<StatusHost>, cx: &mut gpui::TestAppContext) -> f32 {
+        window
+            .update(cx, |_host, window, _cx| {
+                f32::from(window.viewport_size().height) - 12.0
+            })
+            .expect("读 viewport 高")
+    }
+
+    /// xlsx 面：网格态起（初始 true）→ 扫描命中切换钮 → 翻转到文本态
+    /// （false）→ 同点再击回切网格态（true）→ pdf 态全程不受扰
+    /// （两钮互斥在场，点击不串道）。
+    #[gpui::test]
+    fn xlsx_view_toggle_click_flips_and_restores(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = host_window(cx);
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(smoke_xlsx(), window, cx);
+                });
+            })
+            .expect("开 xlsx 标签");
+        cx.run_until_parked();
+        let (pdf0, xlsx0) = view_modes(&shell, cx);
+        assert!(xlsx0, "xlsx 态初始 = 网格视图（ShellApp 默认 true）");
+        assert!(pdf0, "pdf 态默认 true（未开 pdf 标签不受扰）");
+
+        // 扫描命中（Some = 右区存在交互钮且点击真实翻转了状态）。
+        let (hit_x, (pdf1, xlsx1)) =
+            sweep_statusbar_right(&shell, &window, cx).expect("xlsx 标签活跃：右区应命中切换钮");
+        assert!(!xlsx1, "第一击：网格 → 文本（true → false）");
+        assert!(pdf1 == pdf0, "xlsx 钮点击不串扰 pdf 态");
+
+        // 同点回切（文案两态等宽——按钮不位移；仍重绘保命中盒新鲜）。
+        let status_y = statusbar_y(&window, cx);
+        redraw(&window, cx);
+        click_at(&window, cx, hit_x, status_y);
+        let (pdf2, xlsx2) = view_modes(&shell, cx);
+        assert!(xlsx2, "第二击：文本 → 网格（false → true，回切闭环）");
+        assert!(pdf2 == pdf0, "回切仍不串扰 pdf 态");
+    }
+
+    /// md 面：非 pdf/xlsx 标签——右区全扫零翻转（双钮零占位的运行时
+    /// 证据：用户点了没反应；占位渲染与 toggle 守卫同谓词，见模块
+    /// 头「条件占位断言边界」）。
+    #[gpui::test]
+    fn md_tab_statusbar_right_zone_is_inert(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("mdc-b11-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("note.md");
+        std::fs::write(&md, "批 11\n状态栏零占位\n").unwrap();
+
+        let (shell, window) = host_window(cx);
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(md.clone(), window, cx);
+                });
+            })
+            .expect("开 md 标签");
+        cx.run_until_parked();
+
+        let before = view_modes(&shell, cx);
+        let swept = sweep_statusbar_right(&shell, &window, cx);
+        assert!(
+            swept.is_none(),
+            "md 标签：右区全扫零翻转（得 {:?}——存在不应在场的交互钮）",
+            swept.map(|(x, _)| x)
+        );
+        assert_eq!(view_modes(&shell, cx), before, "双视图态纹丝不动");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pdf 面：pdf 标签活跃 → 扫描命中 → 翻转回切（xlsx 态不串扰）。
+    /// 引擎门控：无 libpdfium 时开档即失败（open 走 Failed 分支）→
+    /// SKIP 横幅（AGENTS 13.1——不伪装通过）；#422 pdf_view_ctrl_f
+    /// 同口径。
+    #[gpui::test]
+    fn pdf_view_toggle_click_flips_and_restores(cx: &mut gpui::TestAppContext) {
+        let pdf_bytes = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.pdf"),
+        )
+        .unwrap_or_else(|e| panic!("夹具不可读：{e}"));
+        let dir = std::env::temp_dir().join(format!("mdc-b11-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("s.pdf");
+        std::fs::write(&pdf, pdf_bytes).unwrap();
+
+        let (shell, window) = host_window(cx);
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(pdf.clone(), window, cx);
+                });
+            })
+            .expect("开 pdf 标签");
+        cx.run_until_parked();
+        // 引擎门控：无 libpdfium → pdf_doc::load 失败 → 无标签 + notice。
+        let open_ok = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, _| shell.tab_count() == 1)
+            })
+            .expect("查标签数");
+        if !open_ok {
+            let notice = window
+                .update(cx, |_host, _window, cx| {
+                    shell.update(cx, |shell, _| {
+                        shell.notice_board.message().map(str::to_owned)
+                    })
+                })
+                .expect("查 notice");
+            if notice.as_deref().is_some_and(|m| m.contains("libpdfium")) {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——批 11 pdf 视图切换钮 e2e 未真跑\n  \
+                     （xlsx/md 两面已全量真跑——覆盖同一接线模式）。\n  \
+                     有 libpdfium 的环境全量执行。\n═════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            panic!("pdf 标签开档失败（夹具/真缺陷，非环境缺件）：{notice:?}");
+        }
+
+        let (pdf0, xlsx0) = view_modes(&shell, cx);
+        assert!(pdf0, "pdf 态初始 = 页面视图（ShellApp 默认 true）");
+
+        let (hit_x, (pdf1, xlsx1)) =
+            sweep_statusbar_right(&shell, &window, cx).expect("pdf 标签活跃：右区应命中切换钮");
+        assert!(!pdf1, "第一击：页面 → 文本（true → false）");
+        assert!(xlsx1 == xlsx0, "pdf 钮点击不串扰 xlsx 态");
+
+        let status_y = statusbar_y(&window, cx);
+        redraw(&window, cx);
+        click_at(&window, cx, hit_x, status_y);
+        let (pdf2, _) = view_modes(&shell, cx);
+        assert!(pdf2, "第二击：文本 → 页面（false → true，回切闭环）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
