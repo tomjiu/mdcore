@@ -2340,7 +2340,10 @@ mod tests {
         assert!(md.contains("First body paragraph [^1]"), "{md}");
         assert!(md.contains("Second with two refs [^2] [^3]"), "{md}");
         // 无引用位段落零变化。
-        assert!(md.contains("\nNo refs here") || md.contains("No refs here\n"), "{md}");
+        assert!(
+            md.contains("\nNo refs here") || md.contains("No refs here\n"),
+            "{md}"
+        );
         // 定义块：文档尾节，多段懒连续形。
         assert!(md.contains("[^1]: First note"), "{md}");
         assert!(md.contains("[^2]: Second note first para\nSecond note second para"), "{md}");
