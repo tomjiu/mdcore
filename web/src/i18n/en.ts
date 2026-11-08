@@ -116,6 +116,8 @@ export const en = {
   'status.exported': 'exported: {parts}',
   'status.importFailed': 'import failed ({code}): {message}',
   'status.exportFailed': 'export failed ({code}): {message}',
+  'docx.footnoteRef.one': '{n} footnote ref',
+  'docx.footnoteRef.many': '{n} footnote refs',
   'status.gridSuffix': ' · workbook in grid ({n} sheet{plural})',
   'docx.heading.one': '{n} heading',
   'docx.heading.many': '{n} headings',

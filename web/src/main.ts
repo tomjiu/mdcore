@@ -1898,6 +1898,10 @@ type DocxImportStats = {
   /** #22 P2-4：元素形升级（count/severity 加性——引擎条目保留
    * detail；既有 kind/part 读取方零破坏）。 */
   warnings: ImportWarning[];
+  /** #485：脚注接入面——引用位发射数（段落尾接 [^N] marker 总数）；
+   * footnote_blocks_dropped 为 additive JSON 面直传（宿主按需读取），
+   * 不进本类型。 */
+  footnote_refs?: number;
 };
 
 /** wasm import_docx 的薄包装：JSON 出入口 + 异常 → typed 结果（不抛出）。 */
@@ -1938,6 +1942,8 @@ function docxStatusLine(stats: DocxImportStats): string {
   // 防御 ?? 0）。
   const importedParts = (stats.headers_imported ?? 0) + (stats.footers_imported ?? 0);
   if (importedParts > 0) parts.push(tCount('docx.headerFooterImported', importedParts));
+  // #485：脚注引用位（>0 才显示——非脚注文档零噪声）。
+  if ((stats.footnote_refs ?? 0) > 0) parts.push(tCount('docx.footnoteRef', stats.footnote_refs ?? 0));
   // #22 P2-4：可见警告数（error 档显式提示）；明细面板点击展开。
   const warnSum = warningsSummary(stats.warnings);
   if (warnSum) parts.push(warnSum);
