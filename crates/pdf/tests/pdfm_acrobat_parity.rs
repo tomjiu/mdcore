@@ -25,6 +25,8 @@
 //! （env `MDC_PDFIUM_LIB` → 候选清单 → 系统），fixtures 走 crate 本地
 //! `fixtures/`（env `MDC_PDF_TEST_FIXTURES` 覆盖面见 pdfc_engine.rs）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(all(feature = "engine-lopdf", feature = "engine-pdfium"))]
 #![cfg(any(feature = "engine-pdfium", feature = "engine-lopdf"))]
 
 use std::path::PathBuf;

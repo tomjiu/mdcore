@@ -105,6 +105,8 @@ clippy 0 警告；fmt 0 diff；Cargo.lock 零 diff（无新依赖）。
 - 加密档任何结构操作（含先解密再组织）——S5 双形态拒；
 - 双方都带名称树的命名目的地合并（见 §4.5）；
 - 签名档：结构重写使增量签名必然失效——不验签不阻断，调用方慎用；
-- `crates/pdf/examples/q31_acceptance.rs` 默认特性 E0432 为 **main
-  既有基线**（example 消费 engine-lopdf 门后 API，净仓验证过——
-  非本分支引入），与 office-io examples wasm32 基线红同族。
+- `crates/pdf/examples/q31_acceptance.rs` 默认特性 E0432 曾为 main
+  既有基线——**已收口**(#469:example `required-features` + 19 个
+  特性门后测试文件头部 `#![cfg(feature)]`,裸 `cargo check/test
+  -p mdc-pdf --all-targets` 转绿,特性面 247 测试零行为变化);
+  office-io examples wasm32 基线红同族仍在(另行评估)。

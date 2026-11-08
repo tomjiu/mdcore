@@ -26,6 +26,8 @@
 //! 已签名文档的签名有效性保持（ByteRange 覆盖段逐位不变）验收面在
 //! `signed_sample.pdf` 上——见本文件第二部分。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
 #![cfg(feature = "engine-lopdf")]
 
 use std::path::PathBuf;

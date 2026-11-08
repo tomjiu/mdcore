@@ -22,6 +22,8 @@
 //!    · 其余 8 类全件 OK（真实世界件必须能开）；
 //!    · freeculture.pdf = 352 页长文档在语料（大文档覆盖锚点）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
 #![cfg(feature = "engine-lopdf")]
 
 use mdc_pdf::organize::PdfOrganizer;

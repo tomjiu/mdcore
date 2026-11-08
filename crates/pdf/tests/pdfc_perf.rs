@@ -14,6 +14,8 @@
 //! 主导成本在 pdfium 内部，故 debug 轮数字对渲染面有代表性；Rust 侧
 //! 逻辑无逐像素处理（零 image 依赖的直接收益）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-pdfium")]
 // feature 门（默认构建零引擎依赖——本文件整体退化为空目标，跨环境
 // 可构建纪律保持）。
 #![cfg(feature = "engine-pdfium")]

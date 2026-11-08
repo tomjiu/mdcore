@@ -18,6 +18,9 @@
 //! 分化）已用 pyhanko 独立验证：未改动档 intact=True、覆盖段篡改
 //! intact=False（#303 关闭报告的双向证据，同款方法）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-lopdf")]
+
 use std::path::PathBuf;
 
 use mdc_pdf::signature::{read_signatures, SignatureError};

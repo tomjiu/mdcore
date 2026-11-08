@@ -19,6 +19,9 @@
 //!
 //! 环境合同与 pdfc_engine.rs 同源（pdfium 库走定位序，不静默 skip）。
 
+// #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
+#![cfg(feature = "engine-pdfium")]
+
 use mdc_pdf::table::{extract_tables, PositionedChar, Table, TableCell};
 
 /// 构造网格字符（宽=高=字号——CJK 形态；位置即几何）。
