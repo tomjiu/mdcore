@@ -1080,6 +1080,10 @@ impl ShellApp {
             // #307 ②功能独立项：导出为 DOCX（PDF 文本层 → office-io
             // 写面——纯 Rust 链路，无外部工具依赖）。
             Act::ExportDocx => self.export_active_docx(window, cx),
+            // #507 / #240 任务②：壳面系统打印流（方案 C——Windows 打印
+            // 动词 / macOS open -p / CUPS lp；设置面由系统对话框或 lp
+            // 参数承载）。
+            Act::Print => self.print_active_document(cx),
             // 与标题栏 × 钮同一条 cx.quit 既有路径（该路径不经
             // on_should_close 脏确认——× 钮现状同此，行为对齐不超范围
             // 修补；统一走脏确认建议另开 issue）。
@@ -1718,6 +1722,39 @@ impl ShellApp {
             Err(_canceled) => {}
         })
         .detach();
+    }
+
+    /// #507 / #240 任务②：打印活动标签的 PDF 文档（菜单「打印…」的
+    /// 分发目标）。
+    ///
+    /// 最小闭环（方案 C——PR #256 同层恢复）：交系统打印——Linux 走
+    /// CUPS `lp`（缺省设置 = 全部页/1 份/实际大小；设置面扩展位见
+    /// `print::PrintSettings`），Windows/macOS 走系统打印对话框。
+    /// 非 PDF 文档给可操作提示（不静默也不崩溃）；无打印机环境
+    /// （CI/沙箱）后端缺席 = typed 错误横幅——诚实报告，不伪造成功。
+    fn print_active_document(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.show_notice("无打开文档——先打开一个 PDF 再打印".into(), cx);
+            return;
+        };
+        if tab.editor.read(cx).doc_kind() != "pdf" {
+            self.show_notice("打印仅支持 PDF 文档（当前标签不是 .pdf）。".into(), cx);
+            return;
+        }
+        let path = tab.path.clone();
+        let doc_name = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let job = crate::print::PrintJob {
+            doc_name: &doc_name,
+            file: &path,
+            settings: crate::print::PrintSettings::default(),
+        };
+        match crate::print::print_pdf(&job) {
+            Ok(outcome) => self.show_notice(format!("已送打印（{}）", outcome.describe()), cx),
+            Err(err) => self.show_notice(format!("打印失败：{err}"), cx),
+        }
     }
 
     /// #307 ②功能独立项：导出为 DOCX（文本版）——PDF 标签专用。

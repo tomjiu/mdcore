@@ -99,6 +99,9 @@ mod status_info;
 // #185：系统原生错误对话框——GPU/图形栈初始化失败（GPUI 起不来）
 // 时的「用户看得见」兑底（zenity/kdialog/xmessage/notify-send 候选链）。
 mod native_dialog;
+// #507 / #240 任务②：壳面打印流（PDF → 系统打印——方案 C；参数构造
+// 纯函数面，同 native_dialog/perf 模式进 lib 树供单测）。
+mod print;
 // #302 阶段 2·④：PDF 标注写会话（pdf_pages 的右键拖框高亮后端）。
 mod pdf_annotate;
 // #307 ②功能独立项：PDF→DOCX 文本版导出桥组合根（与 lib 树同源——
