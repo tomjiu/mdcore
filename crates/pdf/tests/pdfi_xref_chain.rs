@@ -33,7 +33,12 @@
 //! 4. `mangled_product_shape_is_exactly_the_incident`——事故形态钉定：
 //!    Guard A 拦截的输入若被旧版写器接受，其产物正是锁 3 的链断裂
 //!    形态（前缀逐位=篡改输入、trailer 无 /Prev、页树不可达）——
-//!    把「为什么入口拒绝是对的」钉成可执行断言。
+//!    把「为什么入口拒绝是对的」钉成可执行断言；
+//! 5. `writer_rejects_offset_corrected_input`——偏移修正档守卫
+//!    （#573：lopdf 0.46 `xref_recovery` 两档扩面）：startxref 写错的
+//!    档（装载改用邻近节，`xref_start != 0`——旧守卫盲区形态）在
+//!    写器/门面/匿名化三入口必须响亮拒绝（决策 B 保守拒绝），
+//!    零修复装载不受误伤。
 //!
 //! 环境合同同 pdff2_annotate：fixtures 仓内随包；测试内**只在内存**
 //! 构造篡改形态（盘上夹具永不落污染字节）。
@@ -45,6 +50,7 @@
 use std::path::Path;
 
 use mdc_pdf::annotate::{read_annotations, PdfAnnotator};
+use mdc_pdf::anonymize::anonymize_pdf_info;
 use mdc_pdf::command::CommandError;
 use mdc_pdf::security::Limits;
 use mdc_pdf::writer_lopdf::{lopdf, LopdfWriter};
@@ -86,6 +92,36 @@ fn append_revision_without_prev(mut pdf: Vec<u8>) -> Vec<u8> {
         .as_bytes(),
     );
     pdf
+}
+
+/// 构造偏移修正档（#573 锁 5 专用）：把尾部 `startxref` 的信写错
+/// `delta` 字节（+4 = 指到 `xref` 关键字后——镜像 lopdf 上游自测
+/// `recovers_from_miswritten_startxref_offset` 的真实生成器缺陷形态：
+/// 有些生成器把 startxref 指到 xref 关键字的下一行）。装载侧效果：
+/// lopdf 在 ±64 字节窗口内找回真实 xref 节——
+/// `xref_recovery = Some(OffsetCorrected)` 且 `xref_start != 0`
+/// （能读——旧守卫仅查 `xref_start == 0`，此档被放行 = 盲区形态）。
+/// 档身其余字节逐位不动（对象偏移/xref 表本体均未改）。
+fn miswritten_startxref(data: &[u8], delta: usize) -> Vec<u8> {
+    let marker = b"startxref\n";
+    let pos = data
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .expect("夹具应有 startxref 尾");
+    let num_start = pos + marker.len();
+    let num_end = data[num_start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("startxref 后应有换行")
+        + num_start;
+    let claimed: usize = std::str::from_utf8(&data[num_start..num_end])
+        .expect("startxref 值应为 ASCII 数字")
+        .parse()
+        .expect("startxref 值应可解析");
+    let mut out = data.to_vec();
+    out.truncate(num_start);
+    out.extend_from_slice(format!("{}\n%%EOF\n", claimed + delta).as_bytes());
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +223,81 @@ fn read_rejects_unreachable_page_tree() {
     let (annots, report) = read_annotations(fixture_bytes("small.pdf"), Limits::default()).unwrap();
     assert_eq!(report.parsed, 0, "合法档零标注是正常态");
     assert!(annots.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 5. 偏移修正档守卫（#573：lopdf 0.46 `xref_recovery` 两档扩面，决策 B）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn writer_rejects_offset_corrected_input() {
+    let pristine = fixture_bytes("small.pdf");
+    let miswritten = miswritten_startxref(&pristine, 4);
+
+    // 前置钉定（盲区形态）：装载改用邻近节成功且页可读、
+    // xref_start != 0——旧守卫（仅查 xref_start == 0）放行此档。
+    let doc = lopdf::Document::load_mem(&miswritten)
+        .expect("偏移修正档可装载（宽容修正——这正是盲区的隐蔽性）");
+    assert_eq!(
+        doc.xref_recovery,
+        Some(lopdf::xref::XrefRecovery::OffsetCorrected),
+        "构造面应为偏移修正档（startxref 写错 +4，邻近节找回）"
+    );
+    assert_ne!(
+        doc.xref_start, 0,
+        "偏移修正档 xref_start 非零——旧守卫盲区形态的关键特征"
+    );
+    assert_eq!(doc.get_pages().len(), 3, "宽容修正下页仍可读——隐蔽面");
+
+    // 写入口必须响亮拒绝（决策 B：装载期修复动作 = 不可信——不押注
+    // 「修正后的偏移恰好正确」）。
+    let err = LopdfWriter::from_bytes(miswritten.clone())
+        .expect_err("写入口必须拒绝偏移修正档（#573 盲区收口）");
+    match err {
+        CommandError::Engine(msg) => {
+            assert!(msg.contains("xref"), "拒绝理由应指向 xref 链：{msg}");
+            assert!(
+                msg.contains("OffsetCorrected"),
+                "拒绝理由应名档位（偏移修正）：{msg}"
+            );
+        }
+        other => panic!("应为 Engine 错误，得 {other:?}"),
+    }
+
+    // 门面同款（PdfAnnotator::open 内部即 from_bytes——单一咽喉点）。
+    let err2 =
+        PdfAnnotator::open(miswritten.clone()).expect_err("PdfAnnotator::open 必须拒绝偏移修正档");
+    match err2 {
+        CommandError::Engine(msg) => {
+            assert!(
+                msg.contains("OffsetCorrected"),
+                "门面拒绝理由应名档位：{msg}"
+            )
+        }
+        other => panic!("应为 Engine 错误，得 {other:?}"),
+    }
+
+    // 匿名化面同款（三写面同一纪律——共享判定单点）。
+    let err3 = anonymize_pdf_info(&miswritten).expect_err("anonymize_pdf_info 必须拒绝偏移修正档");
+    match err3 {
+        CommandError::Engine(msg) => {
+            assert!(
+                msg.contains("OffsetCorrected"),
+                "匿名化拒绝理由应名档位：{msg}"
+            )
+        }
+        other => panic!("应为 Engine 错误，得 {other:?}"),
+    }
+
+    // 守卫无误伤：零修复装载（xref_recovery = None）照常可开。
+    let clean = lopdf::Document::load_mem(&pristine).unwrap();
+    assert_eq!(
+        clean.xref_recovery, None,
+        "未篡改原件应为零修复装载（#573 守卫的故行面基线）"
+    );
+    LopdfWriter::from_bytes(pristine.clone()).expect("零修复装载不受守卫影响");
+    PdfAnnotator::open(pristine.clone()).expect("零修复装载门面照常可开");
+    anonymize_pdf_info(&pristine).expect("零修复装载匿名化面照常可开");
 }
 
 // ---------------------------------------------------------------------------

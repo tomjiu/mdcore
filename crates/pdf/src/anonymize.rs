@@ -64,12 +64,13 @@ pub fn anonymize_pdf_info(pdf: &[u8]) -> Result<Vec<u8>, CommandError> {
             reason: REASON_ENCRYPTED_WRITE,
         });
     }
-    // xref 链守卫：重建装载档（xref_start=0）无 /Prev 可回指——
-    // 增量修订静默产毒面，入口响亮拒绝。
-    if doc.xref_start == 0 {
-        return Err(CommandError::engine(
-            "xref 链不可信（扫描重建装载）——增量修订要求可信前序链",
-        ));
+    // xref 链守卫（#573 扩两档——判定与 writer_lopdf/forms 共享单点）：
+    // 装载期有修复动作的档（扫描重建 / 偏移修正）无 /Prev 可信回指面
+    // ——增量修订静默产毒面，入口响亮拒绝。
+    if let Some(kind) = crate::writer_lopdf::xref_chain_untrusted_reason(&doc) {
+        return Err(CommandError::engine(format!(
+            "xref 链不可信（{kind}）——增量修订要求可信前序链"
+        )));
     }
     // DocMDP 写前门：元数据改写 = ContentRewrite 类（任何 P 级拒——
     // 元数据不在 P=1/2/3 任何许可面；暗标纪律 = 先匿名后签）。

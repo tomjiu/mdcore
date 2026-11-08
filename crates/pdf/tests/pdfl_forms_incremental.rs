@@ -21,7 +21,11 @@
 //!    且原字节段里不含这些新定义；
 //! 4. `save_refuses_reconstructed_xref_input`——xref 链守卫：扫描重建
 //!    装载档（行尾污染形态）上拒绝写并给可操作指引（2026-10-31 事故
-//!    防线，`writer_lopdf.rs` 同款）。
+//!    防线，`writer_lopdf.rs` 同款）；
+//! 5. `save_refuses_offset_corrected_xref_input`——偏移修正档守卫
+//!    （#573：lopdf 0.46 `xref_recovery` 两档扩面，决策 B 保守拒绝）：
+//!    startxref 写错的档（装载改用邻近节，`xref_start != 0`——旧守卫
+//!    盲区形态）可读可填域，但 save 必须响亮拒绝。
 //!
 //! 已签名文档的签名有效性保持（ByteRange 覆盖段逐位不变）验收面在
 //! `signed_sample.pdf` 上——见本文件第二部分。
@@ -62,6 +66,33 @@ fn crlf_mangled(data: &[u8]) -> Vec<u8> {
             }
         })
         .collect()
+}
+
+/// 构造偏移修正档（#573 锁 5；与 pdfi_xref_chain 同款构造）：把尾部
+/// `startxref` 写错 +4（指到 `xref` 关键字后）——lopdf 在 ±64 字节窗口
+/// 找回真实 xref 节：`xref_recovery = Some(OffsetCorrected)` 且
+/// `xref_start != 0`（旧守卫盲区形态：可读可填，但增量写押注在修正
+/// 后偏移恰好正确上）。档身其余字节逐位不动。
+fn miswritten_startxref(data: &[u8]) -> Vec<u8> {
+    let marker = b"startxref\n";
+    let pos = data
+        .windows(marker.len())
+        .rposition(|w| w == marker)
+        .expect("夹具应有 startxref 尾");
+    let num_start = pos + marker.len();
+    let num_end = data[num_start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("startxref 后应有换行")
+        + num_start;
+    let claimed: usize = std::str::from_utf8(&data[num_start..num_end])
+        .expect("startxref 值应为 ASCII 数字")
+        .parse()
+        .expect("startxref 值应可解析");
+    let mut out = data.to_vec();
+    out.truncate(num_start);
+    out.extend_from_slice(format!("{}\n%%EOF\n", claimed + 4).as_bytes());
+    out
 }
 
 // ---------------------------------------------------------------- 1. 增量语义
@@ -185,6 +216,38 @@ fn save_refuses_reconstructed_xref_input() {
         }
         other => panic!("应为 Save 错误，得 {other:?}"),
     }
+}
+
+#[test]
+fn save_refuses_offset_corrected_xref_input() {
+    let pristine = bid_letter();
+    let miswritten = miswritten_startxref(&pristine);
+
+    // 前置钉定（盲区形态）：偏移修正档可读可填域、xref_start != 0——
+    // 旧守卫（仅查 xref_start == 0）放行此档。
+    let probe = PdfForm::read(&miswritten).unwrap();
+    assert!(!probe.is_empty(), "偏移修正装载下域仍可读（隐蔽面）");
+    drop(probe);
+
+    // 填表后保存必须响亮拒绝（决策 B：不押注「修正后偏移恰好正确」）。
+    let mut form = PdfForm::read(&miswritten).unwrap();
+    form.set_field("project_name", "x").unwrap();
+    let err = form.save().unwrap_err();
+    match err {
+        FormError::Save(msg) => {
+            assert!(msg.contains("xref"), "拒绝理由应指向 xref 链：{msg}");
+            assert!(
+                msg.contains("OffsetCorrected"),
+                "拒绝理由应名档位（偏移修正）：{msg}"
+            );
+        }
+        other => panic!("应为 Save 错误，得 {other:?}"),
+    }
+
+    // 守卫无误伤：零修复原件照常填存。
+    let mut clean = PdfForm::read(&pristine).unwrap();
+    clean.set_field("project_name", "y").unwrap();
+    clean.save().expect("零修复装载不受守卫影响");
 }
 
 // ---------------------------------------------------------------- 3. 已签名文档
