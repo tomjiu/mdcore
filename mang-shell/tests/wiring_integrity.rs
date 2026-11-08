@@ -562,3 +562,61 @@ fn palette_data_covers_all_commands() {
         "palette_view 不再经 build_sections 装配分组"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #389 阶段 2：xlsx 网格编辑链（双击 → set_cell → 会话银行 → 保存 →
+// 脏拦截——静态锚点钉住五段接线不脱钩）
+// ---------------------------------------------------------------------------
+
+/// xlsx 编辑闭环接线面：
+/// ① 视图层——双击进编辑（click_count）、提交走引擎 `set_cell`、
+///    保存走 `save_to_vec` + 原子写盘；
+/// ② shell 层——会话银行（切标签保活）、保存统一收口 `save_xlsx_at`
+///    （菜单/确认框/退出三路）、脏拦截（`xlsx_dirty_at`）。
+#[test]
+fn xlsx_grid_edit_chain_wired() {
+    let view = src("xlsx_grid_view.rs");
+    // ① 双击进编辑：click_count 分流（单击选中/双击编辑）。
+    assert!(
+        view.contains("ev.click_count >= 2") && view.contains("begin_edit_at"),
+        "网格无双击进编辑接线（click_count 分流缺失）"
+    );
+    // ② 提交走引擎公开 API（不改 office-io 内部）。
+    assert!(
+        view.contains(".set_cell(") && view.contains("commit_cell_edit"),
+        "编辑提交未走 XlsxEditor::set_cell（引擎公开面）"
+    );
+    // ③ 保存走 save_to_vec + 原子写盘（临时文件 + rename）。
+    assert!(
+        view.contains(".save_to_vec(") && view.contains("write_xlsx_atomically"),
+        "保存未走 save_to_vec + 原子写盘（写坏毁原件风险）"
+    );
+    // ④ 键位面：Enter 提交 / Esc 取消（编辑态键处理在场）。
+    assert!(
+        view.contains("\"enter\"") && view.contains("\"escape\""),
+        "编辑态缺 Enter/Esc 键位臂"
+    );
+
+    let shell = src("shell.rs");
+    // ⑤ 会话银行：切标签 stash + 重建回接（脏编辑跨实体保活）。
+    assert!(
+        shell.contains("xlsx_sessions") && shell.contains("stash_xlsx_session"),
+        "shell 缺会话银行（切标签重建丢已提交未落盘编辑——静默丢失）"
+    );
+    assert!(
+        shell.contains("new_with_session"),
+        "shell 缺会话回接（银行命中未注回重建实体）"
+    );
+    // ⑥ 保存统一收口：菜单保存（dispatch_editor_cmd）与关闭确认/
+    //    退出共用 save_xlsx_at。
+    assert!(
+        shell.contains("save_xlsx_at"),
+        "shell 缺 xlsx 保存统一收口（Ctrl+S/菜单/关闭确认三路分叉）"
+    );
+    // ⑦ 脏拦截：关闭确认/标签脏态查询追查网格会话（不再只看行模型
+    //    只读编辑器的恒 false）。
+    assert!(
+        shell.contains("xlsx_dirty_at"),
+        "shell 缺 xlsx 会话脏态查询（关闭确认漏拦网格编辑丢失）"
+    );
+}

@@ -156,6 +156,12 @@ pub struct ShellApp {
     /// #389 阶段 1：xlsx 网格视图（当前 xlsx 标签的真网格渲染实体 +
     /// 归属路径——生命周期与 pdf_pages 同模式：切标签重建/关标签丢弃）。
     xlsx_grid: Option<(PathBuf, Entity<XlsxGridView>)>,
+    /// #389 阶段 2：xlsx 编辑会话银行（路径 → 会话 + 脏标记）。切标签
+    /// 重建网格实体时，旧实体会话先行入行（`stash_xlsx_session`）
+    /// ——已提交未落盘编辑跨实体存活零丢失；回切时经
+    /// `new_with_session` 注回；关标签丢弃（关闭确认在前保证 dirty
+    /// 先保存/放弃）。
+    xlsx_sessions: std::collections::HashMap<PathBuf, (mdc_office_io::xlsx_edit::XlsxEditor, bool)>,
     /// #389 阶段 1：xlsx 显示模式（true = 网格视图——缺省；false =
     /// 文本行模型 fallback。状态栏「网格/文本」钮切换——pdf 页面/文本
     /// 先例同构）。
@@ -383,6 +389,7 @@ impl ShellApp {
             pdf_pages: None,
             pdf_view_mode: true,
             xlsx_grid: None,
+            xlsx_sessions: std::collections::HashMap::new(),
             xlsx_grid_view_mode: true,
             perf_first_frame: crate::perf::on().then(crate::perf::boot),
             chord: None,
@@ -445,11 +452,12 @@ impl ShellApp {
         self.tabs.get(idx).map(|tab| tab.path.clone())
     }
 
-    /// 指定标签是否有未保存修改（越界 `None`）。
+    /// 指定标签是否有未保存修改（越界 `None`）。#389 阶段 2：xlsx
+    /// 标签追加网格编辑会话脏态（活实体或银行会话——两路同查）。
     pub fn tab_is_modified(&self, idx: usize, cx: &App) -> Option<bool> {
         self.tabs
             .get(idx)
-            .map(|tab| tab.editor.read(cx).is_modified())
+            .map(|tab| tab.editor.read(cx).is_modified() || self.xlsx_dirty_at(&tab.path, cx))
     }
 
     /// 指定标签是否只读渲染态（越界 `None`）。
@@ -730,6 +738,8 @@ impl ShellApp {
 
     /// 确保当前 xlsx 标签的网格视图实体在场（生命周期与 ensure_pdf_pages
     /// 同模式：非 xlsx 态 / 已在同路径实体上 = 无操作；切标签重建）。
+    /// #389 阶段 2：重建前旧实体会话入行（`stash_xlsx_session`——脏
+    /// 编辑跨实体存活）；银行命中时经 `new_with_session` 回接。
     fn ensure_xlsx_grid(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -743,10 +753,25 @@ impl ShellApp {
                 return;
             }
         }
+        // #389 阶段 2：旧实体退役——会话（含未收尾缓冲的提交）入行。
+        self.stash_xlsx_session(cx);
         // 网格模型装载（office-io 读面同源——xlsx_doc::load 同一入口；
         // 失败 → error 态实体 + 提示，文本模型不受影响）。
         let entity = match crate::xlsx_grid_view::XlsxGridModel::load(&path) {
-            Ok(model) => cx.new(|cx| XlsxGridView::new(model, cx)),
+            Ok(model) => {
+                // #389 阶段 2：银行命中 → 会话回接（脏标记随行）；未
+                // 命中 → 现开（失败不阻渲染，双击时明示拒因）。
+                if let Some((session, dirty)) = self.xlsx_sessions.remove(&path) {
+                    cx.new(|cx| {
+                        let mut view =
+                            XlsxGridView::new_with_session(model, path.clone(), session, cx);
+                        view.set_modified(dirty);
+                        view
+                    })
+                } else {
+                    cx.new(|cx| XlsxGridView::new(model, path.clone(), cx))
+                }
+            }
             Err(err) => {
                 let message = format!("网格视图装载失败（{}）：{err}", path.display());
                 self.show_notice(message, cx);
@@ -755,6 +780,75 @@ impl ShellApp {
         };
         self.xlsx_grid = Some((path, entity));
         cx.notify();
+    }
+
+    /// #389 阶段 2：旧网格实体会话入行（实体退役前调用——`take_session`
+    /// 内部先提交未收尾的编辑缓冲，再交还会话；脏标记随行保存）。
+    fn stash_xlsx_session(&mut self, cx: &mut Context<Self>) {
+        let Some((path, view)) = self.xlsx_grid.take() else {
+            return;
+        };
+        let taken = view.update(cx, |v, _| {
+            let dirty = v.is_modified();
+            v.take_session().map(|session| (session, dirty))
+        });
+        if let Some((session, dirty)) = taken {
+            self.xlsx_sessions.insert(path, (session, dirty));
+        }
+    }
+
+    /// #389 阶段 2：指定路径的 xlsx 脏态（活实体或银行会话任一）。
+    fn xlsx_dirty_at(&self, path: &Path, cx: &App) -> bool {
+        if let Some((owned, view)) = &self.xlsx_grid {
+            if owned == path {
+                return view.read(cx).is_modified();
+            }
+        }
+        self.xlsx_sessions
+            .get(path)
+            .is_some_and(|(_, dirty)| *dirty)
+    }
+
+    /// #389 阶段 2：指定路径的 xlsx 保存（统一收口——Ctrl+S 键位/
+    /// 菜单「文件 → 保存」/关闭确认「保存」/退出确认三路共用）。
+    /// 活实体在场 → 实体保存（会话在实体里）；否则银行会话直接落盘。
+    fn save_xlsx_at(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
+        if let Some((owned, view)) = &self.xlsx_grid {
+            if owned == path {
+                return view.update(cx, |v, _| v.save());
+            }
+        }
+        let Some((session, dirty)) = self.xlsx_sessions.get_mut(path) else {
+            // 无会话 = 只读浏览态（未编辑过）——无可保存，安静成功
+            //（与「保存了但没变化」同语义；假成功风险零——本就无编辑）。
+            return true;
+        };
+        if !*dirty {
+            return true;
+        }
+        // 借用域内完成序列化 + 落盘（错误统一字符串面）。
+        let saved: Result<(), String> =
+            session
+                .save_to_vec()
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    crate::xlsx_grid_view::write_xlsx_atomically(path, &bytes)
+                        .map_err(|e| e.to_string())
+                });
+        // session/dirty 借用已尽（NLL）——dirty 回写与 notice 面安全。
+        match saved {
+            Ok(()) => {
+                if let Some((_, dirty)) = self.xlsx_sessions.get_mut(path) {
+                    *dirty = false;
+                }
+                eprintln!("saved (xlsx session): {}", path.display());
+                true
+            }
+            Err(e) => {
+                self.show_notice(format!("xlsx 保存失败（{}）：{e}", path.display()), cx);
+                false
+            }
+        }
     }
 
     /// #389 阶段 1：切换 xlsx 显示模式（状态栏「网格/文本」钮——pdf
@@ -948,6 +1042,24 @@ impl ShellApp {
                 "已切换到文本视图（页面视图不可用，查找走文本面）".into(),
                 cx,
             );
+        }
+        // #389 阶段 2：xlsx 标签保存 → 编辑会话统一收口（行模型只读
+        // ——直达 editor.save() 是 #386 同款假成功；#422 页视图
+        // Ctrl+F 拦截同模式）。活实体保存（notice 面错误明示）或银行
+        // 会话直存；Ctrl+S 键位在网格视图持焦点时由视图自身 on_key_down
+        // 直通——两路同收口 save_xlsx_at / view.save。
+        if matches!(cmd, crate::editor::commands::Cmd::Save)
+            && editor.read(cx).doc_kind() == "xlsx"
+            && let Some(tab) = self.tabs.get(self.active)
+        {
+            let path = tab.path.clone();
+            let saved = self.save_xlsx_at(&path, cx);
+            if saved {
+                self.show_notice("已保存（xlsx 编辑会话）".into(), cx);
+            } else {
+                self.show_notice("xlsx 保存失败——见网格面板状态条".into(), cx);
+            }
+            return;
         }
         editor.update(cx, |ed, cx| ed.run_command(cmd, window, cx));
     }
@@ -1226,12 +1338,11 @@ impl ShellApp {
         if self.tabs.is_empty() {
             return;
         }
-        // F4：脏标签 → 确认框拦截。
-        if self
-            .tabs
-            .get(self.active)
-            .is_some_and(|tab| tab.editor.read(cx).is_modified())
-        {
+        // F4：脏标签 → 确认框拦截（#389 阶段 2：xlsx 网格编辑会话脏
+        // 态同拦——tab_is_modified 已统一收口）。
+        if self.tabs.get(self.active).is_some_and(|tab| {
+            tab.editor.read(cx).is_modified() || self.xlsx_dirty_at(&tab.path, cx)
+        }) {
             let name = self.tabs[self.active]
                 .editor
                 .read(cx)
@@ -1272,6 +1383,10 @@ impl ShellApp {
                 self.xlsx_grid = None;
             }
         }
+        // #389 阶段 2：会话银行同路径丢弃（关闭确认已保证 dirty 先
+        // 保存/放弃——「不保存」选择到此处即弃；无确认路径（无脏）弃
+        // 会话无损失）。
+        self.xlsx_sessions.remove(&closed_path);
         self.tabs.remove(idx);
         self.active = if idx < self.active {
             self.active - 1
@@ -1303,11 +1418,27 @@ impl ShellApp {
         match confirm.action {
             ConfirmAction::CloseTab { idx } => match choice {
                 0 => {
-                    // 保存后关（保存失败不关——不静默丢内容）。
-                    let saved = self
+                    // 保存后关（保存失败不关——不静默丢内容）。#389
+                    // 阶段 2：xlsx 标签走编辑会话保存（行模型只读，
+                    // editor.save() 是假成功）；其余走编辑器保存。
+                    let is_xlsx = self
                         .tabs
                         .get(idx)
-                        .is_some_and(|tab| tab.editor.update(cx, |ed, _| ed.save()));
+                        .is_some_and(|tab| tab.editor.read(cx).doc_kind() == "xlsx");
+                    let saved = if is_xlsx {
+                        // xlsx 会话保存——路径先取（借用分离，越界回空
+                        // 路径 = 无会话安静成功）。
+                        let path = self
+                            .tabs
+                            .get(idx)
+                            .map(|tab| tab.path.clone())
+                            .unwrap_or_default();
+                        self.save_xlsx_at(&path, cx)
+                    } else {
+                        self.tabs
+                            .get(idx)
+                            .is_some_and(|tab| tab.editor.update(cx, |ed, _| ed.save()))
+                    };
                     if saved {
                         self.close_tab_at(idx, window, cx);
                     }
@@ -1317,10 +1448,23 @@ impl ShellApp {
             },
             ConfirmAction::Quit => match choice {
                 0 => {
+                    // #389 阶段 2：xlsx 标签先落盘编辑会话（收集路径再
+                    // 逐个保存——避开迭代与可变借用冲突）。
+                    let xlsx_paths: Vec<PathBuf> = self
+                        .tabs
+                        .iter()
+                        .filter(|tab| tab.editor.read(cx).doc_kind() == "xlsx")
+                        .map(|tab| tab.path.clone())
+                        .collect();
+                    for path in &xlsx_paths {
+                        self.save_xlsx_at(path, cx);
+                    }
                     for tab in &self.tabs {
-                        tab.editor.update(cx, |ed, _| {
-                            ed.save();
-                        });
+                        if tab.editor.read(cx).doc_kind() != "xlsx" {
+                            tab.editor.update(cx, |ed, _| {
+                                ed.save();
+                            });
+                        }
                     }
                     cx.quit();
                 }
@@ -1352,6 +1496,16 @@ impl ShellApp {
                     window.focus(&focus, cx);
                     return;
                 }
+                // #389 阶段 2：网格视图态 xlsx 标签——焦点落网格视图
+                //（编辑键位面：双击后的 Enter/Esc/输入经视图接收）。
+                if self.xlsx_grid_view_mode
+                    && tab.editor.read(cx).doc_kind() == "xlsx"
+                    && let Some((_, view)) = self.xlsx_grid.as_ref()
+                {
+                    let focus = view.read(cx).focus_handle(cx).clone();
+                    window.focus(&focus, cx);
+                    return;
+                }
                 let focus = tab.editor.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
             }
@@ -1361,8 +1515,22 @@ impl ShellApp {
 
     /// F4：另存为落位（对话框回调 / --smoke-save-as 钩子共用）——
     /// 编辑器写盘 + 身份迁移 + 标签路径更新 + 文件树高亮同步。
+    /// #389 阶段 2：xlsx 标签的另存为**不在本阶段面**（会话迁移 + 双
+    /// 视图重开 + 标签身份三联动——诚实拦截为明示提示，不做静默假
+    /// 成功：行模型 save_as 只读返回 false）。
     pub fn save_active_as(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let path = std::path::absolute(&path).unwrap_or(path);
+        let is_xlsx = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.editor.read(cx).doc_kind() == "xlsx");
+        if is_xlsx {
+            self.show_notice(
+                "xlsx 另存为属后续阶段（当前可编辑保存：Ctrl+S / 文件 → 保存）".into(),
+                cx,
+            );
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
