@@ -204,14 +204,25 @@ fn real_pdf_corpus_behavior_lock() {
         "[pdf-corpus] ok={ok} denied={denied} engine_err={engine_err} panics={panics} max_pages={max_pages}"
     );
 
-    // 断言面（实测基线：ok 68 / denied 8 / engine_err 2 / panics 0）。
+    // 断言面（#573 lopdf 0.45→0.46 升级重钉：ok 70 / denied 8 /
+    // engine_err 0 / panics 0。旧基线 ok 68 / engine_err 2 的翻转件 =
+    // bookmarks/outlines_for_editor.pdf + broken/issue10438_reduced.pdf
+    // ——0.45 扫描重建后页树空（零页拒 spec 7.7.4），0.46 重建器找到
+    // 页树（5 页 / 1 页）转可开。零页读面守卫本身不退场——独立锁在
+    // pdfi_xref_chain 锁 3 + pdfq_hostile_synthetic（构造态零页档））。
     assert_eq!(panics, 0, "真实件解析不得 panic");
     assert!(denied >= 8, "S5 加密拒绝实证：{denied}");
-    assert!(engine_err >= 1, "坏件合理拒绝在档：{engine_err}");
+    assert_eq!(
+        engine_err, 0,
+        "真实件零通用 Engine 拒（0.46 基线：要么可开要么 S5 加密拒；\
+         出现即分布漂移，需重钉并登记）"
+    );
     assert!(ok >= 60, "可开真实件下限：{ok}");
-    // 8 类全件可开（真实世界件必须能开）。
+    // 9 类全件可开（真实世界件必须能开；bookmarks 自 0.46 起全开——
+    // outlines_for_editor.pdf 由零页拒转可开，见上重钉注）。
     for cat in [
         "annotations",
+        "bookmarks",
         "captions",
         "forms",
         "mixed",
@@ -226,12 +237,9 @@ fn real_pdf_corpus_behavior_lock() {
             "category {cat}: {got}/{total} 件可开（真实件应全开）"
         );
     }
-    // bookmarks 4 件中 1 件零页 Engine 拒（spec 7.7.4）——OK ≥ 3。
-    assert!(
-        ok_by_cat.get("bookmarks").copied().unwrap_or(0) >= 3,
-        "bookmarks OK 下限"
-    );
-    // broken 允许 Engine 拒，但结构异常 ≠ 全废：OK ≥ 8（实测 10/12）。
+    // broken 允许 Engine 拒，但结构异常 ≠ 全废：OK ≥ 8（0.46 实测
+    // 12/12 全开——issue10438_reduced 由零页拒转可开，见上重钉注；
+    // 下限保持保守，容未来新增真损坏件）。
     assert!(
         ok_by_cat.get("broken").copied().unwrap_or(0) >= 8,
         "broken OK 下限（结构异常件多数仍应可开）"
