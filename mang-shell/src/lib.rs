@@ -136,3 +136,10 @@ pub mod outline_panel;
 /// （挂 bin 目标 = 假绿）；TreeState 纯状态机单测同树收编。
 #[path = "file_tree.rs"]
 pub mod file_tree;
+
+/// #577（#385 批 9）：git 面板——ShellApp 耦合经 GitPanelHooks 钩子
+/// 注入（open_readonly / escape），lib+bin 共用源码（#575 先例三次
+/// 应用）：键盘导航无头测试 CI 可见；git 纯逻辑单测（parse_porcelain/
+/// parse_log 等）随模块进 lib 树（原挂 bin = 假绿——本批修复）。
+#[path = "git_panel.rs"]
+pub mod git_panel;
