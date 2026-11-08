@@ -37,7 +37,6 @@ use gpui::{App, Context, IntoElement, MouseDownEvent, Render, Role, WeakEntity, 
 use ui::prelude::*;
 use ui::{Icon, IconName, IconSize, Label, LabelSize, ListItem};
 
-use crate::context_menu;
 use crate::shell::ShellApp;
 
 /// 目录条目。
@@ -383,8 +382,9 @@ impl FileTree {
         // ListItem.on_secondary_mouse_down——组件内 MouseButton::Right）。
         .on_secondary_mouse_down(
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                let pos =
-                    context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+                // 点击位直传（gpui::Point<Pixels>——#385 批 1×4 收口后
+                // 不再经自研 f32 Point 往返）。
+                let pos = event.position;
                 let _ = this.shell.update(cx, |shell, cx| {
                     shell.open_file_tree_context_menu(
                         pos,

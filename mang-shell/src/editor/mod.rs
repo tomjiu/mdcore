@@ -89,8 +89,6 @@ use crate::canvas_view::{CanvasView, PAN_KEY_PX, PAN_PAGE_PX, WHEEL_LINE_PX};
 // 本接线接活）。RecentRing 会话态随 Editor 存续，不落盘。
 use crate::command_groups::RecentRing;
 use crate::palette_view;
-// #179（#188 接线）：编辑器区右键菜单——坐标类型 + 上抛回调。
-use crate::context_menu;
 // #217：键位表（编辑器键派发的单一事实源——默认表 = 原两处匹配臂的
 // 精确镜像；纯逻辑层，行为零变化红线）。
 use crate::keymap::{self, EditorAction, KeyQuery};
@@ -478,7 +476,7 @@ pub struct Editor {
 /// 在编辑器的右键 listener 里同步调用，菜单实体构建在 shell 上
 /// （ed-* 动作派发回 shell）。#385 批 1 起 shell 侧用 `ui::ContextMenu`
 /// 组件构建菜单，需要 Window（组件内部要订阅焦点/blur）。
-pub type MenuOpener = Box<dyn Fn(context_menu::Point, bool, bool, &mut Window, &mut App) + 'static>;
+pub type MenuOpener = Box<dyn Fn(gpui::Point<Pixels>, bool, bool, &mut Window, &mut App) + 'static>;
 
 /// #178：锁定行拒改提示（状态栏消费）。
 ///
@@ -3352,7 +3350,9 @@ impl Editor {
             .selection()
             .is_some_and(|sel| sel.start < sel.end);
         let read_only = self.read_only;
-        let pos = context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+        // 点击位直传（gpui::Point<Pixels>——#385 批 1×4 收口后不再经
+        // 自研 f32 Point 往返）。
+        let pos = event.position;
         // 无宿主（单测/独立构造）只移光标不弹菜单；有宿主经回调上抛
         //（闭包里是 shell.open_editor_context_menu——菜单状态与
         // ed-* 动作派发面都在 shell）。

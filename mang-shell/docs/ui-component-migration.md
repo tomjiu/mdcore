@@ -108,6 +108,14 @@
 ```
 批 1（真去重样板）：context_menu → ui::ContextMenu（自研 Point/Rect/height_units
                      几何退役——443+146 行与 ui 组件职责重叠的真去重面）
+                     ✅ 批 1×4 收口已交付：几何层整体退役（place_menu/
+                     place_submenu/menu_size/estimate_width/height_units +
+                     Point/Rect 自研结构——批 4 后仅剩测试自引用的死代码，
+                     PR #519 预登记的合并后收口）；`MenuOpener`/open_* 签名
+                     换 `gpui::Point<Pixels>` 直传（event.position 原样，
+                     消 f32 往返）；补 context_menu 生命周期交互测试
+                     （TestAppContext 无头面——阶段 3 质量门 1 同款，
+                     menu_bar_lifecycle_tests 模式）。
 批 2：tab_bar → ui::TabBar/Tab
 批 3：settings_panel 外壳 → ui::Modal；palette → Popover 组合
 批 4：menu_bar → DropdownMenu/PopoverMenu 组合（键盘导航重构——最重）
