@@ -1021,6 +1021,7 @@ fn encrypted_assessment_denies_writes_policy_first() {
             detail: "Catalog /OpenAction (launch)".into(),
         }],
         form_probe: None,
+        encryption: None,
     };
     let mut s = session_with(2, assessment);
 
@@ -1824,6 +1825,7 @@ fn open_assessment_form_probe_serde_shape() {
             family: DangerousFamily::JavaScript,
             detail: "obj 7 0: /JavaScript 动作".into(),
         }],
+        encryption: None,
         form_probe: Some(FormProbe {
             field_count: 2,
             fields: vec![

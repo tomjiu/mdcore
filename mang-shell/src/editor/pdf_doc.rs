@@ -723,6 +723,8 @@ mod tests {
                 field_count: 3,
                 fields: vec![],
             }),
+            // #493 新增字段：本测试不涉及加密档（AGENTS 0.0.5）
+            encryption: None,
         };
         let lines = security_notice_lines(&assessment);
         assert_eq!(lines.len(), 2, "S2 一行 + S6 一行：{lines:?}");

@@ -41,12 +41,13 @@ use mdc_pdf::document::{DocumentMeta, PdfDocumentId, PdfSession};
 use mdc_pdf::outline::OutlineTree;
 use mdc_pdf::page::{PageCount, PageGeometry, Rotation};
 use mdc_pdf::security::{
-    DangerousFamily, Limits, OpenAssessment, REASON_OPEN_BUDGET, REASON_OPEN_FILE_BYTES,
+    DangerousFamily, EncryptPermissions, EncryptionInfo, Limits, OpenAssessment,
+    REASON_OPEN_BUDGET, REASON_OPEN_FILE_BYTES,
 };
 use mdc_pdf::security_scan::{open_scan, scan_document};
 use mdc_pdf::writer_lopdf::{lopdf, LopdfWriter};
 
-use lopdf::{dictionary, Object, Stream, StringFormat};
+use lopdf::{dictionary, EncryptionVersion, Object, Stream, StringFormat};
 
 // ---------------------------------------------------------------------------
 // fixture 构造（lopdf 现场构造——spike build_form_pdf 同款惯例）
@@ -805,4 +806,155 @@ fn scan_form_walk_terminates_on_cycles() {
     assert_eq!(probe.field_count, 1, "环边不重复计数（节点至多游走一次）");
     assert_eq!(probe.fields.len(), 1, "枚举恰一项：{:?}", probe.fields);
     assert_eq!(probe.fields[0].name, "ouroboros");
+}
+
+// ---------------------------------------------------------------------------
+// 长尾⑤（#493）：/Encrypt P 权限位读面——assessment 承载
+// ---------------------------------------------------------------------------
+
+/// 受限权限加密档构造（permissions 参数化——其余同
+/// `scan_encrypted_flag_and_detection_boundary` 的 build）。
+fn encrypted_pdf_with_permissions(user_password: &str, permissions: lopdf::Permissions) -> Vec<u8> {
+    let mut doc = lopdf::Document::with_version("1.7");
+    doc.trailer.set(
+        "ID",
+        Object::Array(vec![
+            text_string("mdc-pdf-pdfe-perm-id"),
+            text_string("mdc-pdf-pdfe-perm-id"),
+        ]),
+    );
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(Object::Dictionary(dictionary! {
+        "Type" => Object::Name(b"Page".to_vec()),
+        "Parent" => Object::Reference(pages_id),
+        "MediaBox" => vec![
+            Object::Integer(0), Object::Integer(0),
+            Object::Integer(612), Object::Integer(792),
+        ],
+    }));
+    doc.set_object(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => Object::Name(b"Pages".to_vec()),
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => Object::Integer(1),
+        }),
+    );
+    let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
+        "Type" => Object::Name(b"Catalog".to_vec()),
+        "Pages" => Object::Reference(pages_id),
+    }));
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+    let state: lopdf::EncryptionState = EncryptionVersion::V1 {
+        document: &doc,
+        owner_password: "owner-secret",
+        user_password,
+        permissions,
+    }
+    .try_into()
+    .expect("加密状态构造");
+    doc.encrypt(&state).expect("对象加密");
+    save(&mut doc)
+}
+
+#[test]
+fn encrypt_permissions_restricted_bits_parsed() {
+    // 受限权限（仅 PRINTABLE）：仍加密态 /Encrypt 字典可读（字典本身
+    // 不加密）——P 位逐项断言 + 原值回读 + 处理器标识。
+    let bytes = encrypted_pdf_with_permissions("user-secret", lopdf::Permissions::PRINTABLE);
+    let assessment = open_scan(&bytes, &Limits::default()).expect("加密档扫描（S5.1 只读支持）");
+    assert!(assessment.encrypted, "仍加密旗标（S5 写拒面不变）");
+    let info = assessment.encryption.as_ref().expect("加密信息在场");
+    assert_eq!(info.filter, "Standard", "处理器名（lopdf 写面恒 Standard）");
+    assert_eq!(info.version, Some(1), "/V = 1（RC4 40 位）");
+    assert_eq!(info.revision, Some(2), "/R = 2（V1 配套）");
+    let p = &info.permissions;
+    assert!(p.printable, "bit 3 在场");
+    assert!(!p.modifiable && !p.copyable && !p.annotable, "bit 4-6 缺席");
+    assert!(
+        !p.fillable && !p.copyable_for_accessibility,
+        "bit 9-10 缺席"
+    );
+    assert!(
+        !p.assemblable && !p.printable_in_high_quality,
+        "bit 11-12 缺席"
+    );
+    // 原值回读：correct_bits 保留位全 1（低 12 位外）——raw 与解析
+    // 自洽（from_p_value(raw) == 同一解析）。
+    let reparsed = mdc_pdf::security::EncryptPermissions::from_p_value(p.raw);
+    assert_eq!(reparsed, *p, "raw 往返自洽");
+    assert_eq!(
+        p.raw & 0xFFFF_F000,
+        0xFFFF_F000,
+        "保留位全 1（lopdf correct_bits 形态）"
+    );
+}
+
+#[test]
+fn encrypt_permissions_all_bits_when_full() {
+    // 全权限档：8 位全 true（仍加密态）。
+    let bytes = encrypted_pdf_with_permissions("user-secret", lopdf::Permissions::all());
+    let assessment = open_scan(&bytes, &Limits::default()).expect("扫描");
+    let p = &assessment
+        .encryption
+        .as_ref()
+        .expect("加密信息在场")
+        .permissions;
+    assert!(
+        p.printable
+            && p.modifiable
+            && p.copyable
+            && p.annotable
+            && p.fillable
+            && p.copyable_for_accessibility
+            && p.assemblable
+            && p.printable_in_high_quality,
+        "全权限：{:?}",
+        p
+    );
+}
+
+#[test]
+fn encrypt_permissions_was_encrypted_state_not_carried() {
+    // 曾加密（空口令自动解密）：encrypted = false。**诚实边界**：lopdf
+    // `decrypt` 移除 trailer /Encrypt 与字典对象（encryption.rs 文档
+    // 登记的 lopdf 行为）——装载模型里字典不可见，encryption = None。
+    // （仍加密态——口令保护档的产品主流形态——承载完整；曾加密态的
+    // 权限面若需保留 = 读面在 decrypt 前捕获，属后续增强面。）
+    let bytes = encrypted_pdf_with_permissions("", lopdf::Permissions::PRINTABLE);
+    let assessment = open_scan(&bytes, &Limits::default()).expect("扫描");
+    assert!(!assessment.encrypted, "空口令自动解密（was_encrypted 态）");
+    assert!(
+        assessment.encryption.is_none(),
+        "lopdf decrypt 移除 /Encrypt——装载模型不可见（诚实：不猜测）"
+    );
+}
+
+#[test]
+fn encrypt_permissions_plain_document_is_none() {
+    // 非加密档：encryption = None（get_encrypted Err——无 /Encrypt）。
+    let assessment = open_scan(&benign_pdf(), &Limits::default()).expect("扫描");
+    assert!(!assessment.encrypted);
+    assert!(assessment.encryption.is_none(), "无 /Encrypt = 不承载");
+}
+
+#[test]
+fn encrypt_permissions_serde_roundtrip_additive() {
+    // serde 往返：新字段保真 + 旧 JSON（缺 encryption 键）反序列化
+    // None 缺省（加性兼容——form_probe 先例同构）。
+    let info = EncryptionInfo {
+        filter: "Standard".into(),
+        version: Some(4),
+        revision: Some(4),
+        key_length: Some(128),
+        permissions: EncryptPermissions::from_p_value(-1),
+    };
+    let json = serde_json::to_string(&info).expect("序列化");
+    let back: EncryptionInfo = serde_json::from_str(&json).expect("反序列化");
+    assert_eq!(back, info, "往返保真");
+    assert!(back.permissions.printable && back.permissions.printable_in_high_quality);
+    // 加性：旧 assessment JSON（无 encryption 键）→ None。
+    let legacy = r#"{"encrypted":true,"warnings":[]}"#;
+    let back: OpenAssessment = serde_json::from_str(legacy).expect("旧 JSON 兼容");
+    assert!(back.encrypted && back.encryption.is_none() && back.form_probe.is_none());
 }

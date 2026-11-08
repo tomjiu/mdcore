@@ -31,8 +31,37 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::command::CommandError;
 use crate::security::{
-    DangerousFamily, DangerousHit, FormField, FormProbe, Limits, OpenAssessment,
+    DangerousFamily, DangerousHit, EncryptPermissions, EncryptionInfo, FormField, FormProbe,
+    Limits, OpenAssessment,
 };
+
+/// /Encrypt 字典 → [`EncryptionInfo`]（长尾⑤ / #493）。
+///
+/// 缺 P 位（畸形档）= None——权限声明面不完整时**不承载**（宁可
+/// 不可见不猜测缺省——与八族检测的诚实纪律同源）；/Filter 缺失同拒。
+/// /V /R /Length 为加性标识位（缺失 = None 容忍——非权限面）。
+fn read_encryption_info(doc: &Document) -> Option<EncryptionInfo> {
+    let dict = doc.get_encrypted().ok()?;
+    let filter = dict
+        .get(b"Filter")
+        .and_then(Object::as_name)
+        .ok()
+        .and_then(|n| String::from_utf8(n.to_vec()).ok())
+        .filter(|s| !s.is_empty())?;
+    let permissions = dict
+        .get(b"P")
+        .and_then(Object::as_i64)
+        .ok()
+        .map(EncryptPermissions::from_p_value)?;
+    let int_of = |key: &[u8]| -> Option<i64> { dict.get(key).and_then(Object::as_i64).ok() };
+    Some(EncryptionInfo {
+        filter,
+        version: int_of(b"V"),
+        revision: int_of(b"R"),
+        key_length: int_of(b"Length"),
+        permissions,
+    })
+}
 
 /// S2.4 open_scan：打开路径完整扫描（L7 输入字节 ❶ → 装载 → S2 八族
 /// 与 S6 表单探针与 S5 加密旗标 → L0/L4 打开预算 ❶）。成功 = 可直接
@@ -58,6 +87,7 @@ pub fn scan_document(doc: &Document, limits: &Limits) -> OpenAssessment {
         encrypted: doc.is_encrypted(),
         warnings: Vec::new(),
         form_probe: None,
+        encryption: None,
     };
     // ① 对象图全扫（BTreeMap 键序——确定性枚举）。
     for (id, object) in &doc.objects {
@@ -69,6 +99,11 @@ pub fn scan_document(doc: &Document, limits: &Limits) -> OpenAssessment {
             assessment.form_probe = probe_form(doc, acroform, limits);
         }
     }
+    // ②' 长尾⑤（#493）：/Encrypt 字典读面——P 权限位 + 处理器标识。
+    // 两态承载（仍加密/曾加密——trailer /Encrypt 恒在，字典本身不
+    // 加密）；非加密档 = None（get_encrypted Err）。字典字段缺失的
+    // 畸形形态 = None（防御面——不猜测缺省权限）。
+    assessment.encryption = read_encryption_info(doc);
     // ③ 确定性报告：族声明序 × 详情字典序 + 精确去重（同对象同族的
     // 嵌套重复命中合并为一条）。
     assessment
