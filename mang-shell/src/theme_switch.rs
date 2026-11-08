@@ -3,12 +3,14 @@
 //! 现状约束：闭包 JustBase 基础主题只有 One Dark（zed 闭包未带浅色
 //! 主题，`zed_default_dark` 亦为 pub(crate) 不可外用）。本模块以运行时
 //! 基础主题（启动时的全局主题 = One Dark）为蓝本派生浅色主题——
-//! **只精调 mang-shell 实际消费的语义色字段**（全仓 rg 统计 17 个：
-//! background/panel/title_bar/surface/element 系/border/text 系/
-//! editor 行号与活动行系），编辑器语法高亮（token_style）同样映射自
-//! 这些语义字段——整界面一致变浅，无残留深色面。浅色视觉本身由
-//! Xvfb 烟雾 + Lead 真机背书（ThemeColors 无 Default/Serialize，
-//! 纯逻辑单测无法构造 143 字段基线）。
+//! **只精调 mang-shell 实际消费的语义色字段**（28 个：底面 5 /
+//! element 系 5 / ghost 系 5 / border 系 4 / text 系 5 / editor 行号
+//! 与活动行系 4；
+//! ghost 系为 #560 补——#385 迁移批次把 Tab/ListItem/ButtonLike
+//! 透明系的行/hover/选中色槽切到 ghost_*，浅色派生面跟上），编辑器
+//! 语法高亮（token_style）同样映射自这些语义字段——整界面一致变浅，
+//! 无残留深色面。浅色视觉本身由 Xvfb 烟雾 + Lead 真机背书；派生输出
+//! 的色值等值面可单测锁（#560 起 ghost 系断言在案）。
 //!
 //! 切换经 `GlobalTheme::update_theme` + `refresh_windows`（全窗重绘）；
 //! 模式持久化随 settings.json（`theme` 键）。
@@ -43,6 +45,21 @@ pub fn derive_light(base: &Theme) -> Theme {
     let blue = hsla(210. / 360., 60. / 100., 40. / 100., 1.);
     c.element_selected = hsla(210. / 360., 60. / 100., 88. / 100., 1.);
     c.element_selection_background = hsla(210. / 360., 60. / 100., 80. / 100., 0.35);
+    // ghost 系（#560）：#385 迁移批次的组件消费面——
+    //   ui::Tab（批 2）→ ghost_element_hover/active
+    //   ui::ListItem（批 5a/5b/5c）→ hover/active/selected
+    //   ButtonLike 透明系（#525 适配层备选）→ disabled
+    // 深色基线 ghost ≡ element 同值（fallback dark 两族均 dark_alpha
+    // 同步数，#525 P7 锁证）——浅色保持同族配对（取值必须在选中系
+    // 赋值之后，否则读到的是深色旧值），避免浅色下残留深色半透明
+    // 叠加；disabled 弱于 hover（镜像深色 step_3 < step_4 的强度
+    // 关系）；background 透明（与深色基线同——无浅色问题，显式写出
+    // 保证覆盖集可审计）。
+    c.ghost_element_background = gpui::transparent_black();
+    c.ghost_element_hover = c.element_hover;
+    c.ghost_element_active = c.element_active;
+    c.ghost_element_selected = c.element_selected;
+    c.ghost_element_disabled = light_gray(92.);
     c.border_selected = blue;
     c.border_focused = blue;
     // 边框：浅灰。
@@ -138,5 +155,52 @@ mod tests {
         for mode in [MODE_SYSTEM, MODE_LIGHT, MODE_DARK] {
             assert!(!mode_label(mode).is_empty());
         }
+    }
+
+    /// #560：派生浅色主题的 ghost 系覆盖锁——ghost ≡ element 同族
+    /// 配对（深色基线的等值关系在浅色下保持）+ 透明底 + disabled
+    /// 弱于 hover。基线经 `theme::init(JustBase)` 取（TestAppContext
+    /// 无头面——与 #525 button_ext P7 同款技术）。
+    #[gpui::test]
+    fn derive_light_covers_ghost_slots(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            let base = theme::GlobalTheme::theme(app).clone();
+            let light = derive_light(&base);
+            let c = &light.styles.colors;
+            // 同族配对：迁移组件（Tab/ListItem）的 hover/active/selected
+            // 与旧 element 系浅色值一致——浅色下视觉与自绘时代连续。
+            assert_eq!(
+                c.ghost_element_hover, c.element_hover,
+                "ghost hover ≡ element hover（浅色配对）"
+            );
+            assert_eq!(
+                c.ghost_element_active, c.element_active,
+                "ghost active ≡ element active（浅色配对）"
+            );
+            assert_eq!(
+                c.ghost_element_selected, c.element_selected,
+                "ghost selected ≡ element selected（浅色配对——选中浅蓝）"
+            );
+            // 底透明（与深色基线同——Subtle 底近透明的既定语义）。
+            assert_eq!(
+                c.ghost_element_background,
+                gpui::transparent_black(),
+                "ghost background 透明"
+            );
+            // disabled 弱于 hover（浅两档——镜像深色 step_3 < step_4）。
+            assert_eq!(c.ghost_element_disabled, light_gray(92.));
+            // 深色基线不动：JustBase 的 ghost 槽未被派生改写（等值关系
+            // 在深色侧同样成立——#525 P7 锁证，此处回归防漂移）。
+            let base_c = &base.styles.colors;
+            assert_eq!(base_c.ghost_element_hover, base_c.element_hover);
+            assert_eq!(base_c.ghost_element_selected, base_c.element_selected);
+            // 派生浅色值确为浅色系（不再是深色基线的 black-alpha 叠加）。
+            assert_eq!(c.ghost_element_hover, light_gray(89.));
+            assert_eq!(
+                c.ghost_element_selected,
+                hsla(210. / 360., 60. / 100., 88. / 100., 1.)
+            );
+        });
     }
 }

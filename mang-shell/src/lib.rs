@@ -105,3 +105,10 @@ pub mod pdf_pages;
 /// GPUI 层编译面验证 + 真机登记——pdf_pages 同纪律）。
 #[path = "xlsx_grid_view.rs"]
 pub mod xlsx_grid_view;
+
+/// #68 阶段 F6：主题切换（浅色派生 + 模式循环）。进 lib 树（#560）：
+/// 派生主题的色值等值面单测（ghost ≡ element 配对锁）挂 bin 目标 =
+/// CI 永不运行（假绿——document.rs 同纪律）；且浅色派生是纯函数面
+/// （Theme 进出），lib 树零额外依赖。
+#[path = "theme_switch.rs"]
+pub mod theme_switch;
