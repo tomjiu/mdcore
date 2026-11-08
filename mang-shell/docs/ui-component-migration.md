@@ -189,6 +189,17 @@ find_bar（1218 行手写输入面）/ settings 数字输入 / xlsx 批注评语
 1. **交互测试门**：每批迁移必须带「点击 → 状态变化」级测试（非仅
    函数返回值断言）——GPUI 无头面可测状态桥（`TestAppContext` 已在
    editor/mod.rs 用例在案），真机手势待开发机；
+   落地登记：
+   - menu_bar（批 4 交付时带）：`menu_bar_lifecycle_tests`——开/切换/
+     关/可重开 + Cancel → DismissEvent → 清态链；
+   - context_menu（批 1×4 收口带）：`context_menu_lifecycle_tests`——
+     四态开合 + 切换重建 + Cancel 链 + 执行动作不悬挂；
+   - palette/goto-box（阶段 3 批 2）：`palette_goto_interaction_tests`
+     ——Ctrl+Shift+P/Ctrl+G 真实键位入口 + 键入过滤 + ↑↓ 选中 +
+     Enter 执行闭环（OpenFind → 查找条开 + #183 A-3 最近使用记账
+     置顶）+ goto 跳转/clamp/非法不跳不关/Esc；
+   - tab 族：`tab_workflow_tests`（#219 在案，5 例状态桥——先于
+     迁移存在，批 2 迁移后回归通过）；
 2. **截图回归门**：`ui_snapshot.rs`（迁移前基线截图进仓 + 对比）——
    沙箱无 GUI，登记为真机/CI 侧任务；
 3. **SHELL_ICON_SET 门**（已在案）与组件迁移并行不悖。
