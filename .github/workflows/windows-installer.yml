@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p bin/lib
-          curl -fL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8086/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
+          curl -fL "https://github.com/mmqz/mdcore/releases/download/ci-deps-v1/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
           echo "1fd8af952832dbb0eb16d9249f68fe09e5f5ebf7c3dd9f6066ea2720cc28487d  /tmp/pdfium-win-x64.tgz" | sha256sum -c -
           rm -rf /tmp/pdfium-x && mkdir -p /tmp/pdfium-x
           tar -xzf /tmp/pdfium-win-x64.tgz -C /tmp/pdfium-x
