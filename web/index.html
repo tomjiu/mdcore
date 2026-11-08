@@ -424,6 +424,14 @@
   /* 标注/搜索/证据叠加层（默认透传——不遮挡文字选区；ink 模式接管） */
   .pdf-overlay { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
   #pdf-viewport.pdf-mode-ink .pdf-overlay { pointer-events: auto; cursor: crosshair; }
+  /* #466（长尾①）：链接热区层（overlay 末位 = 点击优先级最高；墨迹模式
+     overlay 整层接管 pointer-events——链接不可点是预期，笔迹优先）。 */
+  .pdf-link-layer { position: absolute; inset: 0; }
+  .pdf-link-layer .pdf-link-hotspot { position: absolute; cursor: pointer;
+                                      pointer-events: auto; border-bottom: 1px solid transparent;
+                                      border-radius: 2px; }
+  .pdf-link-layer .pdf-link-hotspot:hover { background: rgb(26 115 232 / 0.14);
+                                             border-bottom: 1px solid var(--accent); }
   #pdf-viewport.pdf-mode-highlight .textLayer { cursor: text; }
   .pdf-annot-highlight { position: absolute; background: rgb(255 214 10 / 0.35);
                          mix-blend-mode: multiply; border-radius: 2px; }

@@ -438,6 +438,11 @@ declare global {
       pages: number[];
       drawerOpen: boolean;
     };
+    /** #466：链接面观测（逐页内/外链计数 + 策略拒绝计数——e2e 断言面）。 */
+    __pdfLinks: () => {
+      perPage: { total: number; internal: number; external: number }[];
+      policySkipped: string[];
+    };
   }
 }
 
@@ -453,6 +458,8 @@ interface PageState {
   annotLayer: HTMLDivElement;
   searchLayer: HTMLDivElement;
   evidenceLayer: HTMLDivElement;
+  /** #466：链接热区层（overlay 末位 = 点击优先级最高）。 */
+  linkLayer: HTMLDivElement;
   proxy: PDFPageProxy;
   viewport: PageViewport; // 当前 scale 的 CSS px 视口
   rendered: boolean;
@@ -460,6 +467,37 @@ interface PageState {
   renderToken: number;
   renderTask: RenderTask | null;
   textLayerActive: { cancel: () => void } | null;
+}
+
+/** #466：链接热区（内链 target = 0 基页号；外链 url = scheme 白名单后串）。 */
+interface PageLinkBox {
+  target: number | null;
+  url: string | null;
+  rect: { x0: number; y0: number; x1: number; y1: number };
+}
+
+/** #466：pdf.js 注释面的最小结构鸭子（不依赖 pdfjs-dist 精确类型面）。 */
+interface PdfAnnotLike {
+  subtype?: string;
+  rect?: number[];
+  dest?: unknown;
+  url?: string;
+  unsafeUrl?: string;
+  action?: string;
+}
+
+/** #466：外链 scheme 白名单（http/https/mailto——阅读器惯例；
+ * javascript:/data:/file: 等一律不渲染，策略拒绝面入探针计数不静默）。 */
+const URL_SCHEME_ALLOW = new Set(['http:', 'https:', 'mailto:']);
+
+function allowExternalUrl(raw: string): string | null {
+  try {
+    // 仅绝对 URL（相对串在 PDF 注释上下文无基准——拒绝并计数）
+    const u = new URL(raw);
+    return URL_SCHEME_ALLOW.has(u.protocol) ? u.href : null;
+  } catch {
+    return null;
+  }
 }
 
 export class PdfViewUI {
@@ -513,6 +551,11 @@ export class PdfViewUI {
   private inkColorSelect: HTMLSelectElement | null = null;
   private inkWidthSelect: HTMLSelectElement | null = null;
   private freetextInput: HTMLInputElement | null = null;
+
+  // 链接状态（#466——显示面数据源 pdf.js getAnnotations；内链页号解析
+  // 复用 dest 解析语义；策略拒绝面计数不静默）
+  private pageLinks: PageLinkBox[][] = [];
+  private linkPolicySkipped: string[] = [];
 
   // 证据区域叠加（钩子面——后续阶段接真数据）
   private readonly evidenceRegions: { page: number; rect: RectJson }[] = [];
@@ -983,6 +1026,58 @@ export class PdfViewUI {
       });
     }
 
+    // ③-bis #466：链接读面（pdf.js getAnnotations → Link 热区；内链
+    // dest 解析为 0 基页号，外链过 scheme 白名单——策略拒绝面计数）。
+    this.pageLinks = [];
+    this.linkPolicySkipped = [];
+    for (let n = 0; n < proxies.length; n++) {
+      const links: PageLinkBox[] = [];
+      try {
+        const annots = (await proxies[n].getAnnotations()) as PdfAnnotLike[];
+        for (const a of annots) {
+          if (a.subtype !== 'Link' || !a.rect || a.rect.length < 4) continue;
+          const rect = {
+            x0: Math.min(a.rect[0], a.rect[2]),
+            y0: Math.min(a.rect[1], a.rect[3]),
+            x1: Math.max(a.rect[0], a.rect[2]),
+            y1: Math.max(a.rect[1], a.rect[3]),
+          };
+          if (a.dest !== undefined && a.dest !== null) {
+            const idx = await this.resolveLinkDest(doc, a.dest);
+            if (idx !== null) {
+              links.push({ target: idx, url: null, rect });
+            } else {
+              // 悬空命名目标 / GoToR 远程目标——pdf-render-ext §4 登记的
+              // 合法 Unresolved 面：不渲染，计数不静默。
+              this.linkPolicySkipped.push('unresolved-dest');
+            }
+            continue;
+          }
+          const raw = typeof a.url === 'string' && a.url
+            ? a.url
+            : typeof a.unsafeUrl === 'string' && a.unsafeUrl
+              ? a.unsafeUrl
+              : null;
+          if (raw) {
+            const safe = allowExternalUrl(raw);
+            if (safe) {
+              links.push({ target: null, url: safe, rect });
+            } else {
+              this.linkPolicySkipped.push(raw.split(':')[0] ?? 'bad-url');
+            }
+            continue;
+          }
+          if (a.action) {
+            // /Launch 等宿主动作——web 面不执行（安全边界），计数登记
+            this.linkPolicySkipped.push(`action:${a.action}`);
+          }
+        }
+      } catch {
+        // 单页注释面失败 = 该页无链接（诚实空面，不阻断打开）
+      }
+      this.pageLinks.push(links);
+    }
+
     // ④ 会话模型面（pkg_pdf 缺位 → display-only 降级）
     this.sessionInitFail = null;
     if (this.sessionCtor) {
@@ -1023,6 +1118,7 @@ export class PdfViewUI {
     this.setScale(visibleNow ? this.fitScale() : 1, { skipAnchor: true });
     this.defaultFitPending = !visibleNow;
     this.renderAllAnnotOverlays(); // refreshAnnotations 早于 buildPages——此处补投影
+    this.renderAllLinkOverlays(); // #466：链接热区投影（open 尾一次）
     void this.renderPage(0);
     if (this.pages.length > 1) void this.renderPage(1);
     this.updatePageLabel();
@@ -1076,6 +1172,70 @@ export class PdfViewUI {
     this.guideEl.hidden = this.doc !== null;
   }
 
+  /** #466：pdf.js 链接 dest（数组/命名目标）→ 0 基页号；不可解析 = null
+   * （悬空命名/GoToR 远程目标的 Unresolved 面——pdf-render-ext §4）。 */
+  private async resolveLinkDest(
+    doc: PDFDocumentProxy,
+    dest: unknown,
+  ): Promise<number | null> {
+    try {
+      let d: unknown = dest;
+      if (typeof d === 'string') d = await doc.getDestination(d);
+      if (!Array.isArray(d) || d.length === 0) return null;
+      const idx = await doc.getPageIndex(d[0] as Parameters<
+        typeof doc.getPageIndex
+      >[0]);
+      return idx;
+    } catch {
+      return null;
+    }
+  }
+
+  /** #466：跳页（内链点击——目标页滚到视口顶 + 页码行同步）。 */
+  private jumpToPage(idx: number): void {
+    const st = this.pages[idx];
+    if (!st) return;
+    st.el.scrollIntoView({ block: 'start', behavior: 'auto' });
+    this.updatePageLabel();
+  }
+
+  /** #466：全部页链接热区投影（open 尾 + relayout 重投影）。 */
+  private renderAllLinkOverlays(): void {
+    for (let i = 0; i < this.pages.length; i++) this.renderLinkOverlay(i);
+  }
+
+  /** #466：单页链接热区（内链 = preventDefault + 跳页；外链 = 白名单
+   * 后 href + _blank + noopener——手势级可点击 <a>）。 */
+  private renderLinkOverlay(page: number): void {
+    const st = this.pages[page];
+    if (!st) return;
+    st.linkLayer.replaceChildren();
+    for (const link of this.pageLinks[page] ?? []) {
+      const box = this.userRectToViewport(st, link.rect);
+      const a = document.createElement('a');
+      a.className = 'pdf-link-hotspot';
+      a.dataset.page = String(page);
+      if (link.target !== null) {
+        a.href = '#';
+        a.title = t('pdf.linkToPage', { n: link.target + 1 });
+        a.addEventListener('click', (e) => {
+          e.preventDefault();
+          this.jumpToPage(link.target as number);
+        });
+      } else {
+        a.href = link.url ?? '#';
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.title = link.url ?? '';
+      }
+      a.style.left = `${box.x}px`;
+      a.style.top = `${box.y}px`;
+      a.style.width = `${box.w}px`;
+      a.style.height = `${box.h}px`;
+      st.linkLayer.appendChild(a);
+    }
+  }
+
   /** 旧文档拆卸（IO/渲染任务/位图缓存/overlay/文本缓存全清）。 */
   private teardownDocument(): void {
     this.io?.disconnect();
@@ -1108,6 +1268,9 @@ export class PdfViewUI {
     this.doc = null;
     // #475：注释列表面拆卸（层随页元素移除;开合保留用户选择）。
     this.syncAnnotsPanel();
+    // #466：链接面拆卸（热区/策略拒绝计数归零——层随页元素移除）。
+    this.pageLinks = [];
+    this.linkPolicySkipped = [];
     // #3 UI 批 E：拆卸后表面归零——引导卡片回显（打开失败/换开路径）。
     this.syncGuide();
   }
@@ -1419,7 +1582,10 @@ export class PdfViewUI {
       searchLayer.className = 'pdf-search-layer';
       const evidenceLayer = document.createElement('div');
       evidenceLayer.className = 'pdf-evidence-layer';
-      overlay.append(annotLayer, searchLayer, evidenceLayer);
+      // #466：链接层（overlay 末位——点击优先级最高；打印态随 .pdf-overlay 隐藏）
+      const linkLayer = document.createElement('div');
+      linkLayer.className = 'pdf-link-layer';
+      overlay.append(annotLayer, searchLayer, evidenceLayer, linkLayer);
 
       el.append(canvas, textLayer, overlay);
       frag.appendChild(el);
@@ -1432,6 +1598,7 @@ export class PdfViewUI {
         annotLayer,
         searchLayer,
         evidenceLayer,
+        linkLayer,
         proxy: proxies[i],
         viewport: proxies[i].getViewport({ scale: this.scale }),
         rendered: false,
@@ -1484,6 +1651,7 @@ export class PdfViewUI {
     void this.renderSearchOverlay();
     this.renderAllAnnotOverlays();
     this.renderAllEvidenceOverlays();
+    this.renderAllLinkOverlays(); // #466：链接热区随 scale 重投影
   }
 
   private scheduleRenderVisible(): void {
@@ -2276,6 +2444,16 @@ export class PdfViewUI {
       ids: this.annotations.map((a) => a.id),
       pages: this.annotations.map((a) => a.page),
       drawerOpen: this.annotsDrawer !== null && !this.annotsDrawer.hidden,
+    });
+
+    // #466：链接面探针（逐页内/外链计数 + 策略拒绝面——e2e 断言面）。
+    window.__pdfLinks = () => ({
+      perPage: this.pageLinks.map((links) => ({
+        total: links.length,
+        internal: links.filter((l) => l.target !== null).length,
+        external: links.filter((l) => l.url !== null).length,
+      })),
+      policySkipped: [...this.linkPolicySkipped],
     });
 
     // 证据跳转钩子（evidence_panel 的 evidence-jump 事件——后续阶段接真
