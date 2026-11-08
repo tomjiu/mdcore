@@ -785,12 +785,14 @@ mod keyboard_tests {
     use gpui::Entity;
     use std::sync::Mutex;
 
-    /// 测试钩子：open_file 捕获触发路径（断言面）；其余为 no-op。
+    /// 测试钩子：open_file 捕获路径；其他入口触发即失败，防止测试漏接交互。
     fn test_hooks(opened: Arc<Mutex<Vec<PathBuf>>>) -> FileTreeHooks {
         FileTreeHooks {
             open_file: Arc::new(move |path, _, _| opened.lock().unwrap().push(path)),
-            context_menu: Arc::new(|_, _, _, _, _| {}),
-            escape: Arc::new(|_, _| {}),
+            context_menu: Arc::new(|_, _, _, _, _| {
+                panic!("unexpected context menu in keyboard test")
+            }),
+            escape: Arc::new(|_, _| panic!("unexpected escape in keyboard test")),
         }
     }
 
