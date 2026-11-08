@@ -2288,9 +2288,13 @@ mod g1_find_replace_tests {
     }
 
     #[test]
-    fn replace_batch_thousand_matches_under_100ms() {
-        // #91 G1 验收线：1000 处全部替换 < 100ms（构建不计时——只卡
+    fn replace_batch_thousand_matches_under_200ms() {
+        // #91 G1 验收线：1000 处全部替换 < 200ms（构建不计时——只卡
         // 批量替换本体；单事务口径下实测应为数十 ms 量级）。
+        // #547：100ms → 200ms——原线在多进程编译负载下假红（实测
+        // 117-130ms vs 100ms，与代码改动无关）。200ms 是容忍负载
+        // 抖动的线：真实算法退化是 10 倍级（数十 ms → 数百 ms），
+        // 抓退化能力不因放宽而丢失。
         let lines: Vec<String> = (0..1000).map(|i| format!("第{i}行 foo 内容")).collect();
         let mut b = Buffer::from_plain_text(&lines.join("\n"));
         let edits: Vec<(Point, Point, String)> = b
@@ -2312,10 +2316,10 @@ mod g1_find_replace_tests {
         let n = b.replace_batch(edits);
         let elapsed = t.elapsed();
         assert_eq!(n, 1000);
-        println!("perf(千处批量替换) = {elapsed:?}  (验收线 <100ms)");
+        println!("perf(千处批量替换) = {elapsed:?}  (验收线 <200ms，#547 负载容忍线)");
         assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "千处批量替换超验收线：{elapsed:?}"
+            elapsed < std::time::Duration::from_millis(200),
+            "千处批量替换超验收线（负载敏感，200ms 容忍抖动，真实退化为 10 倍级）：{elapsed:?}"
         );
         // 一次撤销整批回滚同样在验收量级
         let t = std::time::Instant::now();
