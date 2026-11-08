@@ -152,7 +152,7 @@ impl DocxWriter {
     /// 显示空插入标记，计数 1 段 + 0 run）；`\n` 由引擎 `add_text`
     /// 剥除（与普通 `paragraph()` 路径同源——不拆 w:br）。
     ///
-    /// r4-t2 计数：1 段 + N run（`count_raw_emission` 漏斗，不放宽
+    /// r4-t2 计数与输入校验：1 段 + N run（`count_specs` 复用 V12，不放宽
     /// 上限）。
     pub fn insert_runs_revised(&mut self, runs: &[RunSpec], mark: &RevisionMark) {
         self.note_unshippable_revision_payloads(runs, "insert_runs_revised");
@@ -167,7 +167,7 @@ impl DocxWriter {
         let p = docx_rs::Paragraph::new().add_insert(ins);
         let docx = std::mem::take(self.docx_mut());
         *self.docx_mut() = docx.add_paragraph(p);
-        self.count_raw_emission(1, runs.len() as u64);
+        self.count_specs(1, runs);
     }
 
     /// 发射**删除修订段（富文本多 run，#556）**：`<w:p><w:del …>
@@ -190,7 +190,7 @@ impl DocxWriter {
         let p = docx_rs::Paragraph::new().add_delete(del);
         let docx = std::mem::take(self.docx_mut());
         *self.docx_mut() = docx.add_paragraph(p);
-        self.count_raw_emission(1, runs.len() as u64);
+        self.count_specs(1, runs);
     }
 
     /// V13 边界检查（私有——两富文本发射面共用）：修订容器不能合法
