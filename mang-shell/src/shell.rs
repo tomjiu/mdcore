@@ -4945,6 +4945,15 @@ mod confirm_lifecycle_tests {
 
     /// 真实键派发（批 10 的 press_escape 同构——键名参数化）。
     fn press_key(cx: &mut gpui::TestAppContext, window: &gpui::WindowHandle<Host>, key: &str) {
+        press_key_with_modifiers(cx, window, key, Default::default());
+    }
+
+    fn press_key_with_modifiers(
+        cx: &mut gpui::TestAppContext,
+        window: &gpui::WindowHandle<Host>,
+        key: &str,
+        modifiers: gpui::Modifiers,
+    ) {
         let any: gpui::AnyWindowHandle = (*window).into();
         cx.update_window(any, |_, window, cx| {
             window.draw(cx).clear(cx);
@@ -4954,7 +4963,7 @@ mod confirm_lifecycle_tests {
             window.dispatch_event(
                 gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
                     keystroke: gpui::Keystroke {
-                        modifiers: Default::default(),
+                        modifiers,
                         key: key.into(),
                         key_char: None,
                     },
@@ -5106,5 +5115,224 @@ mod confirm_lifecycle_tests {
         shell.update(cx, |shell, _| {
             assert!(shell.confirm.is_none(), "模态消散后 Enter 零副作用");
         });
+    }
+
+    /// Owned real file: create_dir succeeds only for this fresh test directory.
+    struct RealMdFixture {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl RealMdFixture {
+        fn new(tag: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("mdc-confirm-{tag}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&dir).expect("create owned test directory");
+            let path = dir.join("real.md");
+            std::fs::write(&path, "L0\n").expect("write real markdown fixture");
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for RealMdFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn redraw(window: &gpui::WindowHandle<Host>, cx: &mut gpui::TestAppContext) {
+        let any: gpui::AnyWindowHandle = (*window).into();
+        cx.update_window(any, |_, window, cx| window.draw(cx).clear(cx))
+            .expect("draw actual dispatch tree");
+    }
+
+    fn open_real_clean_tab(
+        shell: &Entity<ShellApp>,
+        window: &gpui::WindowHandle<Host>,
+        cx: &mut gpui::TestAppContext,
+        path: &Path,
+    ) -> Entity<Editor> {
+        let editor = window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    let focus = shell
+                        .open_document_tab(path.to_path_buf(), cx)
+                        .expect("real fixture opens through production tab loader");
+                    window.focus(&focus, cx);
+                    assert_eq!(shell.tab_count(), 1);
+                    let editor = shell.tab_editor(0).unwrap().clone();
+                    assert!(!editor.read(cx).is_modified(), "fixture starts clean");
+                    editor
+                })
+            })
+            .expect("open real clean tab");
+        assert_editor_restored(shell, window, cx, &editor, "L0", false);
+        editor
+    }
+
+    fn assert_editor_restored(
+        shell: &Entity<ShellApp>,
+        window: &gpui::WindowHandle<Host>,
+        cx: &mut gpui::TestAppContext,
+        expected: &Entity<Editor>,
+        content: &str,
+        dirty: bool,
+    ) {
+        redraw(window, cx);
+        window
+            .update(cx, |_host, window, cx| {
+                let shell = shell.read(cx);
+                assert!(shell.confirm.is_none());
+                assert_eq!(shell.tab_count(), 1, "cancel retains a valid tab");
+                let editor = shell.tab_editor(0).expect("real tab remains");
+                assert_eq!(
+                    editor.entity_id(),
+                    expected.entity_id(),
+                    "same Editor entity"
+                );
+                let editor = editor.read(cx);
+                assert_eq!(editor.buffer_line(0), content);
+                assert_eq!(editor.is_modified(), dirty);
+                let focus = editor.focus_handle();
+                assert!(focus.is_focused(window), "actual Editor focus restored");
+                assert!(
+                    shell.root_focus.contains(focus, window),
+                    "Editor is mounted in drawn tree"
+                );
+                assert!(
+                    !shell.confirm_focus.is_focused(window),
+                    "modal focus released"
+                );
+            })
+            .expect("observe actual Editor and focus");
+    }
+
+    fn show_real_close_confirm(
+        shell: &Entity<ShellApp>,
+        window: &gpui::WindowHandle<Host>,
+        cx: &mut gpui::TestAppContext,
+        editor: &Entity<Editor>,
+    ) {
+        // True Ctrl+W reaches production close_active_tab, which constructs and
+        // focuses the modal. Do not inject ConfirmState or call resolve_confirm.
+        press_key_with_modifiers(
+            cx,
+            window,
+            "w",
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        redraw(window, cx);
+        window
+            .update(cx, |_host, window, cx| {
+                let shell = shell.read(cx);
+                let confirm = shell
+                    .confirm
+                    .as_ref()
+                    .expect("dirty tab produces actual modal");
+                assert!(matches!(confirm.action, ConfirmAction::CloseTab { idx: 0 }));
+                assert_eq!(confirm.selected, 0);
+                assert_eq!(confirm.buttons, CONFIRM_BUTTONS.to_vec());
+                assert!(
+                    shell.confirm_focus.is_focused(window),
+                    "modal actually takes focus"
+                );
+                assert!(
+                    shell.root_focus.contains(&shell.confirm_focus, window),
+                    "modal mounted in drawn tree"
+                );
+                assert!(!editor.read(cx).focus_handle().is_focused(window));
+            })
+            .expect("observe real modal focus transfer");
+    }
+
+    fn assert_root_restored(
+        shell: &Entity<ShellApp>,
+        window: &gpui::WindowHandle<Host>,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        redraw(window, cx);
+        window
+            .update(cx, |_host, window, cx| {
+                let shell = shell.read(cx);
+                assert_eq!(shell.tab_count(), 0, "positive control really closes tab");
+                assert!(shell.confirm.is_none());
+                assert!(
+                    shell.root_focus.is_focused(window),
+                    "empty-state root focus restored"
+                );
+                assert!(!shell.confirm_focus.is_focused(window));
+            })
+            .expect("observe root focus after true close");
+    }
+
+    #[gpui::test]
+    fn confirm_enter_cancel_retains_real_tab_and_restores_editor_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fixture = RealMdFixture::new("enter");
+        let (shell, window) = shell_window(cx);
+        open_real_clean_tab(&shell, &window, cx, &fixture.path);
+        // Positive control: this valid clean tab can truly be closed via the
+        // same production close_tab_at reached by a wrong cancel decision.
+        press_key_with_modifiers(
+            cx,
+            &window,
+            "w",
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        );
+        assert_root_restored(&shell, &window, cx);
+        let editor = open_real_clean_tab(&shell, &window, cx, &fixture.path);
+        editor.update(cx, |editor, cx| {
+            editor
+                .insert_text_at(0, 2, "X", cx)
+                .expect("real edit makes tab dirty");
+        });
+        show_real_close_confirm(&shell, &window, cx, &editor);
+        press_key(cx, &window, "tab");
+        press_key(cx, &window, "tab");
+        assert_eq!(selected(&shell, cx), 2, "real keys select Cancel");
+        press_key(cx, &window, "enter");
+        assert_editor_restored(&shell, &window, cx, &editor, "L0X", true);
+        assert_eq!(
+            std::fs::read_to_string(&fixture.path).unwrap(),
+            "L0\n",
+            "cancel never saves/discards source"
+        );
+    }
+
+    #[gpui::test]
+    fn confirm_escape_retains_real_tab_and_true_close_restores_root_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fixture = RealMdFixture::new("escape");
+        let (shell, window) = shell_window(cx);
+        let editor = open_real_clean_tab(&shell, &window, cx, &fixture.path);
+        editor.update(cx, |editor, cx| {
+            editor
+                .insert_text_at(0, 2, "X", cx)
+                .expect("real edit makes tab dirty");
+        });
+        show_real_close_confirm(&shell, &window, cx, &editor);
+        press_key(cx, &window, "escape");
+        assert_editor_restored(&shell, &window, cx, &editor, "L0X", true);
+        assert_eq!(std::fs::read_to_string(&fixture.path).unwrap(), "L0\n");
+        // Positive decision control on the same real tab: select Don't Save
+        // via Tab and Enter, then verify real removal and root focus return.
+        show_real_close_confirm(&shell, &window, cx, &editor);
+        press_key(cx, &window, "tab");
+        assert_eq!(selected(&shell, cx), 1);
+        press_key(cx, &window, "enter");
+        assert_root_restored(&shell, &window, cx);
+        assert_eq!(std::fs::read_to_string(&fixture.path).unwrap(), "L0\n");
     }
 }
