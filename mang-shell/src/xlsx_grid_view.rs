@@ -1,11 +1,16 @@
-//! XLSX 网格视图（#389 阶段 1——桌面端真网格渲染骨架）。
+//! XLSX 网格视图（#389 阶段 1——真网格渲染骨架；**阶段 2——单元格编辑接线**）。
 //!
 //! # 定位（issue #389 阶段 1 范围声明）
 //!
 //! 现状：桌面 xlsx = 只读**行模型**（`editor::xlsx_doc` 把表格拍平成
 //! 文本行——引擎能改 / wasm 能改 / 桌面只能看）。本模块把显示面换成
 //! **真网格**：列字母行 + 行号列边缘固定、单元格点选高亮、双向虚拟
-//! 化滚动、工作表切换树保留。
+//! 化滚动、工作表切换树保留；**阶段 2 起接编辑**：双击进入内联编辑
+//! （键位直输——`keystroke.key_char`，编辑器同源无 IME 路径），
+//! Enter 提交 → `XlsxEditor::set_cell` 落账（公式格拒改——引擎面
+//! `FormulaCell` 错误明示），Ctrl+S / 菜单保存 → `save_to_vec` 写盘
+//! （临时文件 + rename——docx 保存同纪律，写坏不毁原件），脏标记 +
+//! 关闭确认由 shell 面统一拦截（`tab_is_modified` / `close_active_tab`）。
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────┐
@@ -26,22 +31,30 @@
 //!   纯函数）——滚轮 deltaX / Shift+滚轮 deltaY 驱动（`clamp_scroll_x`
 //!   钳制），窗口外列零构建；底部滚动指示条按 scroll_x / 总宽渲染。
 //!
-//! # 点选（命中测试）
+//! # 点选/编辑（命中测试）
 //!
 //! 覆盖 canvas 的 paint 期注册窗口级鼠标观察器（pdf_pages 同模式：
 //! bounds 过滤 + 不占命中区不挡滚动）——`hit_test_cell` 纯函数把局部
-//! 坐标 + 滚动状态解析为 (行, 列)，选中格高亮边框 + 行号/列头联动。
+//! 坐标 + 滚动状态解析为 (行, 列)，选中格高亮边框 + 行号/列头联动；
+//! **双击**（`MouseDownEvent::click_count >= 2`）进入内联编辑，
+//! 单击在编辑态时先提交当前编辑再选新格（Excel 同款语义）。
 //!
 //! # 数据面（单一来源：office-io 读面）
 //!
 //! `XlsxGridModel` = `io::read_book_with_options` 的网格化转译（与
 //! `xlsx_doc::load` 同一读面、同一护栏口径：行 1000 / 列 64 / 单元格宽
-//! 24）。**阶段 1 不接编辑**（阶段 2 另轮）；**不动 `xlsx_doc.rs`**
-//! （保留为 fallback / 文本视图——状态栏切换钮同 pdf 页面/文本模式
-//! 先例）。
+//! 24）。编辑会话 = `mdc_office_io::xlsx_edit::XlsxEditor`（同一文件的
+//! 独立打开——office-io 门面恒严格）；**不动 `xlsx_doc.rs`**（保留为
+//! fallback / 文本视图——状态栏切换钮同 pdf 页面/文本模式先例）。
 //!
-//! # 已知边界（阶段 1 登记——issue 阶段 3 完善项）
+//! # 已知边界（阶段 2 登记）
 //!
+//! - 公式格拒改（`set_cell` 引擎面 `FormulaCell`——重算留阶段 3，
+//!   issue 明示「阶段 2 先做改值」）；
+//! - 编辑限网格可见域（护栏内——越界格不可见亦不可达）；
+//! - 文本视图（xlsx_doc 行模型）为打开时快照——保存后重开生效
+//!   （两视图内容零漂移口径的已知例外，状态栏可切回网格视图看实况）；
+//! - 键盘导航（方向键移选区）不在阶段 2 面——登记待后续打磨轮；
 //! - 合并格显示 = 左上单点语义（与行模型同口径——真跨格渲染属阶段 3）；
 //! - 超链接/数字格式面外（`CellData::display` 同行模型口径）；
 //! - 沙箱无 GUI：GPUI 层编译面验证 + 逻辑面（模型/几何纯函数 + 夹具
@@ -49,14 +62,15 @@
 //!   待开发机（与 #302 pdf_pages 同纪律）。
 
 use std::cell::Cell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Context, DispatchPhase, FocusHandle, Focusable, Pixels, ScrollEvent,
-    SharedString, UniformListScrollHandle, Window, px,
+    AnyElement, App, Context, DispatchPhase, FocusHandle, Focusable, KeyDownEvent, Pixels,
+    ScrollEvent, SharedString, UniformListScrollHandle, Window, px,
 };
 use mdc_office_io::io::{Book, CellData, ReadOptions};
+use mdc_office_io::xlsx_edit::{CellEdit, XlsxEditor};
 use ui::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -196,6 +210,105 @@ fn cell_display(cell: Option<&CellData>, formula: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// #389 阶段 2：编辑纯函数面（零 GPUI——单测锚点）
+// ---------------------------------------------------------------------------
+
+/// 显示坐标 → 绝对 A1 引用（`selected_a1` 同口径——提交/错误面共用）。
+fn cell_ref_for(sheet: &GridSheet, row: usize, col: usize) -> String {
+    format!(
+        "{}{}",
+        col_letter(sheet.start_col + col as u32),
+        sheet.start_row + row as u32 + 1
+    )
+}
+
+/// 内联输入 → [`CellEdit`]（Excel 直觉口径）：
+/// - 空白（含空白字符）→ `Text("")`（清格——引擎面 validate_text 放行）；
+/// - 可解析为有限 f64 → `Number`（前后空白容忍）；
+/// - `TRUE`/`FALSE`（大小写不敏感）→ `Boolean`；
+/// - 其余 → `Text`（原文——保留内边空白，不加引号/不转义）。
+fn parse_cell_input(raw: &str) -> CellEdit {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return CellEdit::Text(String::new());
+    }
+    if let Ok(n) = trimmed.parse::<f64>() {
+        if n.is_finite() {
+            return CellEdit::Number(n);
+        }
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" => CellEdit::Boolean(true),
+        "false" => CellEdit::Boolean(false),
+        _ => CellEdit::Text(raw.to_string()),
+    }
+}
+
+/// 提交编辑（引擎落账 + 显示面即时更新——「点击 → 状态变化」的核心
+/// 纯函数，单测直接钉定）。
+///
+/// - 值走 [`XlsxEditor::set_cell`]（公式格/不可编辑表/非法字符 =
+///   `Err`——错误文案原样上浮到面板 notice）；
+/// - 落账成功 → `GridSheet::cells` 即时改写为输入原文（pending 视觉
+///   ——与重开读面口径一致：Number 显示输入文本）。
+fn commit_cell_edit(
+    editor: &mut XlsxEditor,
+    model: &mut XlsxGridModel,
+    sheet_idx: usize,
+    row: usize,
+    col: usize,
+    buffer: &str,
+) -> Result<(), String> {
+    let sheet = model
+        .sheets
+        .get(sheet_idx)
+        .ok_or_else(|| format!("表下标越界: {sheet_idx}"))?;
+    let cell_ref = cell_ref_for(sheet, row, col);
+    let value = parse_cell_input(buffer);
+    editor
+        .set_cell(sheet_idx, &cell_ref, value)
+        .map_err(|e| e.to_string())?;
+    if let Some(cell_row) = model.sheets[sheet_idx].cells.get_mut(row) {
+        if let Some(text) = cell_row.get_mut(col) {
+            *text = buffer.to_string();
+        }
+    }
+    Ok(())
+}
+
+/// 打开编辑会话（`fs::read` → `XlsxEditor::open`——office-io 门面恒
+/// 严格；失败返回 (None, Some(原因))——不阻网格渲染，编辑面明示拒因）。
+fn open_edit_session(path: &Path) -> (Option<XlsxEditor>, Option<String>) {
+    match std::fs::read(path) {
+        Ok(bytes) => match XlsxEditor::open(&bytes) {
+            Ok(session) => (Some(session), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+        Err(e) => (None, Some(format!("读取失败：{e}"))),
+    }
+}
+
+/// 原子写盘（临时文件 + rename——docx 保存同纪律：写坏不毁原件）。
+/// `pub`：shell 会话银行直接落盘路径（`save_xlsx_at`）共用同一纪律。
+pub fn write_xlsx_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.to_path_buf();
+    let tag = format!(
+        ".mang-tmp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    tmp.set_extension(format!(
+        "{}.{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("xlsx"),
+        tag
+    ));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+// ---------------------------------------------------------------------------
 // 几何纯函数（零 GPUI——单测锚点）
 // ---------------------------------------------------------------------------
 
@@ -330,7 +443,16 @@ pub fn hit_test_cell(
 // 视图（GPUI 层——编译面验证 + 真机登记）
 // ---------------------------------------------------------------------------
 
-/// XLSX 网格视图实体。
+/// 内联编辑态（双击进入——Enter 提交 / Esc 取消 / Backspace 删 /
+/// 可打印字符追加；显示坐标 (行, 列)）。
+struct CellEditing {
+    row: usize,
+    col: usize,
+    /// 输入缓冲（未提交原文——提交时经 [`parse_cell_input`] 分型）。
+    buffer: String,
+}
+
+/// XLSX 网格视图实体（#389 阶段 2：含编辑会话）。
 pub struct XlsxGridView {
     model: XlsxGridModel,
     /// 当前表（簿序索引）。
@@ -350,15 +472,52 @@ pub struct XlsxGridView {
     selected: Option<(usize, usize)>,
     /// 纵向虚拟化滚动句柄。
     scroll: UniformListScrollHandle,
-    /// 焦点域（键盘域占位——阶段 1 无键位面）。
+    /// 焦点域（编辑态键位接收面——根元素 track_focus）。
     focus_handle: FocusHandle,
     /// 引擎面错误（构造期失败——面板明示，不白屏）。
     error: Option<String>,
+    /// 源文件路径（保存写回目标；error 态无）。
+    path: Option<PathBuf>,
+    /// 编辑会话（#389 阶段 2；None = 会话不可用——打开失败/文件不可
+    /// 读，双击明示拒因，不静默无反应）。
+    editor: Option<XlsxEditor>,
+    /// 会话打开失败原因（面板状态条明示）。
+    editor_error: Option<String>,
+    /// 内联编辑态（双击进入）。
+    editing: Option<CellEditing>,
+    /// 脏标记（有已提交未落盘编辑——`tab_is_modified`/关闭确认消费）。
+    dirty: bool,
+    /// 瞬时错误/状态面（提交被拒/保存失败——下一次成功动作清除）。
+    notice: Option<String>,
 }
 
 impl XlsxGridView {
-    /// 构造（模型就绪路径——`XlsxGridModel::load` 由 Shell 侧先行）。
-    pub fn new(model: XlsxGridModel, cx: &mut App) -> Self {
+    /// 构造（模型就绪路径——`XlsxGridModel::load` 由 Shell 侧先行；
+    /// 编辑会话从同路径字节独立打开，失败不阻渲染——双击时明示拒因）。
+    pub fn new(model: XlsxGridModel, path: PathBuf, cx: &mut App) -> Self {
+        let (editor, editor_error) = open_edit_session(&path);
+        Self::with_session(model, Some(path), editor, editor_error, cx)
+    }
+
+    /// 会话回接构造（#389 阶段 2：切标签/切视图重建实体时，shell 把
+    /// 既有会话注入——已提交未落盘编辑跨实体存活，零静默丢失）。
+    pub fn new_with_session(
+        model: XlsxGridModel,
+        path: PathBuf,
+        session: XlsxEditor,
+        cx: &mut App,
+    ) -> Self {
+        Self::with_session(model, Some(path), Some(session), None, cx)
+    }
+
+    /// 共用构造体（editor = None + editor_error = Some = 会话不可用）。
+    fn with_session(
+        model: XlsxGridModel,
+        path: Option<PathBuf>,
+        editor: Option<XlsxEditor>,
+        editor_error: Option<String>,
+        cx: &mut App,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let mut this = Self {
             sheet_idx: 0,
@@ -371,13 +530,19 @@ impl XlsxGridView {
             scroll: UniformListScrollHandle::new(),
             focus_handle,
             error: None,
+            path,
+            editor,
+            editor_error,
+            editing: None,
+            dirty: false,
+            notice: None,
             model,
         };
         this.recompute_col_widths();
         this
     }
 
-    /// error 态构造（模型装载失败——面板明示）。
+    /// error 态构造（模型装载失败——面板明示；无编辑面）。
     pub fn error_state(message: String, cx: &mut App) -> Self {
         Self {
             model: XlsxGridModel::default(),
@@ -391,6 +556,65 @@ impl XlsxGridView {
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             error: Some(message),
+            path: None,
+            editor: None,
+            editor_error: None,
+            editing: None,
+            dirty: false,
+            notice: None,
+        }
+    }
+
+    /// 会话交还（shell 切标签/关实体前提取——脏会话进 shell 会话银行
+    /// `xlsx_sessions`，重建时经 [`Self::new_with_session`] 注回）。
+    pub fn take_session(&mut self) -> Option<XlsxEditor> {
+        // 编辑中的缓冲先行提交（切走不丢未按 Enter 的输入——Excel 同款）。
+        self.commit_edit();
+        self.editor.take()
+    }
+
+    /// 脏标记（shell `tab_is_modified` / 关闭确认消费）。
+    pub fn is_modified(&self) -> bool {
+        self.dirty
+    }
+
+    /// 脏标记回置（shell 会话银行回接时随行——`ensure_xlsx_grid` 消费）。
+    pub fn set_modified(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
+
+    /// 保存（#389 阶段 2：会话 `save_to_vec` → 临时文件 + rename 写盘
+    /// ——docx 保存同纪律，写坏不毁原件；成功清脏 + 清 notice，失败
+    /// 错误文案进 notice 返回 false）。
+    pub fn save(&mut self) -> bool {
+        // 编辑中的缓冲先行提交（保存语义 = 落盘全部已输入内容）。
+        self.commit_edit();
+        let Some(path) = self.path.clone() else {
+            self.notice = Some("保存失败：无源路径（error 态视图）".into());
+            return false;
+        };
+        let Some(editor) = self.editor.as_ref() else {
+            self.notice = Some("保存失败：编辑会话不可用".into());
+            return false;
+        };
+        let bytes = match editor.save_to_vec() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.notice = Some(format!("保存失败：{e}"));
+                return false;
+            }
+        };
+        match write_xlsx_atomically(&path, &bytes) {
+            Ok(()) => {
+                self.dirty = false;
+                self.notice = None;
+                eprintln!("saved (xlsx): {}", path.display());
+                true
+            }
+            Err(e) => {
+                self.notice = Some(format!("保存失败：{e}"));
+                false
+            }
         }
     }
 
@@ -479,7 +703,12 @@ impl XlsxGridView {
     }
 
     /// 点选收尾（命中测试 → 选中 + 越界钳制；行号槽点击 = 无操作）。
+    /// 编辑态先提交当前编辑（Excel 同款：点别的格 = 落定输入）。
     fn select_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.commit_edit();
+            cx.notify();
+        }
         let sheet_rows = self.sheet().rows;
         let hit = hit_test_cell(
             &self.col_offsets,
@@ -493,6 +722,151 @@ impl XlsxGridView {
         if hit.is_some() {
             self.selected = hit;
             cx.notify();
+        }
+    }
+
+    // ── #389 阶段 2：内联编辑交互 ──────────────────────────────
+
+    /// 双击进入编辑（选中格随双击更新；缓冲以当前格显示文本起步——
+    /// Excel「双击改原值」同款）。会话不可用/越界 → notice 明示拒因。
+    fn begin_edit_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.commit_edit();
+        }
+        let sheet_rows = self.sheet().rows;
+        let hit = hit_test_cell(
+            &self.col_offsets,
+            &self.col_widths,
+            self.scroll_x,
+            self.first_visible_row(),
+            x,
+            y,
+        )
+        .filter(|(r, _)| *r < sheet_rows);
+        let Some((row, col)) = hit else {
+            return;
+        };
+        self.selected = Some((row, col));
+        if self.editor.is_none() {
+            self.notice = Some(format!(
+                "编辑不可用：{}",
+                self.editor_error
+                    .clone()
+                    .unwrap_or_else(|| "编辑会话未开启".into())
+            ));
+            cx.notify();
+            return;
+        }
+        let current = self
+            .sheet()
+            .cells
+            .get(row)
+            .and_then(|r| r.get(col))
+            .cloned()
+            .unwrap_or_default();
+        self.notice = None;
+        self.editing = Some(CellEditing {
+            row,
+            col,
+            buffer: current,
+        });
+        cx.notify();
+    }
+
+    /// 提交编辑（Enter / 切选区 / 保存 / 会话交还的统一收口——
+    /// `commit_cell_edit` 纯函数核心 + 脏标记 + notice 错误面）。
+    fn commit_edit(&mut self) {
+        let Some(ed) = self.editing.take() else {
+            return;
+        };
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        match commit_cell_edit(
+            editor,
+            &mut self.model,
+            self.sheet_idx,
+            ed.row,
+            ed.col,
+            &ed.buffer,
+        ) {
+            Ok(()) => {
+                self.dirty = true;
+                self.notice = None;
+            }
+            Err(e) => {
+                // 引擎拒改（公式格/非法字符等）——原值不动，错误明示。
+                let cell_ref = self
+                    .model
+                    .sheets
+                    .get(self.sheet_idx)
+                    .map(|s| cell_ref_for(s, ed.row, ed.col))
+                    .unwrap_or_default();
+                self.notice = Some(format!("{cell_ref} 未改：{e}"));
+            }
+        }
+    }
+
+    /// 取消编辑（Esc——丢弃缓冲，原值不动）。
+    fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    /// 键位面（编辑态：Enter 提交 / Esc 取消 / Backspace 删尾 / 可打印
+    /// 字符追加；非编辑态：Ctrl+S 保存——菜单路径之外的键位直通车）。
+    /// 编辑器同源口径：`keystroke.key_char` 无 IME 直输（find_bar/buffer
+    /// 同款已知边界）。
+    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        let ctrl = ks.modifiers.control || ks.modifiers.platform;
+        let key = ks.key.to_lowercase();
+        if let Some(ed) = self.editing.as_mut() {
+            match key.as_str() {
+                "enter" => {
+                    self.commit_edit();
+                    cx.notify();
+                }
+                "escape" => {
+                    self.cancel_edit();
+                    cx.notify();
+                }
+                "backspace" => {
+                    ed.buffer.pop();
+                    cx.notify();
+                }
+                _ => {
+                    // 修饰键组合（Ctrl/Cmd/Alt）不进缓冲——快捷键让路。
+                    if ctrl || ks.modifiers.alt {
+                        return;
+                    }
+                    // key_char 为 Option<String>（组合键可为空串）——
+                    // 控制字符不入缓冲，其余逐字符追加。
+                    let text = ks.key_char.as_deref().unwrap_or("");
+                    let mut pushed = false;
+                    for ch in text.chars().filter(|c| !c.is_control()) {
+                        ed.buffer.push(ch);
+                        pushed = true;
+                    }
+                    if pushed {
+                        cx.notify();
+                    }
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // 非编辑态：Ctrl+S 直通保存（网格视图持焦点时编辑器键位面
+        // 不可达——菜单栏「文件 → 保存」走 shell 拦截，两路同收口）。
+        if ctrl && key == "s" {
+            let saved = self.save();
+            if !saved {
+                eprintln!(
+                    "mang-shell: xlsx 保存失败（notice 见网格面板）：{}",
+                    self.notice.clone().unwrap_or_default()
+                );
+            }
+            cx.notify();
+            cx.stop_propagation();
         }
     }
 
@@ -624,18 +998,32 @@ impl XlsxGridView {
             .flex_none()
             .bg(colors.background);
         for c in first..end {
-            let text = sheet
-                .cells
-                .get(r)
-                .and_then(|row| row.get(c))
-                .cloned()
-                .unwrap_or_default();
+            // #389 阶段 2：编辑中的格显示输入缓冲（编辑样式——accent
+            // 双线框 + 活动底色，与选中态视觉可区分）。
+            let editing_here = self
+                .editing
+                .as_ref()
+                .is_some_and(|ed| ed.row == r && ed.col == c);
+            let text = if editing_here {
+                self.editing
+                    .as_ref()
+                    .map(|ed| ed.buffer.clone())
+                    .unwrap_or_default()
+            } else {
+                sheet
+                    .cells
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .cloned()
+                    .unwrap_or_default()
+            };
             let x = self.col_offsets[c] - self.scroll_x;
             let w = self.col_widths[c];
             let is_selected = self.selected == Some((r, c));
             let border = colors.border;
             let accent = colors.element_selected;
             let hover = colors.element_hover;
+            let active_bg = colors.element_active;
             row = row.child(
                 div()
                     .id(SharedString::from(format!("xlsx-grid-cell-{r}-{c}")))
@@ -650,7 +1038,10 @@ impl XlsxGridView {
                     .overflow_hidden()
                     .border_r_1()
                     .border_color(border)
-                    .when(is_selected, move |el| {
+                    .when(editing_here, move |el| {
+                        el.border_1().border_color(accent).bg(active_bg)
+                    })
+                    .when(is_selected && !editing_here, move |el| {
                         el.border_1().border_color(accent).bg(hover)
                     })
                     .child(
@@ -831,6 +1222,8 @@ impl Render for XlsxGridView {
                         },
                     );
                     // 点击命中：局部坐标 → (行, 列) 选中（bounds 内才动作）。
+                    // #389 阶段 2：双击（click_count >= 2）→ 内联编辑；
+                    // 单击在编辑态 → 先提交再选新格（select_at 内收口）。
                     window.on_mouse_event(
                         move |ev: &gpui::MouseDownEvent,
                               phase: DispatchPhase,
@@ -850,19 +1243,84 @@ impl Render for XlsxGridView {
                             }
                             let x = f32::from(ev.position.x - bounds.origin.x);
                             let y = f32::from(ev.position.y - bounds.origin.y);
-                            let _ = ent_click.update(cx, |view, cx| {
-                                view.select_at(x, y, cx);
+                            let double_click = ev.click_count >= 2;
+                            // 点击即落焦（编辑键位面激活——pdf_pages 点击
+                            // 同款纪律；handle 经实体 update 取出后在
+                            // 观察器 window 域落焦，F7 教训同源）。
+                            let focus = ent_click.update(cx, |view, cx| {
+                                let handle = view.focus_handle(cx).clone();
+                                if double_click {
+                                    view.begin_edit_at(x, y, cx);
+                                } else {
+                                    view.select_at(x, y, cx);
+                                }
+                                handle
                             });
+                            if let Ok(handle) = focus {
+                                _w.focus(&handle, cx);
+                            }
                         },
                     );
                 },
             ));
+        // #389 阶段 2：状态条（脏标记 / 编辑会话拒因 / 提交与保存错误
+        // ——非静默纪律：每个失败面都有可见文案）。
+        let dirty_chip = self.dirty.then(|| {
+            div()
+                .id("xlsx-grid-dirty")
+                .flex_none()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .bg(colors.element_hover)
+                .child(
+                    ui::Label::new("● 未保存")
+                        .size(ui::LabelSize::XSmall)
+                        .color(ui::Color::Warning),
+                )
+        });
+        let notice_banner = self.notice.as_ref().map(|msg| {
+            div()
+                .id("xlsx-grid-notice")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .bg(colors.panel_background)
+                .border_t_1()
+                .border_color(colors.border)
+                .child(
+                    ui::Label::new(msg.as_str())
+                        .size(ui::LabelSize::XSmall)
+                        .color(ui::Color::Warning),
+                )
+        });
+        let editor_error_banner = self.editor_error.as_ref().map(|msg| {
+            div()
+                .id("xlsx-grid-editor-error")
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .bg(colors.panel_background)
+                .border_t_1()
+                .border_color(colors.border)
+                .child(
+                    ui::Label::new(format!("编辑不可用（只读浏览）：{msg}"))
+                        .size(ui::LabelSize::XSmall)
+                        .color(ui::Color::Muted),
+                )
+        });
         v_flex()
             .id("xlsx-grid-root")
             .relative()
             .size_full()
             .min_w_0()
             .bg(colors.background)
+            // #389 阶段 2：焦点域（编辑态键位接收——pdf_pages 同款
+            // track_focus 挂根模式）+ 键位分发（编辑/保存）。
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key))
             .child(sheet_tabs)
             .child(col_header)
             .child(
@@ -874,6 +1332,9 @@ impl Render for XlsxGridView {
                     .children(h_scroll),
             )
             .children(truncation_banner)
+            .children(editor_error_banner)
+            .children(notice_banner)
+            .children(dirty_chip)
             .child(overlay)
             .into_any_element()
     }
@@ -886,6 +1347,94 @@ impl Render for XlsxGridView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #389 阶段 2：编辑面（parse/引用/提交/往返） ─────────────
+
+    /// 夹具路径（tests/fixtures/smoke.xlsx——B2=100 数值格、B4=SUM 公式
+    /// 格、A2=「一月」共享串格；xlsx_grid_model.rs 同源夹具）。
+    fn fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.xlsx")
+    }
+
+    #[test]
+    fn parse_cell_input_variants() {
+        // 数值（前后空白容忍；f64 有限值）。
+        assert!(matches!(parse_cell_input("100"), CellEdit::Number(n) if n == 100.0));
+        assert!(matches!(parse_cell_input(" 200.5 "), CellEdit::Number(n) if n == 200.5));
+        assert!(matches!(parse_cell_input("-3"), CellEdit::Number(n) if n == -3.0));
+        // 布尔（大小写不敏感）。
+        assert!(matches!(parse_cell_input("TRUE"), CellEdit::Boolean(true)));
+        assert!(matches!(
+            parse_cell_input("false"),
+            CellEdit::Boolean(false)
+        ));
+        // 文本（原文保留——内边空白不裁剪、无引号转义）。
+        assert!(
+            matches!(parse_cell_input("hello world"), CellEdit::Text(ref t) if t == "hello world")
+        );
+        assert!(matches!(parse_cell_input("  pad  "), CellEdit::Text(ref t) if t == "  pad  "));
+        // 数值不可解析的近形（日期/分数/科学计数法越界）→ 文本。
+        assert!(matches!(parse_cell_input("2026-01-01"), CellEdit::Text(_)));
+        // 空白 → 清格（空 Text——引擎面 validate_text 放行）。
+        assert!(matches!(parse_cell_input("   "), CellEdit::Text(ref t) if t.is_empty()));
+    }
+
+    #[test]
+    fn cell_ref_for_maps_display_coords_to_a1() {
+        let mut sheet = GridSheet::default();
+        sheet.start_row = 0;
+        sheet.start_col = 0;
+        assert_eq!(cell_ref_for(&sheet, 0, 0), "A1");
+        assert_eq!(cell_ref_for(&sheet, 2, 1), "B3");
+        // 数据区不从 A1 起的簿（office-io 包围盒偏移）。
+        sheet.start_row = 3;
+        sheet.start_col = 2;
+        assert_eq!(cell_ref_for(&sheet, 0, 0), "C4");
+        assert_eq!(cell_ref_for(&sheet, 1, 0), "C5");
+    }
+
+    #[test]
+    fn commit_cell_edit_updates_model_and_rejects_formula() {
+        let bytes = std::fs::read(fixture()).expect("夹具读取");
+        let mut editor = XlsxEditor::open(&bytes).expect("编辑会话打开");
+        let mut model = XlsxGridModel::load(&fixture()).expect("网格模型装载");
+
+        // B2（数值格，显示坐标 (1,1)——表头行 0）改文本：落账 + 显示面
+        // 即时更新。
+        commit_cell_edit(&mut editor, &mut model, 0, 1, 1, "三百").expect("B2 值编辑落账");
+        assert_eq!(model.sheets[0].cells[1][1], "三百", "pending 显示面更新");
+
+        // B4（公式格，显示坐标 (3,1)）拒改——引擎面 FormulaCell。
+        let err =
+            commit_cell_edit(&mut editor, &mut model, 0, 3, 1, "999").expect_err("公式格必须拒改");
+        assert!(err.contains("公式"), "拒改文案含公式语义：{err}");
+        // 拒改后显示面不动（原缓存值 300.5 保持）。
+        assert_eq!(model.sheets[0].cells[3][1], "300.5");
+
+        // 保存 → 重开读面：B2 新值在场（真落盘闭环——不是只改内存态）。
+        let saved = editor.save_to_vec().expect("保存序列化");
+        let mut reopened = XlsxEditor::open(&saved).expect("重开会话");
+        let info = reopened.cell_info(0, "B2").expect("B2 在场").expect("非空");
+        assert_eq!(info.text, "三百", "落盘后 B2 = 三百");
+    }
+
+    #[test]
+    fn write_xlsx_atomically_preserves_original_on_failure() {
+        // 正常路径：临时文件 + rename 落位（目标可写）。
+        let dir = std::env::temp_dir().join(format!("mang-xlsx-atom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.xlsx");
+        assert!(write_xlsx_atomically(&target, b"PK\x03\x04bytes").is_ok());
+        assert_eq!(std::fs::read(&target).unwrap(), b"PK\x03\x04bytes");
+        // 临时文件不残留（rename 收干净）。
+        let residue: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("mang-tmp"))
+            .collect();
+        assert!(residue.is_empty(), "无临时文件残留：{residue:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn col_letter_sequence_and_wrap() {
