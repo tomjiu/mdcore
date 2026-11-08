@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 WEB = Path(__file__).resolve().parent.parent
 OUT = WEB / "tests" / "results" / "results_canvas_view.json"
@@ -151,6 +151,7 @@ def main() -> int:
                           "canvas_brush_ai_mirror_sync", "canvas_brush_esc_cancel",
                           "canvas_brush_style_selectors", "canvas_brush_custom_color",
                           "canvas_brush_style_persist",
+                          "canvas_restore_after_clear",
                           "canvas_eraser_two_phase", "canvas_eraser_undo_unit",
                           "canvas_eraser_esc_cancel",
                           "canvas_perf_smoke"]:
@@ -708,9 +709,8 @@ def main() -> int:
                       json.dumps({"custom": custom}, ensure_ascii=False))
 
                 # 14h. 重开后保留（save → restore 用户手势 + 探针 serde
-                # 往返：样式字段逐字段相等。注：不叠 clear——clear 产生
-                # 的删除 tombstone 会经 restore 的 AI 追赶回灌（CRDT
-                # 收敛语义 vs 快照恢复产品语义的既有冲突，另登记不修）。
+                # 往返：样式字段逐字段相等；对照组 = 不叠 clear——叠
+                # clear 的序列由 14h2 覆盖，#451 修复后两路均应成立）。
                 before = page.evaluate(
                     "() => window.__canvasObjects().filter(o => o.kind === 'stroke')"
                     ".map(o => ({ color: o.color, width: o.width, tool: o.tool }))")
@@ -746,6 +746,71 @@ def main() -> int:
                       json.dumps({"rr3": {k: rr3.get(k) for k in ("ok", "code", "message")},
                                   "before": before, "after": after},
                                  ensure_ascii=False))
+
+                # ---- 14h2. #451 快照恢复优先（save → clear → restore：
+                # 修复前 clear 的删除 tombstone 经 AI 追赶差分回灌，恢复
+                # 后 0 objects；修复后双端同快照重建，对象回归且 DOM
+                # 可见——issue 验收判据 1）。 ----
+                r_ra = page.evaluate(
+                    "([x, y, l]) => window.__canvasAddNode(x, y, l)",
+                    [920, 240, "Restore A"])
+                r_rb = page.evaluate(
+                    "([x, y, l]) => window.__canvasAddNode(x, y, l)",
+                    [920, 420, "Restore B"])
+                before451 = page.evaluate("""() => ({
+                    objects: window.__canvasState().objects,
+                    domNodes: document.querySelectorAll('#cv-l-nodes > g.node').length,
+                    domStrokes: document.querySelectorAll('#cv-l-strokes > path.stroke').length,
+                })""")
+                page.click('#canvas-save-btn')
+                page.click('#canvas-clear-btn')
+                page.wait_for_function("""
+                    () => window.__canvasState().objects === 0
+                       && document.querySelectorAll('#cv-l-nodes > g.node').length === 0
+                       && document.querySelectorAll('#cv-l-strokes > path.stroke').length === 0
+                """, timeout=5000)
+                after_clear = page.evaluate("""() => ({
+                    objects: window.__canvasState().objects,
+                    domNodes: document.querySelectorAll('#cv-l-nodes > g.node').length,
+                })""")
+                page.click('#canvas-restore-btn')
+                # #451 回归探针：缺陷态下恢复后 DOM 不回归——超时降级为
+                # check FAIL（带诊断 JSON）而非整场崩溃（TimeoutError 会
+                # 砍掉后续 9 个用例）。
+                try:
+                    page.wait_for_function(
+                        "n => document.querySelectorAll('#cv-l-nodes > g.node').length === n",
+                        arg=before451["domNodes"], timeout=5000)
+                    dom_back = True
+                except PlaywrightTimeoutError:
+                    dom_back = False
+                restored451 = page.evaluate("""() => ({
+                    state: window.__canvasState(),
+                    domNodes: document.querySelectorAll('#cv-l-nodes > g.node').length,
+                    domStrokes: document.querySelectorAll('#cv-l-strokes > path.stroke').length,
+                    labels: window.__canvasObjects().filter(o => o.kind === 'node')
+                              .map(o => (o.props ?? {}).label),
+                    sync: window.__canvasSyncState(),
+                })""")
+                check("canvas_restore_after_clear",
+                      r_ra.get("ok") is True and r_rb.get("ok") is True
+                      and dom_back
+                      # clear 后归零（缺陷场景就位——非空快照 + 真删除）
+                      and after_clear["objects"] == 0 and after_clear["domNodes"] == 0
+                      # 恢复后：对象全回归（含本用例新增两节点）+ DOM 可见
+                      and restored451["state"]["objects"] == before451["objects"]
+                      and restored451["domNodes"] == before451["domNodes"]
+                      and restored451["domStrokes"] == before451["domStrokes"]
+                      and "Restore A" in restored451["labels"]
+                      and "Restore B" in restored451["labels"]
+                      # 新会话：撤销栈重置
+                      and restored451["state"]["undoDepth"] == 0
+                      # 双端收敛（AI 镜像同快照重建——不再持 tombstone）
+                      and restored451["sync"]["converged"] is True
+                      and restored451["sync"]["main"] == restored451["sync"]["ai"],
+                      json.dumps({"before": before451, "after_clear": after_clear,
+                                  "restored": restored451, "dom_back": dom_back,
+                                  "adds": [r_ra, r_rb]}, ensure_ascii=False))
 
                 # ---- 14i-14k. #454 橡皮擦两段式（#44 落地顺序步 4：
                 # 拖过变预览色，松手才删，一次 Ctrl+Z 全恢复）。
