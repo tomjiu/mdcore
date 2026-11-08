@@ -59,6 +59,8 @@
 | ③ | 壳侧无位图渲染 | P2 | mang-shell `pdf_doc.rs` 走文本行模型；web 面有完整 canvas 渲染（`pdf_view.ts` LRU 64MB）——壳侧渲染待 #68 阅读面 |
 | ④ | 书签编辑/命名目标 | P3 | 仅页目标读面（`outline.rs`）；web `buildOutlineJson` 恒空树（`pdf_view.ts:192` 登记） |
 | ⑤ | 加密档解密/权限位模型 | P3 | **P 位读面已落地**（#493：`OpenAssessment.encryption`——仍加密态承载 8 命名位 + 处理器标识；策略遵从=Lead 裁定面不越权）；余：口令输入 UI、解密、读/打印路径遵从 |
+| ④ | 书签编辑/命名目标 | P3 | 读面（`outline.rs`）；**web 大纲树已接**（#463：`pdf.js getOutline` → 树 UI + 点击跳页 + 会话 ctor 实数据注入，e2e `pdf_outline.py` 10 锁）；书签**编辑**/命名目标仍不在 |
+| ⑤ | 加密档解密/权限位模型 | P3 | 曾解密档只读放行写拒（S5 策略）；无口令输入 UI、无 /Encrypt P 位遵从 |
 | ⑥ | 验签/签署 | P3 | 结构验签在（`signature.rs`）；密码学校验（链/时间戳/摘要复算）与签署域不在 v1——pdfi_signature 头注如实登记 |
 | ⑦ | /Info/XMP 元数据 | P3 | **/Info 面板已接**（#472：web `getMetadata` → 属性抽屉 13 字段 + 评估汇总，e2e `pdf_props.py` 8 锁）；XMP 原始面仍不在 |
 | ⑧ | /Name 标准图章图形/动态图章/骑缝章 | P4 | `/Approved` 等标准图形映射不做（`docs/pdf-annotate.md` 边界）；公章内容流盖章已在 |
