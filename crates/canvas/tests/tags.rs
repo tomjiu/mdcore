@@ -317,14 +317,14 @@ fn tag_undo_redo() {
     add_tag(&mut s, "n1", "风险");
     assert_eq!(s.find_object("n1").unwrap().tags, vec!["风险"]);
 
-    assert!(s.undo(Actor::Human), "撤销加 tag");
+    assert!(s.undo(Actor::Human).expect("undo"), "撤销加 tag");
     assert_eq!(
         s.find_object("n1").unwrap().tags,
         Vec::<String>::new(),
         "撤销后标签消失"
     );
 
-    assert!(s.redo(Actor::Human), "重做加 tag");
+    assert!(s.redo(Actor::Human).expect("redo"), "重做加 tag");
     assert_eq!(
         s.find_object("n1").unwrap().tags,
         vec!["风险"],
@@ -333,7 +333,7 @@ fn tag_undo_redo() {
 
     // 删 tag 也可撤销。
     remove_tag(&mut s, "n1", "风险");
-    assert!(s.undo(Actor::Human), "撤销删 tag");
+    assert!(s.undo(Actor::Human).expect("undo"), "撤销删 tag");
     assert_eq!(
         s.find_object("n1").unwrap().tags,
         vec!["风险"],

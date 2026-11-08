@@ -250,7 +250,7 @@ mod bench {
                     let t = Instant::now();
                     c.execute(Actor::Human, CanvasCommand::RemoveObject { id: id.clone() })
                         .unwrap();
-                    let undone = c.undo(Actor::Human);
+                    let undone = c.undo(Actor::Human).expect("undo");
                     samples.push(t.elapsed().as_micros());
                     assert!(undone, "撤销复原");
                     assert!(c.find_object(&id).is_some(), "删除撤销同 ID 回归");

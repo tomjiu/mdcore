@@ -224,6 +224,13 @@ pub enum CanvasError {
         object_id: String,
         op: &'static str,
     },
+    /// #353：三态驾驶闸拒绝（含当前模式与被拒 actor；wasm 码
+    /// `cv_mode_denied`）。两类触发面同一变体：① `User` 模式下 Ai 的
+    /// 一切写入面；② Ai 的非法模式转移（仅 Ai 态可让出——自我提权被拒）。
+    ModeDenied {
+        mode: DriveMode,
+        actor: Actor,
+    },
 }
 
 impl std::fmt::Display for CanvasError {
@@ -253,6 +260,16 @@ impl std::fmt::Display for CanvasError {
             CanvasError::KindMismatch { object_id, op } => {
                 write!(f, "object {object_id} kind does not support {op}")
             }
+            CanvasError::ModeDenied { mode, actor } => {
+                let who = match actor {
+                    Actor::Human => "human",
+                    Actor::Ai => "ai",
+                };
+                write!(
+                    f,
+                    "drive mode `{mode}` denied `{who}` operation (mode gate #353)"
+                )
+            }
         }
     }
 }
@@ -272,6 +289,52 @@ impl Actor {
             Actor::Human => Origin::from("mdc:human"),
             Actor::Ai => Origin::from("mdc:ai"),
         }
+    }
+}
+
+/// #353：三态驾驶闸（kokoa 协议①——AI 能不能改画布的授权面，与
+/// `Actor`（谁在改）正交）。
+///
+/// - `User`：AI 的一切写入面（execute/execute_batch/undo/redo/切模式）
+///   被拒 [`CanvasError::ModeDenied`]——安全默认（宿主显式开启锁定后）。
+/// - `Collaborative`：双方都能改——**会话缺省**（零破坏：现网 AI 路径
+///   消费者/既有测试/wasm 调用方不回归；Lead 裁定点 1，PR 显著标注）。
+/// - `Ai`：AI 绘制中，人可随时夺回（Human 永不被闸拒）。
+///
+/// 模式是**会话本地策略，不入 CRDT**（issue 第 4 点：两端策略由宿主
+/// 各自决定，不产生同步语义）——切换零 CRDT 字节/零事件/零撤销入栈
+/// （Lead 裁定点 2：不做切换事件，读面轮询 [`Self::drive_mode`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DriveMode {
+    User,
+    Collaborative,
+    Ai,
+}
+
+impl DriveMode {
+    /// wire 名（wasm/JSON 面）。
+    pub fn wire(self) -> &'static str {
+        match self {
+            DriveMode::User => "user",
+            DriveMode::Collaborative => "collaborative",
+            DriveMode::Ai => "ai",
+        }
+    }
+
+    /// wire 反解（wasm 命令面）。
+    pub fn from_wire(s: &str) -> Option<DriveMode> {
+        match s {
+            "user" => Some(DriveMode::User),
+            "collaborative" => Some(DriveMode::Collaborative),
+            "ai" => Some(DriveMode::Ai),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DriveMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire())
     }
 }
 
@@ -449,6 +512,13 @@ pub enum CanvasCommand {
         id: String,
         parent: Option<String>,
     },
+    /// #353：三态驾驶闸切换（Human 任意态可切；Ai 仅能从 Ai 态让出
+    /// ——自我提权被拒）。模式不入 CRDT：成功也零字节/零事件/零入栈。
+    /// **不可进 execute_batch**（批语义只覆盖载体变更，会话本地策略在
+    /// 沙箱内静默丢失 = 谎报——入口拒）。
+    SetDriveMode {
+        mode: DriveMode,
+    },
 }
 
 /// 命令回执。
@@ -526,6 +596,10 @@ pub enum CommandOutcome {
     ParentSet {
         id: String,
     },
+    /// #353：驾驶模式已切（幂等同模式也回此回执——零载体字节）。
+    DriveModeSet {
+        mode: DriveMode,
+    },
 }
 
 /// Canvas 会话。
@@ -536,6 +610,9 @@ pub struct CanvasSession {
     options: SessionOptions,
     next_seq: u64,
     undo_cleared_last: bool,
+    /// #353：驾驶模式（会话本地策略，不入 CRDT——两端策略由宿主各自
+    /// 决定，不产生同步语义）。缺省 Collaborative（零破坏裁定点）。
+    drive_mode: DriveMode,
     /// 事件订阅面（集成项③——见 events 模块）。
     pub(crate) hub: EventHub,
     /// 事务字节收集器。
@@ -577,6 +654,7 @@ impl CanvasSession {
             options,
             next_seq: 0,
             undo_cleared_last: false,
+            drive_mode: DriveMode::Collaborative,
             hub: EventHub::default(),
             collector,
             touched,
@@ -672,7 +750,47 @@ impl CanvasSession {
 
     // ── 撤销面 ─────────────────────────────────────────────────────
 
-    pub fn undo(&mut self, actor: Actor) -> bool {
+    /// #353：驾驶闸（读面轮询——会话本地策略，无事件面）。
+    pub fn drive_mode(&self) -> DriveMode {
+        self.drive_mode
+    }
+
+    /// #353：写入面闸——`User` 模式下 Ai 的一切写入面被拒（拒绝路径
+    /// 零 CRDT 字节/零事件/零撤销入栈：入口早退，收集器未 begin）。
+    /// Human 永不被拒（安全默认：人可随时夺回）。
+    fn gate_actor(&self, actor: Actor) -> Result<(), CanvasError> {
+        if matches!(actor, Actor::Ai) && matches!(self.drive_mode, DriveMode::User) {
+            return Err(CanvasError::ModeDenied {
+                mode: self.drive_mode,
+                actor,
+            });
+        }
+        Ok(())
+    }
+
+    /// #353：模式切换（会话方法——与 `set_drive_mode` 命令同语义）。
+    /// Human 可切任意态；Ai 仅能从 Ai 态让出（→ User/Collaborative/
+    /// 幂等 Ai；任何自我提权被拒）。零 CRDT 字节/零事件/零入栈。
+    pub fn set_drive_mode(&mut self, actor: Actor, mode: DriveMode) -> Result<(), CanvasError> {
+        self.gate_actor(actor)?;
+        let transition_ok = match actor {
+            Actor::Human => true,
+            Actor::Ai => matches!(self.drive_mode, DriveMode::Ai),
+        };
+        if !transition_ok {
+            return Err(CanvasError::ModeDenied {
+                mode: self.drive_mode,
+                actor,
+            });
+        }
+        self.drive_mode = mode;
+        Ok(())
+    }
+
+    /// 撤销（按 origin 分栈）。#353：`User` 模式下 Ai 借撤销面改状态
+    /// 同样被拒（`ModeDenied`）；`Ok(false)` = 栈空。
+    pub fn undo(&mut self, actor: Actor) -> Result<bool, CanvasError> {
+        self.gate_actor(actor)?;
         self.collector.begin();
         self.touched.begin();
         let r = match actor {
@@ -689,10 +807,12 @@ impl CanvasSession {
                 touched,
             });
         }
-        r
+        Ok(r)
     }
 
-    pub fn redo(&mut self, actor: Actor) -> bool {
+    /// 重做（#353 同拒语义）。
+    pub fn redo(&mut self, actor: Actor) -> Result<bool, CanvasError> {
+        self.gate_actor(actor)?;
         self.collector.begin();
         self.touched.begin();
         let r = match actor {
@@ -708,7 +828,7 @@ impl CanvasSession {
                 touched,
             });
         }
-        r
+        Ok(r)
     }
 
     // ── 事件面（集成项③）────────────────────────────────
@@ -927,6 +1047,8 @@ impl CanvasSession {
         actor: Actor,
         cmd: CanvasCommand,
     ) -> Result<CommandReceipt, CanvasError> {
+        // #353：驾驶闸在收集器 begin 之前——拒绝路径零字节/零事件/零入栈。
+        self.gate_actor(actor)?;
         self.collector.begin();
         self.touched.begin();
         let result = self.execute_inner(actor, cmd);
@@ -1050,6 +1172,13 @@ impl CanvasSession {
                 self.set_parent(actor, &id, parent)?;
                 CommandOutcome::ParentSet { id }
             }
+            // #353：模式切换命令（门已过 gate_actor；此处只裁转移
+            // 合法性——Human 任意态 / Ai 仅让出）。零载体字节：事件
+            // 面零派发（updates 空）、撤销栈零入栈。
+            CanvasCommand::SetDriveMode { mode } => {
+                self.set_drive_mode(actor, mode)?;
+                CommandOutcome::DriveModeSet { mode }
+            }
         };
         Ok(CommandReceipt {
             outcome,
@@ -1099,9 +1228,21 @@ impl CanvasSession {
         actor: Actor,
         cmds: Vec<CanvasCommand>,
     ) -> Result<BatchReceipt, CanvasError> {
+        // #353：驾驶闸在沙箱副本之前——拒绝路径零状态拷贝/零字节/零事件。
+        self.gate_actor(actor)?;
         if cmds.is_empty() {
             return Err(CanvasError::InvalidInput(
                 "空批不可执行（无意义的撤销单元）".into(),
+            ));
+        }
+        // #353：会话本地策略不入 CRDT——在沙箱内“成功”也不会出现在差量里
+        // （真实会话模式不变 = 回执谎报）。批入口显式拒绝，零静默丢弃面。
+        if cmds
+            .iter()
+            .any(|c| matches!(c, CanvasCommand::SetDriveMode { .. }))
+        {
+            return Err(CanvasError::InvalidInput(
+                "set_drive_mode 不能进批：会话本地策略非载体变更（批语义只覆盖 CRDT 字节）".into(),
             ));
         }
         // 批前基线：全量状态（沙箱种子）+ 真实 SV（差量基准）。

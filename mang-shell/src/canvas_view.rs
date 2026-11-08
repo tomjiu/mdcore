@@ -220,7 +220,12 @@ impl CanvasView {
 
     #[allow(dead_code)]
     pub fn undo(&mut self) -> bool {
-        let done = self.session.undo(Actor::Human);
+        // #353：Human 永不被驾驶闸拒（安全默认）——ModeDenied 对本面
+        // 不可达，expect 带证明性消息。
+        let done = self
+            .session
+            .undo(Actor::Human)
+            .expect("human actor never mode-denied (#353)");
         if done {
             self.regenerate();
         }
@@ -229,7 +234,10 @@ impl CanvasView {
 
     #[allow(dead_code)]
     pub fn redo(&mut self) -> bool {
-        let done = self.session.redo(Actor::Human);
+        let done = self
+            .session
+            .redo(Actor::Human)
+            .expect("human actor never mode-denied (#353)");
         if done {
             self.regenerate();
         }
