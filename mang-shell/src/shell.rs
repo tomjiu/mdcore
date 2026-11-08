@@ -44,6 +44,7 @@ use crate::file_tree::FileTree;
 use crate::git_panel::GitPanel;
 use crate::menu_bar;
 use crate::menu_bar_view;
+use crate::outline_panel::OutlinePanel;
 // #217：键位表（shell 键钩子的单一事实源——默认表 = 原分支精确镜像）。
 use crate::keymap::{self, ShellAction};
 use crate::panels;
@@ -141,6 +142,9 @@ pub struct ShellApp {
     workspace: Option<Entity<FileTree>>,
     /// F7：git 面板（工作区打开即建——非 git 目录走面板内提示态）。
     git_panel: Option<Entity<GitPanel>>,
+    /// #571：大纲面板实体（批 7——激活标签的键盘导航结构树；
+    /// 换绑判据见 [`Self::sync_outline`]）。
+    outline: Option<Entity<OutlinePanel>>,
     /// F7：左栏视图（文件树 / git——图标条切换）。
     git_view: bool,
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
@@ -398,6 +402,7 @@ impl ShellApp {
             active: 0,
             workspace,
             git_panel: None,
+            outline: None,
             git_view: false,
             settings_open: false,
             pdf_pages: None,
@@ -440,6 +445,8 @@ impl ShellApp {
         }
         // F6：记忆字号应用到启动标签。
         this.apply_font_size(px(this.font_size), cx);
+        // #571：启动标签的大纲面板落位。
+        this.sync_outline(cx);
         this
     }
 
@@ -604,6 +611,35 @@ impl ShellApp {
     }
 
     /// F7：git 面板实体（烟雾钩子/内部访问）。
+    /// #571：大纲面板换绑——激活编辑器变更时重建（同步行集 + 句柄
+    /// 差量在实体内部）；同编辑器（含光标/编辑中）复用既有实体（焦点
+    /// 身份稳定）。#289-④ pdf 页滚经 ActivateHook 注入（实体在 lib 树
+    /// 不引 shell——依赖倒置）。
+    fn sync_outline(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor().cloned() else {
+            self.outline = None;
+            return;
+        };
+        let stale = match &self.outline {
+            Some(panel) => panel.read(cx).editor() != &editor,
+            None => true,
+        };
+        if stale {
+            let shell = cx.entity().downgrade();
+            let ed = editor.clone();
+            // #289-④：pdf 页面视图下激活行随页滚动（书签链同款）。
+            let hook = move |line: usize, window: &mut Window, cx: &mut App| {
+                if let Some(page) = ed.read(cx).pdf_page_for_line(line) {
+                    if let Some(shell) = shell.upgrade() {
+                        let _ = shell.update(cx, |shell, cx| shell.scroll_pdf_to_page(page, cx));
+                    }
+                }
+            };
+            self.outline =
+                Some(cx.new(|cx| OutlinePanel::new(editor, Some(std::sync::Arc::new(hook)), cx)));
+        }
+    }
+
     pub fn git_panel(&self) -> Option<Entity<GitPanel>> {
         self.git_panel.clone()
     }
@@ -715,6 +751,8 @@ impl ShellApp {
         let focus = editor.read(cx).focus_handle().clone();
         self.tabs.push(TabItem { path, editor });
         self.active = self.tabs.len() - 1;
+        // #571：激活编辑器变更 → 大纲面板换绑。
+        self.sync_outline(cx);
         eprintln!("git-view: {title}（tabs: {} 开）", self.tabs.len());
         cx.notify();
         Some(focus)
@@ -1453,6 +1491,8 @@ impl ShellApp {
                     editor,
                 });
                 self.active = self.tabs.len() - 1;
+                // #571：激活编辑器变更 → 大纲面板换绑。
+                self.sync_outline(cx);
                 self.notice_board.clear();
                 self.recent.record_file(&path);
                 eprintln!(
@@ -1505,6 +1545,8 @@ impl ShellApp {
     fn activate_tab_focus(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<FocusHandle> {
         let tab = self.tabs.get(idx)?.clone();
         self.active = idx;
+        // #571：激活编辑器变更 → 大纲面板换绑。
+        self.sync_outline(cx);
         // #289-④：pdf 标签 → 页视图随标签落位（同路径复用，异路径重建）。
         self.ensure_pdf_pages(cx);
         // #389 阶段 1：xlsx 标签 → 网格视图随标签落位（同路径复用，异路径重建）。
@@ -1576,6 +1618,8 @@ impl ShellApp {
         } else {
             self.active
         };
+        // #571：关签后激活面可能变更 → 大纲面板换绑（同编辑器复用）。
+        self.sync_outline(cx);
         eprintln!(
             "tabs: close → {} 开（active {}）",
             self.tabs.len(),
@@ -2651,8 +2695,9 @@ impl Render for ShellApp {
                             self.git_view,
                             // G4：可拖拽宽度（域钳制 + settings 持久化）
                             self.left_width,
-                            // #289-④：书签点击在 pdf 页面视图下随页滚动。
-                            Some(cx.entity().downgrade()),
+                            // #571：大纲面板实体（键盘导航 + #289-④
+                            // 页滚钩子在实体构造时注入）。
+                            self.outline.as_ref(),
                             cx,
                         ))
                         // G4：左栏右缘 4px 拖拽热区

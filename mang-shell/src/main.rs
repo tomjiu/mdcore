@@ -71,6 +71,7 @@ mod document;
 mod editor;
 mod file_tree;
 mod git_panel;
+mod outline_panel;
 mod panels;
 mod recent;
 // doc_events：文档变更事件总线（#111 订阅模式）——editor 的编辑收尾

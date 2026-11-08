@@ -116,10 +116,16 @@
                      标题 trigger 自绘保留（按钮族语系）；←→ 切顶部菜单降级为组件
                      语义（← 关/→ 进子菜单），PR 描述已登记
 批 5：panels/file_tree/git_panel → ui::List 族（虚拟化/多选桥接）
-                     ✅ 批 5a 已交付（PR #482 在审）：panels.rs 行渲染迁
+                     ✅ 批 5a 已交付（PR #482 已合）：panels.rs 行渲染迁
                      List/ListHeader/ListItem（hover/选中/缩进语义统一）；
                      键盘导航（Navigable）坦白未接——panels 无状态渲染架构
                      需先立焦点/选中状态面，挂后续批次。
+                     ✅ 批 7 已交付（#571，feat/571-outline-keyboard-nav）：
+                     键盘导航挂账兑现——heading_tree 内联渲染退役，迁
+                     OutlinePanel 实体（行焦点句柄按行号差量复用）+
+                     ui::Navigable 接线（↑↓ 焦点行移动 / Enter 激活 =
+                     跳行 + #289-④ 页滚 / Esc 焦点还编辑区）；md 大纲
+                     补齐（md_outline 首次入面板——主格式此前无结构树）。
                      ✅ 批 5b 已合并（PR #498）：file_tree 行渲染迁 ListItem
                      （indent_level×14px 深度缩进 + start_slot 折叠箭头 +
                      on_click/on_secondary_mouse_down 左右键 + toggle_state
