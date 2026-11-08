@@ -308,3 +308,182 @@ fn no_index_exit_one_still_returns_stdout() {
         "stdout 完整返回"
     );
 }
+
+#[test]
+fn status_path_roundtrip_unicode_space() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = repo_with_head("status-path", "seed.txt", "seed\n");
+    let name = "带 空格 名.txt";
+    std::fs::write(dir.join(name), "literal-path\n").unwrap();
+    sh(&dir, &["config", "core.quotepath", "true"]);
+    let changes = mang_shell::git_repo::git_status(&dir).unwrap();
+    let change = changes.iter().find(|c| c.code == "??").unwrap();
+    assert_eq!(
+        change.path, name,
+        "actual Git status path is operational, not C-quoted display text"
+    );
+    let diff = git_diff(&dir, &change.path).expect("actual panel path yields diff");
+    assert!(diff.contains("+literal-path"));
+}
+
+#[test]
+fn leading_dash_untracked_status_path_yields_diff() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = repo_with_head("leading", "seed.txt", "seed\n");
+    let name = "-lead.txt";
+    std::fs::write(dir.join(name), "leading-dash\n").unwrap();
+    let changes = mang_shell::git_repo::git_status(&dir).unwrap();
+    let change = changes.iter().find(|c| c.path == name).unwrap();
+    let diff = git_diff(&dir, &change.path).expect("leading '-' path is not an option");
+    assert!(diff.contains("+leading-dash"));
+}
+
+#[test]
+fn renamed_status_path_is_destination_and_diff_keeps_rename() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = repo_with_head("rename-z", "old.txt", "one\ntwo\nthree\nfour\n");
+    let name = "重命名 文件.txt";
+    sh(&dir, &["mv", "--", "old.txt", name]);
+    let changes = mang_shell::git_repo::git_status(&dir).unwrap();
+    let change = changes.iter().find(|c| c.code.contains('R')).unwrap();
+    assert_eq!(
+        change.path, name,
+        "rename destination, not 'old -> new' display text"
+    );
+    assert_eq!(changes.len(), 1, "source NUL record is not a second change");
+    let diff = git_diff(&dir, &change.path).expect("renamed path remains readable");
+    assert!(diff.contains("rename from") && diff.contains("rename to"));
+}
+
+#[test]
+fn copy_status_source_record_is_not_a_change() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let content = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n";
+    let dir = repo_with_head("copy-z", "source.txt", content);
+    let name = "复制 文件.txt";
+    std::fs::write(dir.join(name), content).unwrap();
+    std::fs::write(dir.join("source.txt"), format!("changed\n{content}")).unwrap();
+    sh(&dir, &["config", "status.renames", "copies"]);
+    sh(&dir, &["add", "--", "source.txt", name]);
+    let changes = mang_shell::git_repo::git_status(&dir).unwrap();
+    let copied = changes
+        .iter()
+        .find(|c| c.code.contains('C'))
+        .expect("real Git reports copy");
+    assert_eq!(copied.path, name);
+    assert_eq!(
+        changes.len(),
+        2,
+        "one source modification and one copy, no extra source record"
+    );
+    let diff = git_diff(&dir, &copied.path).unwrap();
+    assert!(diff.contains("+one"));
+    assert!(
+        !diff.contains("+changed"),
+        "copy diff must not include the source's independent modification"
+    );
+}
+
+#[test]
+fn no_head_sha256_uses_repository_empty_tree() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("mdc-588-sha256-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    sh(&dir, &["init", "-q", "--object-format=sha256"]);
+    std::fs::write(dir.join("initial.txt"), "initial-sha256\n").unwrap();
+    sh(&dir, &["add", "--", "initial.txt"]);
+    let diff =
+        git_diff(&dir, "initial.txt").expect("unborn SHA256 repo must not use SHA1 empty tree");
+    assert!(diff.contains("+initial-sha256"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_path_roundtrip_quotes_and_newline() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = repo_with_head("quoted-newline", "seed.txt", "seed\n");
+    let name = "引号\"和\n换行.txt";
+    std::fs::write(dir.join(name), "special-literal\n").unwrap();
+    let changes = mang_shell::git_repo::git_status(&dir).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].path, name);
+    assert!(
+        git_diff(&dir, &changes[0].path)
+            .unwrap()
+            .contains("+special-literal")
+    );
+}
+
+#[test]
+fn literal_filename_does_not_match_sibling_glob() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = repo("literal-pathspec");
+    std::fs::write(dir.join("r[1].txt"), "literal\n").unwrap();
+    std::fs::write(dir.join("r1.txt"), "sibling\n").unwrap();
+    sh(&dir, &["add", "--all"]);
+    sh(&dir, &["commit", "-q", "-m", "literal fixture"]);
+    std::fs::write(dir.join("r1.txt"), "sibling\nchanged\n").unwrap();
+    let diff = git_diff(&dir, "r[1].txt").expect("exact tracked filename has a result");
+    assert!(
+        diff.is_empty(),
+        "unchanged literal r[1].txt must not pick r1.txt changes: {diff}"
+    );
+    assert!(git_diff(&dir, "r1.txt").unwrap().contains("+changed"));
+}
+
+#[test]
+fn no_index_execution_failure_returns_none() {
+    if !git_present() {
+        eprintln!("SKIP: git unavailable");
+        return;
+    }
+    let dir = repo_with_head("no-index-failure", "seed.txt", "seed\n");
+    std::fs::write(dir.join("new.txt"), "new-content\n").unwrap();
+    sh(
+        &dir,
+        &["config", "diff.external", "mdcore-nonexistent-diff-tool"],
+    );
+    let direct = Command::new("git")
+        .args([
+            "-C",
+            dir.to_str().unwrap(),
+            "diff",
+            "--no-index",
+            "--",
+            "/dev/null",
+            "new.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !matches!(direct.status.code(), Some(0 | 1)),
+        "real external diff fails to execute"
+    );
+    assert_eq!(
+        git_diff(&dir, "new.txt"),
+        None,
+        "execution failure must not appear as empty success"
+    );
+}
