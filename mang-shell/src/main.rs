@@ -302,6 +302,25 @@ fn main() {
             theme::init(theme::LoadThemes::JustBase, cx);
             theme::set_theme_settings_provider(Box::new(settings::ShellThemeSettings), cx);
 
+            // #385 批 4：ui::ContextMenu 族的键盘导航激活面——组件的
+            // on_action（menu::Cancel/SelectNext/Confirm…）依赖宿主 app
+            // 注册 KeyBinding（zed 原版在其闭包外主程序注册——闭包内
+            // ui/menu crates 零自带绑定；不注册则焦点在菜单时 ↑↓/Enter
+            // 全部无效且冒泡泄漏进编辑器命令处理）。key context = 组件
+            // 渲染根的 "menu"（context_menu.rs:357）。批 1（#464）右键
+            // 菜单同受益——本注册点是全局单点（先合并者加，后者 rebase
+            // 即得；review 评论 6717358271 实证链）。
+            cx.bind_keys([
+                gpui::KeyBinding::new("escape", menu::Cancel, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("up", menu::SelectPrevious, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+                gpui::KeyBinding::new("right", menu::SelectChild, Some("menu")),
+                gpui::KeyBinding::new("left", menu::SelectParent, Some("menu")),
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("end", menu::SelectLast, Some("menu")),
+            ]);
+
             // 文档分派：首个非 flag 参数为文件路径（#68 阶段 1.1；跳过
             // 各 flag 的值参数，避免误判为文件）。F1 起与 Ctrl+O 运行时
             // 打开共用 document::open_editor 通道（同一分派语义）。
