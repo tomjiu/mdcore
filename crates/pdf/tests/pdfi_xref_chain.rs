@@ -265,21 +265,26 @@ fn writer_rejects_offset_corrected_input() {
     }
 
     // 门面同款（PdfAnnotator::open 内部即 from_bytes——单一咽喉点）。
-    let err2 = PdfAnnotator::open(miswritten.clone())
-        .expect_err("PdfAnnotator::open 必须拒绝偏移修正档");
+    let err2 =
+        PdfAnnotator::open(miswritten.clone()).expect_err("PdfAnnotator::open 必须拒绝偏移修正档");
     match err2 {
         CommandError::Engine(msg) => {
-            assert!(msg.contains("OffsetCorrected"), "门面拒绝理由应名档位：{msg}")
+            assert!(
+                msg.contains("OffsetCorrected"),
+                "门面拒绝理由应名档位：{msg}"
+            )
         }
         other => panic!("应为 Engine 错误，得 {other:?}"),
     }
 
     // 匿名化面同款（三写面同一纪律——共享判定单点）。
-    let err3 = anonymize_pdf_info(&miswritten)
-        .expect_err("anonymize_pdf_info 必须拒绝偏移修正档");
+    let err3 = anonymize_pdf_info(&miswritten).expect_err("anonymize_pdf_info 必须拒绝偏移修正档");
     match err3 {
         CommandError::Engine(msg) => {
-            assert!(msg.contains("OffsetCorrected"), "匿名化拒绝理由应名档位：{msg}")
+            assert!(
+                msg.contains("OffsetCorrected"),
+                "匿名化拒绝理由应名档位：{msg}"
+            )
         }
         other => panic!("应为 Engine 错误，得 {other:?}"),
     }
