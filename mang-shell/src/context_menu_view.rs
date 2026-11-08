@@ -1,10 +1,12 @@
-//! 右键菜单渲染层（#385 批 1：手写浮层 → `ui::ContextMenu` 组件）。
+//! 右键菜单渲染层（#385 批 1：手写浮层 → `ui::ContextMenu` 组件；
+//! 批 1×4 收口：几何层已退役）。
 //!
 //! # 分层（迁移后）
 //!
 //! - 数据/预置菜单在 [`crate::context_menu`]（零 gpui 依赖，lib/bin 共用
-//!   ——不变）；几何 `place_menu` 一族仍在彼处供 `menu_bar_view` 消费
-//!  （批 4 迁移时一并退役）。
+//!   ——不变）；自研几何（`place_menu`/`menu_size`/`estimate_width` 一族
+//!   + Point/Rect）已随批 4 迁完整体退役——摆放全部交 gpui
+//!   `anchored` 按实际渲染尺寸处理。
 //! - 本模块只做两件桥接：
 //!   ① [`build_context_menu`]——`MenuItem` 数据 → `ui::ContextMenu`
 //!     实体（键盘导航 / 焦点 / ARIA / dismiss 全部由组件自带）；
