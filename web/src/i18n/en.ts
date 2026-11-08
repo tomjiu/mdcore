@@ -239,7 +239,6 @@ export const en = {
   'pdf.propsWarnings': 'warnings',
   'pdf.propsYes': 'yes',
   'pdf.propsNo': 'no',
-||||||| eadb47e
   // #463（长尾④）：大纲面（pdf.js getOutline → 树 + 点击跳页）
   'pdf.outline': 'outline',
   'pdf.outlineTitle': 'Document outline (bookmarks) panel',

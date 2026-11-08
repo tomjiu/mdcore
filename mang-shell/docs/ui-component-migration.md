@@ -82,7 +82,7 @@
 | # | mang-shell 现状（行数） | zed ui 对应 | 难度 | 优先级 | 批次建议 | 备注 |
 |---|---|---|---|---|---|---|
 | 1 | `title_bar.rs`（123）窗口控制 | **已迁移**（`ui::IconButton` 在用——#289 已做） | — | — | — | 剩余：菜单钮位视觉打磨 |
-| 2 | 各面板按钮（panels/git_panel/settings_panel/pdf 工具条的 `div().on_click`） | **维持自绘**（见结论 2：视觉语系一致性 + 精确几何控制；IconButton 无固定尺寸 API） | — | — | 不迁 | 零件级 ui::Tooltip 已在用；后续若 Lead 弃 36×36 规格再评估 |
+| 2 | 各面板按钮（panels/git_panel/settings_panel/pdf 工具条的 `div().on_click`） | **维持自绘**（见结论 2：视觉语系一致性 + 精确几何控制；IconButton 无固定尺寸 API） | — | — | 不迁 | 零件级 ui::Tooltip 已在用；~~后续若 Lead 弃 36×36 规格再评估~~ **#525 裁定（2026-11-08）：36×36 不需弃——适配层成立**（`src/button_ext.rs` IconButton 渲染拦截路径：width 走 FixedWidth + render() 返回公开 ButtonLike 补 height——无头实测精确 36×36 全盒命中，外层容器方案死区证伪）；替换批次待 Lead 排期 |
 | 3 | `activity_bar.rs`（139）视图切换钮 | **维持自绘**（模块文档在案：IconButton rem 推导无法钉 36×36 Lead 硬规格） | — | — | 不迁 | 自绘单元同时掌控 hover/selected 主题色 |
 | 4 | `right_dock.rs`（52 恒在 dock 条） | **维持自绘**（复用 bar_button 单元——左右两条同语系） | — | — | 不迁 | 同上 |
 | 5 | `tab_bar.rs`（218 手写 tab） | `ui::TabBar` + `ui::Tab` | 中 | P1 | **批 2** | 溢出横滚已用 gpui 原生；Tab 组件带关闭钮/激活态语义 |
@@ -108,6 +108,14 @@
 ```
 批 1（真去重样板）：context_menu → ui::ContextMenu（自研 Point/Rect/height_units
                      几何退役——443+146 行与 ui 组件职责重叠的真去重面）
+                     ✅ 批 1×4 收口已交付：几何层整体退役（place_menu/
+                     place_submenu/menu_size/estimate_width/height_units +
+                     Point/Rect 自研结构——批 4 后仅剩测试自引用的死代码，
+                     PR #519 预登记的合并后收口）；`MenuOpener`/open_* 签名
+                     换 `gpui::Point<Pixels>` 直传（event.position 原样，
+                     消 f32 往返）；补 context_menu 生命周期交互测试
+                     （TestAppContext 无头面——阶段 3 质量门 1 同款，
+                     menu_bar_lifecycle_tests 模式）。
 批 2：tab_bar → ui::TabBar/Tab
 批 3：settings_panel 外壳 → ui::Modal；palette → Popover 组合
 批 4：menu_bar → DropdownMenu/PopoverMenu 组合（键盘导航重构——最重）
@@ -181,6 +189,17 @@ find_bar（1218 行手写输入面）/ settings 数字输入 / xlsx 批注评语
 1. **交互测试门**：每批迁移必须带「点击 → 状态变化」级测试（非仅
    函数返回值断言）——GPUI 无头面可测状态桥（`TestAppContext` 已在
    editor/mod.rs 用例在案），真机手势待开发机；
+   落地登记：
+   - menu_bar（批 4 交付时带）：`menu_bar_lifecycle_tests`——开/切换/
+     关/可重开 + Cancel → DismissEvent → 清态链；
+   - context_menu（批 1×4 收口带）：`context_menu_lifecycle_tests`——
+     四态开合 + 切换重建 + Cancel 链 + 执行动作不悬挂；
+   - palette/goto-box（阶段 3 批 2）：`palette_goto_interaction_tests`
+     ——Ctrl+Shift+P/Ctrl+G 真实键位入口 + 键入过滤 + ↑↓ 选中 +
+     Enter 执行闭环（OpenFind → 查找条开 + #183 A-3 最近使用记账
+     置顶）+ goto 跳转/clamp/非法不跳不关/Esc；
+   - tab 族：`tab_workflow_tests`（#219 在案，5 例状态桥——先于
+     迁移存在，批 2 迁移后回归通过）；
 2. **截图回归门**：`ui_snapshot.rs`（迁移前基线截图进仓 + 对比）——
    沙箱无 GUI，登记为真机/CI 侧任务；
 3. **SHELL_ICON_SET 门**（已在案）与组件迁移并行不悖。

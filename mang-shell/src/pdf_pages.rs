@@ -124,6 +124,7 @@ use mdc_pdf::table::PositionedChar;
 use mdc_pdf::worker::{RenderWorker, WorkerReply};
 use mdc_pdf::writer::IncrementalSave;
 use smallvec::SmallVec;
+use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::canvas_view::WHEEL_LINE_PX;
@@ -1862,7 +1863,9 @@ impl PdfPagesView {
                         .text_color(colors.text_muted)
                         .child(label),
                 )
-                // 前一命中（Shift+Enter 同源）。
+                // 前一命中（Shift+Enter 同源）。#565：批 6 登记遗留件
+                // 补齐（#445 冲突区已解除）——icon-only 钮 tooltip
+                // 统一化（editor find-close 同款）。零行为改动。
                 .child(
                     div()
                         .id("pdf-search-prev")
@@ -1872,10 +1875,11 @@ impl PdfPagesView {
                         .line_height(px(16.))
                         .text_color(colors.text_muted)
                         .hover(|el| el.bg(colors.element_hover))
+                        .tooltip(Tooltip::text("上一处（Shift+Enter）"))
                         .child("↑")
                         .on_click(cx.listener(|this, _, _, cx| this.jump_search(false, cx))),
                 )
-                // 下一命中（Enter / Ctrl+G 同源）。
+                // 下一命中（Enter / Ctrl+G 同源）。#565：tooltip 补齐同上。
                 .child(
                     div()
                         .id("pdf-search-next")
@@ -1885,10 +1889,11 @@ impl PdfPagesView {
                         .line_height(px(16.))
                         .text_color(colors.text_muted)
                         .hover(|el| el.bg(colors.element_hover))
+                        .tooltip(Tooltip::text("下一处（Enter / Ctrl+G）"))
                         .child("↓")
                         .on_click(cx.listener(|this, _, _, cx| this.jump_search(true, cx))),
                 )
-                // 关闭（Esc 同源——层索引随之丢弃）。
+                // 关闭（Esc 同源——层索引随之丢弃）。#565：tooltip 补齐同上。
                 .child(
                     div()
                         .id("pdf-search-close")
@@ -1898,6 +1903,7 @@ impl PdfPagesView {
                         .line_height(px(16.))
                         .text_color(colors.text_muted)
                         .hover(|el| el.bg(colors.element_hover))
+                        .tooltip(Tooltip::text("关闭搜索（Esc）"))
                         .child("×")
                         .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx))),
                 )

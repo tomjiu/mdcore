@@ -89,8 +89,6 @@ use crate::canvas_view::{CanvasView, PAN_KEY_PX, PAN_PAGE_PX, WHEEL_LINE_PX};
 // 本接线接活）。RecentRing 会话态随 Editor 存续，不落盘。
 use crate::command_groups::RecentRing;
 use crate::palette_view;
-// #179（#188 接线）：编辑器区右键菜单——坐标类型 + 上抛回调。
-use crate::context_menu;
 // #217：键位表（编辑器键派发的单一事实源——默认表 = 原两处匹配臂的
 // 精确镜像；纯逻辑层，行为零变化红线）。
 use crate::keymap::{self, EditorAction, KeyQuery};
@@ -478,7 +476,7 @@ pub struct Editor {
 /// 在编辑器的右键 listener 里同步调用，菜单实体构建在 shell 上
 /// （ed-* 动作派发回 shell）。#385 批 1 起 shell 侧用 `ui::ContextMenu`
 /// 组件构建菜单，需要 Window（组件内部要订阅焦点/blur）。
-pub type MenuOpener = Box<dyn Fn(context_menu::Point, bool, bool, &mut Window, &mut App) + 'static>;
+pub type MenuOpener = Box<dyn Fn(gpui::Point<Pixels>, bool, bool, &mut Window, &mut App) + 'static>;
 
 /// #178：锁定行拒改提示（状态栏消费）。
 ///
@@ -3352,7 +3350,9 @@ impl Editor {
             .selection()
             .is_some_and(|sel| sel.start < sel.end);
         let read_only = self.read_only;
-        let pos = context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+        // 点击位直传（gpui::Point<Pixels>——#385 批 1×4 收口后不再经
+        // 自研 f32 Point 往返）。
+        let pos = event.position;
         // 无宿主（单测/独立构造）只移光标不弹菜单；有宿主经回调上抛
         //（闭包里是 shell.open_editor_context_menu——菜单状态与
         // ed-* 动作派发面都在 shell）。
@@ -5891,5 +5891,244 @@ mod save_outcome_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #385 阶段 3 批 2：命令面板 / 跳行框交互测试（TestAppContext 无头面——
+// 对照表 §六 质量门 1「输入 → 状态变化」级）。两面板此前只有纯逻辑
+// 单测（goto_parse 一族 / commands::search 一族），状态桥与键盘链
+// 零运行时覆盖——本模块经真实 `dispatch_key` 入口驱动（与焦点路径
+// 到达的同一分发体，#217 keymap 解析 + 面板拦截序全链）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod palette_goto_interaction_tests {
+    use super::*;
+
+    /// 测试宿主（EditorHost 同款——模块间不共享私有设施，各 10 行）。
+    struct PalHost {
+        _ed: gpui::Entity<Editor>,
+    }
+
+    impl gpui::Render for PalHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// md 编辑器 + 宿主窗口（面板键处理需要真实 `Window`）。
+    fn pal_window(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+    ) -> (gpui::Entity<Editor>, gpui::WindowHandle<PalHost>) {
+        let ed =
+            cx.update(|cx| cx.new(|cx| Editor::new(Some("pal.md".into()), text.to_string(), cx)));
+        let ed_for_host = ed.clone();
+        let window = cx.add_window(move |_window, _cx| PalHost {
+            _ed: ed_for_host.clone(),
+        });
+        (ed, window)
+    }
+
+    /// 无修饰键事件（`key_char` = 可打印字符入查询框；None = 控制键）。
+    fn key(key: &str, key_char: Option<&str>) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: key.into(),
+                key_char: key_char.map(str::to_string),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// Ctrl 组合键事件。
+    fn ctrl(key: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// 经真实分发入口派一个键（dispatch_key = 焦点路径到达的同一分发体）。
+    fn press(ed: &gpui::Entity<Editor>, window: &mut Window, cx: &mut App, event: KeyDownEvent) {
+        ed.update(cx, |ed, cx| ed.dispatch_key(&event, window, cx));
+    }
+
+    /// 开合 + 键入过滤 + ↑↓ 选中移动 + Esc 关闭 + 重开换新（状态桥四段）。
+    #[gpui::test]
+    fn palette_open_type_navigate_esc_lifecycle(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("Ctrl+Shift+P 开面板");
+            assert_eq!(pal.query, "", "初开查询为空");
+            assert_eq!(pal.selected, 0, "选中复位 0");
+            assert_eq!(
+                pal.items.len(),
+                commands::search("").len(),
+                "空查询 = 全命令集（与 commands::search 同源）"
+            );
+        });
+        // 键入「折叠」两字——过滤到折叠族 + 选中复位。
+        let _ = window.update(cx, |_host, window, cx| {
+            for ch in ["折", "叠"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("面板保持开");
+            assert_eq!(pal.query, "折叠", "可打印字符入查询");
+            assert_eq!(pal.selected, 0, "键入后选中复位 0");
+            assert_eq!(
+                pal.items.len(),
+                commands::search("折叠").len(),
+                "查询过滤 = commands::search 同源"
+            );
+            assert!(!pal.items.is_empty(), "折叠族命令在场（前置——防空集假绿）");
+        });
+        // ↑↓：down ×2 → up（min 夹紧语义）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("down", None));
+            press(&ed, window, cx, key("down", None));
+            press(&ed, window, cx, key("up", None));
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("面板保持开");
+            assert_eq!(pal.selected, 1, "↓↓↑ = 选中 1（0 基扁平序）");
+        });
+        // Esc 关闭 → 重开换新（残留查询不带入）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| assert!(ed.palette.is_none(), "Esc 关面板"));
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("重开面板");
+            assert_eq!(pal.query, "", "重开 = 换新（不携带上次查询）");
+            assert_eq!(pal.selected, 0, "重开选中复位");
+        });
+    }
+
+    /// Enter 执行命令闭环：键入唯一命中「查找」→ Enter → 面板关 +
+    /// 查找条开 + 最近使用记账（#183 A-3——下次打开面板顶部可见）。
+    #[gpui::test]
+    fn palette_enter_executes_and_touches_recent(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        ed.update(cx, |ed, _| {
+            assert!(ed.find.is_none(), "前置：查找条未开");
+            assert!(!ed.palette_recent.contains(Cmd::OpenFind), "前置：无记账");
+        });
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+            for ch in ["查", "找"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("面板开");
+            // 「查找」在命令标题中唯一命中 OpenFind（替换条无此子序列）。
+            assert_eq!(
+                pal.items,
+                vec![Cmd::OpenFind],
+                "「查找」唯一命中 OpenFind（选中 0 即目标）"
+            );
+        });
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("enter", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "Enter 执行后面板关（选完即关）");
+            assert!(ed.find.is_some(), "OpenFind 执行 → 查找条开（状态变化）");
+            assert!(
+                ed.palette_recent.contains(Cmd::OpenFind),
+                "#183 A-3：面板执行记入最近使用"
+            );
+        });
+        // 重开面板：最近使用段置顶该命令（记账的消费面）。
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("重开面板");
+            assert_eq!(
+                pal.items.first(),
+                Some(&Cmd::OpenFind),
+                "最近使用段置顶（扁平序首位）"
+            );
+        });
+    }
+
+    /// 跳行框闭环：Ctrl+G 开 → 键入行号 → Enter 跳转（光标可见移动）→
+    /// 越界 clamp → 非法输入不跳不关 → Esc 关闭不移动。
+    #[gpui::test]
+    fn goto_open_type_enter_jump_and_edges(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "L0\nL1\nL2\nL3\nL4");
+        // Ctrl+G 开框 → 键入 3 → Enter → 跳第 3 行（0 基 2）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, ctrl("g"));
+            press(&ed, window, cx, key("3", Some("3")));
+            press(&ed, window, cx, key("enter", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.goto.is_none(), "Enter 跳转后框关");
+            assert_eq!(ed.buffer.cursor().line, 2, "跳到第 3 行（0 基 2）");
+        });
+        // 越界：999 → clamp 到末行。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, ctrl("g"));
+            for ch in ["9", "9", "9"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+            press(&ed, window, cx, key("enter", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.goto.is_none(), "越界跳转同样关框");
+            assert_eq!(ed.buffer.cursor().line, 4, "越界 clamp 到末行（0 基 4）");
+        });
+        // 非法输入：Enter 不跳不关（提示行可见——不静默吞）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, ctrl("g"));
+            for ch in ["a", "b"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+            press(&ed, window, cx, key("enter", None));
+        });
+        ed.update(cx, |ed, _| {
+            let goto = ed.goto.as_ref().expect("非法输入不关框（改提示）");
+            assert_eq!(goto.input, "ab");
+            assert_eq!(goto.hint, "未跳——请输入有效行号");
+            assert_eq!(ed.buffer.cursor().line, 4, "光标不动（不跳）");
+        });
+        // Esc 关闭不移动。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.goto.is_none(), "Esc 关框");
+            assert_eq!(ed.buffer.cursor().line, 4, "关框不移动光标");
+        });
     }
 }
