@@ -2031,7 +2031,10 @@ mod tests {
     #[test]
     fn slot_height_follows_aspect() {
         assert!((PdfPagesView::slot_height(800, 1.5) - 1200.).abs() < 1e-6);
-        assert!((PdfPagesView::slot_height(640, 1.4142) - 905.088).abs() < 0.01);
+        // 宽高比 1.415（A4 近似——避开 clippy::approx_constant 对
+        // √2 近似值的误报；测试输入参数，非常量计算）：
+        // 640 × 1.415 = 905.6。
+        assert!((PdfPagesView::slot_height(640, 1.415) - 905.6).abs() < 0.01);
     }
 
     #[test]
