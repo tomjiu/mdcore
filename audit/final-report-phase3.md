@@ -68,7 +68,7 @@
 
 ### 新 P3（精选）
 
-研究仓侧：remote URL 内嵌 GitHub 令牌（本地 .git/config 面，操作泄露风险）；1 个 .pyc 已入库；6 个 typora-analysis 脚本硬编码 `/home/z/...` 绝对路径（「可独立复跑」不成立）；race_capture.py:68 恒 False 死分支（链式比较）；extract_endpoints.py 域名正则把 `e.top` 等当域名（假阳性入 endpoints_old.json）；zip_cab_index.py:48 MSCF 头格式串错位（versionMinor/Major 读成 u16=259，全部 CAB indexed=1、gc_hits 全空——WORKLOG R6 叙述与证据不符）；acrobat 两 JSON 为早期脚本代次产物与最终 schema 不同名（README「复现一致性」需加范围限定）；update_mdcore_compliance.py 为写入型卷宗注入件（未执行）。mdcore/web 侧：tr2b_l23 硬编码 /tmp soffice 路径（测试不可移植，T-e）；CI wasm32 无 mdc-pdf-wasm（T-b）；compliance/README 分支叙事与主树现实不符；zed_port.py 三起事故同根因（正则 TOML 解析单点脆弱、上游 commit 钉值无机器校验）；`sed 's/mang/mdcore/g'` 子串反转机制脆弱；9 个根部草稿文件零信息损失可删（仓库卫生）；L3 语料 Word-Crash067 引擎全空 vs LO 可提取（T-f，需 office 线复核）。
+研究仓侧：remote URL 内嵌 GitHub 令牌（本地 .git/config 面，操作泄露风险）；1 个 .pyc 已入库；6 个 typora-analysis 脚本硬编码本机绝对路径（「可独立复跑」不成立）；race_capture.py:68 恒 False 死分支（链式比较）；extract_endpoints.py 域名正则把 `e.top` 等当域名（假阳性入 endpoints_old.json）；zip_cab_index.py:48 MSCF 头格式串错位（versionMinor/Major 读成 u16=259，全部 CAB indexed=1、gc_hits 全空——WORKLOG R6 叙述与证据不符）；acrobat 两 JSON 为早期脚本代次产物与最终 schema 不同名（README「复现一致性」需加范围限定）；update_mdcore_compliance.py 为写入型卷宗注入件（未执行）。mdcore/web 侧：tr2b_l23 硬编码 /tmp soffice 路径（测试不可移植，T-e）；CI wasm32 无 mdc-pdf-wasm（T-b）；compliance/README 分支叙事与主树现实不符；zed_port.py 三起事故同根因（正则 TOML 解析单点脆弱、上游 commit 钉值无机器校验）；`sed 's/mang/mdcore/g'` 子串反转机制脆弱；9 个根部草稿文件零信息损失可删（仓库卫生）；L3 语料 Word-Crash067 引擎全空 vs LO 可提取（T-f，需 office 线复核）。
 
 ## 3. 决策谱系对账摘要（cleanroom → mdcore，笔记 27）
 

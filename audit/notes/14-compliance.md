@@ -117,7 +117,7 @@ L1 主 workspace（引擎）16 自研 crate；**16 个 Cargo.toml 全部无 lice
 ### 3.3 工程质量缺陷清单
 
 - **A · 无豁免机制（根因）**：compliance/README.md:21-23 规定「合法独立用词 → 登记书面豁免后放行」，但 scan.sh **没有任何 allowlist 消费逻辑**——豁免表（README:46-51）是纯文档，登记了也照样红。有账无闸。
-- **B · 静默假 PASS（最重缺陷，本地实证）**：`PATHS` 全为**相对路径**（相对调用方 cwd，非 ROOT）；从非仓根目录调用（如 CI checkout 变体、`bash /path/compliance/scan.sh` 于任意子目录）时 glob 不展开、grep 报「No such file or directory」被 `2>/dev/null || true`（L51）吞噬 → **全部词零命中 → PASS**。本地复现：从 `/home/z/my-project` 调用得 `PASS: product surface clean`，从仓根调用得 exit 1——同一脚本两个相反结论。安全门单向失效（只可能放过，不可能误拦）。
+- **B · 静默假 PASS（最重缺陷，本地实证）**：`PATHS` 全为**相对路径**（相对调用方 cwd，非 ROOT）；从非仓根目录调用（如 CI checkout 变体、`bash /path/compliance/scan.sh` 于任意子目录）时 glob 不展开、grep 报「No such file or directory」被 `2>/dev/null || true`（L51）吞噬 → **全部词零命中 → PASS**。本地复现：从本机上级目录（仓根之外）调用得 `PASS: product surface clean`，从仓根调用得 exit 1——同一脚本两个相反结论。安全门单向失效（只可能放过，不可能误拦）。
 - **C · 覆盖面缺口**：PRODUCT_PATHS 不含 `mang-shell/src`（**当前真正的产品面**——GPUI 壳编译进发布产物）、不含 `sdk/`、不含 `scripts/`（zed_port.py 含 zed ×7 词）；`--all` 不含 mang-shell/tests。而 mang-shell/src 实测含 `gpui` 词（assets.rs:11 等）与 `zed` 词（title_bar.rs、git_panel.rs、canvas_view.rs 等注释）——若纳入将大面积命中，故该门对 Zed 搬运后的架构**实际上已无解释力**（PROVENANCE.md:161 自述「scan.sh 的 PRODUCT_PATHS 不含 third_party」）。
 - **D · 模式匹配残留面**：`-w` 词边界对 `sum_tree/SumTree/language_tree`（denylist:35-37）这类下划线词有效，但对 Zed 命名域的变体（`Zed` 命中 `zEditor`？——`-w` 下 zEditor 不算 Zed 词，反向：denylist 词形仅 8 个 Zed 域词，上游 ~195 STRICT 特征针在分析仓，产品仓只剩词法影子）；子串误报已由 `-w` 抑制（「自证清单」命中是**整词**出现——词边界救不了文档引用词，需豁免/路径排除）。
 - **E · 小项**：命中输出 `head -20` 截断（超限不警示）；`fail` 计「词×路径」非命中总数；`--all` 语义（product+tests）与 gates.md:347「strict 0 / ns 0」双口径术语已无对应实现（strict/ns 分类在产品仓不存在）。

@@ -199,7 +199,7 @@ NSIS 三缺陷、macOS 无链**。BUILD-VERIFY.md 作为验证报告本身可信
 
 ### 4.4 zed_port.py（431 行）【质量：可用但脆弱——关键基建单点】
 
-10-mangshell.md:76 已覆盖「升级四步 + 默认 `/home/z/my-project/zed-upstream`」（zed_port.py:16，
+10-mangshell.md:76 已覆盖「升级四步 + 默认 `zed-upstream` 本地克隆」（zed_port.py:16，
 可 `ZED_UPSTREAM` env 覆盖）。本轮补**本体代码质量**（笔记 10/22 均未读此文件）：
 
 - **正则解析 TOML 而非真解析器**：全链靠手写正则 + 括号配平聚合（:24-63、:116-231）。
@@ -208,7 +208,7 @@ NSIS 三缺陷、macOS 无链**。BUILD-VERIFY.md 作为验证报告本身可信
   根表字段丢弃致闭包内依赖静默吃默认 features（:280-282）——**三处历史 bug 全部源于同一
   根因**。上游 Cargo.toml 排版稍变即再触发，且发生在「闭包计算/依赖展开」这类静默面。
   【已确认（代码级）；升级重放风险需真机验证】
-- **docstring 过时**：:5 说「产出: /home/z/my-project/zed-port-lab/」，实际产出 =
+- **docstring 过时**：:5 说「产出: <本机>/zed-port-lab/」，实际产出 =
   本仓 `third_party/zed`（:17-18 注释已改，docstring 未同步）【已确认】。
 - `os.popen(f"cd {ZED} && git rev-parse HEAD")`（:375）取上游 commit 写入生成注释——
   shell 注入面可控（ZED 来自 env），但 os.popen 已是弃用风格；上游钉值只落在生成物注释 +
@@ -311,7 +311,7 @@ checklist.md:24-25）已经失效，A5 变为**可执行未执行**【已确认�
 ## 7. g) web 位置之谜——证据链与答案
 
 **问题**：web-e2e.log（audit/notes/test-runs/web-e2e.log，全文仅 12 行）记录
-`python3: can't open file '/home/z/my-project/mdcore-audit/web/tests/tr2b_l1_commonmark.py': No such file or directory`（同型共 4 条：tr2b_l1_commonmark / tr2a_cross_process / k5_recheck / k45_recheck，均 exit=2，时戳 20:02:32）。
+`python3: can't open file '<mdcore-audit>/web/tests/tr2b_l1_commonmark.py': No such file or directory`（同型共 4 条：tr2b_l1_commonmark / tr2a_cross_process / k5_recheck / k45_recheck，均 exit=2，时戳 20:02:32）。
 
 **答案（逐问）**：
 
@@ -322,7 +322,7 @@ checklist.md:24-25）已经失效，A5 变为**可执行未执行**【已确认�
    （mang_mcp/mang_rpc），**无任何 web 前端**。notes 20（静态全量）/21（实跑）审的就是这个
    真实目录——非幻影。
 2. **报错根因**：那 4 个文件**位于 `web/` 根而非 `web/tests/`**【已确认】。深化轮沙箱运行器
-   `/home/z/my-project/scripts/run_web_tests.sh`（仓外；:4 `cd .../web`，:9 默认集
+   `run_web_tests.sh`（仓外本机；:4 `cd .../web`，:9 默认集
    `ls tests/*.py` 且排除表漏了 tr2b_l1_commonmark）以 `tests/<name>.py` 相对路径调起了
    这批根级脚本 → ENOENT。web/ 根的 6 个脚本（tr2a_cross_process / tr2b_l1_commonmark /
    tr2b_l23_external / k5_recheck / k45_recheck / acceptance_pdf5_ui）中，acceptance_pdf5_ui.py
@@ -345,7 +345,7 @@ checklist.md:24-25）已经失效，A5 变为**可执行未执行**【已确认�
    - 笔记 21:56「含 web/ 根目录 4 个」实为 **6 个**（记分板 25-30 行自己列了 6）——笔记内
      计数不一致【已确认】。
    - 笔记 21 §9（:177）称 web-e2e.log 为「全量运行日志」——该文件实为**只有 4 条失败记录的
-     尾片段**（759B/12 行；完整日志在仓外 audit-out/web-test-runs.log，同为 12 行，说明批跑
+     尾片段**（759B/12 行；完整日志在仓外 audit-out/（审计工作输出目录，未入库）web-test-runs.log，同为 12 行，说明批跑
      器只留下了这段）。26 个 tests/ 套件的逐套件日志**未归档**【已确认——档案完整性缺口】。
 
 ---

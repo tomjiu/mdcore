@@ -1,6 +1,6 @@
 # mdcore 文档状态模型深度审计（02-core-state）
 
-- 审计对象：`/home/z/my-project/mdcore-audit`（main@96596d7）`crates/mdcore`
+- 审计对象：mdcore 仓 audit 分支（main@96596d7）`crates/mdcore`
 - 审计方式：只读静态审计，沿真实调用链验证，引用 `文件:行号`
 - 规模基线（loc-stats.md）：mdcore src 18 文件 / 8786 LOC；tests 19 文件 / 7322 LOC；240 `#[test]`；0 unsafe；依赖仅 ropey / serde / sha2
 - 分级：P0=可能数据丢失/核心状态破坏；P1=核心正确性重大问题；P2=明显技术债；P3=建议
@@ -266,4 +266,4 @@ chunk.rs 内嵌测试（边界矩阵 + 确定性 + 内容寻址）+ r16_blocks_r
 
 修复路径清晰且不动骨架：开档时重建 BlockId↔历史物化 ID 映射或对物化插入做冲突检测（修 F-1）；锚点偏移映射（修 F-2）；marks 并入 markdown 序列化或声明弃用 op 层 marks（修 F-3）。在此之前，mdcore 可作为**单会话、以 markdown 文本为交换格式**的可靠引擎，不能作为跨会话身份/协作的基座。
 
-（审计只读，未修改任何仓库文件；本报告写入 /home/z/my-project/audit-notes/02-core-state.md）
+（审计只读，未修改任何仓库文件；本报告写入本机 audit-notes/02-core-state.md）

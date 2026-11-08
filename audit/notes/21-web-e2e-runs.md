@@ -123,7 +123,7 @@ Enter 后光标后的 `b` **同时留在原块和出现在新块**（正确语�
 DOM 多一空行 → 下一键 Y 物化为【普通段落】而非列表延续项
 ```
 视图/核心瞬时分叉 + 块类型物化错误（应为新 `- ` 列表项，实为 paragraph）。
-复现脚本：`/home/z/my-project/scripts/probe_p04_{enter,forensic,mid}.py`（序列化步骤见脚本）。
+复现脚本：`probe_p04_{enter,forensic,mid}.py`（审计者本机，未入库；序列化步骤见脚本）。
 
 ## 6. P1-18 实测推翻（降级 P1 → P3）
 
@@ -206,4 +206,4 @@ p2 顶占 ID 3）→ undo 删除 → 树内 `vec![1,2,3,3,4]` **重复 BlockId 3
 结论：`forms.rs:1038`「增量修订——原字节前缀逐位保持」的文档声称被字节级证据推翻；
 对「填已签名投标函」场景的直接含义：签署字节区间被整体重写 → 签名摘要输入变更 →
 签名必然失效（P0-3 从「代码直读+零测试」升级为「本地复现+量化」）。
-复现工程：`/home/z/my-project/scratch-p03`（Cargo.toml path 依赖 + main.rs 全步骤）。
+复现工程：`scratch-p03`（本机临时工程，未入库；Cargo.toml path 依赖 + main.rs 全步骤）。

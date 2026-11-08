@@ -1,6 +1,6 @@
 # 审计笔记 28：研究仓元面审计 + 备份目录 + 全仓语法级代码测试（R5-e，2026-11-05）
 
-> 只读审计。对象：`/home/z/my-project/mang-research-archive`（mmqz/mang-research-archive，HEAD=e625568，=origin/main，工作树审计起点干净）。
+> 只读审计。对象：mang-research-archive 仓（mmqz/mang-research-archive，HEAD=e625568，=origin/main，工作树审计起点干净）。
 > 证据口径：所有 `文件:行号` 与 git 命令输出均为 HEAD 实测（沙箱时钟 2026-11-04 21:0x-21:1x UTC）；git 仅用 log/show/ls-tree/rev-list/remote/status 查询型命令，mdcore-audit 目录内零 git 命令。
 > 分工：本笔记覆盖 **仓库元面 + _deleted-repos-backup + 全仓语法级代码测试**；typora-analysis / typora-re-analysis / acrobat-pro-audit / cleanroom-analysis 四子仓内容审计由其他子代理（R5-a..d 等）负责，本笔记不重复其内容面。
 

@@ -78,7 +78,7 @@ gates.md「T1 卫生修复轮 · feature 面前置 bootstrap」。默认面常�
   **SBOM 全量复跑（366 三方包去重，cargo metadata --locked 逐包 license 取证）**：
   0 UNKNOWN / 0 GPL / 0 白名单外；唯一 LGPL 字样 `r-efi@6.0.0`（`MIT OR
   Apache-2.0 OR LGPL-2.1-or-later` 三选一组合，取 MIT 路径满足，无强制 LGPL）。
-  脚本：分析侧 `scripts/sbom_check.py`（工作区 `/home/z/my-project/scripts/`），
+  脚本：分析侧 `scripts/sbom_check.py`（本机工作区 `scripts/`），
   可复跑。**webkit2gtk 系统库**（LGPL，deb `Depends: libwebkit2gtk-4.1-0` /
   `libgtk-3-0` 由系统提供、动态链接不进产物二进制——§3 既有政策，deb
   control Depends 已声明）。NOTICES 全量再生成待 compliance-baseline 分支

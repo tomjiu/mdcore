@@ -51,7 +51,7 @@ libjavascriptcoregtk-4.1-dev
 叠加（不遮蔽系统值）：
 
 ```bash
-source /home/z/my-project/optroot/env.sh   # 提取树在场时
+source <sysroot>/env.sh   # 提取树在场时（sysroot = 本机工具根，见上文部署）
 cargo check -p mdshell-native
 ```
 

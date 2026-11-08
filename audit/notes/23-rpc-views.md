@@ -1,6 +1,6 @@
 # C6 — mang-shell RPC 服务层与文档视图深审（覆盖收尾轮）
 
-- 仓库：`/home/z/my-project/mdcore-audit`（audit 分支，源码 = main@6322f86）
+- 仓库：mdcore 仓 audit 分支（源码 = main@6322f86）
 - 范围：`mang-shell/src/rpc.rs`（实测 3071 行）、`editor/{docx_doc,xlsx_doc,pdf_doc}.rs`、`canvas_view.rs`、`shell.rs`、`settings.rs`、`tests/rpc_client.py`（实测 947 行，派单写 921——以实测为准）、`sdk/python/mang_rpc`
 - 方式：纯静态逐行阅读。mang-shell 无法在本沙箱编译（GPUI/Xvfb 面缺位）——所有结论以 文件:行号 为锚；置信四档标注（已确认 / 高度怀疑 / 需外部环境验证 / 设计偏好）。
 - 铁律遵守：只读，未改动仓库任何文件。
