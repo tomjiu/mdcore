@@ -1,0 +1,134 @@
+name: web-check
+
+# #570：web 面门禁——#561 类残留（i18n diff3 标记 + CSS 未闭合残片）
+# 曾直接进 main 而三 windows 门全绿放行（门不含 web 面：rg web|npm|node
+# 零命中）。本门补齐：wasm 双包构建 → esbuild build → tsc typecheck
+# → e2e 五套件（canonical 冒烟 + PDF 三链 + i18n）。
+#
+# 纪律：
+#   - 纯 JS/Python 面 → ubuntu runner（无 #[cfg(windows)] 需求，计费 1×
+#     ——windows 门是 Rust cfg 覆盖的必要面，web 面没有这个绑定）
+#   - concurrency 组循 #550 先例（同分支连推只留最新，防队列爆炸）
+#   - 不动既有三 windows workflow（#570 范围约束）
+#   - e2e 套件集 = 2026-11-08 本地实测全绿的五件（web_smoke 13 检 +
+#     pdf_links 9 + pdf_outline 11 + pdf_view 16 + i18n_ui 9）——
+#     扩面（46 套件全量）留后续按运行时长数据裁定
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # #548：types 显式化（默认即 opened/synchronize/reopened——写出来
+    # 防后人误加放大面）。
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# #548：队列深度防线——同 workflow + 同 ref 只保留最新 run
+#（详见 windows-check.yml 同款注释）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+
+jobs:
+  web:
+    name: web / build + typecheck + e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo (wasm target)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-wasm-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-wasm-cargo-
+
+      - name: Install wasm-bindgen CLI (Cargo.lock 精确同版)
+        # 纪律（build-wasm.sh 头注）：CLI 版本必须与 Cargo.lock 的
+        # wasm-bindgen 精确一致（当前 0.2.129），否则运行期 link 失败——
+        # 从 lock 提取自动同步，升版零维护。预编译二进制（上游 GitHub
+        # release，与仓库同宿主）秒级，替代 cargo install 的编译分钟数。
+        run: |
+          WB_VERSION=$(grep -A1 '^name = "wasm-bindgen"$' ../Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)
+          echo "wasm-bindgen CLI 版本（Cargo.lock 提取）：$WB_VERSION"
+          mkdir -p "$HOME/.local/bin"
+          curl -fL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WB_VERSION}/wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /tmp
+          install -m755 "/tmp/wasm-bindgen-${WB_VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" \
+            "$HOME/.local/bin/wasm-bindgen"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build wasm packages (mdcore-wasm + mdc-pdf-wasm)
+        # build-pdf-wasm.sh 对 crate 缺席优雅降级（exit 0 + 说明）——
+        # mdc-pdf-wasm 未在场时 pkg_pdf 缺席，pdf_view e2e 走 SKIP 门
+        #（不假绿——evidence_panel.py 同款纪律）。
+        run: |
+          ./build-wasm.sh
+          ./build-pdf-wasm.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Build (esbuild)
+        # #561 类缺陷的第一拦截点：i18n diff3 标记在此报
+        # 「Expected identifier but found "||"」（esbuild 语法错）。
+        run: npm run build
+
+      - name: Typecheck (tsc)
+        # #561 类缺陷的第二拦截点：tsc 对冲突标记有专属错误码
+        # TS1185「Merge conflict marker encountered」。
+        run: npm run typecheck
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+
+      - name: Install Playwright + Chromium
+        run: |
+          python3 -m pip install playwright
+          python3 -m playwright install chromium --with-deps
+
+      - name: e2e (五套件)
+        # 套件自管 http.server + 无头 Chromium；各自 sys.exit(0/1)，
+        # 任一失败即步骤红。全套件 2026-11-08 本地实测：
+        # web_smoke pass / pdf_links 9/9 / pdf_outline 11/11 /
+        # pdf_view 16/16(+1 SKIP——pkg_pdf 缺席门) / i18n_ui 9/9。
+        run: |
+          python3 tests/web_smoke.py
+          python3 tests/pdf_links.py
+          python3 tests/pdf_outline.py
+          python3 tests/pdf_view.py
+          python3 tests/i18n_ui.py
