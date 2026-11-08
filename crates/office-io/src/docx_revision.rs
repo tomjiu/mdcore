@@ -193,11 +193,33 @@ impl DocxWriter {
         self.count_raw_emission(1, runs.len() as u64);
     }
 
-    /// V13 边界检查（私有——两富文本发射面共用）：修订容器不能合法
-    /// 承载的 RunSpec 载荷登记粘性错误（首错留存，save 漏斗拒）。
+    /// V12/V13 边界检查（私有——两富文本发射面共用）：修订容器不能
+    /// 合法承载的 RunSpec 载荷登记粘性错误（首错留存，save 漏斗拒）。
     /// anchor 优先于 link 报告（V8 优先序镜像——同 Some 时 anchor 赢）。
+    ///
+    /// #580 审核补丁：**V12 字符样式引用同款校验**——修订路径的
+    /// `count_raw_emission` 绕过了普通段落的 `count_specs` 校验漏斗
+    /// （审核负例：`char_styled("x","NoSuchStyle")`——普通段落 V12
+    /// 拒，修订路径原样发射悬空 rStyle，Word 静默忽略 = 视觉丢失）。
+    /// 与 `count_specs` 同域复检：预置（Strong/Emphasis）∪
+    /// `define_style` 账本（`defined_styles` 访问器）；空串同拒。
     fn note_unshippable_revision_payloads(&mut self, runs: &[RunSpec], face: &str) {
         for (i, spec) in runs.iter().enumerate() {
+            // V12：字符样式合法性域与普通段落同一真相源，修订路径不豁免。
+            if let Some(cs) = &spec.char_style {
+                let known = crate::style::PRESET_CHAR_STYLE_IDS.contains(&cs.as_str())
+                    || self.defined_styles().contains(cs);
+                if cs.is_empty() {
+                    self.note_validation_error(
+                        "V12: 修订 run 字符样式引用为空串（save 漏斗零产物）".into(),
+                    );
+                } else if !known {
+                    self.note_validation_error(format!(
+                        "V12: {face} RunSpec[{i}] 字符样式 '{cs}' 未定义（预置 Strong/Emphasis 或先 define_style——修订路径与 count_specs 同域校验，不豁免）"
+                    ));
+                }
+            }
+            // V13：容器不能承载的载荷形态。
             let kind = if spec.anchor.is_some() {
                 "anchor"
             } else if spec.link.is_some() {
