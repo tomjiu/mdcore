@@ -72,6 +72,7 @@ mod editor;
 mod file_tree;
 mod git_panel;
 mod outline_panel;
+mod git_repo;
 mod panels;
 mod recent;
 // doc_events：文档变更事件总线（#111 订阅模式）——editor 的编辑收尾
@@ -553,7 +554,7 @@ fn main() {
                             let Some((root, path)) = panel.read(cx).first_change() else {
                                 return;
                             };
-                            let Some(text) = git_panel::git_diff(&root, &path) else {
+                            let Some(text) = git_repo::git_diff(&root, &path) else {
                                 return;
                             };
                             if let Some(focus) =
