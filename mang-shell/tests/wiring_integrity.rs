@@ -459,17 +459,42 @@ fn title_bar_window_controls_wired() {
     );
 }
 
-/// 右键菜单渲染层：可点击项的 on_click 必须落到 shell 的动作派发
-/// （activate_context_menu_item）——渲染与接线不脱钩。
+/// 右键菜单构建层（#385 批 1 迁 ui::ContextMenu）：可点击项的 handler
+/// 必须落到 shell 的动作派发（activate_context_menu_item）——构建与
+/// 接线不脱钩；部署（anchored/deferred）与点外关闭（DismissEvent →
+/// shell 订阅清态）面也在锚定范围。
 #[test]
 fn context_menu_view_clicks_dispatch_to_shell() {
     let file = src("context_menu_view.rs");
-    let body = fn_body(&file, "fn context_menu_overlay(");
+    let body = fn_body(&file, "fn build_context_menu(");
     assert!(
         body.contains("activate_context_menu_item"),
-        "菜单项 on_click 未接 activate_context_menu_item（点击无效果）"
+        "菜单项 handler 未接 activate_context_menu_item（点击无效果）"
     );
-    // 灰显项（enabled=false）不挂 on_click 是设计（点不到不算死按钮）。
+    // 灰显项（enabled=false）→ selectable(false)（点不到不算死按钮；
+    // 键盘导航跳过 + 无 handler——组件语义）。
+    assert!(
+        body.contains(".selectable(*enabled)"),
+        "动作项未按 enabled 挂 selectable（灰显项仍可点/键盘仍选中）"
+    );
+    // 部署面：anchored + deferred（gpui 接管边缘翻转/夹紧与浮层层序）
+    // 必须在场——自研 place_menu/全屏遮罩退役的前提是框架锚定真的接上。
+    let deploy = fn_body(&file, "fn context_menu_anchor(");
+    assert!(
+        deploy.contains("anchored") && deploy.contains("deferred("),
+        "部署层缺 deferred/anchored（浮层层序与边缘翻转未接框架）"
+    );
+    // shell 接线面：构建挂载 + DismissEvent 订阅（点外/Esc/选完动作 →
+    // 清态——遮罩退役后的关闭链）。
+    let shell = src("shell.rs");
+    assert!(
+        shell.contains("context_menu_view::build_context_menu("),
+        "shell open_* 未走 build_context_menu（菜单实体没建）"
+    );
+    assert!(
+        shell.contains("DismissEvent"),
+        "shell 未订阅 DismissEvent（点外/Esc 不关闭，菜单状态悬挂）"
+    );
     assert!(
         dead_closures(&file).is_empty(),
         "context_menu_view.rs 存在空闭包（死交互）"
