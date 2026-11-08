@@ -41,7 +41,7 @@
 
 use gpui::{Context, MouseButton, Pixels, px};
 use ui::prelude::*;
-use ui::{IconButton, IconName, Label, LabelSize};
+use ui::{IconButton, IconName, Label, LabelSize, Tooltip};
 
 use crate::menu_bar;
 use crate::menu_bar_view;
@@ -113,11 +113,19 @@ fn window_controls() -> impl IntoElement {
         .pr_2()
         .child(
             IconButton::new("win-minimize", IconName::SquareMinus)
+                // #385 批 6：icon-only 窗口控制钮 tooltip 统一化（与
+                // activity_bar bar_button 同一 ui::Tooltip 语系）。
+                .tooltip(Tooltip::text("最小化"))
                 .on_click(|_, window, _| window.minimize_window()),
         )
         .child(
             IconButton::new("win-maximize", IconName::Maximize)
+                .tooltip(Tooltip::text("最大化 / 还原"))
                 .on_click(|_, window, _| window.zoom_window()),
         )
-        .child(IconButton::new("win-close", IconName::Close).on_click(|_, _, cx| cx.quit()))
+        .child(
+            IconButton::new("win-close", IconName::Close)
+                .tooltip(Tooltip::text("关闭"))
+                .on_click(|_, _, cx| cx.quit()),
+        )
 }
