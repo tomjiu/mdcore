@@ -48,11 +48,13 @@
 //! - 不做 `w:rPrChange`/`w:pPrChange`（格式变更修订——另开 issue）；
 //! - 不做 `w:moveFrom`/`w:moveTo`（移动修订可用 del+ins 降级——issue
 //!   明列）；
-//! - v0 发射**单 run 纯文本**修订段（与 [`DocxWriter::paragraph_text`]
-//!   同级粒度）：富文本修订（加粗/斜体 run 混排进修订容器）随 redline
-//!   集成轮按需扩展——`docx_rs::Insert::add_run` 面已备，扩面是加法。
+//! - 富文本修订**已扩面**（#556：[`DocxWriter::insert_runs_revised`]/
+//!   [`DocxWriter::delete_runs_revised`] 多 run + rPr 保留）；**新边界**
+//!   = `link`/`anchor`/`footnote`/`field` 载荷——引擎修订容器 child 面
+//!   （docx-rs 0.4.22 `InsertChild`/`DeleteChild` 仅 Run/Delete/Comment）
+//!   无对应形态，V13 粘性拒（save 漏斗零产物，不伪称支持）。
 
-use crate::docx::DocxWriter;
+use crate::docx::{spec_run_property, DocxWriter, RunSpec};
 
 /// 修订标记元数据（`w:ins`/`w:del` 的 `w:author` + `w:date` 承载）。
 ///
@@ -129,6 +131,90 @@ impl DocxWriter {
         let docx = std::mem::take(self.docx_mut());
         *self.docx_mut() = docx.add_paragraph(p);
         self.count_raw_emission(1, 1);
+    }
+
+    /// 发射**插入修订段（富文本多 run，#556）**：`<w:p><w:ins …>
+    /// <w:r rPr>…</w:r>×N</w:ins></w:p>`——每个 [`RunSpec`] 一个
+    /// run，rPr 经 [`crate::docx::spec_run_property`] 单点翻译保留
+    /// （加粗/斜体/删除线/下画线/等宽/字符样式）。
+    ///
+    /// **单元素等价**：`insert_runs_revised(&[RunSpec::text(x)])` 与
+    /// [`DocxWriter::insert_run_revised`](x) 产物逐字节一致
+    /// （`Insert::new(run)` ≡ `new_with_empty().add_run(run)`——
+    /// tests/docx_revision_write.rs 锁定，含 id 归一化对照）。
+    ///
+    /// **边界（V13 粘性拒——save 漏斗零产物）**：`link`/`anchor`/
+    /// `footnote`/`field` 载荷的 RunSpec 不能经引擎修订容器合法承载
+    /// （见模块文档）；带载荷调用即落粘性错误，文本面照常发射但文档
+    /// 永不产出（V7 同语义——写自洽不产出半合法文档）。
+    ///
+    /// **行为锁**：零 run = 空容器（`<w:ins …/>` 合法最小形，Word
+    /// 显示空插入标记，计数 1 段 + 0 run）；`\n` 由引擎 `add_text`
+    /// 剥除（与普通 `paragraph()` 路径同源——不拆 w:br）。
+    ///
+    /// r4-t2 计数：1 段 + N run（`count_raw_emission` 漏斗，不放宽
+    /// 上限）。
+    pub fn insert_runs_revised(&mut self, runs: &[RunSpec], mark: &RevisionMark) {
+        self.note_unshippable_revision_payloads(runs, "insert_runs_revised");
+        let mut ins = docx_rs::Insert::new_with_empty()
+            .author(&mark.author)
+            .date(&mark.date);
+        for spec in runs {
+            let mut run = docx_rs::Run::new().add_text(spec.text.as_str());
+            run.run_property = spec_run_property(spec);
+            ins = ins.add_run(run);
+        }
+        let p = docx_rs::Paragraph::new().add_insert(ins);
+        let docx = std::mem::take(self.docx_mut());
+        *self.docx_mut() = docx.add_paragraph(p);
+        self.count_raw_emission(1, runs.len() as u64);
+    }
+
+    /// 发射**删除修订段（富文本多 run，#556）**：`<w:p><w:del …>
+    /// <w:r rPr><w:delText>…</w:delText></w:r>×N</w:del></w:p>`——
+    /// 每个 run 用 `w:delText` 承载（OOXML 删除修订约定，`w:t` 在
+    /// `w:del` 内非法）+ rPr 逐 run 保留（与
+    /// [`DocxWriter::insert_runs_revised`] 同翻译单点）。
+    ///
+    /// 边界（V13）/行为锁（零 run 空容器、`\n` 剥除）/计数（1 段 +
+    /// N run）均与 [`DocxWriter::insert_runs_revised`] 同面；单元素
+    /// 与 [`DocxWriter::delete_run_revised`] 等价（测试锁定）。
+    pub fn delete_runs_revised(&mut self, runs: &[RunSpec], mark: &RevisionMark) {
+        self.note_unshippable_revision_payloads(runs, "delete_runs_revised");
+        let mut del = docx_rs::Delete::new().author(&mark.author).date(&mark.date);
+        for spec in runs {
+            let mut run = docx_rs::Run::new().add_delete_text(spec.text.as_str());
+            run.run_property = spec_run_property(spec);
+            del = del.add_run(run);
+        }
+        let p = docx_rs::Paragraph::new().add_delete(del);
+        let docx = std::mem::take(self.docx_mut());
+        *self.docx_mut() = docx.add_paragraph(p);
+        self.count_raw_emission(1, runs.len() as u64);
+    }
+
+    /// V13 边界检查（私有——两富文本发射面共用）：修订容器不能合法
+    /// 承载的 RunSpec 载荷登记粘性错误（首错留存，save 漏斗拒）。
+    /// anchor 优先于 link 报告（V8 优先序镜像——同 Some 时 anchor 赢）。
+    fn note_unshippable_revision_payloads(&mut self, runs: &[RunSpec], face: &str) {
+        for (i, spec) in runs.iter().enumerate() {
+            let kind = if spec.anchor.is_some() {
+                "anchor"
+            } else if spec.link.is_some() {
+                "link"
+            } else if spec.footnote.is_some() {
+                "footnote"
+            } else if spec.field.is_some() {
+                "field"
+            } else {
+                continue;
+            };
+            self.note_validation_error(format!(
+                "V13: {face} RunSpec[{i}] 带 {kind} 载荷——docx-rs 0.4.22 \
+                 修订容器 child 面（InsertChild/DeleteChild）仅 Run/Delete/Comment，
+                 {kind} 不能合法承载（修订容器富文本边界，save 漏斗零产物）"
+            ));
+        }
     }
 }
 
