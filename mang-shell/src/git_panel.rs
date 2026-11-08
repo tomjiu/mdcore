@@ -366,6 +366,7 @@ impl Render for GitPanel {
         let header = h_flex()
             .id("git-header")
             .w_full()
+            .flex_shrink_0()
             .gap_1()
             .mb_1()
             .child(
@@ -460,17 +461,26 @@ impl Render for GitPanel {
                             .empty_message("工作区干净（无改动）")
                             .into_any_element()
                     } else {
+                        let mut entries = Vec::with_capacity(self.changes.len());
                         let rows = List::new().children(self.changes.iter().map(|change| {
                             let path = change.path.clone();
                             let path_for_id = path.clone();
                             let path_for_click = path.clone();
+                            let path_for_debug = path.clone();
                             let code = change.code.clone();
                             let handle = self.change_handles[&path].clone();
+                            let anchor = ScrollAnchor::for_handle(scroll.clone());
+                            entries.push(NavigableEntry {
+                                focus_handle: handle.clone(),
+                                scroll_anchor: Some(anchor.clone()),
+                            });
                             div()
                                 .id(gpui::SharedString::from(format!(
                                     "git-chg-row-{path_for_id}"
                                 )))
+                                .debug_selector(move || format!("git-chg-row-{path_for_debug}"))
                                 .track_focus(&handle)
+                                .anchor_scroll(Some(anchor))
                                 // 点击 = 行聚焦 + 打开（#575 同款单一模型）。
                                 .on_click({
                                     let handle = handle.clone();
@@ -508,29 +518,34 @@ impl Render for GitPanel {
                         let mut nav = Navigable::new(
                             v_flex()
                                 .id("git-changes")
-                                .flex_1()
-                                .min_h_0()
+                                .size_full()
                                 .overflow_y_scroll()
                                 .track_scroll(&scroll)
                                 .child(rows)
                                 .into_any_element(),
                         );
-                        for change in &self.changes {
-                            nav = nav.entry(NavigableEntry {
-                                focus_handle: self.change_handles[&change.path].clone(),
-                                scroll_anchor: Some(ScrollAnchor::for_handle(scroll.clone())),
-                            });
+                        for entry in entries {
+                            nav = nav.entry(entry);
                         }
                         nav.into_any_element()
                     }
                 }
                 GitView::History => {
+                    let mut entries = Vec::with_capacity(self.commits.len());
                     let rows = List::new().children(self.commits.iter().map(|commit| {
                         let hash = commit.hash.clone();
+                        let hash_for_debug = hash.clone();
                         let handle = self.commit_handles[&hash].clone();
+                        let anchor = ScrollAnchor::for_handle(scroll.clone());
+                        entries.push(NavigableEntry {
+                            focus_handle: handle.clone(),
+                            scroll_anchor: Some(anchor.clone()),
+                        });
                         div()
                             .id(gpui::SharedString::from(format!("git-cmt-row-{hash}")))
+                            .debug_selector(move || format!("git-cmt-row-{hash_for_debug}"))
                             .track_focus(&handle)
+                            .anchor_scroll(Some(anchor))
                             .on_click({
                                 let handle = handle.clone();
                                 move |_, window, cx| handle.focus(window, cx)
@@ -569,18 +584,14 @@ impl Render for GitPanel {
                     let mut nav = Navigable::new(
                         v_flex()
                             .id("git-history")
-                            .flex_1()
-                            .min_h_0()
+                            .size_full()
                             .overflow_y_scroll()
                             .track_scroll(&scroll)
                             .child(rows)
                             .into_any_element(),
                     );
-                    for commit in &self.commits {
-                        nav = nav.entry(NavigableEntry {
-                            focus_handle: self.commit_handles[&commit.hash].clone(),
-                            scroll_anchor: Some(ScrollAnchor::for_handle(scroll.clone())),
-                        });
+                    for entry in entries {
+                        nav = nav.entry(entry);
                     }
                     nav.into_any_element()
                 }
@@ -607,7 +618,8 @@ impl Render for GitPanel {
             .min_h_0()
             .gap_1()
             .child(header)
-            .child(body)
+            // Navigable 自身 size_full；外层为剩余高度提供有界滚动 viewport。
+            .child(div().w_full().flex_1().min_h_0().child(body))
     }
 }
 
@@ -697,7 +709,7 @@ mod keyboard_tests {
 
     impl gpui::Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            gpui::div().size_full().child(self.0.clone())
+            v_flex().size_full().child(self.0.clone())
         }
     }
 
@@ -841,6 +853,111 @@ mod keyboard_tests {
         let _ = std::fs::remove_dir_all(
             std::env::temp_dir().join(format!("mang-git-act-{}", std::process::id())),
         );
+    }
+
+    /// 双视图长列表走同一真实 Navigable/下一帧布局链：只移动焦点不算滚动成功。
+    fn assert_long_view_navigation_scrolls(
+        cx: &mut gpui::TestAppContext,
+        view: GitView,
+        target_selector: &'static str,
+    ) {
+        let (panel, mut visual, _) = synth_panel_window(cx);
+        panel.update(&mut visual, |p, cx| {
+            p.changes = (0..64)
+                .map(|i| GitChange {
+                    code: "M".into(),
+                    path: format!("src/row-{i:02}.rs"),
+                })
+                .collect();
+            p.commits = (0..64)
+                .map(|i| GitCommit {
+                    hash: format!("c{i:06}"),
+                    subject: format!("Commit {i}"),
+                    time: "1 hour ago".into(),
+                })
+                .collect();
+            p.view = view;
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (first, target) = panel.read_with(&visual, |p, _| match view {
+            GitView::Changes => (
+                p.change_handles["src/row-00.rs"].clone(),
+                p.change_handles["src/row-35.rs"].clone(),
+            ),
+            GitView::History => (
+                p.commit_handles["c000000"].clone(),
+                p.commit_handles["c000035"].clone(),
+            ),
+        });
+        let viewport = panel.read_with(&visual, |p, _| p.scroll.bounds());
+        assert!(viewport.size.height > gpui::px(0.), "滚动体必须有实际高度");
+        assert!(
+            viewport.bottom() <= gpui::px(400.),
+            "滚动体必须受窗口高度约束：{viewport:?}"
+        );
+        if let Some(before) = visual.debug_bounds(target_selector) {
+            assert!(
+                !viewport.contains(&before.origin),
+                "前置：第36行必须超出初始viewport"
+            );
+        }
+        visual.update(|window, cx| first.focus(window, cx));
+        for _ in 0..35 {
+            visual.dispatch_action(menu::SelectNext);
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        visual.update(|window, cx| assert!(target.contains_focused(window, cx)));
+        let (viewport, offset) =
+            panel.read_with(&visual, |p, _| (p.scroll.bounds(), p.scroll.offset()));
+        let after = visual
+            .debug_bounds(target_selector)
+            .expect("目标行必须真实渲染并进入viewport");
+        assert!(
+            offset.y < gpui::px(0.),
+            "必须改变实际滚动offset，不能只移动焦点：{offset:?}"
+        );
+        assert!(
+            viewport.contains(&after.origin),
+            "目标行起点必须入viewport：{after:?} / {viewport:?}"
+        );
+        assert!(
+            after.bottom() <= viewport.bottom(),
+            "目标行完整高度必须可见"
+        );
+
+        // 原 Navigable 环绕/反向链也必须使前一行可见，而非回到默认原点。
+        visual.dispatch_action(menu::SelectPrevious);
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        let previous = panel.read_with(&visual, |p, _| match view {
+            GitView::Changes => p.change_handles["src/row-34.rs"].clone(),
+            GitView::History => p.commit_handles["c000034"].clone(),
+        });
+        visual.update(|window, cx| assert!(previous.contains_focused(window, cx)));
+        let selector = match view {
+            GitView::Changes => "git-chg-row-src/row-34.rs",
+            GitView::History => "git-cmt-row-c000034",
+        };
+        let previous_bounds = visual.debug_bounds(selector).expect("反向导航行真实渲染");
+        let viewport = panel.read_with(&visual, |p, _| p.scroll.bounds());
+        assert!(viewport.contains(&previous_bounds.origin));
+        assert!(previous_bounds.bottom() <= viewport.bottom());
+    }
+
+    #[gpui::test]
+    fn long_changes_navigation_scrolls_target_into_view(cx: &mut gpui::TestAppContext) {
+        assert_long_view_navigation_scrolls(cx, GitView::Changes, "git-chg-row-src/row-35.rs");
+    }
+
+    #[gpui::test]
+    fn long_history_navigation_scrolls_target_into_view(cx: &mut gpui::TestAppContext) {
+        assert_long_view_navigation_scrolls(cx, GitView::History, "git-cmt-row-c000035");
     }
 
     /// 句柄差量：键存续复用 / 离场清退（prune_handles 纯状态面）。
