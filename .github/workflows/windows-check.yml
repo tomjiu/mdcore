@@ -9,7 +9,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # #548：types 显式化（默认即 opened/synchronize/reopened——写出来
+    # 防后人误加 ready_for_review 等放大面；关闭重开走 reopened）。
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
+
+# #548：队列深度防线——同 workflow + 同 ref 只保留最新 run。
+# 同分支连推 5 次 → 前 4 个自动取消，只跑最后一次（PR 的
+# synchronize 追加推送同理；不同 PR = 不同 ref，互不干扰）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
