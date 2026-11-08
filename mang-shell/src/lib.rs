@@ -105,3 +105,12 @@ pub mod pdf_pages;
 /// GPUI 层编译面验证 + 真机登记——pdf_pages 同纪律）。
 #[path = "xlsx_grid_view.rs"]
 pub mod xlsx_grid_view;
+
+/// #525：Zed 按钮组件 36×36 硬规格适配层（IconButton 渲染拦截路径）+
+/// 无头验证测试（布局实测/命中区域/禁用门/色槽等值）——决策证据链
+/// 见模块文档。bar_button 等自绘单元的批量替换是后续独立批次（#385
+/// 对照表行 2/3/4 解冻件），本层只交适配器与验证。进 lib 树理由：
+/// `#[gpui::test]` 无头面挂 bin 目标 = CI 永不运行（假绿），与
+/// document.rs 同纪律。
+#[path = "button_ext.rs"]
+pub mod button_ext;
