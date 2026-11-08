@@ -7061,6 +7061,15 @@ impl DocxWriter {
         names
     }
 
+    /// #586：粘性校验错误落账单点（pub(crate)——docx_revision.rs 分文件
+    /// impl 桥消费：兄弟模块不可及私有字段，经此面记录；**首错语义**
+    /// 与 V7-V12 同——后续违规不覆盖，save 漏斗零产物拒绝）。
+    pub(crate) fn record_validation_error(&mut self, msg: String) {
+        if self.validation_error.is_none() {
+            self.validation_error = Some(msg);
+        }
+    }
+
     /// r4-t2：段/run 计数单点（paras 含本段；脚注规格 +1 段 +1 run）。
     /// S1 样式面：pub(crate)（style.rs `styled_paragraph` 复用）。
     /// S1 编号面：pub(crate)（numbering.rs `numbered_list_item` 复用）。
