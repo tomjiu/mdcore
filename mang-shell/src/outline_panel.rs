@@ -42,6 +42,9 @@ use crate::editor::Editor;
 /// 入参 = 激活行号；`jump_to_line` 已由面板本体先行执行。
 pub type ActivateHook = Arc<dyn Fn(usize, &mut Window, &mut App)>;
 
+/// Esc 宿主回调：焦点还给实际挂载的 PDF 页面 / XLSX 网格 / 编辑器 / 空态根。
+pub type EscapeHook = Arc<dyn Fn(&mut Window, &mut App)>;
+
 /// 钩子的借用形态（clippy type_complexity 收口）。
 type ActivateHookRef<'a> = Option<&'a dyn Fn(usize, &mut Window, &mut App)>;
 
@@ -68,6 +71,8 @@ pub struct OutlinePanel {
     scroll: ScrollHandle,
     /// bin 面副作用注入（见模块文档「lib 树纪律」）。
     activate_hook: Option<ActivateHook>,
+    /// 独立宿主可省略；Shell 注入当前活动视图的焦点路由。
+    escape_hook: Option<EscapeHook>,
 }
 
 impl OutlinePanel {
@@ -83,6 +88,7 @@ impl OutlinePanel {
             handles: HashMap::new(),
             scroll: ScrollHandle::new(),
             activate_hook,
+            escape_hook: None,
         };
         this.refresh(cx);
         // 编辑器通知（buffer 编辑/标题增删）→ 行集差量刷新。
@@ -93,6 +99,12 @@ impl OutlinePanel {
         })
         .detach();
         this
+    }
+
+    /// 注入 Esc 焦点路由，不改变构造签名；未注入时沿用独立编辑器行为。
+    pub fn with_escape_hook(mut self, hook: EscapeHook) -> Self {
+        self.escape_hook = Some(hook);
+        self
     }
 
     /// 宿主编辑器（shell 侧实体换绑判据）。
@@ -252,9 +264,14 @@ impl gpui::Render for OutlinePanel {
             // 不消费时该 action 会冒泡进窗口级关闭链——显式收口）。
             .on_action({
                 let editor = editor.clone();
+                let escape = self.escape_hook.clone();
                 move |_: &menu::Cancel, window, cx| {
-                    let handle = editor.read(cx).focus_handle().clone();
-                    handle.focus(window, cx);
+                    if let Some(escape) = &escape {
+                        escape(window, cx);
+                    } else {
+                        let handle = editor.read(cx).focus_handle().clone();
+                        handle.focus(window, cx);
+                    }
                 }
             })
             .child(navigable)
@@ -576,5 +593,123 @@ mod tests {
             "目标行起点须滚入viewport：{after:?} / {viewport:?}"
         );
         assert!(after.bottom() <= viewport.bottom(), "目标行完整高度可见");
+    }
+
+    /// Hook 模式只挂载替代视图目标，隐藏模型 Editor；默认模式挂真实 Editor。
+    struct EscapeHost {
+        panel: Entity<OutlinePanel>,
+        editor: Option<Entity<Editor>>,
+        host_target: Option<FocusHandle>,
+    }
+
+    impl gpui::Render for EscapeHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .size_full()
+                .child(self.panel.clone())
+                .when_some(self.editor.clone(), |el, editor| {
+                    el.child(v_flex().w_full().h(gpui::px(100.)).child(editor))
+                })
+                .when_some(self.host_target.clone(), |el, target| {
+                    el.child(
+                        div()
+                            .id("outline-host-focus-target")
+                            .debug_selector(|| "outline-host-focus-target".to_string())
+                            .w_full()
+                            .h(gpui::px(1.))
+                            .flex_shrink_0()
+                            .track_focus(&target),
+                    )
+                })
+        }
+    }
+
+    fn escape_window(
+        cx: &mut TestAppContext,
+        inject_host_hook: bool,
+    ) -> (
+        Entity<Editor>,
+        Entity<OutlinePanel>,
+        VisualTestContext,
+        FocusHandle,
+    ) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let editor = md_editor(cx, "# Heading\nBody");
+        let target = cx.update(|app| app.focus_handle());
+        let panel = cx.update(|app| {
+            let editor = editor.clone();
+            let target = target.clone();
+            app.new(|cx| {
+                let panel = OutlinePanel::new(editor, None, cx);
+                if inject_host_hook {
+                    panel.with_escape_hook(Arc::new(move |window, cx| target.focus(window, cx)))
+                } else {
+                    panel
+                }
+            })
+        });
+        let window = cx.open_window(size(gpui::px(260.), gpui::px(400.)), {
+            let panel = panel.clone();
+            let editor = (!inject_host_hook).then_some(editor.clone());
+            let host_target = inject_host_hook.then_some(target.clone());
+            move |_, _| EscapeHost {
+                panel,
+                editor,
+                host_target,
+            }
+        });
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        (editor, panel, visual, target)
+    }
+
+    #[gpui::test]
+    fn cancel_with_host_hook_focuses_mounted_target_instead_of_hidden_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, panel, mut visual, target) = escape_window(cx, true);
+        assert!(
+            visual.debug_bounds("outline-host-focus-target").is_some(),
+            "宿主焦点目标必须真实渲染挂载"
+        );
+        let row = panel.read_with(&visual, |p, _| p.rows[0].focus_handle.clone());
+        let model_focus = editor.read_with(&visual, |ed, _| ed.focus_handle().clone());
+        visual.update(|window, cx| row.focus(window, cx));
+        visual.dispatch_action(menu::Cancel);
+        visual.update(|window, cx| {
+            assert!(
+                target.contains_focused(window, cx),
+                "Cancel 走宿主的实际视图目标"
+            );
+            assert!(
+                !model_focus.contains_focused(window, cx),
+                "不能落到未挂载模型 Editor"
+            );
+            assert!(
+                !row.contains_focused(window, cx),
+                "Cancel 必须离开大纲行焦点"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn cancel_without_host_hook_preserves_editor_focus_fallback(cx: &mut TestAppContext) {
+        let (editor, panel, mut visual, _) = escape_window(cx, false);
+        panel.read_with(&visual, |p, _| assert!(p.escape_hook.is_none()));
+        let row = panel.read_with(&visual, |p, _| p.rows[0].focus_handle.clone());
+        let editor_focus = editor.read_with(&visual, |ed, _| ed.focus_handle().clone());
+        visual.update(|window, cx| row.focus(window, cx));
+        visual.dispatch_action(menu::Cancel);
+        visual.update(|window, cx| {
+            assert!(
+                editor_focus.contains_focused(window, cx),
+                "未注入hook时仍回独立Editor"
+            );
+            assert!(!row.contains_focused(window, cx));
+        });
     }
 }

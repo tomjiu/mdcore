@@ -626,6 +626,7 @@ impl ShellApp {
         };
         if stale {
             let shell = cx.entity().downgrade();
+            let escape_shell = shell.clone();
             let ed = editor.clone();
             // #289-④：pdf 页面视图下激活行随页滚动（书签链同款）。
             let hook = move |line: usize, window: &mut Window, cx: &mut App| {
@@ -635,8 +636,13 @@ impl ShellApp {
                     }
                 }
             };
-            self.outline =
-                Some(cx.new(|cx| OutlinePanel::new(editor, Some(std::sync::Arc::new(hook)), cx)));
+            let escape = move |window: &mut Window, cx: &mut App| {
+                let _ = escape_shell.update(cx, |shell, cx| shell.focus_active(window, cx));
+            };
+            self.outline = Some(cx.new(|cx| {
+                OutlinePanel::new(editor, Some(std::sync::Arc::new(hook)), cx)
+                    .with_escape_hook(std::sync::Arc::new(escape))
+            }));
         }
     }
 
@@ -665,12 +671,7 @@ impl ShellApp {
             }),
             // Esc → 焦点还激活编辑器（#571 大纲面板同语义）。
             escape: Arc::new(move |window, cx| {
-                let _ = shell.update(cx, |shell, cx| {
-                    if let Some(ed) = shell.editor() {
-                        let focus = ed.read(cx).focus_handle().clone();
-                        window.focus(&focus, cx);
-                    }
-                });
+                let _ = shell.update(cx, |shell, cx| shell.focus_active(window, cx));
             }),
         }
     }
@@ -691,12 +692,7 @@ impl ShellApp {
                 }
             }),
             escape: Arc::new(move |window, cx| {
-                let _ = shell.update(cx, |shell, cx| {
-                    if let Some(ed) = shell.editor() {
-                        let focus = ed.read(cx).focus_handle().clone();
-                        window.focus(&focus, cx);
-                    }
-                });
+                let _ = shell.update(cx, |shell, cx| shell.focus_active(window, cx));
             }),
         }
     }

@@ -481,17 +481,14 @@ impl Render for GitPanel {
                                 .debug_selector(move || format!("git-chg-row-{path_for_debug}"))
                                 .track_focus(&handle)
                                 .anchor_scroll(Some(anchor))
-                                // 点击 = 行聚焦 + 打开（#575 同款单一模型）。
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, window, cx| handle.focus(window, cx)
-                                })
+                                // 聚焦与打开在同一 child 回调；避免父 click 冒泡抢回焦点。
                                 .child(
                                     ListItem::new(gpui::SharedString::from(format!(
                                         "git-chg-{path}"
                                     )))
                                     .inset(true)
                                     .on_click(cx.listener(move |this, _, window, cx| {
+                                        handle.focus(window, cx);
                                         this.open_diff(&path_for_click, window, cx);
                                     }))
                                     .child(
@@ -546,14 +543,11 @@ impl Render for GitPanel {
                             .debug_selector(move || format!("git-cmt-row-{hash_for_debug}"))
                             .track_focus(&handle)
                             .anchor_scroll(Some(anchor))
-                            .on_click({
-                                let handle = handle.clone();
-                                move |_, window, cx| handle.focus(window, cx)
-                            })
                             .child(
                                 ListItem::new(gpui::SharedString::from(format!("git-cmt-{hash}")))
                                     .inset(true)
                                     .on_click(cx.listener(move |this, _, window, cx| {
+                                        handle.focus(window, cx);
                                         this.open_commit(&hash, window, cx);
                                     }))
                                     .child(
@@ -958,6 +952,136 @@ mod keyboard_tests {
     #[gpui::test]
     fn long_history_navigation_scrolls_target_into_view(cx: &mut gpui::TestAppContext) {
         assert_long_view_navigation_scrolls(cx, GitView::History, "git-cmt-row-c000035");
+    }
+
+    /// 注入的只读标签焦点必须挂在真实宿主树中，才能检查点击最终焦点。
+    struct ClickHost {
+        panel: gpui::Entity<GitPanel>,
+        opened_focus: FocusHandle,
+    }
+
+    impl Render for ClickHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full().child(self.panel.clone()).child(
+                div()
+                    .id("git-opened-readonly-target")
+                    .w_full()
+                    .h(gpui::px(1.))
+                    .flex_shrink_0()
+                    .track_focus(&self.opened_focus),
+            )
+        }
+    }
+
+    /// 实际 mouse down/up 冒泡 + 真 Git 命令 + hook 落焦，不只断言标题/次数。
+    fn assert_mouse_open_preserves_hook_focus(cx: &mut gpui::TestAppContext, view: GitView) {
+        assert!(git_available(), "真 Git 点击回归需要 git");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("mang-git-click-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("probe.txt"), "original\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git 进程");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "click-test@example.invalid"]);
+        git(&["config", "user.name", "Git click test"]);
+        git(&["add", "probe.txt"]);
+        git(&["commit", "-qm", "Initial"]);
+        std::fs::write(dir.join("probe.txt"), "changed\n").unwrap();
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let opened_focus = cx.update(|app| app.focus_handle());
+        let opened: Arc<Mutex<Vec<String>>> = Arc::default();
+        let hook_focus = opened_focus.clone();
+        let captured = opened.clone();
+        let panel = cx.update(|app| {
+            app.new(|cx| {
+                let mut panel = GitPanel::new(
+                    dir.clone(),
+                    GitPanelHooks {
+                        open_readonly: Arc::new(move |title, _, window, cx| {
+                            captured.lock().unwrap().push(title);
+                            hook_focus.focus(window, cx);
+                        }),
+                        escape: Arc::new(|_, _| panic!("unexpected Escape in click test")),
+                    },
+                    cx,
+                );
+                panel.view = view;
+                assert_eq!(panel.changes.len(), 1, "真仓库含一条改动");
+                assert_eq!(panel.commits.len(), 1, "真仓库含一条提交");
+                panel
+            })
+        });
+        let window = cx.open_window(gpui::size(gpui::px(260.), gpui::px(400.)), {
+            let panel = panel.clone();
+            let opened_focus = opened_focus.clone();
+            move |_, _| ClickHost {
+                panel,
+                opened_focus,
+            }
+        });
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (row_focus, selector, expected_title) = panel.read_with(&visual, |p, _| match view {
+            GitView::Changes => (
+                p.change_handles["probe.txt"].clone(),
+                "git-chg-row-probe.txt".to_string(),
+                "diff: probe.txt".to_string(),
+            ),
+            GitView::History => {
+                let hash = &p.commits[0].hash;
+                (
+                    p.commit_handles[hash].clone(),
+                    format!("git-cmt-row-{hash}"),
+                    format!("提交 {hash}"),
+                )
+            }
+        });
+        // GPUI debug_bounds 要求 static selector；仅测试进程保留真实提交的短哈希键。
+        let selector: &'static str = Box::leak(selector.into_boxed_str());
+        let bounds = visual.debug_bounds(selector).expect("真实 Git 行布局");
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        visual.update(|window, cx| {
+            assert!(
+                opened_focus.contains_focused(window, cx),
+                "点击打开后最终焦点必须留在注入的只读标签目标"
+            );
+            assert!(
+                !row_focus.contains_focused(window, cx),
+                "父行 click 冒泡不得把焦点抢回 Git 行"
+            );
+        });
+        assert_eq!(*opened.lock().unwrap(), vec![expected_title]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn clicking_change_keeps_focus_on_opened_readonly_target(cx: &mut gpui::TestAppContext) {
+        assert_mouse_open_preserves_hook_focus(cx, GitView::Changes);
+    }
+
+    #[gpui::test]
+    fn clicking_commit_keeps_focus_on_opened_readonly_target(cx: &mut gpui::TestAppContext) {
+        assert_mouse_open_preserves_hook_focus(cx, GitView::History);
     }
 
     /// 句柄差量：键存续复用 / 离场清退（prune_handles 纯状态面）。
