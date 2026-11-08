@@ -2333,6 +2333,28 @@ impl Render for ShellApp {
                     return;
                 }
 
+                // #421：pdf 页面视图键域——缩放命令（canvas 态键域同构
+                // 先例：editor::dispatch_canvas_key 在 keymap 表之前分流
+                // 视口命令）。pdf 页面视图是替换渲染面（editor_area 分流
+                // 编辑器不在场），shell 单点接键：Ctrl+0 适应页面 /
+                // Ctrl+1 实际大小 / Ctrl+Shift+0 适应宽度 / Ctrl+=·Ctrl+-
+                // 步进缩放。消费即 return——防 Ctrl+0/=/- 落 keymap 字号
+                // 键（S6-S9）二次响应；非 pdf 态/文本视图不进本分支，
+                // 键位行为零变化。Ctrl+滚轮在视图内 capture 期拦截
+                //（pdf_pages paint 注册），不经本分支。
+                if this.pdf_view_mode && this.active_is_pdf(cx) {
+                    if let Some((_, entity)) = &this.pdf_pages {
+                        let mut zoom_consumed = false;
+                        entity.update(cx, |view, cx| {
+                            zoom_consumed =
+                                view.dispatch_zoom_key(&key, ctrl, ks.modifiers.shift, cx);
+                        });
+                        if zoom_consumed {
+                            return;
+                        }
+                    }
+                }
+
                 // #217：shell 键位改查 keymap 表（默认表 = 下方原分支的
                 // 精确镜像，行为零变化；用户换绑后跟随）。模态守卫（菜单
                 // /右键菜单/确认框）在表之前——模态语义不入表。
