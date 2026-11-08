@@ -82,7 +82,7 @@
 | # | mang-shell 现状（行数） | zed ui 对应 | 难度 | 优先级 | 批次建议 | 备注 |
 |---|---|---|---|---|---|---|
 | 1 | `title_bar.rs`（123）窗口控制 | **已迁移**（`ui::IconButton` 在用——#289 已做） | — | — | — | 剩余：菜单钮位视觉打磨 |
-| 2 | 各面板按钮（panels/git_panel/settings_panel/pdf 工具条的 `div().on_click`） | **维持自绘**（见结论 2：视觉语系一致性 + 精确几何控制；IconButton 无固定尺寸 API） | — | — | 不迁 | 零件级 ui::Tooltip 已在用；后续若 Lead 弃 36×36 规格再评估 |
+| 2 | 各面板按钮（panels/git_panel/settings_panel/pdf 工具条的 `div().on_click`） | **维持自绘**（见结论 2：视觉语系一致性 + 精确几何控制；IconButton 无固定尺寸 API） | — | — | 不迁 | 零件级 ui::Tooltip 已在用；~~后续若 Lead 弃 36×36 规格再评估~~ **#525 裁定（2026-11-08）：36×36 不需弃——适配层成立**（`src/button_ext.rs` IconButton 渲染拦截路径：width 走 FixedWidth + render() 返回公开 ButtonLike 补 height——无头实测精确 36×36 全盒命中，外层容器方案死区证伪）；替换批次待 Lead 排期 |
 | 3 | `activity_bar.rs`（139）视图切换钮 | **维持自绘**（模块文档在案：IconButton rem 推导无法钉 36×36 Lead 硬规格） | — | — | 不迁 | 自绘单元同时掌控 hover/selected 主题色 |
 | 4 | `right_dock.rs`（52 恒在 dock 条） | **维持自绘**（复用 bar_button 单元——左右两条同语系） | — | — | 不迁 | 同上 |
 | 5 | `tab_bar.rs`（218 手写 tab） | `ui::TabBar` + `ui::Tab` | 中 | P1 | **批 2** | 溢出横滚已用 gpui 原生；Tab 组件带关闭钮/激活态语义 |
