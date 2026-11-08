@@ -12,6 +12,7 @@ R17: W13 非 BMP 单位宪法（码点↔UTF-16 换算 + 事件流 op 偏移=码
 import time
 import http.server
 import json
+import math
 import socketserver
 import sys
 import threading
@@ -816,6 +817,8 @@ def g1_cursor_latency(browser, port):
           const blocks = window.__blocks();
           core.set_clock_ms(BigInt(Date.now()));
           const coreMs = [];
+          const coreRevisionBefore = Number(core.revision());
+          const coreExpected = [];
           for (let i = 0; i < 30; i++) {
             const idx = (i * 97) % blocks.length;
             const b = blocks[idx];
@@ -824,11 +827,16 @@ def g1_cursor_latency(browser, port):
             const t = performance.now();
             core.apply_ops(JSON.stringify([op]), 'view', 'g1-probe');
             coreMs.push(performance.now() - t);
+            coreExpected.push({id: b.id, text: op.insert + Array.from(b.text).slice(op.end).join('')});
           }
+          const coreAfter = new Map(JSON.parse(core.blocks_json()).map(b => [b.id, b.text]));
+          const coreVerified = coreExpected.filter(b => coreAfter.get(b.id) === b.text).length;
           const mem = performance.memory ? performance.memory.usedJSHeapSize : null;
           return {cursor_p95: p95(cur), cursor_max: Math.max(...cur),
                   type_p95: p95(typ), type_max: Math.max(...typ),
                   core_p95: p95(coreMs), core_p50: [...coreMs].sort((x,y)=>x-y)[15],
+                  core_samples: coreMs, core_revision_delta: Number(core.revision()) - coreRevisionBefore,
+                  core_verified: coreVerified,
                   doc_len: docLen, blocks: blocks.length, heap_used_mb: mem ? mem / 1048576 : null};
         }""")
         checks = [
@@ -839,7 +847,13 @@ def g1_cursor_latency(browser, port):
             check("typing full path p95 recorded (attribution, non-gate)",
                   r["type_p95"] > 0, f"p95={r['type_p95']:.1f}ms"),
             check("core-only op p95 recorded (attribution, non-gate)",
-                  r["core_p95"] > 0, f"p95={r['core_p95']:.1f}ms p50={r['core_p50']:.1f}ms"),
+                  len(r["core_samples"]) == 30 and math.isfinite(r["core_p95"])
+                  and r["core_p95"] >= 0
+                  and all(math.isfinite(ms) and ms >= 0 for ms in r["core_samples"]),
+                  f"p95={r['core_p95']:.1f}ms p50={r['core_p50']:.1f}ms samples={len(r['core_samples'])}"),
+            check("30 core-only mutations actually applied", len(r["core_samples"]) == 30
+                  and r["core_verified"] == 30,
+                  f"samples={len(r['core_samples'])} verified={r['core_verified']} revisions={r['core_revision_delta']}"),
         ]
         # Gate 2 判定（§15.3 <16ms）：记录于 gate_verdict / gates.md，不翻全局
         # pass（回归套件与门判定分离；R15 增量窗口化后的归因见 gates.md）。
@@ -852,6 +866,11 @@ def g1_cursor_latency(browser, port):
                 "typing_p95_ms": round(r["type_p95"], 1),
                 "core_only_p95_ms": round(r["core_p95"], 1),
                 "core_only_p50_ms": round(r["core_p50"], 1),
+                # 计时精度可能把真实快速调用记为0；保存原样本与内容回查，
+                # 不把归因诊断的正值要求当性能门。revision可因合法合并窗不变。
+                "core_only_samples_ms": r["core_samples"],
+                "core_only_verified": r["core_verified"],
+                "core_revision_delta": r["core_revision_delta"],
                 "heap_used_mb": round(r["heap_used_mb"], 1) if r["heap_used_mb"] else None,
                 "doc_len": r["doc_len"], "blocks": r["blocks"], "gate_verdict": verdict}
     finally:

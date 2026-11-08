@@ -531,7 +531,7 @@ mod tests {
             let button = icon_button_36("a11y-focus", IconName::Settings)
                 .tooltip_text("显式焦点")
                 .build(window, cx)
-                .tab_index(0);
+                .tab_index(0_isize);
             let focused = rendered_a11y_node(button, window, cx);
             assert!(focused.supports_action(A11yAction::Focus));
 
