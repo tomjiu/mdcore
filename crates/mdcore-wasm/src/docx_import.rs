@@ -1640,6 +1640,7 @@ mod tests {
             merges: vec![],
             source: BlockSource::Body,
             nested: false,
+            footnote_refs: Vec::new(),
         })]);
         let (md, stats) = docx_to_markdown(&doc);
         assert_eq!(md, "| a\\|b | x |\n| --- | --- |\n| two lines |  |");
@@ -1650,6 +1651,7 @@ mod tests {
             merges: vec![],
             source: BlockSource::Body,
             nested: false,
+            footnote_refs: Vec::new(),
         })]));
         assert_eq!(md2, "");
         assert_eq!(stats2["tables"], 0);
@@ -1681,6 +1683,7 @@ mod tests {
             ],
             source: BlockSource::Body,
             nested: false,
+            footnote_refs: Vec::new(),
         })]);
         let (md, stats) = docx_to_markdown(&doc);
         assert_eq!(stats["merged_ranges"], 2, "两处合并计数: {stats}");
@@ -1700,6 +1703,7 @@ mod tests {
                 merges: vec![],
                 source: BlockSource::Body,
                 nested: false,
+                footnote_refs: Vec::new(),
             }),
             Block::Table(TableData {
                 rows: vec![
@@ -1717,6 +1721,7 @@ mod tests {
                 merges: vec![],
                 source: BlockSource::Body,
                 nested: true,
+                footnote_refs: Vec::new(),
             }),
         ]);
         let (md, stats) = docx_to_markdown(&doc);
@@ -1894,6 +1899,7 @@ mod tests {
                         merges: vec![],
                         source: BlockSource::Header,
                         nested: false,
+                        footnote_refs: Vec::new(),
                     }),
                 ],
             }],

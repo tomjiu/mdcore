@@ -1679,6 +1679,26 @@ pub struct TableData {
     /// 表——消费方可分流（标书侧费率表等实质性条款区识别面）。
     /// 缺省语义不可依赖 serde（本类型无 serde 面——构造点显式赋值）。
     pub nested: bool,
+    /// #517 ①（层 1）：表内段脚注引用位（cell 段级——仅含有引用的
+    /// cell 段，绝大多数表为空 Vec）。行/列为栅格原点格坐标（gridSpan
+    /// 展开前）；`para` = cell 内段序；`ids` = 引用 id 序（文档序）。
+    /// 层 2（mdcore-wasm import 的 cell 文本尾接 [^N]）待接——本层
+    /// 先交数据面。
+    pub footnote_refs: Vec<TableCellNoteRef>,
+}
+
+/// #517：表内段脚注引用位（cell 段级——`TableData::footnote_refs` 条目）。
+/// 定位 = (栅格行, 原点格列, cell 内段序)；引用面 = `w:footnoteReference`
+/// id 序（文档序）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCellNoteRef {
+    pub row: usize,
+    pub col: usize,
+    /// cell 内段序（0 基——cell 段文档序，与 `parts.join("\n")` 的
+    /// 段序一致）。
+    pub para: usize,
+    /// 引用 id 序（文档序——段内多次引用按遇见序）。
+    pub ids: Vec<i64>,
 }
 
 /// 表格合并区域（#22 P2-2）：`start`/`end` 为栅格矩形对角（0 基、
@@ -2532,6 +2552,9 @@ fn paragraph_text_box_children(p: &docx_rs::Paragraph) -> Vec<&Vec<docx_rs::Text
 
 /// #18：文本框内层块提取（与正文同一机制——样式索引/域状态机/修订
 /// 通道/超链接联接全承载；TextBoxContentChild 段落/表两型）。
+/// #517 ②：框内段引用位透传——`notes` 三元组 = (宿主 body 块索引,
+/// 框序, scan 侧 text_boxes 键表)，DrawingML 主路径传入；VML 第二趟
+/// 路径传 None（引用位保持静默——登记面）。
 #[allow(clippy::too_many_arguments)]
 fn text_box_blocks(
     children: &[docx_rs::TextBoxContentChild],
@@ -2542,17 +2565,34 @@ fn text_box_blocks(
     source: BlockSource,
     strict: bool,
     warnings: &mut Vec<CompatibilityWarning>,
+    notes: Option<(usize, usize, &HashMap<(usize, usize, usize), Vec<i64>>)>,
 ) -> Result<Vec<Block>, io::ReadError> {
     let mut out = Vec::new();
+    // #517 ②：框内段序计数（与 scan 的 txbxContent 域段序一致——
+    // TextBoxContentChild::Paragraph 枚举序）。
+    let mut para_seq = 0usize;
     for c in children {
         match c {
-            docx_rs::TextBoxContentChild::Paragraph(p) => out.push(Block::Paragraph(
-                extract_paragraph(p, table, index, styles, part, source, strict, warnings)?,
-            )),
+            docx_rs::TextBoxContentChild::Paragraph(p) => {
+                let mut pd =
+                    extract_paragraph(p, table, index, styles, part, source, strict, warnings)?;
+                // #517 ②：框内段引用位标注（键 = 宿主块/框序/段序）。
+                if let Some((host, box_idx, scan)) = &notes {
+                    if let Some(refs) = scan.get(&(*host, *box_idx, para_seq)) {
+                        pd.footnote_refs = refs.clone();
+                    }
+                }
+                para_seq += 1;
+                out.push(Block::Paragraph(pd));
+            }
             docx_rs::TextBoxContentChild::Table(t) => {
                 // #39：嵌套表沿文档序独立成块（extract_table 返回
-                // [本表, 内层表…]）。
-                for td in extract_table(t, table, index, styles, part, source, strict, warnings)? {
+                // [本表, 内层表…]）。框内表段不在此枚举（para_seq 不
+                // 动——与 scan 侧「框内表段归 tbl 域」的口径一致；
+                // 框内表的引用位无消费面，#517 登记面）。
+                for td in extract_table(
+                    t, table, index, styles, part, source, strict, warnings, None,
+                )? {
                     out.push(Block::Table(td));
                 }
             }
@@ -3042,18 +3082,48 @@ fn parse_textbox_region(
         BlockSource::Body,
         strict,
         warnings,
+        // #517 ②：VML 第二趟路径——引用位不透传（DrawingML 主路径专
+        // 属键；VML 框内引用位保持静默，登记面）。
+        None,
     )
 }
 
-/// #19：正文脚注引用位扫描（`w:footnoteReference`——引擎 run 模型
-/// 不承载，CAPABILITY_NOTES §5；文档级第二趟）。
+/// #517：脚注引用位扫描结果（三维键——body 段 / 表内段 / 文本框内
+/// 段）。键口径与消费面（extract_blocks / extract_table_inner /
+/// text_box_blocks）的计数契约见 [`scan_note_references`] 文档。
+#[derive(Debug, Default)]
+struct NoteRefScan {
+    /// body 顶层段落：body 块索引 → 脚注 id 序（文档序）——既有面（#19）。
+    body: HashMap<usize, Vec<i64>>,
+    /// 表内段（#517 ①）：(tbl 文档序号, 表内段序) → id 序。嵌套表段
+    /// 归嵌套表自己的键（外层不计）；mc:Fallback 复制区不计数。
+    table_cells: HashMap<(usize, usize), Vec<i64>>,
+    /// 文本框内段（#517 ②——DrawingML 主形态）：
+    /// (宿主 body 块索引, 宿主块内框序, 框内段序) → id 序。
+    /// VML / 表内 tc 框不在本键（登记面，见扫描器文档）。
+    text_boxes: HashMap<(usize, usize, usize), Vec<i64>>,
+}
+
+/// #19 / #517：正文脚注引用位扫描（`w:footnoteReference`——引擎 run
+/// 模型不承载，CAPABILITY_NOTES §5；文档级第二趟）。
 ///
-/// 返回 body 块索引 → 脚注 id 序（文档序）。body 块索引 = `w:p`/
-/// `w:tbl` 的 body 直接子层计数（与 extract_blocks/scan_vml_textbox_regions
-/// 一致，含自闭合形态）；文本框内容（`w:txbxContent`）与 mc:Fallback
-/// 复制区内引用不标注（内层块非 body 块 / Fallback 为复制区）；表内
-/// 段引用归表块（标注面为 body 段落——表块不消费，静默）。
-fn scan_note_references(xml: &str) -> HashMap<usize, Vec<i64>> {
+/// 返回 [`NoteRefScan`]（三维键——body 段 / 表内段 / 文本框内段）。
+/// mc:Fallback 复制区内的引用一律不标注（复制区语义，既有行为保持）。
+///
+/// # 键口径（消费面 extract_blocks / extract_table_inner /
+/// text_box_blocks 与本扫描的计数契约）
+///
+/// · body 块索引 = `w:p`/`w:tbl` 的 body 直接子层计数（Fallback 内
+///   不计——docx-rs 模型面 D1 选择面已剔除 Fallback，两侧一致）；
+/// · tbl 序号 = document.xml 内 `w:tbl` 遇见序（含嵌套表——各自独立
+///   计序，嵌套表段归嵌套表键）；表内段序 = 该 tbl 直接子树内的 `w:p`
+///   文档序（嵌套表内段不计入外层——与 extract_table_inner 的 cell
+///   段遍历序一致）；
+/// · 文本框键只覆盖 **DrawingML 主形态**（父链 `wps:txbx`——
+///   text_box_blocks 消费路径）；VML（`v:textbox` 第二趟）与表内
+///   tc 文本框（#345 路径）不在本键（引用位保持静默——与既有行为
+///   一致，#517 层 1 登记面）。
+fn scan_note_references(xml: &str) -> NoteRefScan {
     use quick_xml::events::Event;
 
     /// 条目 id 属性读取（w:id——ASCII 数位，损失解码防御）。
@@ -3072,55 +3142,180 @@ fn scan_note_references(xml: &str) -> HashMap<usize, Vec<i64>> {
         None
     }
 
+    /// 容器栈帧：段/引用归属的判定面（最近未闭合容器）。
+    enum Frame {
+        /// body 顶层域：`cur` = 当前 body 块索引（最近计数的段/表）。
+        Body { cur: Option<usize> },
+        /// 表域：`seq` = tbl 文档序号；`para_seq` = 下一表内段序；
+        /// `cur` = 当前段序（引用挂接用）。
+        Tbl {
+            seq: usize,
+            para_seq: usize,
+            cur: Option<usize>,
+        },
+        /// 文本框域（DrawingML）：`host` = 宿主 body 块索引；
+        /// `box_idx` = 宿主块内框序；`para_seq`/`cur` 同表域口径。
+        Txbx {
+            host: usize,
+            box_idx: usize,
+            para_seq: usize,
+            cur: Option<usize>,
+        },
+        /// 哑框（VML `v:textbox` 形态）：隔离其内段的 body 块计数
+        /// （消费面 docx-rs 模型不含 VML 框内段——坐标系不因 VML
+        /// 漂移）；引用不入键（登记面）。
+        TxbxSkip,
+    }
+
     let mut reader = quick_xml::Reader::from_str(xml);
-    let mut depth: usize = 0;
-    let mut body_child_depth: Option<usize> = None;
+    let mut stack: Vec<Frame> = Vec::new();
     let mut block_idx: usize = 0;
+    let mut tbl_seq: usize = 0;
+    // 宿主 body 块 → 已见 DrawingML 框数（框序分配——与 extract_blocks
+    // 的 paragraph_text_box_children 枚举序一致：DrawingML 框按 XML
+    // 遇见序连续编号，VML 框不占号）。
+    let mut host_boxes: HashMap<usize, usize> = HashMap::new();
     let mut in_fallback: usize = 0;
-    let mut in_txbx: usize = 0;
-    let mut out: HashMap<usize, Vec<i64>> = HashMap::new();
-    // 引用位记录（自闭合/双标签同形）。
-    let record = |e: &quick_xml::events::BytesStart<'_>,
-                  block_idx: usize,
-                  in_fallback: usize,
-                  in_txbx: usize,
-                  out: &mut HashMap<usize, Vec<i64>>| {
-        if in_fallback == 0 && in_txbx == 0 {
-            if let Some(id) = note_id(e) {
-                out.entry(block_idx.saturating_sub(1)).or_default().push(id);
+    // 最近一次 Start 的 local name（txbxContent 的形态分流：父链
+    // wps:txbx = DrawingML 主形态；v:textbox = VML，不入键）。
+    let mut last_start = String::new();
+    let mut out = NoteRefScan::default();
+
+    /// 引用位记录（当前容器栈顶帧的当前段）。
+    fn record(frame: &Frame, e: &quick_xml::events::BytesStart<'_>, out: &mut NoteRefScan) {
+        let Some(id) = note_id(e) else { return };
+        match frame {
+            Frame::Body { cur: Some(k) } => {
+                out.body.entry(*k).or_default().push(id);
             }
+            Frame::Tbl {
+                seq, cur: Some(p), ..
+            } => {
+                out.table_cells.entry((*seq, *p)).or_default().push(id);
+            }
+            Frame::Txbx {
+                host,
+                box_idx,
+                cur: Some(p),
+                ..
+            } => {
+                out.text_boxes
+                    .entry((*host, *box_idx, *p))
+                    .or_default()
+                    .push(id);
+            }
+            // 段未开（引用在段外——结构病态）：跳过（防御，不 panic）。
+            _ => {}
         }
-    };
+    }
+
+    /// 段开始：按容器栈顶归属计数（body 顶层 = body 块索引；表/框 =
+    /// 域内段序；哑框 = 不计数），并挂接当前段序（引用记录用）。
+    fn open_para(stack: &mut [Frame], block_idx: &mut usize) {
+        match stack.last_mut() {
+            Some(Frame::Body { cur }) => {
+                *block_idx += 1;
+                *cur = Some(*block_idx - 1);
+            }
+            Some(Frame::Tbl { para_seq, cur, .. }) => {
+                *cur = Some(*para_seq);
+                *para_seq += 1;
+            }
+            Some(Frame::Txbx { para_seq, cur, .. }) => {
+                *cur = Some(*para_seq);
+                *para_seq += 1;
+            }
+            // 哑框（VML）：段被隔离（不计数不入键）；无 body 域
+            // （document.xml 病态前置段）：不归属。
+            _ => {}
+        }
+    }
+
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 match name.as_str() {
-                    "body" => body_child_depth = Some(depth + 1),
+                    "body" => stack.push(Frame::Body { cur: None }),
                     "Fallback" => in_fallback += 1,
-                    "txbxContent" => in_txbx += 1,
-                    "p" | "tbl" => {
-                        if in_fallback == 0 && body_child_depth == Some(depth) {
-                            block_idx += 1;
+                    "tbl" => {
+                        if in_fallback == 0 {
+                            // body 顶层表 = body 块（块计数）；嵌套表 =
+                            // 独立域（body 块不计——非 body 直接子层）。
+                            if matches!(stack.last(), Some(Frame::Body { .. })) && stack.len() == 1
+                            {
+                                block_idx += 1;
+                                if let Some(Frame::Body { cur }) = stack.last_mut() {
+                                    *cur = Some(block_idx - 1);
+                                }
+                            }
+                            stack.push(Frame::Tbl {
+                                seq: tbl_seq,
+                                para_seq: 0,
+                                cur: None,
+                            });
+                            tbl_seq += 1;
+                        }
+                    }
+                    "txbxContent" => {
+                        // DrawingML 主形态（父 wps:txbx）入键；VML
+                        // （父 v:textbox）push 哑框——隔离其内段的 body
+                        // 块计数（坐标系稳定），引用不入键（登记面）；
+                        // Fallback 内不入任何帧（复制区整体跳过）。
+                        if in_fallback == 0 {
+                            if last_start == "txbx" {
+                                // 宿主 = 最近 body 顶层块（Body 帧的当前块
+                                // ——段宿主 / 表宿主（tc 内框，数据面在
+                                // 而消费面登记不覆盖））。
+                                let host = match stack.first() {
+                                    Some(Frame::Body { cur: Some(k) }) => *k,
+                                    _ => continue,
+                                };
+                                let box_idx = *host_boxes.entry(host).or_insert(0);
+                                host_boxes.insert(host, box_idx + 1);
+                                stack.push(Frame::Txbx {
+                                    host,
+                                    box_idx,
+                                    para_seq: 0,
+                                    cur: None,
+                                });
+                            } else {
+                                stack.push(Frame::TxbxSkip);
+                            }
+                        }
+                    }
+                    "p" => {
+                        if in_fallback == 0 {
+                            open_para(&mut stack, &mut block_idx);
                         }
                     }
                     "footnoteReference" => {
-                        record(&e, block_idx, in_fallback, in_txbx, &mut out);
+                        if in_fallback == 0 {
+                            if let Some(frame) = stack.last() {
+                                record(frame, &e, &mut out);
+                            }
+                        }
                     }
                     _ => {}
                 }
-                depth += 1;
+                last_start = name;
             }
             Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 match name.as_str() {
-                    "p" | "tbl" => {
-                        if in_fallback == 0 && body_child_depth == Some(depth) {
-                            block_idx += 1;
+                    // 自闭合段（空段）/自闭合表（退化形）——计数口径与
+                    // Start 同形（块/段序照计，无内容可记）。
+                    "p" => {
+                        if in_fallback == 0 {
+                            open_para(&mut stack, &mut block_idx);
                         }
                     }
                     "footnoteReference" => {
-                        record(&e, block_idx, in_fallback, in_txbx, &mut out);
+                        if in_fallback == 0 {
+                            if let Some(frame) = stack.last() {
+                                record(frame, &e, &mut out);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -3128,11 +3323,27 @@ fn scan_note_references(xml: &str) -> HashMap<usize, Vec<i64>> {
             Ok(Event::End(e)) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 match name.as_str() {
+                    "body" => {
+                        if matches!(stack.last(), Some(Frame::Body { .. })) {
+                            stack.pop();
+                        }
+                    }
                     "Fallback" => in_fallback = in_fallback.saturating_sub(1),
-                    "txbxContent" => in_txbx = in_txbx.saturating_sub(1),
+                    "tbl" => {
+                        if matches!(stack.last(), Some(Frame::Tbl { .. })) {
+                            stack.pop();
+                        }
+                    }
+                    "txbxContent" => {
+                        if matches!(
+                            stack.last(),
+                            Some(Frame::Txbx { .. }) | Some(Frame::TxbxSkip)
+                        ) {
+                            stack.pop();
+                        }
+                    }
                     _ => {}
                 }
-                depth = depth.saturating_sub(1);
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -3300,6 +3511,7 @@ fn parse_note_region(
                         BlockSource::Body,
                         strict,
                         warnings,
+                        None, // #517 ①：部件/批注面（页眉/页脚/批注/框内）——无引用数据
                     )? {
                         blocks.push(Block::Table(td));
                     }
@@ -3387,6 +3599,7 @@ fn extract_comments(
                         BlockSource::Body,
                         strict,
                         warnings,
+                        None, // #517 ①：部件/批注面（页眉/页脚/批注/框内）——无引用数据
                     )? {
                         cblocks.push(Block::Table(td));
                     }
@@ -3583,7 +3796,7 @@ fn extract_blocks(
     styles: &StyleIndex,
     strict: bool,
     warnings: &mut Vec<CompatibilityWarning>,
-    note_refs: &HashMap<usize, Vec<i64>>,
+    scan: &NoteRefScan,
 ) -> Result<(Vec<Block>, CommentAnchors, SectionMarks, Vec<usize>), io::ReadError> {
     let table = bundle.document.as_ref();
     let mut blocks = Vec::new();
@@ -3596,6 +3809,10 @@ fn extract_blocks(
     // 全局块序——build_sections 按节 block_range 切分归属）。
     let mut column_break_blocks: Vec<usize> = Vec::new();
     let mut body_idx: usize = 0;
+    // #517 ①：tbl 文档序号计数器（document.xml 全局——跨所有 body 表
+    // 与嵌套递归共享；与 scan 侧的 tbl 遇见序一致：外层表、其嵌套表、
+    // 下一个外层表……按文档遇见序连续编号）。
+    let mut tbl_seq: usize = 0;
     for child in &docx.document.children {
         match child {
             docx_rs::DocumentChild::Paragraph(p) => {
@@ -3612,7 +3829,7 @@ fn extract_blocks(
                     warnings,
                 )?;
                 // #19：脚注引用位标注（文档级扫描 → 段落标记面）。
-                if let Some(refs) = note_refs.get(&k) {
+                if let Some(refs) = scan.body.get(&k) {
                     pd.footnote_refs = refs.clone();
                 }
                 // #19：段落级批注锚（ParagraphChild::CommentStart——
@@ -3632,7 +3849,9 @@ fn extract_blocks(
                 // #18：DrawingML 文本框（w:drawing → wps:txbx——引擎
                 // 读面已承载）宿主段后发射；VML 形态走文档级第二趟
                 // （apply_vml_textboxes——读面不承载，登记）。
-                for tb in paragraph_text_box_children(p) {
+                // #517 ②：框内段引用位随框透传（键 = 宿主块 k + 枚举序
+                // 框号 + 框内段序——与 scan 的 DrawingML 键口径一致）。
+                for (box_idx, tb) in paragraph_text_box_children(p).into_iter().enumerate() {
                     let tb_blocks = text_box_blocks(
                         tb,
                         table,
@@ -3642,6 +3861,7 @@ fn extract_blocks(
                         BlockSource::Body,
                         strict,
                         warnings,
+                        Some((k, box_idx, &scan.text_boxes)),
                     )?;
                     if !tb_blocks.is_empty() {
                         blocks.push(Block::TextBox(TextBoxData {
@@ -3660,7 +3880,10 @@ fn extract_blocks(
             docx_rs::DocumentChild::Table(t) => {
                 let k = body_idx;
                 body_idx += 1;
-                // #39：嵌套表同构独立成块。
+                // #39：嵌套表同构独立成块。#517 ①：表内段引用位随表
+                // 透传（tbl 键 = 文档序号——穿递归共享计数器；`k` 仍归
+                // 表块的 body 索引面（apply_tc_textboxes 等文档级第二趟
+                // 的定位坐标系）。
                 for td in extract_table(
                     t,
                     table,
@@ -3670,9 +3893,8 @@ fn extract_blocks(
                     BlockSource::Body,
                     strict,
                     warnings,
+                    Some((&mut tbl_seq, &scan.table_cells)),
                 )? {
-                    // #19：表内脚注引用位不标注（body 段落标记面——表内
-                    // 段落非 body 块；文档级面待需要时扩展）。
                     let _ = k;
                     blocks.push(Block::Table(td));
                 }
@@ -4064,7 +4286,6 @@ fn count_del_text(r: &docx_rs::Run) -> usize {
 /// - 孤儿续格（`continue` 无前置 restart，OOXML 未定义）：不发明
 ///   区域，按普通格落栅格（内容可见）；
 /// - 续格 span 与 restart 不一致：不匹配开放区，同孤儿处理（登记）。
-#[allow(clippy::too_many_arguments)]
 fn extract_table(
     t: &docx_rs::Table,
     table: Option<&RelationshipTable>,
@@ -4074,8 +4295,11 @@ fn extract_table(
     source: BlockSource,
     strict: bool,
     warnings: &mut Vec<CompatibilityWarning>,
+    notes: Option<(&mut usize, &HashMap<(usize, usize), Vec<i64>>)>,
 ) -> Result<Vec<TableData>, io::ReadError> {
-    extract_table_inner(t, table, index, styles, part, source, strict, warnings, 0)
+    extract_table_inner(
+        t, table, index, styles, part, source, strict, warnings, 0, notes,
+    )
 }
 
 /// #39：嵌套表深度上限（敌意深嵌 XML 防栈溢出——起域内递归；超限
@@ -4083,7 +4307,12 @@ fn extract_table(
 /// 深度普遍 ≤ 3（layout 表套数据表）；16 = 宽裕域。
 const MAX_NESTED_TABLE_DEPTH: usize = 16;
 
-#[allow(clippy::too_many_arguments)] // 9 参 = 既有 extract_table 8 参 + depth（同豁免模式）
+/// #517 ①：表内段引用位采集的穿递归上下文（进入本表时 `tbl_seq`
+/// 取当前值并自增——与 scan 侧的 tbl 遇见序一致；嵌套递归共享同一
+/// 计数器）。None = 无引用数据面（页眉/页脚表 / 框内表——登记面）。
+type TableNotes<'a> = Option<(&'a mut usize, &'a HashMap<(usize, usize), Vec<i64>>)>;
+
+#[allow(clippy::too_many_arguments)] // 10 参 = 既有 8 参 + depth（同豁免模式）+ notes（#517）
 fn extract_table_inner(
     t: &docx_rs::Table,
     table: Option<&RelationshipTable>,
@@ -4094,6 +4323,7 @@ fn extract_table_inner(
     strict: bool,
     warnings: &mut Vec<CompatibilityWarning>,
     depth: usize,
+    mut notes: TableNotes<'_>,
 ) -> Result<Vec<TableData>, io::ReadError> {
     // 注：docx-rs 0.4.22 模型中 TableChild/TableRowChild 均为单变体
     //（TableRow/TableCell）——直接解构；模型升级增变体时此函数
@@ -4149,9 +4379,22 @@ fn extract_table_inner(
         // 单行单列 restart 未续：无覆盖非原点格——非合并，不发。
     };
 
+    // #517 ①：本表的引用键域——进入时取当前 tbl_seq（与 scan 的
+    // 遇见序一致；嵌套递归共享同一计数器，文档序连续）。None = 无
+    // 引用数据面（页眉/页脚表 / 框内表）。
+    let tbl_note_key: Option<usize> = notes.as_ref().map(|(seq, _)| **seq);
+    if let Some((seq, _)) = &mut notes {
+        **seq += 1;
+    }
+
     let mut grid_rows: Vec<Vec<String>> = Vec::new();
     let mut merges: Vec<MergeRange> = Vec::new();
     let mut open_v: Vec<OpenVmerge> = Vec::new();
+    // #517 ①：表内段引用位清单（cell 段级——仅含有引用的段）。
+    let mut footnote_refs: Vec<TableCellNoteRef> = Vec::new();
+    // #517 ①：本表内段全局序计数（与 scan 侧 Tbl 帧的 para_seq 同口径
+    // ——仅本表直接子树段，嵌套表段由递归子调用自己的域计数）。
+    let mut para_seq = 0usize;
     // #39：内嵌表块流（沿文档序——行主序单元序、递归深度优先；
     // 返回序 = [外层表, 内层表…]）。内层表不进单元格文本（独立块
     // 发射——方案 A：表数守恒 + 消费方 nested 标记分流）。
@@ -4167,6 +4410,9 @@ fn extract_table_inner(
             let docx_rs::TableRowChild::TableCell(c) = cell;
             let (span, vmerge) = cell_props(c);
             let mut parts = Vec::new();
+            // #517 ①：cell 内段序（引用位定位的第三维——与
+            // parts.join("\n") 的段序一致）。
+            let mut cell_para = 0usize;
             for content in &c.children {
                 match content {
                     docx_rs::TableCellContent::Paragraph(p) => {
@@ -4174,6 +4420,21 @@ fn extract_table_inner(
                         let pd = extract_paragraph(
                             p, table, index, styles, part, source, strict, warnings,
                         )?;
+                        // #517 ①：表内段引用位采集（键 = (本表 seq,
+                        // 表内段全局序)——与 scan 侧一致；值挂 cell 段
+                        // 级定位（行/原点格列/cell 内段序））。
+                        if let (Some(seq), Some((_, scan))) = (tbl_note_key, notes.as_ref()) {
+                            if let Some(ids) = scan.get(&(seq, para_seq)) {
+                                footnote_refs.push(TableCellNoteRef {
+                                    row: ri,
+                                    col,
+                                    para: cell_para,
+                                    ids: ids.clone(),
+                                });
+                            }
+                        }
+                        para_seq += 1;
+                        cell_para += 1;
                         parts.push(pd.text());
                     }
                     // #39：内嵌表递归提取（w:tbl@w:tc depth≥2——此前
@@ -4202,6 +4463,9 @@ fn extract_table_inner(
                                 strict,
                                 warnings,
                                 depth + 1,
+                                // #517 ①：嵌套表共享同一计数器（文档序
+                                // 连续——与 scan 侧嵌套表独立键一致）。
+                                notes.as_mut().map(|(seq, scan)| (&mut **seq, *scan)),
                             )? {
                                 td.nested = true;
                                 nested_tables.push(td);
@@ -4296,6 +4560,7 @@ fn extract_table_inner(
         merges,
         source,
         nested: false,
+        footnote_refs,
     }]
     .into_iter()
     .chain(nested_tables)
@@ -4500,6 +4765,7 @@ fn extract_headers_footers(
                         BlockSource::Header,
                         strict,
                         warnings,
+                        None, // #517 ①：部件/批注面（页眉/页脚/批注/框内）——无引用数据
                     )? {
                         blocks.push(Block::Table(td));
                     }
@@ -4617,6 +4883,7 @@ fn extract_headers_footers(
                         BlockSource::Footer,
                         strict,
                         warnings,
+                        None, // #517 ①：部件/批注面（页眉/页脚/批注/框内）——无引用数据
                     )? {
                         blocks.push(Block::Table(td));
                     }
@@ -4717,6 +4984,7 @@ fn header_children_blocks(
                     BlockSource::Header,
                     strict,
                     warnings,
+                    None, // #517 ①：部件/批注面（页眉/页脚/批注/框内）——无引用数据
                 )? {
                     blocks.push(Block::Table(td));
                 }
@@ -4763,6 +5031,7 @@ fn footer_children_blocks(
                     BlockSource::Footer,
                     strict,
                     warnings,
+                    None, // #517 ①：部件/批注面（页眉/页脚/批注/框内）——无引用数据
                 )? {
                     blocks.push(Block::Table(td));
                 }
@@ -11077,5 +11346,115 @@ mod tests {
         let h1 = b.tree.get("Heading1").expect("读回 Heading1");
         assert_eq!(h1.run.size, Some(32), "Heading1.size 读回");
         assert_eq!(h1.run.bold, Some(true), "Heading1.bold 读回");
+    }
+
+    // ── #517 层 1：引用位扫描三维键（body 段 / 表内段 / 文本框内段）──
+
+    /// 表内段引用位：body 段归 body 键、表内段归 (tbl 序, 表内段序) 二维
+    /// 键；嵌套表段归嵌套表自己的键（外层段序不含嵌套段）。
+    #[test]
+    fn scan_note_refs_table_cells_two_dimensional_key() {
+        let xml = r#"<?xml version="1.0"?>
+<w:document><w:body>
+<w:p><w:r><w:t>首段</w:t></w:r><w:footnoteReference w:id="1"/></w:p>
+<w:tbl><w:tr><w:tc>
+  <w:p><w:r><w:t>单元格段0</w:t></w:r><w:footnoteReference w:id="2"/></w:p>
+</w:tc><w:tc>
+  <w:p><w:r><w:t>单元格段1</w:t></w:r></w:p>
+  <w:tbl><w:tr><w:tc><w:p><w:footnoteReference w:id="9"/></w:p></w:tc></w:tr></w:tbl>
+</w:tc></w:tr></w:tbl>
+<w:p><w:footnoteReference w:id="5"/><w:footnoteReference w:id="6"/></w:p>
+</w:body></w:document>"#;
+        let scan = scan_note_references(xml);
+        // body 段：块 0（id=1）、块 2（id=5,6——文档序）；块 1 是表。
+        assert_eq!(scan.body.get(&0), Some(&vec![1]));
+        assert_eq!(scan.body.get(&2), Some(&vec![5, 6]));
+        assert!(!scan.body.contains_key(&1), "表块本身无 body 段引用键");
+        // 表 0（文档序第一个 tbl）：段 0 引用 id=2；段 1（无引用）无键。
+        assert_eq!(scan.table_cells.get(&(0, 0)), Some(&vec![2]));
+        assert!(!scan.table_cells.contains_key(&(0, 1)));
+        // 嵌套表 = tbl 序 1：其段 0 引用 id=9；外层表段序不含嵌套段
+        //（外层只有 2 段——段 1 之后无段 2 键）。
+        assert_eq!(scan.table_cells.get(&(1, 0)), Some(&vec![9]));
+        assert!(!scan.table_cells.contains_key(&(0, 2)));
+    }
+
+    /// 文本框内段引用位（DrawingML 主形态 wps:txbx）：键 = (宿主块,
+    /// 框序, 框内段序)；VML（v:textbox）不入键（登记面）。
+    #[test]
+    fn scan_note_refs_text_box_drawingml_only() {
+        let xml = r#"<?xml version="1.0"?>
+<w:document><w:body>
+<w:p><w:r>
+  <w:drawing><wps:txbx><w:txbxContent>
+    <w:p><w:footnoteReference w:id="3"/></w:p>
+    <w:p><w:r><w:t>无引用</w:t></w:r></w:p>
+    <w:p><w:footnoteReference w:id="4"/></w:p>
+  </w:txbxContent></wps:txbx></w:drawing>
+</w:r></w:p>
+<w:p><w:r><w:pict><v:textbox><w:txbxContent>
+    <w:p><w:footnoteReference w:id="7"/></w:p>
+</w:txbxContent></v:textbox></w:pict></w:r></w:p>
+<w:p><w:r>
+  <w:drawing><wps:txbx><w:txbxContent>
+    <w:p><w:footnoteReference w:id="8"/></w:p>
+  </w:txbxContent></wps:txbx></w:drawing>
+  <w:drawing><wps:txbx><w:txbxContent>
+    <w:p><w:footnoteReference w:id="10"/></w:p>
+  </w:txbxContent></wps:txbx></w:drawing>
+</w:r></w:p>
+</w:body></w:document>"#;
+        let scan = scan_note_references(xml);
+        // 段 0 框 0：三段中段 0/段 2 有引用（段序 = 框内枚举序）。
+        assert_eq!(scan.text_boxes.get(&(0, 0, 0)), Some(&vec![3]));
+        assert!(!scan.text_boxes.contains_key(&(0, 0, 1)));
+        assert_eq!(scan.text_boxes.get(&(0, 0, 2)), Some(&vec![4]));
+        // 段 1 的 VML 框：不入键（登记面——引用位保持静默）。
+        assert!(
+            !scan.text_boxes.values().any(|v| v.contains(&7)),
+            "VML 框引用（id=7）不应出现在任何键"
+        );
+        // 段 2 双框：框序 0/1 各自入键。
+        assert_eq!(scan.text_boxes.get(&(2, 0, 0)), Some(&vec![8]));
+        assert_eq!(scan.text_boxes.get(&(2, 1, 0)), Some(&vec![10]));
+    }
+
+    /// mc:Fallback 复制区：区内的 body 段/表内段/框内段引用一律跳过
+    /// （复制区语义——既有行为保持，#517 不改变）。
+    #[test]
+    fn scan_note_refs_fallback_still_skipped() {
+        let xml = r#"<?xml version="1.0"?>
+<w:document><w:body>
+<w:p>
+  <mc:AlternateContent><mc:Choice><w:drawing><wps:txbx><w:txbxContent>
+    <w:p><w:footnoteReference w:id="1"/></w:p>
+  </w:txbxContent></wps:txbx></w:drawing></mc:Choice>
+  <mc:Fallback><w:pict><v:textbox><w:txbxContent>
+    <w:p><w:footnoteReference w:id="2"/></w:p>
+  </w:txbxContent></v:textbox></w:pict></mc:Fallback></mc:AlternateContent>
+</w:p>
+</w:body></w:document>"#;
+        let scan = scan_note_references(xml);
+        // Choice 主选框入键（DrawingML）；Fallback 的 VML 副本不入。
+        assert_eq!(scan.text_boxes.get(&(0, 0, 0)), Some(&vec![1]));
+        assert!(
+            !scan.text_boxes.values().any(|v| v.contains(&2)),
+            "Fallback 副本引用不入键"
+        );
+    }
+
+    /// 空段（自闭合）与 body 块计数的既有口径：块序照计（引用键的
+    /// 块坐标系不因空段漂移）。
+    #[test]
+    fn scan_note_refs_empty_para_keeps_block_coords() {
+        let xml = r#"<?xml version="1.0"?>
+<w:document><w:body>
+<w:p/><w:p/>
+<w:p><w:footnoteReference w:id="4"/></w:p>
+</w:body></w:document>"#;
+        let scan = scan_note_references(xml);
+        // 空段占块 0/1；引用段 = 块 2。
+        assert_eq!(scan.body.get(&2), Some(&vec![4]));
+        assert_eq!(scan.body.len(), 1);
     }
 }
