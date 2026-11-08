@@ -34,7 +34,7 @@ use theme::Theme;
 use ui::prelude::*;
 
 use crate::activity_bar;
-use crate::context_menu::{self, MenuItem, Rect as MenuRect};
+use crate::context_menu::{self, ContextMenu, MenuItem, Rect as MenuRect};
 use crate::context_menu_view;
 use crate::document::{self, OpenOutcome};
 use crate::editor::Editor;
@@ -208,13 +208,19 @@ pub struct ShellApp {
     /// #166：文件树右键目标（动作执行的路径面——新建/打开/重命名/删除/
     /// 资源管理器揭示都需要知道右键的是哪一行）。
     context_menu_target: Option<PathBuf>,
-    /// #209：顶部菜单栏状态（哪个菜单开/选中项/子菜单开合/下拉锚点——
-    /// menu_bar::MenuBarState 纯状态机；键盘导航在根 on_key_down 的
-    /// 模态拦截分支，鼠标接线在 menu_bar_view）。
-    menu_bar: menu_bar::MenuBarState,
-    /// #209：菜单栏模态焦点域（菜单开着时接管键盘——键事件沿浮层→
-    /// shell 根冒泡，编辑器隔离；确认框 confirm_focus 同款模式）。
-    menu_focus: FocusHandle,
+    /// #209（#385 批 4）：当前展开的顶部菜单序号（None = 全关）。
+    /// 选中项/子菜单开合/键盘导航已由 `ui::ContextMenu` 组件自带，
+    /// shell 只编排「哪个菜单开」与浮层实体生命周期。
+    menu_bar_open: Option<usize>,
+    /// #385 批 4：菜单栏下拉实体（`ui::ContextMenu`——打开时构建，
+    /// 动作派发回 `activate_menu_action`；DismissEvent → close 清态）。
+    menu_bar_entity: Option<Entity<ui::ContextMenu>>,
+    /// 下拉展开锚点（标题点击 x + 标题栏下缘 y——`anchored` 定位用，
+    /// 溢出翻转/吸附由引擎按实际渲染尺寸处理）。
+    menu_bar_anchor: gpui::Point<Pixels>,
+    /// 菜单实体的 DismissEvent 订阅（打开下一个菜单时 drop 旧的——
+    /// 防旧实体的迟到 Dismiss 误关新菜单；与实体的生命周期同步）。
+    menu_bar_subscription: Option<gpui::Subscription>,
 }
 
 /// 右键菜单来源（决定同一动作 id 派发到哪套处理器）。
@@ -412,8 +418,10 @@ impl ShellApp {
             context_menu_pos: gpui::Point::new(Pixels::ZERO, Pixels::ZERO),
             context_menu_origin: MenuOrigin::default(),
             context_menu_target: None,
-            menu_bar: menu_bar::MenuBarState::default(),
-            menu_focus: cx.focus_handle(),
+            menu_bar_open: None,
+            menu_bar_entity: None,
+            menu_bar_anchor: gpui::Point::new(Pixels::ZERO, Pixels::ZERO),
+            menu_bar_subscription: None,
         };
         // 初始焦点：有文档 → 编辑器（键入/编辑即时可用）；空态 →
         // shell 根域（Ctrl+O 等空态键位经 root→shell 根路径可达——
@@ -1148,15 +1156,19 @@ impl ShellApp {
     }
 
     /// #209：顶部菜单 `idx` 是否正展开（标题行点击的开/关判定——
-    /// `menu_bar` 字段私有，menu_bar_view 经此只读；同菜单再点 = 关，
-    /// 别的菜单 = 一键切换）。
+    /// 标题按钮自绘保留，判定面公开给 menu_bar_view）。
     pub fn is_menu_bar_open_at(&self, idx: usize) -> bool {
-        self.menu_bar.open == Some(idx)
+        self.menu_bar_open == Some(idx)
     }
 
-    /// #209：打开顶部菜单（标题点击——`anchor_x` = 点击 x）。焦点移入
-    /// 菜单模态域（编辑器隔离：↑↓ 不再动光标）；右键菜单互斥关闭
-    /// （遮罩本就挡住右键源，此处防御性收口）。
+    /// #209（#385 批 4）：打开顶部菜单（标题点击——`anchor_x` = 点击 x）。
+    ///
+    /// - 构建 `ui::ContextMenu` 实体（键盘导航/浮层/子菜单/点外关闭全
+    ///   部组件自带——与批 1 右键菜单同构）；
+    /// - 订阅 `DismissEvent`（激活动作/点外/Esc → close 清态）——订阅
+    ///   存字段，切菜单时 drop 旧的（迟到事件不再可达，无误关窗口）；
+    /// - 两帧后聚焦菜单（deferred 树链入焦点域后再聚焦——批 1 同款）；
+    /// - 右键菜单互斥关闭（旧链路保留）。
     pub fn open_menu_bar(
         &mut self,
         idx: usize,
@@ -1166,31 +1178,54 @@ impl ShellApp {
     ) {
         self.close_context_menu(cx);
         let menus = menu_bar::build_menus(&self.menu_context(cx));
-        self.menu_bar.open_menu(idx, anchor_x, &menus);
-        window.focus(&self.menu_focus.clone(), cx);
+        let Some(menu) = menus.get(idx) else {
+            return;
+        };
+        let shell = cx.entity().downgrade();
+        let entity = menu_bar_view::build_menu_bar_menu(menu, shell, window, cx);
+        // 旧订阅先退役（drop = 取消订阅）：旧实体的迟到 DismissEvent
+        // 不会误关刚开的新菜单。订阅存字段（不 detach——生命周期与
+        // 实体同步，drop 即取消）。
+        self.menu_bar_subscription = None;
+        self.menu_bar_subscription = Some(cx.subscribe(
+            &entity,
+            |this, _, _: &gpui::DismissEvent, cx| {
+                this.close_menu_bar_internal(cx);
+            },
+        ));
+        self.menu_bar_open = Some(idx);
+        self.menu_bar_entity = Some(entity.clone());
+        self.menu_bar_anchor = gpui::Point::new(px(anchor_x), px(menu_bar_view::menu_anchor_y()));
+        // 键盘导航需要焦点在菜单（deferred 渲染树链入后两帧聚焦——
+        // 批 1 spawn_context_menu 同款）。
+        let focus = entity.read(cx).focus_handle(cx).clone();
+        window.on_next_frame(move |window, _cx| {
+            window.on_next_frame(move |window, cx| {
+                window.focus(&focus, cx);
+            });
+        });
         cx.notify();
     }
 
-    /// #209：关闭菜单栏（Esc / 点外部 / 动作执行后）——焦点归回活动
-    /// 标签（空态回 shell 根域，`focus_active` 既有口径）。
+    /// #209（#385 批 4）：关闭菜单栏（Esc / 点外部 / 动作执行后）——
+    /// 焦点归回活动标签（空态回 shell 根域，`focus_active` 既有口径）。
     pub fn close_menu_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.menu_bar.is_open() {
+        if self.menu_bar_open.is_none() {
             return;
         }
-        self.menu_bar.close();
+        self.close_menu_bar_internal(cx);
         self.focus_active(window, cx);
         cx.notify();
     }
 
-    /// #209：子菜单开/合（父行点击——键盘 Enter/→ 同效）。
-    pub fn toggle_menu_submenu(&mut self, entry_idx: usize, cx: &mut Context<Self>) {
-        let menus = menu_bar::build_menus(&self.menu_context(cx));
-        if self.menu_bar.open_submenu == Some(entry_idx) {
-            self.menu_bar.close_submenu();
-        } else {
-            self.menu_bar.open_submenu_at(&menus, entry_idx);
-        }
-        cx.notify();
+    /// 清态单点（DismissEvent 订阅回调用——不做焦点归位，焦点在菜单
+    /// 实体上，随实体摘除自然回 shell 根域；标题点击路径的关停由
+    /// `close_menu_bar` 补焦点归位）。
+    fn close_menu_bar_internal(&mut self, cx: &mut Context<Self>) {
+        self.menu_bar_open = None;
+        self.menu_bar_entity = None;
+        self.menu_bar_subscription = None;
+        let _ = cx;
     }
 
     /// #209：执行菜单动作（条目点击 / Enter——与右键菜单
@@ -1205,7 +1240,9 @@ impl ShellApp {
         cx: &mut Context<Self>,
     ) {
         // 先关菜单 + 焦点归位（动作可能开对话框/浮层，菜单不得残留）。
-        self.menu_bar.close();
+        self.menu_bar_entity = None;
+        self.menu_bar_subscription = None;
+        self.menu_bar_open = None;
         self.focus_active(window, cx);
         use menu_bar::MenuAction as Act;
         match action {
@@ -2315,22 +2352,14 @@ impl Render for ShellApp {
                 let ctrl = ks.modifiers.control || ks.modifiers.platform;
                 let key = ks.key.to_lowercase();
 
-                // #209：菜单栏模态拦截（菜单开着时接管导航键——焦点已
-                // 移入菜单浮层域 menu_focus，编辑器收不到键；其余键位
-                // 全隔离：确认框同款模态语义）。←→ 切菜单/进出子菜单、
-                // ↑↓ 移动、Enter 确认/进子菜单、Esc 关闭；动作执行走
-                // activate_menu_action（与右键菜单/命令面板同一分发单
-                // 点）。菜单与右键菜单互斥（打开时已收口），先后无行为差。
-                if this.menu_bar.is_open() {
-                    let title = this.title_with(cx);
-                    let menus = menu_bar::build_menus(&this.menu_context(cx));
-                    if let Some(action) =
-                        menu_bar::navigate(&mut this.menu_bar, &menus, &key, &title)
-                    {
-                        this.activate_menu_action(action, window, cx);
-                    } else {
-                        cx.notify();
-                    }
+                // #209（#385 批 4）：菜单栏 Esc 兑底关闭。菜单焦点在
+                // `ui::ContextMenu` 时组件自身的 Cancel 已处理（→
+                // DismissEvent → close_menu_bar_internal）；此处保留作为
+                // 焦点不在菜单时的兑底（防御：键盘焦点被别处夺走时 Esc
+                // 仍可关——批 1 右键菜单同款口径）。其余导航键（↑↓/
+                // Enter/←→）由组件内建，shell 不再拦截。
+                if key == "escape" && this.menu_bar_open.is_some() {
+                    this.close_menu_bar(window, cx);
                     return;
                 }
 
@@ -2513,7 +2542,7 @@ impl Render for ShellApp {
                     }
                 }
             }))
-            .child(title_bar::title_bar(&title, &menus, &self.menu_bar, cx))
+            .child(title_bar::title_bar(&title, &menus, self.menu_bar_open, cx))
             // F3：标签栏（有标签才渲染；标题栏与主体之间）。
             .when(!self.tabs.is_empty(), |el| {
                 let ws_root = self
@@ -2640,28 +2669,15 @@ impl Render for ShellApp {
                 )),
                 None => el,
             })
-            // #209：菜单栏浮层——右键菜单浮层之后再挂（同为链尾最上层；
-            // 两者互斥——打开菜单栏时已收口右键菜单）。遮罩从标题栏下
-            // 缘起（标题按钮保持可点——一键切换菜单），摆放几何按当前
-            // 窗口尺寸算（place_menu 边缘翻转复用右键菜单同款）。
-            .map(|el| match self.menu_bar.open {
-                Some(_) => {
-                    let bounds = window.bounds();
-                    let screen = MenuRect::new(
-                        0.,
-                        0.,
-                        bounds.size.width.as_f32(),
-                        bounds.size.height.as_f32(),
-                    );
-                    el.child(menu_bar_view::menu_bar_overlay(
-                        &menus,
-                        &self.menu_bar,
-                        &self.menu_focus,
-                        screen,
-                        cx,
-                    ))
+            // #209（#385 批 4）：菜单栏下拉浮层——链尾最上层（与右键菜单
+            // 浮层互斥——打开时已收口）。`deferred + anchored` 引擎级
+            // 浮层（溢出翻转/吸附按实际渲染尺寸），点外关闭由组件
+            // on_mouse_down_out → DismissEvent 承担（全屏遮罩退役）。
+            .map(|el| match (&self.menu_bar_open, &self.menu_bar_entity) {
+                (Some(_), Some(entity)) => {
+                    el.child(menu_bar_view::menu_bar_anchor(entity, self.menu_bar_anchor))
                 }
-                None => el,
+                _ => el,
             })
     }
 }
@@ -3619,5 +3635,124 @@ mod pdf_search_wiring_tests {
             .expect("断言");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #385 批 4：菜单栏状态桥交互测试（TestAppContext 无头面——对照表
+// §六 质量门 1：「点击 → 状态变化」级，非仅函数返回值断言）。
+//
+// 宿主：ShellHost 模式同 tab_workflow_tests（ShellApp 不作根视图——
+// render 路径与本测试无关，空 div 宿主开窗只取真实 Window）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod menu_bar_lifecycle_tests {
+    use super::*;
+    // menu crate（action 定义——批 3 起依赖）：本地 `menu` 变量名会
+    // 遮蔽 crate 名，测试内以别名引用。
+    use menu as menu_crate;
+
+    /// 测试宿主（ShellHost 同款——模块间不共享私有设施，各 10 行）。
+    struct Host(Entity<ShellApp>);
+
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// 空态 ShellApp + 宿主窗口（theme::init 序列镜像 main.rs）。
+    fn shell_window(cx: &mut gpui::TestAppContext) -> (Entity<ShellApp>, gpui::WindowHandle<Host>) {
+        cx.update(|app| theme::init(theme::LoadThemes::JustBase, app));
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            Host(shell)
+        });
+        (slot.expect("宿主构造即置"), window)
+    }
+
+    /// 开合状态桥：open（实体在场 + open 序）→ 切换（重建实体）→
+    /// close（全清）→ 重开；外加组件 Cancel 路径（DismissEvent →
+    /// 订阅回调清态——点外关闭的等价通道）。
+    #[gpui::test]
+    fn menu_bar_open_switch_close_lifecycle(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = shell_window(cx);
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                // 初始全关。
+                assert_eq!(shell.menu_bar_open, None);
+                assert!(shell.menu_bar_entity.is_none());
+
+                // 开文件菜单（标题点击路径——anchor_x = 点击位）。
+                shell.open_menu_bar(0, 120.0, window, cx);
+                assert_eq!(shell.menu_bar_open, Some(0), "开菜单 → open 序");
+                let first = shell.menu_bar_entity.clone().expect("菜单实体构建在场");
+                assert!(
+                    shell.menu_bar_subscription.is_some(),
+                    "DismissEvent 订阅在场"
+                );
+
+                // 一键切换到帮助菜单（idx 3）——实体重建（旧订阅退役）。
+                shell.open_menu_bar(3, 400.0, window, cx);
+                assert_eq!(shell.menu_bar_open, Some(3), "切换 → 新 open 序");
+                assert_ne!(
+                    shell.menu_bar_entity.as_ref(),
+                    Some(&first),
+                    "切换 = 重建实体（旧实体不残留）"
+                );
+
+                // 关闭 → 全清（Esc / 点外部路径的 shell 侧终点）。
+                shell.close_menu_bar(window, cx);
+                assert_eq!(shell.menu_bar_open, None, "关闭 → open 清");
+                assert!(shell.menu_bar_entity.is_none(), "关闭 → 实体清");
+                assert!(shell.menu_bar_subscription.is_none(), "关闭 → 订阅退役");
+
+                // 可重开。
+                shell.open_menu_bar(2, 300.0, window, cx);
+                assert_eq!(shell.menu_bar_open, Some(2), "关闭后可重开");
+            });
+        });
+    }
+
+    /// 组件 Cancel → DismissEvent → shell 清态链（菜单实体的
+    /// `menu::Cancel` action 处理器 emit DismissEvent——shell 订阅
+    /// 回调收口；等效于「点菜单外部」与「Esc」两条关闭路）。
+    ///
+    /// emit 的派发走 effect 队列（异步）——cancel 后 `run_until_parked`
+    /// 等订阅回调实际送达再断言（TestAppContext 的标准等待原语）。
+    #[gpui::test]
+    fn menu_bar_cancel_action_dismisses(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = shell_window(cx);
+        let menu = window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_menu_bar(0, 120.0, window, cx);
+                });
+                // 读实体（update 返回 Result——TestWindow 签名）。
+                shell
+                    .read(cx)
+                    .menu_bar_entity
+                    .clone()
+                    .expect("菜单实体在场")
+            })
+            .expect("宿主窗口更新");
+        // 组件公有的 cancel 处理器（on_action 同一入口——键盘 Esc 经
+        // KeyBinding 到达的就是它，批 4 的 bind_keys 注册面）。
+        window.update(cx, |_host, window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.cancel(&menu_crate::Cancel, window, cx);
+            });
+        });
+        // DismissEvent 派发 → shell 订阅回调（close_menu_bar_internal）。
+        cx.run_until_parked();
+        shell.update(cx, |shell, _| {
+            assert_eq!(
+                shell.menu_bar_open, None,
+                "Cancel → DismissEvent → 订阅回调清态"
+            );
+            assert!(shell.menu_bar_entity.is_none(), "实体随清态退役");
+        });
     }
 }

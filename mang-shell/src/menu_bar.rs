@@ -1,19 +1,27 @@
-//! 顶部菜单栏模型层（#209）——纯数据 / 纯状态机，零 GPUI 依赖。
+//! 顶部菜单栏模型层（#209）——纯数据，零 GPUI 依赖。
 //!
-//! # 分层（与 context_menu ↔ context_menu_view 同构）
+//! # 分层（#385 批 4 后）
 //!
-//! - 本模块：**菜单结构**（四菜单 + 子菜单 + 动作映射）、**键盘导航状态机**、
-//!   **下拉几何估算**——全部纯函数/纯数据，单测钉定，不起窗口可验；
-//! - `menu_bar_view.rs`（bin 专属）：GPUI 渲染——标题行/浮层/遮罩/条目行/
-//!   灰显，形态循 `context_menu_view.rs`；
-//! - `shell.rs`：状态归属（`ShellApp.menu_bar` + `menu_focus` 焦点域）与
-//!   动作派发（`activate_menu_action`——与右键菜单/命令面板同一分发单点）。
+//! - 本模块：**菜单结构**（四菜单 + 一层子菜单 + 动作映射）与灰显/勾选
+//!   依据（`MenuContext` 快照 → `build_menus` 纯函数）——单测钉定，
+//!   不起窗口可验；
+//! - `menu_bar_view.rs`（bin 专属）：桥接层——`build_menu_bar_menu` 把
+//!   本模块数据构建成 `ui::ContextMenu` 实体（浮层/行渲染/一层子菜单/
+//!   键盘导航/点外关闭全部由组件自带，与 #385 批 1 右键菜单同构）+
+//!   `anchored` 锚定挂载 + 自绘标题行（按钮族语系——对照表结论 2）；
+//! - `shell.rs`：开合编排（`menu_bar_open`/`menu_bar_entity` 状态 +
+//!   `DismissEvent` 订阅）与动作派发（`activate_menu_action`——与右键
+//!   菜单/命令面板同一分发单点）。
 //!
-//! 下拉摆放（边缘翻转/夹紧）与宽度估算**复用** `context_menu` 的
-//! [`place_menu`](crate::context_menu::place_menu) /
-//! [`place_submenu`](crate::context_menu::place_submenu) /
-//! [`menu_size`](crate::context_menu::menu_size)——那套几何对着屏幕边界
-//! 写过暴力扫描测试，不重写第二份。
+//! # 批 4 退役面（与批 1 同构的组件接管）
+//!
+//! 旧版自研的键盘导航状态机（`MenuBarState`/`navigate`——↑↓/Enter/
+//! Esc/←→ 转移）、下拉几何估算（`to_context_items`/`row_y_offset`/
+//! `estimate_anchor_x`——自研宽度估算与摆放翻转）随渲染层迁移一并
+//! 退役：组件按实际渲染尺寸锚定（`gpui::anchored`），键盘语义内建
+//! （`menu::SelectNext/Confirm/Cancel` 一族）。
+//! 已知行为差异（诚实登记）：←→ 切换顶部菜单 → 组件语义（← 在顶层
+//! 关闭菜单 / → 进子菜单）；键盘切换顶部菜单需 Esc 后鼠标点开。
 //!
 //! # 动作映射铁律（issue #209 层 2 / owner 指令）
 //!
@@ -36,7 +44,6 @@
 
 use std::path::PathBuf;
 
-use crate::context_menu::{self, MenuItem};
 use crate::editor::commands::Cmd;
 
 /// 主题模式串（settings.json `theme` 键的持久化契约值——与
@@ -197,15 +204,6 @@ impl MenuEntry {
         }
     }
 
-    /// 附加快捷键标签（只对动作项生效——字面量口，测试/无表动作用；
-    /// 产物默认走 [`Self::shortcut_for`]）。
-    pub fn shortcut(mut self, key: impl Into<String>) -> Self {
-        if let MenuEntry::Item(spec) = &mut self {
-            spec.shortcut = Some(key.into());
-        }
-        self
-    }
-
     /// 从 keymap 表取该动作的当前键位标签（#217 单一事实源：默认表
     /// = 现状键位镜像；用户换绑后菜单标签跟随。无绑定 → 不标）。
     pub fn shortcut_for(mut self, action_id: &str) -> Self {
@@ -237,15 +235,6 @@ impl MenuEntry {
             spec.checked = on;
         }
         self
-    }
-
-    /// 占位高度（行）——与 `context_menu::MenuItem::height_units` 同口径
-    ///（下拉高度估算/子菜单行定位共用）。
-    pub fn height_units(&self) -> f32 {
-        match self {
-            MenuEntry::Separator => context_menu::SEPARATOR_UNITS,
-            _ => 1.0,
-        }
     }
 }
 
@@ -438,290 +427,7 @@ fn recent_entries(ctx: &MenuContext) -> Vec<MenuEntry> {
         .collect()
 }
 
-// ─── 键盘导航状态机 ─────────────────────────────────────────────────
-//
-// 状态归 ShellApp（menu_bar 字段）；本节全部纯方法，对着 build_menus
-// 的结构做转移。防御口径：菜单结构在打开期间理论不变（模态），但索引
-// 全部按「当前 menus 越界即自愈/无操作」处理——结构漂移不 panic。
-
-/// 菜单栏导航状态（哪个菜单开 / 选中项 / 子菜单开合 / 下拉锚点 x）。
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MenuBarState {
-    /// 打开的顶部菜单序号（None = 全关）。
-    pub open: Option<usize>,
-    /// 顶部菜单内的选中条目序（**原始索引域**——含分隔线；导航跳过分隔线，
-    /// 但索引不重编，结构漂移时天然自洽）。
-    pub selected: usize,
-    /// 打开的子菜单所在条目序（None = 无子菜单展开）。
-    pub open_submenu: Option<usize>,
-    /// 子菜单内选中条目序（原始索引域，同上）。
-    pub submenu_selected: usize,
-    /// 下拉锚点 x（窗口坐标——标题点击时的 event.position.x；键盘切菜单
-    /// 时按 [`estimate_anchor_x`] 估算重锚）。
-    pub anchor_x: f32,
-}
-
-/// 条目是否可停靠（分隔线不可——灰显项**可**停靠：桌面菜单惯例，禁用项
-/// 可被高亮查看但 Enter 无操作）。
-fn is_navigable(entry: &MenuEntry) -> bool {
-    !matches!(entry, MenuEntry::Separator)
-}
-
-/// 首个可停靠条目序（全分隔线/空 → None）。
-fn first_navigable(entries: &[MenuEntry]) -> Option<usize> {
-    entries.iter().position(is_navigable)
-}
-
-/// 从 `from` 起向前/向后找下一个可停靠条目（wrap；`from` 本身可停靠且
-/// 是唯一可停靠项时回到自身；无可停靠 → None）。
-fn step_navigable(entries: &[MenuEntry], from: usize, forward: bool) -> Option<usize> {
-    let len = entries.len();
-    if len == 0 {
-        return None;
-    }
-    let mut i = from % len;
-    for _ in 0..len {
-        i = if forward {
-            (i + 1) % len
-        } else {
-            (i + len - 1) % len
-        };
-        if is_navigable(&entries[i]) {
-            return Some(i);
-        }
-    }
-    None
-}
-
-impl MenuBarState {
-    pub fn is_open(&self) -> bool {
-        self.open.is_some()
-    }
-
-    /// 打开顶部菜单 `idx`（锚点 = 点击 x；选中重置到首个可停靠条目）。
-    pub fn open_menu(&mut self, idx: usize, anchor_x: f32, menus: &[TopMenu]) {
-        self.open = Some(idx);
-        self.anchor_x = anchor_x;
-        self.open_submenu = None;
-        self.submenu_selected = 0;
-        self.selected = menus
-            .get(idx)
-            .and_then(|m| first_navigable(&m.entries))
-            .unwrap_or(0);
-    }
-
-    /// 全关（Esc / 动作执行后；幂等——重复关无副作用）。选中序不清零：
-    /// 重开时 `open_menu` 会重置，残留值不可达。
-    pub fn close(&mut self) {
-        self.open = None;
-        self.open_submenu = None;
-    }
-
-    /// ↑↓ 移动（子菜单展开时在子菜单层移动，否则在顶部菜单层）。
-    /// 返回是否变化（调用方决定是否重绘）。
-    pub fn move_vertical(&mut self, menus: &[TopMenu], forward: bool) -> bool {
-        let Some(menu) = menus.get(self.open.unwrap_or(usize::MAX)) else {
-            return false;
-        };
-        if let Some(sub_idx) = self.open_submenu {
-            match menu.entries.get(sub_idx) {
-                Some(MenuEntry::Submenu { items, .. }) => {
-                    if let Some(next) = step_navigable(items, self.submenu_selected, forward) {
-                        let changed = next != self.submenu_selected;
-                        self.submenu_selected = next;
-                        return changed;
-                    }
-                    return false;
-                }
-                // 结构漂移防御：子菜单项不在了——退回顶部层继续导航。
-                _ => self.open_submenu = None,
-            }
-        }
-        match step_navigable(&menu.entries, self.selected, forward) {
-            Some(next) => {
-                let changed = next != self.selected;
-                self.selected = next;
-                changed
-            }
-            None => false,
-        }
-    }
-
-    /// 当前选中条目是否是子菜单标题（Enter/→ 进入子菜单的判定）。
-    pub fn selected_is_submenu(&self, menus: &[TopMenu]) -> bool {
-        matches!(
-            menus
-                .get(self.open.unwrap_or(usize::MAX))
-                .and_then(|m| m.entries.get(self.selected)),
-            Some(MenuEntry::Submenu { .. })
-        )
-    }
-
-    /// 打开 `entry_idx` 处的子菜单（非子菜单条目 = 无操作）。
-    pub fn open_submenu_at(&mut self, menus: &[TopMenu], entry_idx: usize) -> bool {
-        let Some(menu) = menus.get(self.open.unwrap_or(usize::MAX)) else {
-            return false;
-        };
-        match menu.entries.get(entry_idx) {
-            Some(MenuEntry::Submenu { items, .. }) => {
-                if self.open_submenu == Some(entry_idx) {
-                    return false;
-                }
-                self.open_submenu = Some(entry_idx);
-                self.submenu_selected = first_navigable(items).unwrap_or(0);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// 关闭子菜单（← 在子菜单层）。返回是否变化。
-    pub fn close_submenu(&mut self) -> bool {
-        self.open_submenu.take().is_some()
-    }
-
-    /// ←→ 切换顶部菜单（子菜单收起、选中重置、锚点按估算重锚）。
-    pub fn switch_menu(&mut self, menus: &[TopMenu], forward: bool, title_text: &str) -> bool {
-        let Some(cur) = self.open else {
-            return false;
-        };
-        let len = menus.len();
-        if len == 0 {
-            self.close();
-            return false;
-        }
-        let next = (cur + if forward { 1 } else { len - 1 }) % len;
-        self.open_submenu = None;
-        self.open = Some(next);
-        self.selected = first_navigable(&menus[next].entries).unwrap_or(0);
-        self.anchor_x = estimate_anchor_x(menus, next, title_text);
-        true
-    }
-
-    /// 当前键盘焦点项（子菜单展开 = 子菜单选中项；否则 = 顶部菜单选中项）。
-    /// 分隔线 / 子菜单标题 / 越界 → None。
-    pub fn focused_item<'a>(&self, menus: &'a [TopMenu]) -> Option<&'a MenuItemSpec> {
-        let menu = menus.get(self.open?)?;
-        if let Some(sub_idx) = self.open_submenu {
-            return match menu.entries.get(sub_idx)? {
-                MenuEntry::Submenu { items, .. } => match items.get(self.submenu_selected)? {
-                    MenuEntry::Item(spec) => Some(spec),
-                    _ => None,
-                },
-                _ => None,
-            };
-        }
-        match menu.entries.get(self.selected)? {
-            MenuEntry::Item(spec) => Some(spec),
-            _ => None,
-        }
-    }
-
-    /// Enter 激活焦点项（禁用 / 分隔线 / 子菜单标题 → None；激活即全关
-    /// 菜单——动作执行面统一由 shell 收口焦点）。
-    fn take_action(&mut self, menus: &[TopMenu]) -> Option<MenuAction> {
-        let action = match self.focused_item(menus) {
-            Some(spec) if spec.enabled => spec.action,
-            _ => return None,
-        };
-        self.close();
-        Some(action)
-    }
-}
-
-/// 键盘导航一步（纯状态转移——动作执行在 shell，保持本函数可单测）。
-///
-/// 返回 `Some(action)` = 需执行动作（Enter 且焦点项可用；状态已关）；
-/// `None` = 仅导航 / 无操作。键位集：Esc 关闭、↑↓ 移动、← 关子菜单或切
-/// 上一菜单、→ 进子菜单或切下一菜单、Enter 进子菜单或激活。其余键
-/// `None`（shell 侧整段吞掉——菜单开着 = 模态，确认框同款语义）。
-pub fn navigate(
-    state: &mut MenuBarState,
-    menus: &[TopMenu],
-    key: &str,
-    title_text: &str,
-) -> Option<MenuAction> {
-    match key {
-        "escape" => {
-            state.close();
-            None
-        }
-        "up" => {
-            state.move_vertical(menus, false);
-            None
-        }
-        "down" => {
-            state.move_vertical(menus, true);
-            None
-        }
-        "left" => {
-            if state.open_submenu.is_some() {
-                state.close_submenu();
-            } else {
-                state.switch_menu(menus, false, title_text);
-            }
-            None
-        }
-        "right" => {
-            if state.open_submenu.is_none() {
-                if state.selected_is_submenu(menus) {
-                    state.open_submenu_at(menus, state.selected);
-                } else {
-                    state.switch_menu(menus, true, title_text);
-                }
-            }
-            None
-        }
-        "enter" => {
-            if state.open_submenu.is_none() && state.selected_is_submenu(menus) {
-                state.open_submenu_at(menus, state.selected);
-                None
-            } else {
-                state.take_action(menus)
-            }
-        }
-        _ => None,
-    }
-}
-
-// ─── 几何估算（复用 context_menu 的摆放算法） ────────────────────────
-
-/// 把本模型条目转成 `context_menu::MenuItem`（`menu_size` / 摆放算法的
-/// 入参类型——宽度/高度估算与右键菜单同源，不重写第二份）。
-pub fn to_context_items(entries: &[MenuEntry]) -> Vec<MenuItem> {
-    entries
-        .iter()
-        .map(|entry| match entry {
-            MenuEntry::Item(spec) => MenuItem::Action {
-                id: spec.id,
-                label: spec.label.clone(),
-                shortcut: spec.shortcut.clone(),
-                enabled: spec.enabled,
-            },
-            MenuEntry::Separator => MenuItem::Separator,
-            // 几何估算只看子菜单标题宽度（menu_size 口径）——内容不参与。
-            MenuEntry::Submenu { label, .. } => MenuItem::Submenu {
-                label: label.clone(),
-                items: Vec::new(),
-            },
-        })
-        .collect()
-}
-
-/// 条目 `idx` 顶部在菜单内的 y 偏移（含菜单上内边距——`place_submenu`
-/// 的 `row_y` 参数按「row 顶相对菜单顶」口径回扣 MENU_PADDING_Y）。
-pub fn row_y_offset(entries: &[MenuEntry], idx: usize) -> f32 {
-    let mut y = context_menu::MENU_PADDING_Y;
-    for (i, entry) in entries.iter().enumerate() {
-        if i >= idx {
-            break;
-        }
-        y += context_menu::ITEM_HEIGHT * entry.height_units();
-    }
-    y
-}
-
-// ─── 标题栏布局常量（视图层与锚点估算共用——两处必须同值） ──────────
+// ─── 标题栏布局常量（视图层布局消费——menu_titles 唯一使用方） ─────
 
 /// 菜单标题按钮左右内边距（px_3——menu_bar_view 同值）。
 ///
@@ -730,24 +436,6 @@ pub fn row_y_offset(entries: &[MenuEntry], idx: usize) -> f32 {
 pub const TITLE_BTN_PAD_X: f32 = 12.;
 /// 菜单标题按钮间距（gap_1）。
 pub const TITLES_GAP: f32 = 4.;
-
-/// 键盘切菜单时的下拉锚点估算（标题行从左到右累加宽度）。
-///
-/// 鼠标路径不走估算（on_mouse_down 捕获真实点击 x）；只有 ←→ 键盘切换
-/// 才用本估算重锚——误差 ±10px 量级（字符宽度近似），换取零测量成本。
-///
-/// #289-②：菜单栏贴窗口左缘后，锚点不再受应用/文档标题影响（`title_text`
-/// 参数保留是为了 navigate 调用面稳定，布局上已不参与估算）。
-pub fn estimate_anchor_x(menus: &[TopMenu], idx: usize, _title_text: &str) -> f32 {
-    let mut x = TITLE_BTN_PAD_X;
-    for (i, menu) in menus.iter().enumerate() {
-        if i >= idx {
-            break;
-        }
-        x += TITLE_BTN_PAD_X * 2. + context_menu::estimate_width(menu.label) + TITLES_GAP;
-    }
-    x
-}
 
 // ─── 单测（纯逻辑——零 gpui 依赖，无窗口可验） ───────────────────────
 
@@ -1135,206 +823,5 @@ mod tests {
             find(&menus[0].entries, "file-recent-8").is_none(),
             "第 9 条截断（无池位）"
         );
-    }
-
-    // ── 导航状态机 ──────────────────────────────────────────────
-
-    /// 打开菜单：选中落在首个可停靠条目（文件菜单首项「新建」虽置灰但
-    /// 可停靠——桌面惯例：禁用项可高亮）。
-    #[test]
-    fn open_menu_selects_first_navigable() {
-        let menus = build_menus(&empty_ctx());
-        let mut state = MenuBarState::default();
-        state.open_menu(0, 100., &menus);
-        assert_eq!(state.open, Some(0));
-        assert_eq!(state.selected, 0, "文件菜单首项（新建）可停靠");
-        state.open_menu(2, 100., &menus);
-        assert_eq!(state.selected, 0, "查看菜单首项（主题子菜单）");
-    }
-
-    /// ↑↓ 循环跳过分隔线且 wrap。
-    #[test]
-    fn vertical_moves_skip_separators_and_wrap() {
-        let menus = build_menus(&full_ctx());
-        let mut state = MenuBarState::default();
-        state.open_menu(0, 0., &menus);
-        // 文件菜单条目：新建0 打开1 打开文件夹2 保存3 另存为4 导出PDF5 导出DOCX6 打印7 |sep8| 最近打开9 |sep10| 退出11
-        assert_eq!(state.selected, 0);
-        state.move_vertical(&menus, true);
-        assert_eq!(state.selected, 1);
-        // 步进到子菜单标题（9）再下一步是 11（跳过 10 分隔线）。新条目
-        //（打印7）使得到达「最近打开」需 8 步（1+7——含首步）。
-        state.move_vertical(&menus, true);
-        state.move_vertical(&menus, true);
-        state.move_vertical(&menus, true);
-        state.move_vertical(&menus, true);
-        state.move_vertical(&menus, true);
-        state.move_vertical(&menus, true);
-        state.move_vertical(&menus, true);
-        assert_eq!(state.selected, 9, "停在「最近打开」");
-        state.move_vertical(&menus, true);
-        assert_eq!(state.selected, 11, "跳过分隔线 10 到「退出」");
-        state.move_vertical(&menus, true);
-        assert_eq!(state.selected, 0, "wrap 回首项");
-        state.move_vertical(&menus, false);
-        assert_eq!(state.selected, 11, "反向 wrap 回末项（退出）");
-    }
-
-    /// Enter 在子菜单标题上：展开子菜单；↓ 移动后再次 Enter 激活子菜单
-    /// 选中项并全关。
-    #[test]
-    fn enter_opens_submenu_then_activates_child() {
-        let menus = build_menus(&full_ctx());
-        let mut state = MenuBarState::default();
-        state.open_menu(2, 0., &menus); // 查看菜单，选中 = 主题子菜单
-        // → 进子菜单（选中 = 首项「跟随系统」）。
-        assert!(state.open_submenu_at(&menus, state.selected));
-        assert_eq!(state.submenu_selected, 0, "子菜单选中首项（跟随系统）");
-        // ↓ 移到「浅色」，Enter 激活。
-        state.move_vertical(&menus, true);
-        assert_eq!(state.submenu_selected, 1);
-        let action = navigate(&mut state, &menus, "enter", "mang");
-        assert_eq!(action, Some(MenuAction::SetTheme(THEME_LIGHT)));
-        assert!(!state.is_open(), "激活后全关");
-    }
-
-    /// ← 在子菜单层关子菜单；再 ← 切上一菜单；→ 在普通项上切下一菜单。
-    #[test]
-    fn left_closes_submenu_then_switches_menu() {
-        let menus = build_menus(&full_ctx());
-        let mut state = MenuBarState::default();
-        state.open_menu(2, 100., &menus);
-        state.open_submenu_at(&menus, 0);
-        navigate(&mut state, &menus, "left", "mang");
-        assert_eq!(state.open, Some(2), "← 先关子菜单，不切菜单");
-        assert_eq!(state.open_submenu, None);
-        navigate(&mut state, &menus, "left", "mang");
-        assert_eq!(state.open, Some(1), "再 ← 切上一菜单（查看→编辑）");
-        navigate(&mut state, &menus, "right", "mang");
-        assert_eq!(state.open, Some(2), "→ 切回查看");
-        // 锚点随菜单切换重锚（估算）。
-        assert!(state.anchor_x > 0.);
-    }
-
-    /// Enter 在禁用项上：无操作、菜单不关（灰显项可高亮不可激活）。
-    #[test]
-    fn enter_on_disabled_item_is_noop() {
-        let menus = build_menus(&empty_ctx());
-        let mut state = MenuBarState::default();
-        state.open_menu(0, 0., &menus);
-        assert_eq!(state.selected, 0, "「新建」置灰但可停靠");
-        assert_eq!(navigate(&mut state, &menus, "enter", "mang"), None);
-        assert!(state.is_open(), "禁用项 Enter 不关菜单");
-    }
-
-    /// 键盘切菜单：选中重置到新菜单首个可停靠条目、wrap、子菜单收起。
-    #[test]
-    fn switch_menu_resets_selection_and_wraps() {
-        let menus = build_menus(&full_ctx());
-        let mut state = MenuBarState::default();
-        state.open_menu(3, 50., &menus); // 帮助
-        state.selected = 2;
-        state.switch_menu(&menus, true, "mang");
-        assert_eq!(state.open, Some(0), "末位 wrap 回文件");
-        assert_eq!(state.selected, 0, "选中重置到首项");
-        state.open_submenu = Some(0); // 模拟脏状态
-        state.switch_menu(&menus, true, "mang");
-        assert_eq!(state.open_submenu, None, "切菜单收起子菜单");
-    }
-
-    /// 结构漂移防御：选中/子菜单序越界时导航自愈，不 panic。
-    #[test]
-    fn navigation_survives_structure_drift() {
-        let menus = build_menus(&full_ctx());
-        let mut state = MenuBarState {
-            open: Some(0),
-            selected: 99,
-            open_submenu: Some(99),
-            submenu_selected: 99,
-            anchor_x: 0.,
-        };
-        // ↑：不 panic；子菜单序越界 → 退回顶层导航，选中落到某个可停靠项。
-        state.move_vertical(&menus, true);
-        assert!(state.selected < menus[0].entries.len());
-        assert_eq!(state.open_submenu, None, "越界子菜单序自愈清空");
-        // Enter：与 focused_item 的投射一致——钉在普通条目上测（自愈
-        // 落点随菜单结构漂移：「最近打开」子菜单标题的 Enter 语义是
-        // 展开子菜单而非关闭，不作为本断言的载体）。
-        state.selected = 1;
-        let expect = state
-            .focused_item(&menus)
-            .filter(|s| s.enabled)
-            .map(|s| s.action);
-        assert_eq!(navigate(&mut state, &menus, "enter", "mang"), expect);
-        assert!(!state.is_open());
-    }
-
-    /// 空菜单集防御（理论上不可达——build_menus 恒四菜单）。
-    #[test]
-    fn navigation_on_empty_menus_is_noop() {
-        let mut state = MenuBarState {
-            open: Some(0),
-            ..Default::default()
-        };
-        let empty: Vec<TopMenu> = Vec::new();
-        assert!(!state.move_vertical(&empty, true));
-        assert_eq!(navigate(&mut state, &empty, "down", "mang"), None);
-        // ← 触发 switch_menu → 空集全关自愈。
-        assert_eq!(navigate(&mut state, &empty, "left", "mang"), None);
-        assert!(!state.is_open(), "switch_menu 对空集全关自愈");
-    }
-
-    // ── 几何 ────────────────────────────────────────────────────
-
-    /// 转换保宽度估算输入（标签 + 快捷键 + 灰显透传；子菜单按标题估宽）。
-    #[test]
-    fn to_context_items_feeds_menu_size() {
-        let menus = build_menus(&full_ctx());
-        let items = to_context_items(&menus[0].entries);
-        let (w, h) = context_menu::menu_size(&items);
-        assert!(w >= context_menu::MENU_MIN_WIDTH, "宽度不小于最小宽");
-        let expected_h = context_menu::MENU_PADDING_Y * 2.
-            + menus[0]
-                .entries
-                .iter()
-                .map(|e| context_menu::ITEM_HEIGHT * e.height_units())
-                .sum::<f32>();
-        assert_eq!(h, expected_h, "高度 = 内边距×2 + Σ(行高×占位)");
-        // 全条目数（含子菜单标题）都被计入高度——子菜单标题占一行。
-        assert!(items.len() == menus[0].entries.len());
-    }
-
-    /// 行偏移：首行 = 上内边距；分隔线按占位高度累加。
-    #[test]
-    fn row_y_offset_accounts_separators() {
-        let menus = build_menus(&full_ctx());
-        let entries = &menus[0].entries;
-        assert_eq!(row_y_offset(entries, 0), context_menu::MENU_PADDING_Y);
-        // idx 9（最近打开）之前有八项普通条目（0..8，含导出PDF5/导出
-        // DOCX6/打印7）+ 一条分隔线（8）——#507 菜单项后基线同步。
-        let expect = context_menu::MENU_PADDING_Y
-            + context_menu::ITEM_HEIGHT * 8.
-            + context_menu::ITEM_HEIGHT * context_menu::SEPARATOR_UNITS;
-        assert_eq!(row_y_offset(entries, 9), expect);
-    }
-
-    /// 锚点估算随菜单序单调递增（下拉往右跟着标题走）。
-    #[test]
-    fn anchor_estimate_monotonic() {
-        let menus = build_menus(&full_ctx());
-        let mut prev = -1.;
-        for idx in 0..menus.len() {
-            let x = estimate_anchor_x(&menus, idx, "mang — 某文档.md");
-            assert!(x > prev, "锚点应随菜单序递增：{prev} → {x}");
-            prev = x;
-        }
-        // #289-②：菜单栏贴窗口左缘——标题不再参与锚点估算（旧版「标题
-        // 更长 → 锚点更右」已随左侧标题列废弃）。
-        assert_eq!(
-            estimate_anchor_x(&menus, 0, "mang — 很长很长的文档名.md"),
-            estimate_anchor_x(&menus, 0, "mang")
-        );
-        // 首个菜单锚点 = 自身左内边距（窗口左缘起算）。
-        assert_eq!(estimate_anchor_x(&menus, 0, ""), TITLE_BTN_PAD_X);
     }
 }

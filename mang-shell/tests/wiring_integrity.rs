@@ -510,10 +510,11 @@ fn context_menu_view_clicks_dispatch_to_shell() {
     );
 }
 
-/// #209：菜单栏渲染层接线——标题点击开菜单（open_menu_bar）、遮罩点
-/// 击关菜单（close_menu_bar）、条目点击派发动作（activate_menu_action，
-/// 与右键菜单 activate_context_menu_item 同款单点）。灰显项不挂
-/// on_click 是设计（点不到不算死按钮）。
+/// #209（#385 批 4 迁 ui::ContextMenu）：菜单栏桥接层接线——标题点击
+/// 开/关菜单（open_menu_bar/close_menu_bar）、条目激活回 shell 动作
+/// 派发（activate_menu_action，与右键菜单 activate_context_menu_item
+/// 同款单点）；部署（anchored/deferred）与点外关闭（DismissEvent →
+/// shell 订阅清态）面同批锚定。
 #[test]
 fn menu_bar_view_clicks_dispatch_to_shell() {
     let file = src("menu_bar_view.rs");
@@ -523,11 +524,49 @@ fn menu_bar_view_clicks_dispatch_to_shell() {
     );
     assert!(
         file.contains("close_menu_bar"),
-        "菜单遮罩未接 close_menu_bar（点外部不关闭）"
+        "菜单标题未接 close_menu_bar（再点同标题不关闭）"
     );
     assert!(
         file.contains("activate_menu_action"),
-        "菜单项 on_click 未接 activate_menu_action（点击无效果）"
+        "菜单项 handler 未接 activate_menu_action（点击无效果）"
+    );
+    // 灰显项（enabled=false）→ selectable(false)（点不到不算死按钮；
+    // 键盘导航跳过 + 无 handler——组件语义，批 1 同款）。
+    assert!(
+        file.contains(".selectable(spec.enabled)"),
+        "动作项未按 enabled 挂 selectable（灰显项仍可点/键盘仍选中）"
+    );
+    // 子菜单走组件原生 .submenu()（主题/字号/侧栏/最近打开——旧自绘
+    // 「›」行 + place_submenu 摆放的退役面）。
+    assert!(
+        file.contains(".submenu("),
+        "子菜单未走组件 .submenu()（自绘摆放未退役）"
+    );
+    // 部署面：anchored + deferred（引擎接管边缘翻转/浮层层序）。
+    let deploy = fn_body(&file, "fn menu_bar_anchor(");
+    assert!(
+        deploy.contains("anchored") && deploy.contains("deferred("),
+        "部署层缺 deferred/anchored（浮层层序与边缘翻转未接框架）"
+    );
+    // shell 接线面：构建挂载 + DismissEvent 订阅（点外/Esc/选完动作 →
+    // 清态——遮罩退役后的关闭链）。
+    let shell = src("shell.rs");
+    assert!(
+        shell.contains("menu_bar_view::build_menu_bar_menu("),
+        "shell open_menu_bar 未走 build_menu_bar_menu（菜单实体没建）"
+    );
+    assert!(
+        shell.contains("DismissEvent"),
+        "shell 未订阅 DismissEvent（点外/Esc 不关闭，菜单状态悬挂）"
+    );
+    // 退役面防回潮：桥接层不再消费 context_menu 自研几何（place_menu/
+    // place_submenu/menu_size/estimate_width——摆放已交 gpui anchored）。
+    assert!(
+        !file.contains("context_menu::place_menu")
+            && !file.contains("context_menu::place_submenu")
+            && !file.contains("context_menu::menu_size")
+            && !file.contains("context_menu::estimate_width"),
+        "menu_bar_view 仍在消费自研摆放几何（anchored 部署被旁路/回潮）"
     );
     assert!(
         dead_closures(&file).is_empty(),
