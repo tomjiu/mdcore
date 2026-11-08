@@ -168,6 +168,8 @@ export const en = {
   // ---- Grid 面板（xlsx_grid.ts）----
   'grid.noWorkbook': 'no workbook',
   'grid.exportEdited': 'export edited workbook',
+  'grid.exportAnonymized': 'Anonymize',
+  'grid.exportAnonymizedTitle': 'Scrub workbook identity metadata on export (author/company/commenters — dark-label cleanup, same as the DOCX anonymize toggle)',
   'grid.openToStart': 'open a .xlsx workbook to start',
   'grid.opened': 'opened: {n} sheet{plural} ({summary})',
   'grid.openFailed': 'open failed ({code}): {message}',

@@ -164,6 +164,8 @@ export const zhCN: Dict = {
   // ---- Grid 面板（xlsx_grid.ts）----
   'grid.noWorkbook': '无工作簿',
   'grid.exportEdited': '导出已编辑工作簿',
+  'grid.exportAnonymized': '匿名导出',
+  'grid.exportAnonymizedTitle': '导出时清除工作簿身份元数据（作者/公司/批注人——暗标清理，同 DOCX 匿名导出）',
   'grid.openToStart': '打开 .xlsx 工作簿开始',
   'grid.opened': '已打开：{n} 个工作表（{summary}）',
   'grid.openFailed': '打开失败（{code}）：{message}',
