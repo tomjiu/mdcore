@@ -1,13 +1,15 @@
-//! 命令面板的分组渲染（#63 打磨项）。
+//! 命令面板的分组渲染（#63 打磨项；#385 批 3b：列表迁 zed 组件族）。
 //!
 //! 数据与顺序在 [`crate::command_groups`]（纯逻辑、有单测）；本模块只负责
 //! 把 [`Section`] 画成「段标题 + 条目 + 右侧快捷键」。
 //!
-//! 面板本体（输入框、键处理）在 `editor/mod.rs`——那里持有 `PaletteState`。
+//! 面板本体（输入框、键处理）在 `editor/mod.rs`——那里持有 `PaletteState`
+//! 与浮层容器（#385 批 3b：浮层视觉壳已换 `ui::Popover`）。
 //! 本模块提供 [`palette_sections`]，让编辑器在渲染时按分组取数据。
 
 use gpui::{App, SharedString, px};
 use ui::prelude::*;
+use ui::{ListHeader, ListItem};
 
 use crate::command_groups::{Entry, Group, RecentRing, Section, build_sections, flatten};
 use crate::editor::commands::{self, Cmd};
@@ -26,7 +28,11 @@ pub fn palette_flat(sections: &[Section]) -> Vec<Cmd> {
     flatten(sections)
 }
 
-/// 渲染面板列表区（段标题 + 行的绝对序）。
+/// 渲染面板列表区（#385 批 3b：段标题 → `ListHeader`、条目 →
+/// `ListItem`——选中态/排版/间距主题推导）。
+///
+/// 行不挂 `on_click`（行为守恒：面板选中是键盘 ↑↓ 驱动，
+/// `PaletteState.selected` 单一状态源；ListItem 只消费选中态）。
 ///
 /// `selected` = 扁平序里的选中下标；`max_rows` 限制总行数（面板不无限长）。
 pub fn palette_list(
@@ -43,16 +49,8 @@ pub fn palette_list(
         if drawn >= max_rows {
             break;
         }
-        // 段标题（最近使用 / 文件 / 编辑 / 导航 / 视图 / 帮助）
-        col = col.child(
-            div()
-                .id(SharedString::from(format!("pal-sec-{:?}", section.group)))
-                .px_2()
-                .pt_1()
-                .text_size(px(10.))
-                .text_color(colors.text_muted)
-                .child(section.group.title()),
-        );
+        // 段标题（最近使用 / 文件 / 编辑 / 导航 / 视图 / 帮助）。
+        col = col.child(ListHeader::new(section.group.title()));
         for Entry { cmd, index } in &section.entries {
             if drawn >= max_rows {
                 break;
@@ -60,19 +58,11 @@ pub fn palette_list(
             drawn += 1;
             let is_sel = *index == selected;
             col = col.child(
-                div()
-                    .id(SharedString::from(format!("pal-row-{index}")))
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .gap_2()
-                    .h(px(22.))
-                    .px_2()
-                    .mx_1()
-                    .rounded_sm()
-                    .when(is_sel, |e| e.bg(colors.element_hover))
+                ListItem::new(SharedString::from(format!("pal-row-{index}")))
+                    .inset(true)
+                    .toggle_state(is_sel)
                     .child(div().text_color(colors.text).child(cmd.title()))
-                    .child(
+                    .end_slot(
                         div()
                             .text_size(px(11.))
                             .text_color(colors.text_muted)
