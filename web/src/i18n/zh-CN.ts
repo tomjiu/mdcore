@@ -181,6 +181,17 @@ export const zhCN: Dict = {
   'grid.guideHint1': '拖放 .xlsx 到此面板打开',
   'grid.guideHint2': '或使用顶栏「表格页打开 Excel」按钮',
 
+  // ---- 暗标扫描验证面（dark_scan.ts，#520）----
+  'darkscan.scan': '暗标扫描',
+  'darkscan.scanTitle': '扫描任意 .docx/.xlsx 产物的身份残留（作者/公司/批注人——不预设产物出自本引擎）',
+  'darkscan.title': '暗标扫描结果',
+  'darkscan.clean': '0 处身份残留——产物干净',
+  'darkscan.found': '{n} 处身份残留',
+  'darkscan.bridgeAbsent': '扫描面未就绪（wasm dark_scan 缺席——pending rebuild），本次未验证',
+  'darkscan.unsupportedKind': '不支持的文件类型（仅 .docx / .xlsx）：{name}',
+  'darkscan.scanFailed': '扫描失败（{code}）：{message}',
+  'darkscan.close': '关闭',
+
   // ---- PDF 面板（pdf_view.ts）----
   'pdf.open': '打开 PDF',
   'pdf.openTitle': '在「PDF」页签打开文档（pdf.js 显示 + wasm 会话模型）',

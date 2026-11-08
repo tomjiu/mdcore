@@ -239,6 +239,28 @@
   }
   #docx-export-options select:disabled { opacity: .5; }
   #docx-export-options .deo-note { color: var(--fg-muted); font-size: 11px; line-height: 1.5; }
+  /* #520 暗标扫描验证面：浮层锚定 + 结构化清单语系 */
+  .tb-group.darkscan-group { position: relative; }
+  #darkscan-panel {
+    position: absolute; top: calc(100% + 6px); left: 0; z-index: 220;
+    min-width: 360px; max-width: 520px; max-height: 320px; overflow: auto;
+    padding: 12px 14px; background: var(--panel); color: var(--fg);
+    border: 1px solid var(--border-strong); border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.18);
+  }
+  #darkscan-panel .ds-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+  #darkscan-panel .ds-count { font-size: 12px; padding: 1px 8px; border-radius: 8px;
+                              background: var(--panel-hover); color: var(--fg-muted); }
+  #darkscan-panel .ds-count.dirty { color: var(--danger); }
+  #darkscan-panel .ds-close { margin-left: auto; cursor: pointer; border: none; background: none;
+                              color: var(--fg-muted); font-size: 15px; line-height: 1; }
+  #darkscan-panel .ds-clean { color: var(--fg-muted); font-size: 13px; }
+  #darkscan-panel .ds-row { padding: 4px 0; border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+  #darkscan-panel .ds-row:last-child { border-bottom: none; }
+  #darkscan-panel .ds-where { color: var(--fg-muted); }
+  #darkscan-panel .ds-value { color: var(--danger); word-break: break-all; }
+  #darkscan-panel .ds-hint { color: var(--fg-muted); font-size: 11px; }
+  #darkscan-status { margin-left: 4px; color: var(--fg-muted); }
   #xlsx-export-status { margin-left: 10px; color: var(--fg-muted); }
   #xlsx-export-status.xlsx-export-error { color: var(--danger); }
   /* Phase 5 §8.3：视图切换（文档编辑器 <-> 表格面板）*/
@@ -616,6 +638,13 @@
     <span id="docx-export-status"></span>
     <button type="button" class="import-btn" id="xlsx-export-btn" data-i18n-title="toolbar.exportXlsxTitle" title="导出 Excel 工作簿（表格块 → .xlsx 下载）"><span data-i18n="toolbar.exportXlsx">export .xlsx</span></button>
     <span id="xlsx-export-status"></span>
+  </span>
+  <span class="tb-group darkscan-group" aria-label="验证组">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.5 2a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9Zm4.5 8.4 3.3 3.3.8-.8-3.3-3.3a5.5 5.5 0 1 0-.8.8Z"/></svg>
+    <label class="import-btn" for="darkscan-file" data-i18n-title="darkscan.scanTitle" title="扫描任意 .docx/.xlsx 产物的身份残留（作者/公司/批注人——不预设产物出自本引擎）"><span data-i18n="darkscan.scan">暗标扫描</span></label>
+    <input type="file" id="darkscan-file" accept=".docx,.xlsx" hidden />
+    <span id="darkscan-status"></span>
+    <div id="darkscan-panel" hidden></div>
   </span>
   <span class="tb-group" aria-label="表格组">
     <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M2 2h12v12H2V2Zm1.5 3v7.5h9V5h-9Zm0-1.5h9V3.5h-9V3.5Zm2 3h1.5V10H5.5V6.5Zm3 0H10V10H8.5V6.5Z"/></svg>

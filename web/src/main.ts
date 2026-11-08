@@ -76,6 +76,7 @@ import { readDraft, setupDraftPersistence } from './draft.js';
 import { setupEvidencePanel } from './evidence_panel.js';
 import { setupPdfView } from './pdf_view.js';
 import { setupXlsxGrid, gridOpenBytesWhenReady } from './xlsx_grid.js';
+import { setupDarkScan } from './dark_scan.js';
 import { t, tCount, initI18n, applyStaticI18n } from './i18n/index.js';
 import { asyncImport, cancelAsyncImport, asyncImportBusy, WORKER_INFRA_CODES } from './import_async.js';
 
@@ -1742,6 +1743,14 @@ async function main(): Promise<void> {
   // The handle ctor is optional in the current pkg build — the panel runs
   // inert (typed bridge_absent results) until the wasm rebuild lands it.
   setupEvidencePanel(() => import('../pkg/mdcore_wasm.js'));
+
+  // ---- #520: dark-label scan verification face (toolbar entry — any
+  // .docx/.xlsx artifact → wasm free fn dark_scan → structured residual
+  // list). Free-function face probed by duck-typing: a pkg build without
+  // #504's dark_scan degrades to a typed bridge_absent notice (never an
+  // empty list posing as clean). Zero coupling to WasmCore/WasmBook/
+  // WasmWorkbench lifecycles — the scan is stateless per file.
+  setupDarkScan(() => import('../pkg/mdcore_wasm.js'));
 
   // ---- Phase 5 §8.4: PDF surface view (pdf.js display plane + mdc-pdf
   // wasm session model plane). Self-contained lazy boot: pdfjs is bundled
