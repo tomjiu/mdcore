@@ -87,7 +87,7 @@
 | 4 | `right_dock.rs`（52 恒在 dock 条） | **维持自绘**（复用 bar_button 单元——左右两条同语系） | — | — | 不迁 | 同上 |
 | 5 | `tab_bar.rs`（218 手写 tab） | `ui::TabBar` + `ui::Tab` | 中 | P1 | **批 2** | 溢出横滚已用 gpui 原生；Tab 组件带关闭钮/激活态语义 |
 | 6 | `context_menu.rs`（443）+ `context_menu_view.rs`（146） | `ui::ContextMenu` + `ContextMenuEntry` | 中 | **P0** | **批 1（修正后首批）** | 手写含锚点翻转/键盘导航——ContextMenu 自带；`Point/Rect/height_units` 自研几何可退役（真去重面） |
-| 7 | `menu_bar.rs`（1318）+ `menu_bar_view.rs`（344） | `ui::DropdownMenu`/`PopoverMenu` 组合 | **高** | P1 | 批 4+ | 顶栏菜单 + 键盘导航 + `estimate_anchor_x` 自研锚定——需重构；#289 已修贴左 |
+| 7 | `menu_bar.rs`（1318）+ `menu_bar_view.rs`（344） | `ui::DropdownMenu`/`PopoverMenu` 组合 | **高** | P1 | 批 4+ | ✅ 批 4 已交付（feat/385-b4-menu-bar）：下拉/子菜单/键盘导航/点外关闭 → `ui::ContextMenu` 实体（批 1 同构桥接：custom_entry/toggleable_entry/.submenu + anchored/deferred 部署）；自研 MenuBarState 状态机与 place_menu 几何消费面退役；标题行自绘保留（结论 2 语系）。已知降级：←→ 切换顶部菜单 → 组件语义（← 关/→ 进子菜单） | 
 | 8 | `find_bar.rs`（1218，editor/） | **无对应件**（B4 缺件） | 高 | P2 | 待裁定 | 维持手写或闭包扩张（§五） |
 | 9 | `settings_panel.rs`（378 模态弹窗） | `ui::Modal` + `ModalHeader`/`ModalRow` | 中 | P1 | 批 3 | #289 已改模态语义——外壳换 Modal 组件 |
 | 10 | `palette_view.rs`（104 命令面板） | `ui::Popover`/`Modal` 组合 | 中 | P2 | 批 3+ | |
@@ -111,6 +111,10 @@
 批 2：tab_bar → ui::TabBar/Tab
 批 3：settings_panel 外壳 → ui::Modal；palette → Popover 组合
 批 4：menu_bar → DropdownMenu/PopoverMenu 组合（键盘导航重构——最重）
+                     ✅ 批 4 已交付（feat/385-b4-menu-bar）：下拉 → `ui::ContextMenu` 实体
+                     （组件自带键盘导航/一层子菜单/点外关闭；自研状态机与几何退役）；
+                     标题 trigger 自绘保留（按钮族语系）；←→ 切顶部菜单降级为组件
+                     语义（← 关/→ 进子菜单），PR 描述已登记
 批 5：panels/file_tree/git_panel → ui::List 族（虚拟化/多选桥接）
                      ✅ 批 5c 已交付（feat/385-b5c-git-panel-list，PR 见 #385 认领评论）：
                      git_panel 改动/历史行迁 ListItem + 状态码 Chip + 计数 CountBadge +

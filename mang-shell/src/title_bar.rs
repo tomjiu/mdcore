@@ -50,14 +50,14 @@ use crate::shell::ShellApp;
 /// 标题栏高度（px）。
 pub const TITLE_BAR_HEIGHT: Pixels = px(36.);
 
-/// 渲染标题栏。`menus` / `menu_state` = #209 菜单栏（结构与状态由
+/// 渲染标题栏。`menus` / `open_idx` = #209 菜单栏（结构与展开态由
 /// shell 提供——本模块只做布局挂载；`cx.listener` 需要 ShellApp 上下文，
 /// activity_bar/tab_bar 同款签名口径）。`title` 仅用于拖拽区中央的
 /// 居中文案（#289-②——不再占用左侧菜单位）。
 pub fn title_bar(
     title: &str,
     menus: &[menu_bar::TopMenu],
-    menu_state: &menu_bar::MenuBarState,
+    open_idx: Option<usize>,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -69,7 +69,7 @@ pub fn title_bar(
         .bg(colors.title_bar_background)
         // #289-②：菜单栏贴窗口左缘（zed/vscode 同款）——应用名不再
         // 占用菜单位（旧版此处是「mang — 文件」标题列）。
-        .child(menu_bar_view::menu_titles(menus, menu_state, cx))
+        .child(menu_bar_view::menu_titles(menus, open_idx, cx))
         // 拖拽区（flex）：中央居中文档标题（vscode 同款；纯展示 Label
         // 零鼠标监听——不阻断 Windows HTCAPTION 原生接管）。
         .child(
