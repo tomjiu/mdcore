@@ -293,9 +293,9 @@ fn reorder_undo_redo_restores_z() {
     let z_after = z_of(&s, "a");
     assert_ne!(z_before, z_after);
 
-    assert!(s.undo(Actor::Human), "撤销重排");
+    assert!(s.undo(Actor::Human).expect("undo"), "撤销重排");
     assert_eq!(z_of(&s, "a"), z_before, "撤销恢复原 z 键");
-    assert!(s.redo(Actor::Human), "重做重排");
+    assert!(s.redo(Actor::Human).expect("redo"), "重做重排");
     assert_eq!(z_of(&s, "a"), z_after, "重做恢复新 z 键");
 }
 

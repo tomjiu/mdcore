@@ -173,7 +173,7 @@ fn evidence_binds_to_canvas_object_and_degrades_on_move() {
     sidecar.register_source_doc(canvas_ref(&c, 3), 6_000, "system");
     assert_eq!(sidecar.evidence[0].linkage, LinkageStatus::Stale);
     // 撤销 AI 端编辑（AI 自己的栈）→ 语义回归 → 重验后指纹可复原。
-    assert!(ai_side.undo(Actor::Ai));
+    assert!(ai_side.undo(Actor::Ai).expect("undo"));
     let sv = c.state_vector();
     let diff = ai_side.encode_diff(&sv).unwrap();
     c.apply_update(&diff).unwrap();

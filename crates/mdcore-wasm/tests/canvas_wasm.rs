@@ -423,7 +423,7 @@ fn execute_batch_end_to_end_and_receipt_json() {
     // 批效果读回（依赖序列可见）。
     assert_eq!(s.find_object("n1").unwrap().x, 20.0);
     // 一次 undo 全撤。
-    assert!(s.undo(mdc_canvas::Actor::Ai));
+    assert!(s.undo(mdc_canvas::Actor::Ai).expect("undo"));
     assert!(s.find_object("n1").is_none());
     // 失败批：错误码映射 + 零落地。
     let e = s
@@ -740,4 +740,97 @@ fn frame_commands_parse_and_json_shapes() {
         .unwrap_err();
     let e: mdcore_wasm::canvas::CvError = e.into();
     assert_eq!(e.code, "cv_invalid_input", "非 frame 目标拒收");
+}
+
+// ── #353 三态驾驶闸（wasm 面）─────────────────────────────────────
+
+/// set_drive_mode 命令解析（合法三值 + 非法值拒）+ 回执 JSON 形状
+/// + 错误码映射（cv_mode_denied）+ User 拒 Ai 的 wasm 出口语义。
+#[test]
+fn drive_mode_command_parse_receipt_and_gate() {
+    // 解析：合法三值。
+    for (wire, mode) in [
+        ("user", mdc_canvas::DriveMode::User),
+        ("collaborative", mdc_canvas::DriveMode::Collaborative),
+        ("ai", mdc_canvas::DriveMode::Ai),
+    ] {
+        let c = parse_cmd_core(&format!(r#"{{"t":"set_drive_mode","mode":"{wire}"}}"#)).unwrap();
+        assert!(
+            matches!(c, mdc_canvas::CanvasCommand::SetDriveMode { mode: m } if m == mode),
+            "parse {wire}"
+        );
+    }
+    // 解析：非法 mode 值拒（bad_json 面）。
+    assert!(parse_cmd_core(r#"{"t":"set_drive_mode","mode":"auto"}"#).is_err());
+    assert!(parse_cmd_core(r#"{"t":"set_drive_mode"}"#).is_err());
+
+    let mut s = session(53);
+    // 缺省 Collaborative。
+    assert_eq!(s.drive_mode(), mdc_canvas::DriveMode::Collaborative);
+
+    // Human 切 User（命令面）→ 回执 drive_mode_set + mode 字段。
+    let r = s
+        .execute(
+            mdc_canvas::Actor::Human,
+            parse_cmd_core(r#"{"t":"set_drive_mode","mode":"user"}"#).unwrap(),
+        )
+        .unwrap();
+    let rj = receipt_json(&r.outcome, r.undo_depth, r.undo_cleared);
+    assert!(rj.contains(r#""outcome":"drive_mode_set""#), "{rj}");
+    assert!(rj.contains(r#""mode":"user""#), "{rj}");
+    assert_eq!(s.drive_mode(), mdc_canvas::DriveMode::User);
+
+    // User 模式下 Ai 命令被拒 → cv_mode_denied。
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Ai,
+            parse_cmd_core(r#"{"t":"add_node","id":"n1","x":0,"y":0,"w":10,"h":10}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_mode_denied", "User 模式拒 Ai：{e:?}");
+    assert!(e.message.contains("user"), "错误消息含当前模式：{e:?}");
+    assert!(e.message.contains("ai"), "错误消息含被拒 actor：{e:?}");
+
+    // 撤销面同拒 → cv_mode_denied。
+    let e = s.undo(mdc_canvas::Actor::Ai).unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_mode_denied", "User 模式拒 Ai 撤销");
+
+    // Human 恢复 Collaborative → Ai 恢复照常（零回归）。
+    s.execute(
+        mdc_canvas::Actor::Human,
+        parse_cmd_core(r#"{"t":"set_drive_mode","mode":"collaborative"}"#).unwrap(),
+    )
+    .unwrap();
+    s.execute(
+        mdc_canvas::Actor::Ai,
+        parse_cmd_core(r#"{"t":"add_node","id":"n1","x":0,"y":0,"w":10,"h":10}"#).unwrap(),
+    )
+    .unwrap();
+    assert!(s.find_object("n1").is_some());
+
+    // Ai 提权被拒（Collaborative → Ai）：命令面同码。
+    let e = s
+        .execute(
+            mdc_canvas::Actor::Ai,
+            parse_cmd_core(r#"{"t":"set_drive_mode","mode":"ai"}"#).unwrap(),
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_mode_denied", "Ai 自我提权被拒：{e:?}");
+
+    // set_drive_mode 进批 → 入口拒（语义面，非权限面）。
+    let e = s
+        .execute_batch(
+            mdc_canvas::Actor::Human,
+            vec![
+                parse_cmd_core(r#"{"t":"add_node","id":"n9","x":0,"y":0,"w":10,"h":10}"#).unwrap(),
+                parse_cmd_core(r#"{"t":"set_drive_mode","mode":"user"}"#).unwrap(),
+            ],
+        )
+        .unwrap_err();
+    let e: mdcore_wasm::canvas::CvError = e.into();
+    assert_eq!(e.code, "cv_invalid_input", "批入口拒：{e:?}");
+    assert!(e.message.contains("set_drive_mode"), "{e:?}");
 }

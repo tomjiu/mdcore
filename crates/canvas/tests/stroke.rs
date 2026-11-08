@@ -178,7 +178,7 @@ fn set_stroke_style_terminal_replacement_and_fingerprint() {
     let fp1 = c.object_fingerprint("s-1").unwrap();
     assert_ne!(fp0, fp1, "改笔色/粗细/工具 = 语义变更 → 指纹变");
     // 撤销样式 → 指纹复原。
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert_eq!(
         c.object_fingerprint("s-1").unwrap(),
         fp0,
@@ -235,7 +235,7 @@ fn remove_then_undo_restores_same_id_and_payload() {
     )
     .unwrap();
     assert!(c.find_object("s-1").is_none());
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     let o = c.find_object("s-1").expect("撤销删除应复原笔迹");
     assert_eq!(o.kind, ObjectKind::Stroke);
     assert_eq!(o.points.len(), 3);
@@ -247,9 +247,9 @@ fn undo_redo_add_stroke() {
     let mut c = CanvasSession::open(opts(1)).unwrap();
     let r = c.execute(Actor::Human, pen(Some("s-1"))).unwrap();
     assert_eq!(r.undo_depth, 1);
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert!(c.find_object("s-1").is_none(), "撤销加笔 → 笔消失");
-    assert!(c.redo(Actor::Human));
+    assert!(c.redo(Actor::Human).expect("redo"));
     assert_eq!(
         c.find_object("s-1").unwrap().points.len(),
         3,

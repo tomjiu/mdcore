@@ -391,7 +391,7 @@ fn main() {
         )
         .unwrap();
     assert!(human_canvas.find_object("n-total").is_none());
-    assert!(human_canvas.undo(CActor::Human));
+    assert!(human_canvas.undo(CActor::Human).expect("undo"));
     assert_eq!(
         human_canvas.object_fingerprint("n-total").unwrap(),
         fp_before,

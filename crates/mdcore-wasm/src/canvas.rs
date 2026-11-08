@@ -30,8 +30,8 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 use mdc_canvas::{
-    Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, ObjectKind,
-    ReorderOp, SessionOptions, StrokeTool,
+    Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, DriveMode,
+    ObjectKind, ReorderOp, SessionOptions, StrokeTool,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,8 @@ impl From<CanvasError> for CvError {
             CanvasError::MemberNotFound { .. } => "cv_member_not_found",
             CanvasError::NonFiniteGeometry { .. } => "cv_non_finite",
             CanvasError::KindMismatch { .. } => "cv_kind_mismatch",
+            // #353：三态驾驶闸拒绝（User 模式拒 Ai / Ai 非法转移）。
+            CanvasError::ModeDenied { .. } => "cv_mode_denied",
         };
         CvError {
             code,
@@ -317,9 +319,19 @@ pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
             id: s("id")?,
             parent: opt_parent("parent")?,
         }),
+        // #353：三态驾驶闸切换（Human 任意态；Ai 仅让出——自我提权被拒）。
+        "set_drive_mode" => {
+            let mode = DriveMode::from_wire(&s("mode")?).ok_or_else(|| {
+                bad_json(
+                    "command",
+                    "`mode` must be user/collaborative/ai".to_string(),
+                )
+            })?;
+            Ok(CanvasCommand::SetDriveMode { mode })
+        }
         other => Err(bad_json(
             "command",
-            format!("unknown command `{other}` (16 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder/add_tag/remove_tag/create_frame/rename_frame/set_parent)"),
+            format!("unknown command `{other}` (17 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/reorder/add_tag/remove_tag/create_frame/rename_frame/set_parent/set_drive_mode)"),
         )),
     }
 }
@@ -382,6 +394,12 @@ pub fn batch_receipt_json(r: &mdc_canvas::BatchReceipt) -> String {
                 CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
                 CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
                 CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
+                // #353 驾驶闸：批入口已拒 SetDriveMode（会话本地策略非
+                // 载体变更），本臂批路径不可达——穷尽性保匹配全（语义
+                // 同单命令 receipt_json）。
+                CommandOutcome::DriveModeSet { mode } => {
+                    ("drive_mode_set", "mode", mode.wire().into())
+                }
             };
             format!(
                 "{{\"outcome\":\"{kind}\",\"{key}\":{}}}",
@@ -502,6 +520,8 @@ pub fn receipt_json(outcome: &CommandOutcome, undo_depth: usize, undo_cleared: b
         CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
         CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
         CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
+        // #353：驾驶模式已切（mode 字段——同回执面）。
+        CommandOutcome::DriveModeSet { mode } => ("drive_mode_set", "mode", mode.wire().into()),
     };
     format!(
         "{{\"outcome\":\"{kind}\",\"{key}\":{},\"undo_depth\":{undo_depth},\"undo_cleared\":{undo_cleared}}}",
@@ -675,16 +695,21 @@ impl WasmCanvas {
         Ok(batch_receipt_json(&receipt))
     }
 
-    /// 撤销（按 origin 分栈）。
+    /// 撤销（按 origin 分栈）。#353：User 模式下 Ai 撤销被拒
+    /// （`cv_mode_denied`）；`Ok(false)` = 栈空。
     pub fn undo(&mut self, actor: &str) -> Result<bool, JsValue> {
         let actor = parse_actor(actor).map_err(|e| e.to_js())?;
-        Ok(self.session.undo(actor))
+        self.session
+            .undo(actor)
+            .map_err(|e| CvError::from(e).to_js())
     }
 
-    /// 重做。
+    /// 重做（#353 同拒语义）。
     pub fn redo(&mut self, actor: &str) -> Result<bool, JsValue> {
         let actor = parse_actor(actor).map_err(|e| e.to_js())?;
-        Ok(self.session.redo(actor))
+        self.session
+            .redo(actor)
+            .map_err(|e| CvError::from(e).to_js())
     }
 
     pub fn undo_depth(&self, actor: &str) -> Result<usize, JsValue> {
@@ -697,6 +722,26 @@ impl WasmCanvas {
         Ok(self
             .session
             .redo_depth(parse_actor(actor).map_err(|e| e.to_js())?))
+    }
+
+    /// #353：驾驶模式读（wire 名 user/collaborative/ai——会话本地策略，
+    /// 无事件面，宿主轮询）。
+    pub fn drive_mode(&self) -> String {
+        self.session.drive_mode().wire().into()
+    }
+
+    /// #353：驾驶模式写（直写面——与 `set_drive_mode` 命令同语义同
+    /// 单一真相：Human 任意态；Ai 仅从 Ai 态让出，非法转移
+    /// `cv_mode_denied`）。
+    pub fn set_drive_mode(&mut self, actor: &str, mode: &str) -> Result<String, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        let mode = DriveMode::from_wire(mode).ok_or_else(|| {
+            bad_json("mode", format!("unknown `{mode}` (user|collaborative|ai)")).to_js()
+        })?;
+        self.session
+            .set_drive_mode(actor, mode)
+            .map_err(|e| CvError::from(e).to_js())?;
+        Ok(mode.wire().into())
     }
 
     /// 读模型快照（ID 字典序确定性）。

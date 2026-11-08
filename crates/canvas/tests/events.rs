@@ -133,7 +133,7 @@ fn remove_and_props_touched() {
     assert!(a.find_object(&id).is_none());
 
     // 撤销删除 → 同 ID 回归（画布域身份特性）+ touched 钉定。
-    assert!(a.undo(Actor::Human), "undo remove");
+    assert!(a.undo(Actor::Human).expect("undo"), "undo remove");
     let events = rec.take();
     assert_eq!(events.len(), 1);
     assert_eq!(
@@ -287,12 +287,12 @@ fn undo_empty_and_redo_events() {
     let mut a = session(7_300_012);
     let rec = Recorder::new();
     let _sub = rec.attach(&mut a);
-    assert!(!a.undo(Actor::Human), "空栈");
+    assert!(!a.undo(Actor::Human).expect("undo"), "空栈");
     assert!(rec.take().is_empty());
 
     let id = add_node(&mut a, 0.0, 0.0);
     let _ = rec.take(); // 丢弃 add 事件（只验撤销面）
-    assert!(a.undo(Actor::Human));
+    assert!(a.undo(Actor::Human).expect("undo"));
     let events = rec.take();
     assert_eq!(events.len(), 1);
     assert_eq!(
@@ -303,7 +303,7 @@ fn undo_empty_and_redo_events() {
     );
     assert_eq!(events[0].touched, vec![id.clone()]);
 
-    assert!(a.redo(Actor::Human));
+    assert!(a.redo(Actor::Human).expect("redo"));
     let events = rec.take();
     assert_eq!(events.len(), 1);
     assert_eq!(

@@ -175,11 +175,11 @@ fn successful_batch_is_one_undo_unit_with_dependencies() {
     assert!(s.find_object("e1").is_some());
     assert!(s.find_object("g1").is_some());
     // 一次 undo → 全撤（回到基线 1 对象 + move/props/边/组全消失）。
-    assert!(s.undo(Actor::Human));
+    assert!(s.undo(Actor::Human).expect("undo"));
     assert_eq!(s.objects().len(), 1, "批效果全撤，仅剩基线对象 a");
     assert_eq!(s.find_object("a").unwrap().x, 0.0, "a 未被批触碰");
     // 一次 redo → 全恢复。
-    assert!(s.redo(Actor::Human));
+    assert!(s.redo(Actor::Human).expect("redo"));
     assert_eq!(s.objects().len(), 4, "全恢复：a/n1/e1/g1");
     assert_eq!(s.find_object("n1").unwrap().x, 30.0, "move 效果恢复");
     assert_eq!(
@@ -417,7 +417,7 @@ fn single_command_path_still_one_unit_per_command() {
         3,
         "单命令 = 每命令一单元（既有语义）"
     );
-    assert!(s.undo(Actor::Human));
+    assert!(s.undo(Actor::Human).expect("undo"));
     assert_eq!(s.find_object("a").unwrap().x, 0.0, "仅撤最后一条");
     assert!(s.find_object("b").is_some());
 }

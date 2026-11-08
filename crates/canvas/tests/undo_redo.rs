@@ -27,9 +27,9 @@ fn undo_redo_all_op_types() {
         },
     )
     .unwrap();
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert!(c.find_object("n-1").is_none());
-    assert!(c.redo(Actor::Human));
+    assert!(c.redo(Actor::Human).expect("redo"));
     assert_eq!(c.find_object("n-1").unwrap().x, 10.0);
     // 移动撤销。
     c.execute(
@@ -42,7 +42,7 @@ fn undo_redo_all_op_types() {
     )
     .unwrap();
     assert_eq!(c.find_object("n-1").unwrap().x, 500.0);
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert_eq!(c.find_object("n-1").unwrap().x, 10.0, "撤销移动回原位");
     // 缩放撤销。
     c.execute(
@@ -54,7 +54,7 @@ fn undo_redo_all_op_types() {
         },
     )
     .unwrap();
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert_eq!(c.find_object("n-1").unwrap().w, 50.0);
     // 属性撤销。
     let mut p = BTreeMap::new();
@@ -67,7 +67,7 @@ fn undo_redo_all_op_types() {
         },
     )
     .unwrap();
-    assert!(c.undo(Actor::Ai));
+    assert!(c.undo(Actor::Ai).expect("undo"));
     assert!(c.find_object("n-1").unwrap().props.is_empty());
     // 边撤销（端点节点随之恢复的复合场景在删除复原测试覆盖）。
     c.execute(
@@ -92,9 +92,9 @@ fn undo_redo_all_op_types() {
         },
     )
     .unwrap();
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert!(c.find_object("e-1").is_none());
-    assert!(c.redo(Actor::Human));
+    assert!(c.redo(Actor::Human).expect("redo"));
     assert!(c.find_object("e-1").is_some());
     // 分组/解组撤销。
     c.execute(
@@ -105,9 +105,9 @@ fn undo_redo_all_op_types() {
         },
     )
     .unwrap();
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     assert!(c.find_object("g-1").is_none());
-    assert!(c.redo(Actor::Human));
+    assert!(c.redo(Actor::Human).expect("redo"));
     c.execute(
         Actor::Human,
         CanvasCommand::Ungroup {
@@ -115,7 +115,7 @@ fn undo_redo_all_op_types() {
         },
     )
     .unwrap();
-    assert!(c.undo(Actor::Human), "撤销解组 → 组回归");
+    assert!(c.undo(Actor::Human).expect("undo"), "撤销解组 → 组回归");
     assert!(c.find_object("g-1").is_some());
 }
 
@@ -148,7 +148,7 @@ fn delete_then_undo_restores_same_identity() {
     .unwrap();
     assert!(c.find_object("n-quote").is_none());
     // 撤销删除 → 同 ID 回归 + 指纹复原（证据锚的删除复原语义连续性）。
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     let o = c.find_object("n-quote").unwrap();
     assert_eq!(o.kind, ObjectKind::Node);
     assert_eq!(o.props.get("label").map(|s| s.as_str()), Some("报价节点"));
@@ -209,7 +209,7 @@ fn per_actor_interleaved_undo() {
     // evidence_assoc 测试：AI 独立会话的编辑撤销干净复原）。已登记
     // 为已知语义（上游询问候选），此处钉定观测行为防静默漂移。
     for (k, want_x) in [(1usize, 3.0f64), (2, 2.0), (3, 1.0)] {
-        assert!(c.undo(Actor::Ai), "第 {k} 笔 Ai 撤销");
+        assert!(c.undo(Actor::Ai).expect("undo"), "第 {k} 笔 Ai 撤销");
         let o = c.find_object("n").unwrap();
         assert_eq!(
             (o.x, o.y),
@@ -225,13 +225,13 @@ fn per_actor_interleaved_undo() {
     // 撤销的 redo 链复刻（原项保持墓碑）= 无产出项被丢弃，H1 产出
     // → 一次 undo 回初始位（depth 4→1）；再一次 undo 撤建块插入
     // （节点消失）；栈尽 false。跨会话编辑撤销不受此影响。
-    assert!(c.undo(Actor::Human));
+    assert!(c.undo(Actor::Human).expect("undo"));
     let o = c.find_object("n").unwrap();
     assert_eq!((o.x, o.y), (0.0, 0.0), "一次 undo 消耗无产出项 + H1");
     assert_eq!(c.undo_depth(Actor::Human), 1);
-    assert!(c.undo(Actor::Human), "撤建块插入");
+    assert!(c.undo(Actor::Human).expect("undo"), "撤建块插入");
     assert!(c.find_object("n").is_none());
-    assert!(!c.undo(Actor::Human), "栈尽");
+    assert!(!c.undo(Actor::Human).expect("undo"), "栈尽");
 }
 
 /// 撤销栈软上限（粗粒度 clear_all 显式回执——与 mdc-collab 同构）。

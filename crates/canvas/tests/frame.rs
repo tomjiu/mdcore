@@ -319,7 +319,7 @@ fn frame_removal_cascades_children_atomically() {
     );
 
     // 撤销恢复：frame 回归 + 子对象 parent 回归（原子恢复）。
-    assert!(s.undo(Actor::Human), "撤销删 frame");
+    assert!(s.undo(Actor::Human).expect("undo"), "撤销删 frame");
     assert_eq!(s.find_object("f1").unwrap().name.as_deref(), Some("A"));
     assert_eq!(
         s.find_object("n1").unwrap().parent.as_deref(),
