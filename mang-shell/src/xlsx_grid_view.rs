@@ -1,4 +1,17 @@
-//! XLSX 网格视图（#389 阶段 1——真网格渲染骨架；**阶段 2——单元格编辑接线**）。
+//! XLSX 网格视图（#389 阶段 1——真网格渲染骨架；**阶段 2——单元格
+//! 编辑接线**；**#555——合并单元格显示与命中**）。
+//!
+//! #555 面（合并单元格——`xlsx_merge_geometry` 纯函数层 + 本模块接线）：
+//!
+//! - 模型携带：`GridSheet::merge_spans`（绝对 `Dimensions` → 显示坐标
+//!   + guard 裁剪——`from_book` 单点换算）；
+//! - 绘制：合并区 = 一个宽格（跨行跨列单视觉格）——覆盖格不独立构建、
+//!   内部网格线抑制；跨行 span 每行画一段，选中/编辑态四边框按行拼接
+//!   （首行 top / 末行 bottom / 每行 left+right）；滚动只覆盖范围中部
+//!   时绝对定位天然承载部分可见；
+//! - 命中/编辑：点覆盖格 → `canonical_cell` 映射左上（Excel 语义——
+//!   选中/编辑/`selected_a1` 全锚左上）；提交只写左上引用，**禁止复制
+//!   值填满合并区域**（issue #555 明文禁令）。
 //!
 //! # 定位（issue #389 阶段 1 范围声明）
 //!
@@ -73,6 +86,10 @@ use mdc_office_io::io::{Book, CellData, ReadOptions};
 use mdc_office_io::xlsx_edit::{CellEdit, XlsxEditor};
 use ui::prelude::*;
 
+use crate::xlsx_merge_geometry::{
+    MergeSpan, canonical_cell, intersects_window, is_covered, span_edges, span_px, spans_in_row,
+};
+
 // ---------------------------------------------------------------------------
 // 常量（渲染口径——与 xlsx_doc.rs 护栏同源，不另立标准）
 // ---------------------------------------------------------------------------
@@ -118,11 +135,15 @@ pub struct GridSheet {
     pub cells: Vec<Vec<String>>,
     /// 触发渲染护栏（行 > 1000 或列 > 64——非静默截断标记）。
     pub truncated: bool,
-    /// 合并范围数（显示 = 左上单点语义——阶段 3 完善项计数登记；
-    /// 集成测试 `grid_model_geometry_and_guards` 断言消费，bin 视图
-    /// 面暂未渲染——预期内，非死代码）。
+    /// 合并范围数（显示 = 左上单点语义——office-io 原始计数；集成
+    /// 测试 `grid_model_geometry_and_guards` 断言消费；bin 视图面读
+    /// `merge_spans`——计数字段保留为「原始 vs 可渲染」口径分离面）。
     #[allow(dead_code)]
     pub merges: usize,
+    /// #555：合并范围（显示坐标，guard 盒内裁剪后——`from_book` 由
+    /// 绝对 `Dimensions` 换算；渲染/命中/编辑全走
+    /// `xlsx_merge_geometry` 纯函数层）。
+    pub merge_spans: Vec<MergeSpan>,
 }
 
 /// 网格载荷（office-io 读面 → 网格模型——单一来源）。
@@ -152,10 +173,12 @@ impl XlsxGridModel {
         for sheet in &book.sheets {
             let grid = &sheet.typed;
             let Some((row0, col0)) = grid.start() else {
-                // 空表：零行零列（网格面 = 空态提示）。
+                // 空表：零行零列（网格面 = 空态提示；合并范围无渲染面
+                // ——guard 盒零维，clip_to_box 全弃）。
                 sheets.push(GridSheet {
                     name: sheet.name.clone(),
                     merges: sheet.merges.len(),
+                    merge_spans: Vec::new(),
                     ..Default::default()
                 });
                 continue;
@@ -181,6 +204,23 @@ impl XlsxGridModel {
                         .collect()
                 })
                 .collect();
+            // #555：合并范围携带（绝对 → 显示坐标 + guard 盒裁剪——
+            // 部分在护栏内的保留可见段，整段在外丢弃；计数 `merges`
+            // 仍记原始值——「有但裁掉」与「没有」语义可区分）。
+            let merge_spans = sheet
+                .merges
+                .iter()
+                .filter_map(|d| {
+                    MergeSpan::clip_to_box(
+                        (d.start.0, d.start.1),
+                        (d.end.0, d.end.1),
+                        row0,
+                        col0,
+                        rows,
+                        cols,
+                    )
+                })
+                .collect();
             sheets.push(GridSheet {
                 name: sheet.name.clone(),
                 start_row: row0,
@@ -190,6 +230,7 @@ impl XlsxGridModel {
                 cells,
                 truncated,
                 merges: sheet.merges.len(),
+                merge_spans,
             });
         }
         Self {
@@ -628,6 +669,8 @@ impl XlsxGridView {
     }
 
     /// 重算列宽/偏移（构造 + 表切换时——选中/横向滚动随表重置）。
+    /// #555：合并区格（含左上）不参与单列宽计算——左上文本由 span
+    /// 宽格承载（跨列宽度），撑单列会把无关列顶宽。
     fn recompute_col_widths(&mut self) {
         let sheet = self.sheet();
         let mut widths = Vec::with_capacity(sheet.cols);
@@ -635,7 +678,13 @@ impl XlsxGridView {
             let content = sheet
                 .cells
                 .iter()
-                .map(|row| display_width(row.get(c).map(String::as_str).unwrap_or("")))
+                .enumerate()
+                .filter(|(r, row)| {
+                    // 覆盖格（含左上）排除；行向量越界的格不覆盖（空尾行）。
+                    row.get(c)
+                        .is_some_and(|_| !is_covered(&sheet.merge_spans, *r, c))
+                })
+                .map(|(_, row)| display_width(row.get(c).map(String::as_str).unwrap_or("")))
                 .max()
                 .unwrap_or(0);
             widths.push(col_width_px(content));
@@ -704,6 +753,8 @@ impl XlsxGridView {
 
     /// 点选收尾（命中测试 → 选中 + 越界钳制；行号槽点击 = 无操作）。
     /// 编辑态先提交当前编辑（Excel 同款：点别的格 = 落定输入）。
+    /// #555：命中经 `canonical_cell` 映射——点合并区覆盖格选中整个
+    /// 合并区（锚左上——`selected_a1`/列头/行号联动随之锚左上）。
     fn select_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         if self.editing.is_some() {
             self.commit_edit();
@@ -718,7 +769,8 @@ impl XlsxGridView {
             x,
             y,
         )
-        .filter(|(r, _)| *r < sheet_rows);
+        .filter(|(r, _)| *r < sheet_rows)
+        .map(|(r, c)| canonical_cell(&self.sheet().merge_spans, r, c).unwrap_or((r, c)));
         if hit.is_some() {
             self.selected = hit;
             cx.notify();
@@ -742,7 +794,12 @@ impl XlsxGridView {
             x,
             y,
         )
-        .filter(|(r, _)| *r < sheet_rows);
+        .filter(|(r, _)| *r < sheet_rows)
+        .map(|(r, c)| {
+            // #555：双击覆盖格 = 编辑合并区左上（缓冲以左上原值起步
+            // ——Excel「双击改原值」同款；提交走左上引用，覆盖格零写入）。
+            canonical_cell(&self.sheet().merge_spans, r, c).unwrap_or((r, c))
+        });
         let Some((row, col)) = hit else {
             return;
         };
@@ -980,6 +1037,10 @@ impl XlsxGridView {
     /// 绝对定位，窗口外零构建；选中格高亮边框 + 行号/列头联动底色；
     /// 行号槽后置 = 盖住左滑进槽区的半可见格（无 z_index——绘制序即
     /// 层序，列头 corner 同款）。
+    /// #555：合并区切片渲染——覆盖格（含左上）不独立构建，span 宽格
+    /// 统一承载（内部网格线抑制 = 合并视觉整体；跨行 span 每行画
+    /// 自己那一段，选择/编辑态四边框按行拼接：首行 top / 末行
+    /// bottom / 每行 left+right）。
     fn render_row(&self, r: usize, cx: &App) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let sheet = self.sheet();
@@ -996,8 +1057,15 @@ impl XlsxGridView {
             .w_full()
             .h(px(ROW_H))
             .flex_none()
+            .overflow_hidden()
             .bg(colors.background);
+        // 该行的合并 span（一次取出——格循环跳格 + span 循环绘制共用）。
+        let spans = spans_in_row(&sheet.merge_spans, r);
         for c in first..end {
+            // #555：合并覆盖格（含左上）跳过独立渲染——span 宽格承载。
+            if spans.iter().any(|s| s.contains(r, c)) {
+                continue;
+            }
             // #389 阶段 2：编辑中的格显示输入缓冲（编辑样式——accent
             // 双线框 + 活动底色，与选中态视觉可区分）。
             let editing_here = self
@@ -1050,6 +1118,90 @@ impl XlsxGridView {
                             .color(ui::Color::Default),
                     ),
             );
+        }
+        // #555：合并 span 宽格（与可见窗口相交才构建——左端滚出窗外/
+        // 右端未入窗的部分可见照常渲染：绝对定位天然承载，负 x 由
+        // 行号槽后置盖住、右溢由行 overflow_hidden 裁掉）。
+        for span in spans {
+            if !intersects_window(span.col_start, span.col_end, first, end) {
+                continue;
+            }
+            let Some((x, w)) = span_px(
+                &self.col_offsets,
+                &self.col_widths,
+                span.col_start,
+                span.col_end,
+            ) else {
+                continue; // 脏 span 防御（下标越界）——跳过不 panic
+            };
+            let Some(edges) = span_edges(span, r) else {
+                continue;
+            };
+            let x = x - self.scroll_x;
+            let anchor = (span.row_start, span.col_start);
+            // 值只在首行切片显示（Excel 左上单点语义——其余行切片空）。
+            let editing_here = self
+                .editing
+                .as_ref()
+                .is_some_and(|ed| (ed.row, ed.col) == anchor && r == span.row_start);
+            let text = if r == span.row_start {
+                if editing_here {
+                    self.editing
+                        .as_ref()
+                        .map(|ed| ed.buffer.clone())
+                        .unwrap_or_default()
+                } else {
+                    sheet
+                        .cells
+                        .get(span.row_start)
+                        .and_then(|row| row.get(span.col_start))
+                        .cloned()
+                        .unwrap_or_default()
+                }
+            } else {
+                String::new()
+            };
+            let is_selected = self.selected == Some(anchor);
+            let border = colors.border;
+            let accent = colors.element_selected;
+            let hover = colors.element_hover;
+            let active_bg = colors.element_active;
+            // 正常态只画右缘线（与普通格一致——左缘线来自左邻格的
+            // border_r）；选中/编辑态画整区外框的该行段（top/bottom
+            // 分段 + left/right 全行——拼起来 = 整区四边框，行间无
+            // 横线 = 合并视觉整体）。
+            let cell = div()
+                .id(SharedString::from(format!(
+                    "xlsx-grid-merge-{r}-{}-{}",
+                    span.col_start, span.col_end
+                )))
+                .absolute()
+                .left(px(x + GUTTER_W))
+                .top_0()
+                .w(px(w))
+                .h_full()
+                .flex_none()
+                .items_center()
+                .px(px(CELL_PAD))
+                .overflow_hidden()
+                .border_r_1()
+                .border_color(border)
+                .when(is_selected || editing_here, |el| el.border_l_1())
+                .when(is_selected || editing_here, |el| el.border_color(accent))
+                .when((is_selected || editing_here) && edges.top, |el| {
+                    el.border_t_1()
+                })
+                .when((is_selected || editing_here) && edges.bottom, |el| {
+                    el.border_b_1()
+                })
+                .when(editing_here, move |el| el.bg(active_bg))
+                .when(is_selected && !editing_here, move |el| el.bg(hover))
+                .child(
+                    ui::Label::new(text)
+                        .size(ui::LabelSize::XSmall)
+                        .color(ui::Color::Default),
+                );
+            row = row.child(cell);
         }
         // 行号槽（左固定——后置 = 绘制在单元格之上，盖住左滑半可见格）。
         let selected_row = self.selected.is_some_and(|(sr, _)| sr == r);
@@ -1554,5 +1706,241 @@ mod tests {
         );
         assert_eq!(cell_display(Some(&CellData::Number(1.5)), None), "1.5");
         assert_eq!(cell_display(None, None), "");
+    }
+
+    // ── #555：合并单元格（模型携带 + 编辑落账 + 视图接线） ──────
+
+    /// 表 1 合并 B5:C5 的显示坐标锚（绝对 (4,1)-(4,2)，包围盒 A1 起）。
+    fn smoke_merge_span() -> crate::xlsx_merge_geometry::MergeSpan {
+        crate::xlsx_merge_geometry::MergeSpan {
+            row_start: 4,
+            row_end: 4,
+            col_start: 1,
+            col_end: 2,
+        }
+    }
+
+    #[test]
+    fn from_book_carries_merge_spans() {
+        let model = XlsxGridModel::load(&fixture()).expect("网格模型装载");
+        // 表 1：B5:C5（绝对 (4,1)-(4,2)）→ 显示坐标同值（A1 起包围盒）。
+        assert_eq!(
+            model.sheets[0].merge_spans,
+            vec![smoke_merge_span()],
+            "合并范围全量携带（此前只有计数——范围被丢弃）"
+        );
+        // 计数与范围口径分离：merges = 原始计数（含裁掉的），spans = 可渲染。
+        assert_eq!(model.sheets[0].merges, 1);
+        // 表 2：无合并。
+        assert!(model.sheets[1].merge_spans.is_empty(), "表 2 无合并范围");
+        // 覆盖格 C5（显示 (4,2)）命中映射到左上 B5（4,1）。
+        assert_eq!(
+            canonical_cell(&model.sheets[0].merge_spans, 4, 2),
+            Some((4, 1)),
+            "覆盖格 → 左上（Excel 语义）"
+        );
+        // 普通格不受影响（无映射——单格语义零漂移）。
+        assert_eq!(canonical_cell(&model.sheets[0].merge_spans, 1, 1), None);
+    }
+
+    #[test]
+    fn commit_merge_edit_writes_top_left_only_and_preserves_range() {
+        // #555 验收 3（模型/落账面）：双击覆盖格 → 修改左上值 → 保存 →
+        // 重读——左上值已改、merge 范围原样保留、覆盖格未写入重复值。
+        let bytes = std::fs::read(fixture()).expect("夹具读取");
+        let mut editor = XlsxEditor::open(&bytes).expect("编辑会话打开");
+        let mut model = XlsxGridModel::load(&fixture()).expect("网格模型装载");
+
+        // 用户手势的模型面等价：点的是覆盖格 C5（显示 (4,2)），命中映射
+        // 到左上 B5（4,1）后提交编辑。
+        let (r, c) = canonical_cell(&model.sheets[0].merge_spans, 4, 2).expect("覆盖格有映射");
+        assert_eq!((r, c), (4, 1), "C5 → B5");
+        commit_cell_edit(&mut editor, &mut model, 0, r, c, "改后合并值").expect("左上值编辑落账");
+        // pending 显示面：只有左上改（覆盖格不复制值——issue 明文禁令）。
+        assert_eq!(model.sheets[0].cells[4][1], "改后合并值");
+        assert_eq!(
+            model.sheets[0].cells[4][2], "",
+            "覆盖格 C5 显示面不写入重复值"
+        );
+
+        // 保存 → 重开读面（真落盘闭环）。
+        let saved = editor.save_to_vec().expect("保存序列化");
+        let mut reopened = XlsxEditor::open(&saved).expect("重开会话");
+        let info = reopened.cell_info(0, "B5").expect("B5 在场").expect("非空");
+        assert_eq!(info.text, "改后合并值", "落盘后 B5 = 新值");
+        // 覆盖格 C5 读回为空（未写入重复值）。
+        let covered = reopened.cell_info(0, "C5").expect("C5 可查");
+        assert!(
+            covered.is_none(),
+            "覆盖格 C5 未被写入（得 {:?}）——禁止复制值填满合并区域",
+            covered.map(|i| i.text)
+        );
+        // merge 范围原样保留（保存字节 → 读面比对——不污染仓内夹具）。
+        let saved_book = {
+            let tmp = std::env::temp_dir()
+                .join(format!("mang-merge-roundtrip-{}.xlsx", std::process::id()));
+            std::fs::write(&tmp, &saved).expect("临时落盘");
+            let b = mdc_office_io::io::read_book_with_options(
+                &tmp.to_string_lossy(),
+                &ReadOptions { compat: true },
+            )
+            .expect("保存字节读面");
+            let _ = std::fs::remove_file(&tmp);
+            b
+        };
+        assert_eq!(
+            saved_book.sheets[0].merges.len(),
+            1,
+            "merge 范围原样保留（数量）"
+        );
+        let dm = saved_book.sheets[0].merges[0];
+        assert_eq!(
+            (dm.start.0, dm.start.1, dm.end.0, dm.end.1),
+            (4, 1, 4, 2),
+            "merge 范围原样保留（B5:C5 绝对端点）"
+        );
+    }
+
+    /// 测试宿主（pdf_pages SearchHost 同模式——add_window 带出实体）。
+    struct GridHost(gpui::Entity<XlsxGridView>);
+
+    impl Render for GridHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// 合成按键（pdf_pages key_event 同构）。
+    fn grid_key_event(key: &str, key_char: Option<&str>, ctrl: bool) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers {
+                    control: ctrl,
+                    ..Default::default()
+                },
+                key: key.to_string(),
+                key_char: key_char.map(|c| c.to_string()),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// #555 验收 3（视图接线面）：真视图实体上驱动「点覆盖格 → 选整区 →
+    /// 双击进入编辑（左上原值起步）→ 键入 → Enter 提交 → Ctrl+S 落盘」
+    /// 全链，再重读文件断言（左上改 / 范围在 / 覆盖格零写入）。
+    /// 夹具复制到临时目录——save() 写回源路径，不许污染仓内黄金夹具。
+    #[gpui::test]
+    fn merge_covered_click_selects_edits_and_saves(cx: &mut gpui::TestAppContext) {
+        let src = fixture();
+        let tmp = std::env::temp_dir().join(format!("mang-merge-grid-{}.xlsx", std::process::id()));
+        std::fs::copy(&src, &tmp).expect("夹具复制到临时目录");
+        let model = XlsxGridModel::load(&tmp).expect("网格模型装载");
+        assert_eq!(
+            model.sheets[0].merge_spans,
+            vec![smoke_merge_span()],
+            "临时夹具合并范围在档（前置）"
+        );
+
+        let mut slot: Option<gpui::Entity<XlsxGridView>> = None;
+        let window = cx.add_window(|_window, cx| {
+            let v = cx.new(|cx| XlsxGridView::new(model, tmp.clone(), cx));
+            slot = Some(v.clone());
+            GridHost(v)
+        });
+        let view = slot.expect("宿主构造即置");
+
+        // 覆盖格 C5（显示 (4,2)）的点击坐标：行 4 中部、列 2 起点 + 5px。
+        window
+            .update(cx, |_host, _window, cx| {
+                view.update(cx, |v, cx| {
+                    let (off2, w2) = (v.col_offsets[2], v.col_widths[2]);
+                    let x = GUTTER_W + off2 + (w2 / 2.0).min(5.0);
+                    let y = 4.0 * ROW_H + ROW_H / 2.0;
+                    v.select_at(x, y, cx);
+                });
+            })
+            .expect("点覆盖格");
+        window
+            .update(cx, |_host, _window, cx| {
+                view.update(cx, |v, cx| {
+                    // 选中 = 合并区左上 B5（覆盖格点击选中整区的锚点语义）。
+                    assert_eq!(
+                        v.selected_cell(),
+                        Some((4, 1)),
+                        "点 C5 选中锚 B5（整区选择）"
+                    );
+                    assert_eq!(v.selected_a1().as_deref(), Some("B5"));
+                    // 双击覆盖格进入编辑：锚左上，缓冲 = 左上原值。
+                    let (off2, w2) = (v.col_offsets[2], v.col_widths[2]);
+                    let x = GUTTER_W + off2 + (w2 / 2.0).min(5.0);
+                    let y = 4.0 * ROW_H + ROW_H / 2.0;
+                    v.begin_edit_at(x, y, cx);
+                    let ed = v.editing.as_ref().expect("编辑态进入");
+                    assert_eq!((ed.row, ed.col), (4, 1), "编辑锚 = 左上 B5");
+                    assert_eq!(ed.buffer, "外部资料区", "缓冲以左上原值起步");
+                });
+            })
+            .expect("双击覆盖格");
+        // 键入「新」（真实 key_char 路径）→ Enter 提交 → Ctrl+S 落盘。
+        window
+            .update(cx, |_host, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.handle_key(&grid_key_event("新", Some("新"), false), window, cx);
+                    let ed = v.editing.as_ref().expect("编辑态保持");
+                    assert!(ed.buffer.contains("新"), "键入进缓冲：{}", ed.buffer);
+                });
+            })
+            .expect("键入");
+        window
+            .update(cx, |_host, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.handle_key(&grid_key_event("enter", None, false), window, cx);
+                    assert!(v.editing.is_none(), "Enter 提交退出编辑态");
+                    assert!(v.is_modified(), "提交后脏标记");
+                });
+            })
+            .expect("Enter 提交");
+        window
+            .update(cx, |_host, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.handle_key(&grid_key_event("s", None, true), window, cx);
+                    assert!(!v.is_modified(), "Ctrl+S 落盘后脏清除");
+                });
+            })
+            .expect("Ctrl+S 保存");
+
+        // 重读落盘文件：左上新值 + 范围保留 + 覆盖格零写入。
+        let saved_bytes = std::fs::read(&tmp).expect("落盘文件可读");
+        let mut reopened = XlsxEditor::open(&saved_bytes).expect("重开会话");
+        let info = reopened.cell_info(0, "B5").expect("B5 可查").expect("非空");
+        assert!(
+            info.text.contains("新") && info.text.contains("外部资料区"),
+            "B5 = 键入后的完整值（得 {}）",
+            info.text
+        );
+        assert!(
+            reopened.cell_info(0, "C5").expect("C5 可查").is_none(),
+            "覆盖格 C5 零写入（禁止复制值填满合并区域）"
+        );
+        let saved_book = {
+            let tmp2 =
+                std::env::temp_dir().join(format!("mang-merge-verify-{}.xlsx", std::process::id()));
+            std::fs::write(&tmp2, &saved_bytes).expect("验证临时落盘");
+            let b = mdc_office_io::io::read_book_with_options(
+                &tmp2.to_string_lossy(),
+                &ReadOptions { compat: true },
+            )
+            .expect("读面");
+            let _ = std::fs::remove_file(&tmp2);
+            b
+        };
+        let dm = saved_book.sheets[0].merges[0];
+        assert_eq!(
+            (dm.start.0, dm.start.1, dm.end.0, dm.end.1),
+            (4, 1, 4, 2),
+            "merge 范围原样保留（B5:C5）"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
