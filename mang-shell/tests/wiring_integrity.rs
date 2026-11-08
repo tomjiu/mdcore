@@ -404,22 +404,31 @@ fn editor_context_menu_actions_all_wired() {
 /// 按下点坐标与目标路径），「在资源管理器中显示」成为菜单项
 /// ft-reveal——其可达性由 `file_tree_context_menu_actions_all_wired`
 /// 的数据面↔接线面对账保证（更强：菜单项缺失或未接都会被抓）。
+///
+/// #385 批 5b 演进：行渲染迁 `ui::ListItem` 后，左/右键经组件
+/// `on_click` / `on_secondary_mouse_down` 接线（MouseButton 枚举字
+/// 面量随交互迁入组件内部——list_item.rs 源头接线）——锚点改钉组件
+/// 方法名 + 既有通道名，语义不变（左键展开/打开、右键菜单）。
 #[test]
 fn file_tree_row_clicks_wired() {
     let file = src("file_tree.rs");
     let body = fn_body(&file, "fn render_row(");
     assert!(
-        body.contains("MouseButton::Left"),
-        "文件树行无左键处理（展开/打开）"
+        body.contains(".on_click("),
+        "文件树行无左键处理（ListItem.on_click——展开/打开）"
     );
     assert!(
         body.contains("open_document_tab"),
         "文件树左键未接 F1 打开通道（open_document_tab）"
     );
     assert!(
-        body.contains("MouseButton::Right") && body.contains("open_file_tree_context_menu"),
-        "文件树右键未接上下文菜单（open_file_tree_context_menu）——\
-         ft-reveal 等六项菜单动作的入口"
+        body.contains(".on_secondary_mouse_down(") && body.contains("open_file_tree_context_menu"),
+        "文件树右键未接上下文菜单（ListItem.on_secondary_mouse_down → \
+         open_file_tree_context_menu）——ft-reveal 等六项菜单动作的入口"
+    );
+    assert!(
+        body.contains("ListItem::new"),
+        "文件树行未走 ui::ListItem（#385 批 5b 迁移目标——手写行退役）"
     );
     assert!(
         dead_closures(&file).is_empty(),

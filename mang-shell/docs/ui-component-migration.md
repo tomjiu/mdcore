@@ -91,7 +91,7 @@
 | 8 | `find_bar.rs`（1218，editor/） | **无对应件**（B4 缺件） | 高 | P2 | 待裁定 | 维持手写或闭包扩张（§五） |
 | 9 | `settings_panel.rs`（378 模态弹窗） | `ui::Modal` + `ModalHeader`/`ModalRow` | 中 | P1 | 批 3 | #289 已改模态语义——外壳换 Modal 组件 |
 | 10 | `palette_view.rs`（104 命令面板） | `ui::Popover`/`Modal` 组合 | 中 | P2 | 批 3+ | |
-| 11 | `file_tree.rs`（659） | `ui::List` + `TreeViewItem` | 高 | P2 | 批 5 | 自研虚拟化/多选/右键——迁移面大 |
+| 11 | `file_tree.rs`（659） | `ui::List` + `TreeViewItem` | 高 | P2 | 批 5 | 自研虚拟化/多选/右键——迁移面大。**批 5b 实落**：行渲染 → `ListItem`（TreeViewItem 实证不适用——单级缩进/无图标位）；uniform_list 虚拟化保留（ui::List 非虚拟化容器）——偏离全文见下方批次登记 |
 | 12 | `panels.rs`（528 大纲/属性） | `ui::List` + `ListItem` | 中 | P2 | 批 5 | |
 | 13 | `git_panel.rs`（560） | `ui::List` + `Chip`/`CountBadge` | 中 | P3 | 批 5+ | |
 | 14 | `status_bar.rs`（235 标签条） | `ui::Label` 已在用 | — | — | — | 标签面无需组件化 |
@@ -115,7 +115,20 @@
                      ✅ 批 5c 已交付（feat/385-b5c-git-panel-list，PR 见 #385 认领评论）：
                      git_panel 改动/历史行迁 ListItem + 状态码 Chip + 计数 CountBadge +
                      空态 List::empty_message；视图切换 tab 钮不在行 13 映射内未动。
-                     批 5b（file_tree）待接。
+                     ✅ 批 5b 已交付（feat/385-b5b-file-tree-list，PR 见 #385 认领评论）：
+                     file_tree 行渲染迁 ListItem（indent_level 深度缩进 14px 步进 +
+                     start_slot 折叠箭头 + on_click/on_secondary_mouse_down 左右键 +
+                     toggle_state 活动高亮 + aria_role(TreeItem) 无障碍升级）。
+                     **两处实最偏离**（对对照表行 11 原映射）：① TreeViewItem 不适用
+                     ——非根行仅单级缩进线、无图标位、非根目录无折叠箭头、固定
+                     28px 行高，深度嵌套文件树可读性回归（tree_view_item.rs 实证）；
+                     ② uniform_list 虚拟化保留——ui::List 为非虚拟化容器（v_flex +
+                     全量 children），替换即破坏「1000+ 文件只布局可视行」模块不变
+                     量（file_tree.rs 模块文档钉定）。锚点同步：wiring_integrity
+                     `file_tree_row_clicks_wired` + ui_wiring_faces `face4`（MouseButton
+                     字面量随交互迁入组件内部，锚点改钉 .on_click/.on_secondary_
+                     mouse_down + 通道名——语义不变）。
+                     批 5a（panels）PR #482 在审；批 5 三件套仅剩 5a 合并。
 批 6+：Tooltip 统一化 / Chip / CountBadge 等细节件按需
 每批验收：既有单测全绿 + 新增交互测试（不是只测函数返回值）+ 截图对比
 （迁移前/后——沙箱无 GUI 时登记待真机，AGENTS 诚实边界纪律）

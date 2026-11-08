@@ -232,12 +232,15 @@ fn face3_panel_toggle_changes_state() {
 /// 文件树行左键 → `open_document_tab`（shell 通道）→ shell 方法存在且
 /// 被 F1（Ctrl+O 对话框回调）共用——「从树里打开文件」与「对话框打开」
 /// 同一条链。
+///
+/// #385 批 5b 演进：行渲染迁 `ui::ListItem`，左键经组件 `on_click` 接
+/// 线（MouseButton 枚举在组件内部——锚点改钉组件方法名）。
 #[test]
 fn face4_file_tree_click_opens_document() {
     let row = fn_body(&src("file_tree.rs"), "fn render_row(");
     assert!(
-        row.contains("MouseButton::Left") && row.contains("open_document_tab"),
-        "【面 4：文件树点击 → 打开文件】行点击断链——render_row 缺左键处理或\
+        row.contains(".on_click(") && row.contains("open_document_tab"),
+        "【面 4：文件树点击 → 打开文件】行点击断链——render_row 缺 ListItem.on_click 或\
          open_document_tab 调用（实装口径：单击打开）"
     );
     chain(
