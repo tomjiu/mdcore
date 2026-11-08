@@ -381,7 +381,7 @@
                height: calc(100vh - 170px); position: relative; }
   /* #472：min-height(原 height:32px)——控件多时 wrap 到第二行不再被
      视口叠盖(实测:按钮折行溢出 32px 盒,点击被 textLayer 拦截)。 */
-  #pdf-toolbar { display: flex; align-items: center; gap: 6px; font-size: 13px; height: 32px;
+  #pdf-toolbar { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 32px;
 
                  flex-wrap: wrap; }
   .pdf-btn { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid var(--border);

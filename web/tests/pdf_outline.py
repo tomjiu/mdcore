@@ -147,6 +147,21 @@ def main() -> int:
 
             # 5.5 按钮开合(手势级点击 #pdf-outline-btn——工具栏 wrap 两行
             # 时按钮曾溢出 32px 盒被 textLayer 叠盖,此锁专防回归)
+            # 真实窄视窗强制工具栏折行；只测宽视窗捕获不了固定高度回退。
+            page.set_viewport_size({"width": 600, "height": 900})
+            page.wait_for_timeout(100)
+            toolbar = page.eval_on_selector("#pdf-toolbar", """el => {
+                const box = el.getBoundingClientRect();
+                const children = Array.from(el.children)
+                    .filter(child => child.getBoundingClientRect().height > 0);
+                return {minHeight: getComputedStyle(el).minHeight, height: box.height,
+                    bottom: box.bottom,
+                    childBottom: Math.max(...children.map(child => child.getBoundingClientRect().bottom))};
+            }""")
+            check("outline_toolbar_wrap_stays_in_box",
+                  toolbar["minHeight"] == "32px" and toolbar["height"] > 32
+                  and toolbar["childBottom"] <= toolbar["bottom"] + 1,
+                  json.dumps(toolbar))
             page.click("#pdf-outline-btn")
             hidden_after = page.eval_on_selector("#pdf-outline-drawer", "el => el.hidden")
             page.click("#pdf-outline-btn")
@@ -156,6 +171,7 @@ def main() -> int:
                 hidden_after is True and shown_after is False,
                 f"hidden={hidden_after} shown={shown_after}",
             )
+            page.set_viewport_size({"width": 1400, "height": 900})
 
             # 6. 空态对照：无大纲件 → 按钮禁用 + 抽屉隐藏 + 树空
             r2 = page.evaluate("window.__pdfOpenBytes('%s')" % b64(PLAIN))

@@ -28,18 +28,26 @@ export const URL_INPUT_BUDGET = 2048;
  * 避免误伤正常 RTL 文档的合法外链）。 */
 const ZERO_WIDTH_BIDI_RE = /[\u200B-\u200F\u202A-\u202E\u2028\u2029\u2066-\u2069\uFEFF]/;
 
+/** #568：检查用容错 UTF-8 解码器；坏字节替换，不遮蔽相邻合法控制码。
+ * ignoreBOM=true 保留 U+FEFF，使编码 BOM 仍受控制码策略检查。
+ * Source: https://nodejs.org/docs/latest-v24.x/api/util.html#new-textdecoderencoding-options
+ */
+const PERCENT_UTF8_DECODER = new TextDecoder('utf-8', {
+  fatal: false,
+  ignoreBOM: true,
+});
+
 /**
- * 单次百分号解码：连续的**有效** %XX 段整体解码（UTF-8 多字节序列
- * 必须按段解码才能还原多字节字符）；无效段（截断/非 UTF-8）保留字面。
- * 不抛异常（decodeURIComponent 失败 → 保留原样），不双重解码。
+ * 单次百分号解码（仅检查面）：连续 %XX 段按 UTF-8 解码；非法字节替换，
+ * 合法的相邻控制码仍可检测。截断/非 %XX 文本不二次解码，不修改返回 URL。
  */
 function decodePercentOnce(s: string): string {
   return s.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
-    try {
-      return decodeURIComponent(run);
-    } catch {
-      return run; // 无效 UTF-8 序列——字面保留（浏览器同款容错）
+    const bytes = new Uint8Array(run.length / 3);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Number.parseInt(run.slice(i * 3 + 1, i * 3 + 3), 16);
     }
+    return PERCENT_UTF8_DECODER.decode(bytes);
   });
 }
 

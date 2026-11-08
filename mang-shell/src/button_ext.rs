@@ -22,16 +22,16 @@
 //!   Accent/Error/Warning/Success），`element_selected` 字面色无法经
 //!   样式体系注入。zed 官方选中模式 = `selected_style(Tinted(Accent))`
 //!   （ToggleButton 同款）。后续替换批次按 Lead 裁定取舍。
-//! - **hover 色槽半档差（仅浅色主题）**：Subtle 的 hover 走
-//!   `ghost_element_hover`，现自绘走 `element_hover`——JustBase 深色基线
-//!   两槽同值（fallback dark：均 `dark_alpha().step_4()`，P7 锁证）；
-//!   浅色派生主题只覆盖 `element_*` 17 槽（theme_switch.rs），
-//!   `ghost_*` 未覆盖——浅色下有半档差，登记待浅色主题补覆盖时收口。
+//! - **hover 色槽关系**：Subtle 的 hover 走 `ghost_element_hover`，
+//!   现自绘走 `element_hover`。JustBase 深色等值由 P7 锁证；浅色同族
+//!   配对由 #560 的 theme_switch 派生面覆盖，实际组件视觉仍需验证。
 //! - **待真机项（AGENTS 诚实边界纪律）**：Windows 截图对比、键盘焦点
 //!   视觉、tooltip 悬停行为——无头面不可测，未验证前不宣布迁移成功。
 //! - **a11y 净增**：现 bar_button 零 a11y（activity_bar.rs 模块文档自认
 //!   「记为后续 PR」）；适配层经 ButtonLike 机制自带 role=Button +
-//!   aria_label（缺省回落 tooltip 文本）+ tab_index/焦点环。
+//!   aria_label（缺省回落 tooltip 文本）。默认不配置键盘焦点；调用方
+//!   须在合适的 tab_group 中显式设置 `.tab_index()` 或 `.track_focus()`，
+//!   才启用对应焦点机制，不能把公开配置面等同于默认已接线。
 //!
 //! # 使用面
 //!
@@ -70,7 +70,7 @@ pub const ICON_BUTTON_SIDE: Pixels = px(36.);
 pub struct IconButton36 {
     id: &'static str,
     icon: IconName,
-    selected: bool,
+    selected: Option<bool>,
     tooltip: Option<SharedString>,
     hover_background: Option<Hsla>,
     active_background: Option<Hsla>,
@@ -85,7 +85,7 @@ pub fn icon_button_36(id: &'static str, icon: IconName) -> IconButton36 {
     IconButton36 {
         id,
         icon,
-        selected: false,
+        selected: None,
         tooltip: None,
         hover_background: None,
         active_background: None,
@@ -97,11 +97,11 @@ pub fn icon_button_36(id: &'static str, icon: IconName) -> IconButton36 {
 }
 
 impl IconButton36 {
-    /// 选中态（toggle_state）：图标切 `Color::Selected`；底色见
+    /// 显式选中态（toggle_state）：图标切 `Color::Selected`；底色见
     /// [`Self::selected_style`]（缺省维持 Subtle 底——精确色注入边界
-    /// 见模块文档「已知边界」）。
+    /// 见模块文档「已知边界」）。不调用本方法的普通动作不报告pressed属性。
     pub fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
+        self.selected = Some(selected);
         self
     }
 
@@ -172,7 +172,7 @@ impl IconButton36 {
             .style(ButtonStyle::Subtle)
             // 16px 图标——现 bar_button 规格（IconSize::Medium）。
             .icon_size(IconSize::Medium)
-            .toggle_state(self.selected)
+            .when_some(self.selected, |this, selected| this.toggle_state(selected))
             .selected_icon_color(Color::Selected)
             .when_some(self.tooltip, |this, text| this.tooltip(Tooltip::text(text)))
             .when_some(aria_label, |this, label| this.aria_label(label))
@@ -207,7 +207,9 @@ impl IconButton36 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Bounds, Modifiers, Point, TestAppContext, VisualTestContext, px, size};
+    use gpui::{
+        Bounds, Element, IntoElement, Modifiers, Point, TestAppContext, VisualTestContext, px, size,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -475,11 +477,80 @@ mod tests {
         );
     }
 
+    /// 读取实际 ButtonLike 渲染结果写出的 AccessKit 属性，不复制ARIA映射。
+    fn rendered_a11y_node(
+        button: ButtonLike,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::accesskit::Node {
+        let element = button.render(window, cx).into_element();
+        let mut node =
+            gpui::accesskit::Node::new(element.a11y_role().expect("真实按钮节点具有ARIA角色"));
+        element.write_a11y_info(&mut node);
+        node
+    }
+
+    /// 默认动作不报告pressed状态；显式toggle与显式focus保留原生语义。
+    #[gpui::test]
+    fn action_and_toggle_accessibility(cx: &mut TestAppContext) {
+        use gpui::accesskit::{Action as A11yAction, Role, Toggled};
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let window = cx.open_window(size(px(120.), px(120.)), |_, _| gpui::Empty);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            let button = icon_button_36("a11y-action", IconName::MagnifyingGlass)
+                .tooltip_text("普通动作")
+                .on_click(|_, _, _| {})
+                .build(window, cx);
+            let action = rendered_a11y_node(button, window, cx);
+            assert_eq!(action.role(), Role::Button);
+            assert_eq!(action.label(), Some("普通动作"), "读屏标签回落到tooltip");
+            assert_eq!(action.toggled(), None, "普通动作不是未按下的toggle");
+            assert!(action.supports_action(A11yAction::Click));
+            assert!(
+                !action.supports_action(A11yAction::Focus),
+                "默认不启用focus，调用方须显式配置"
+            );
+
+            for (id, selected, expected) in [
+                ("a11y-toggle-off", false, Toggled::False),
+                ("a11y-toggle-on", true, Toggled::True),
+            ] {
+                let button = icon_button_36(id, IconName::FileTree)
+                    .selected(selected)
+                    .aria_label("显式toggle")
+                    .build(window, cx);
+                let toggle = rendered_a11y_node(button, window, cx);
+                assert_eq!(toggle.toggled(), Some(expected));
+            }
+
+            let button = icon_button_36("a11y-focus", IconName::Settings)
+                .tooltip_text("显式焦点")
+                .build(window, cx)
+                .tab_index(0);
+            let focused = rendered_a11y_node(button, window, cx);
+            assert!(focused.supports_action(A11yAction::Focus));
+
+            let button = icon_button_36("a11y-disabled", IconName::Settings)
+                .disabled(true)
+                .tooltip_text("禁用动作")
+                .on_click(|_, _, _| {})
+                .build(window, cx);
+            let disabled = rendered_a11y_node(button, window, cx);
+            assert!(
+                !disabled.supports_action(A11yAction::Click),
+                "禁用门移除实际click动作"
+            );
+        });
+    }
+
     /// #525 色槽等值（P7）：JustBase 深色基线下 element_hover 与
-    /// ghost_element_hover 同值——Subtle 式样的 hover 与旧自绘
-    /// element_hover 视觉等价（fallback dark：均 dark_alpha().step_4()）。
-    /// 选中槽同理（step_5 同值）。浅色主题的 ghost_* 未覆盖属已知边界
-    /// （模块文档「已知边界」第二节）。
+    /// ghost_element_hover 同值。只锁深色基线的色槽关系，不能代表组件
+    /// hover/selected 画面已验收；浅色槽由theme_switch的#560测试覆盖。
     #[gpui::test]
     fn theme_slot_equivalence_justbase(cx: &mut TestAppContext) {
         cx.update(|app| theme::init(theme::LoadThemes::JustBase, app));

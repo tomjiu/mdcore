@@ -85,6 +85,19 @@ POLICY_CASES: list[tuple[str, str, str]] = [
     ("https://x/%E2%80%8Bp", "rej", "zero-width-bidi-encoded"),  # 编码零宽
     ("https://x/%E2%80%AEevil", "rej", "zero-width-bidi-encoded"),  # 编码 Bidi 覆盖
     ("https://x/%ZZ%E2%80%8B", "rej", "zero-width-bidi-encoded"),  # 无效段字面+有效段仍捕获
+    # #568：无效 UTF-8 字节不得掩蔽同一百分号段内的合法控制码。
+    ("https://x/%FF%E2%80%8B", "rej", "zero-width-bidi-encoded"),
+    ("https://x/%E2%80%AE%FF", "rej", "zero-width-bidi-encoded"),
+    ("https://x/%E2%80%8B%80", "rej", "zero-width-bidi-encoded"),
+    ("https://x/%E2%80%FF%E2%80%8B", "rej", "zero-width-bidi-encoded"),  # 损坏序列后仍识别控制码
+    ("https://x/%E2%80%8B%E2%80", "rej", "zero-width-bidi-encoded"),  # 控制码后的截断不遮蔽
+    ("https://x/%ef%bb%bf%FF", "rej", "zero-width-bidi-encoded"),  # BOM 必须保留在检查面
+    ("https://x/%FF%EF%BB%BF", "rej", "zero-width-bidi-encoded"),
+    ("https://x/%25%E2%80%8B", "rej", "zero-width-bidi-encoded"),  # 字面百分号 + 真控制码不是双编
+    ("https://x/%FF", "ok", "url=https://x/%FF"),  # 单纯坏字节不扩大拒绝面，URL 原样规范化
+    ("https://x/%E2%80%FF", "ok", "url=https://x/%E2%80%FF"),
+    ("https://x/%FF%25E2%80%8B", "ok", "url=https://x/%FF%25E2%80%8B"),  # 混合坏字节仍不二次解码
+    ("https://x/%25E2%2580%258B", "ok", "url=https://x/%25E2%2580%258B"),
 ]
 
 
@@ -128,7 +141,7 @@ def main() -> int:
         page.click("#tab-pdf")
         page.wait_for_selector("#pdf-panel:not([hidden])", state="visible")
 
-        # 0. #557 策略纯函数单测（探针直测——21 例）
+        # 0. #557/#568 策略纯函数单测（既有边界 + 混合 UTF-8 反例）
         run_policy_units(page)
 
         r = page.evaluate("window.__pdfOpenBytes('%s')" % b64(FIXTURE))
