@@ -22,6 +22,16 @@
 //! 重命名/删除/在资源管理器中显示；菜单本体在 `context_menu.rs`，动作
 //! 派发在 `shell.rs`）。
 //!
+//! #575（批 8）：**键盘导航**——↑↓ 键盘光标（可见行序，两端夹取 +
+//! `scroll_to_item` 滚动跟随）、Enter 激活（目录 = 展开折叠 / 文件 =
+//! 打开，与点击同链）、Esc 焦点还编辑区；键位走 main.rs 既有 menu
+//! 键位族（#571 批 7 同源）。与批 7 的 ui::Navigable 偏离登记：其
+//! 滚动锚点 ScrollAnchor::for_handle 只吃常规 ScrollHandle，本面
+//! uniform_list 虚拟化（UniformListScrollHandle 不同型）——改用
+//! **键盘光标模型**（单一 selected 序 + 虚拟化安全，无离屏句柄问题）。
+//! ShellApp 耦合经 [`FileTreeHooks`] 钩子注入（本模块 lib 化——
+//! 测试 CI 可见，outline_panel #571 先例二次应用）。
+//!
 //! #385 批 5b：行渲染迁 `ui::ListItem`（zed ui 组件族——缩进/hover/
 //! 选中/左右键接线经组件语义，非手写仿制）。**uniform_list 虚拟化保
 //! 留**（ui::List 为非虚拟化容器，「1000+ 文件只布局可视行」不变量
@@ -32,13 +42,32 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
-use gpui::{App, Context, IntoElement, MouseDownEvent, Render, Role, WeakEntity, px, uniform_list};
+use gpui::{
+    App, Context, FocusHandle, IntoElement, MouseDownEvent, Pixels, Point, Render, Role,
+    ScrollStrategy, UniformListScrollHandle, Window, px, uniform_list,
+};
 use ui::prelude::*;
 use ui::{Icon, IconName, IconSize, Label, LabelSize, ListItem};
 
-use crate::context_menu;
-use crate::shell::ShellApp;
+/// 文件打开钩子（bin 面 ShellApp::open_document_tab + 焦点落位注入）。
+pub type OpenFileHook = Arc<dyn Fn(PathBuf, &mut Window, &mut App)>;
+
+/// 右键菜单钩子（bin 面 ShellApp::open_file_tree_context_menu 注入；
+/// 入参 = 按下点窗口坐标 / 目标路径 / 是否目录）。
+pub type ContextMenuHook = Arc<dyn Fn(Point<Pixels>, PathBuf, bool, &mut Window, &mut App)>;
+
+/// Esc 焦点归还钩子（bin 面：焦点还激活编辑器——#571 同语义）。
+pub type EscapeHook = Arc<dyn Fn(&mut Window, &mut App)>;
+
+/// ShellApp 面收口（#575 lib 化：本模块不引 shell——依赖倒置，
+/// outline_panel 先例）。bin 侧构造闭包捕获 WeakEntity<ShellApp>。
+pub struct FileTreeHooks {
+    pub open_file: OpenFileHook,
+    pub context_menu: ContextMenuHook,
+    pub escape: EscapeHook,
+}
 
 /// 目录条目。
 #[derive(Clone, Debug)]
@@ -248,14 +277,61 @@ impl TreeState {
 /// `open_document` 打开）。
 pub struct FileTree {
     state: TreeState,
-    shell: WeakEntity<ShellApp>,
+    /// #575：bin 面钩子（open_file / context_menu / escape）。
+    hooks: FileTreeHooks,
+    /// #575：键盘光标（可见行序；None = 无光标）。
+    selected: Option<usize>,
+    /// #575：虚拟化滚动句柄（光标行滚动跟随）。
+    scroll: UniformListScrollHandle,
+    /// #575：树根焦点句柄（键位域挂载点——menu 上下文）。
+    tree_focus: FocusHandle,
 }
 
 impl FileTree {
-    pub fn new(root: PathBuf, shell: WeakEntity<ShellApp>) -> Self {
+    pub fn new(root: PathBuf, hooks: FileTreeHooks, cx: &mut Context<Self>) -> Self {
         Self {
             state: TreeState::new(root),
-            shell,
+            hooks,
+            selected: None,
+            scroll: UniformListScrollHandle::new(),
+            tree_focus: cx.focus_handle(),
+        }
+    }
+
+    /// #575：键盘光标移动（delta = ±1；两端夹取；无光标时 ↓=首行 /
+    /// ↑=末行）。行集空 = 光标清空。滚动跟随 Nearest（已可视不动）。
+    fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.state.visible_rows().len();
+        if len == 0 {
+            self.selected = None;
+            cx.notify();
+            return;
+        }
+        let next = match self.selected {
+            Some(i) => (i as isize + delta).clamp(0, len as isize - 1) as usize,
+            None if delta > 0 => 0,
+            None => len - 1,
+        };
+        if self.selected != Some(next) {
+            self.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        }
+        self.selected = Some(next);
+        cx.notify();
+    }
+
+    /// #575：Enter 激活光标行（与点击同链）：目录 = 展开/折叠；
+    /// 文件 = open_file 钩子（bin 面含焦点落位）。
+    fn activate_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.selected else { return };
+        let Some(row) = self.state.visible_rows().get(ix).cloned() else {
+            return;
+        };
+        if row.is_dir {
+            self.state.toggle(&row.path);
+            cx.notify();
+        } else {
+            let hook = self.hooks.open_file.clone();
+            hook(row.path, window, cx);
         }
     }
 
@@ -289,16 +365,46 @@ impl Render for FileTree {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let row_count = self.state.visible_rows().len();
         let weak = cx.entity().downgrade();
-        uniform_list(
-            "file-tree-rows",
-            row_count,
-            move |visible: std::ops::Range<usize>, window: &mut gpui::Window, cx: &mut App| {
-                weak.update(cx, |this, cx| this.render_rows(visible, window, cx))
-                    .unwrap_or_default()
-            },
-        )
-        .flex_1()
-        .min_h_0()
+        let scroll = self.scroll.clone();
+        let tree_focus = self.tree_focus.clone();
+        // #575：键位域根（menu 上下文 = #571 批 7 同源——↑↓/Enter/Esc
+        // 走 main.rs 既有绑定；焦点经行点击落入树根句柄）。
+        div()
+            .id("file-tree")
+            .key_context("menu")
+            .track_focus(&tree_focus)
+            .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| {
+                this.move_cursor(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, _, cx| {
+                this.move_cursor(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                this.activate_cursor(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                let hook = this.hooks.escape.clone();
+                hook(window, cx);
+            }))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                uniform_list(
+                    "file-tree-rows",
+                    row_count,
+                    move |visible: std::ops::Range<usize>,
+                          window: &mut gpui::Window,
+                          cx: &mut App| {
+                        weak.update(cx, |this, cx| this.render_rows(visible, window, cx))
+                            .unwrap_or_default()
+                    },
+                )
+                .track_scroll(&scroll)
+                .flex_1()
+                .min_h_0(),
+            )
     }
 }
 
@@ -310,12 +416,20 @@ impl FileTree {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let rows = self.state.visible_rows();
+        // #575：行序携带（光标视觉 + 点击设光标）。
+        let selected = self.selected;
         range
-            .filter_map(|i| rows.get(i).map(|row| self.render_row(row, cx)))
+            .filter_map(|i| rows.get(i).map(|row| self.render_row(row, i, selected, cx)))
             .collect()
     }
 
-    fn render_row(&self, row: &TreeRow, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_row(
+        &self,
+        row: &TreeRow,
+        index: usize,
+        selected: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let is_dir = row.is_dir;
         let path = row.path.clone();
 
@@ -364,18 +478,17 @@ impl FileTree {
         // 进入，焦点句柄返回后在监听器 window 域落焦——update_in 在派生
         // 上下文解析不到窗口，F7 实测）。
         .on_click(cx.listener(move |this, _, window, cx| {
+            // #575：点击设光标 + 焦点落树根（键位域生效——单一模型）。
+            this.selected = Some(index);
+            let tree_focus = this.tree_focus.clone();
+            tree_focus.focus(window, cx);
             if is_dir {
                 this.state.toggle(&path);
                 cx.notify();
             } else {
-                let shell = this.shell.clone();
-                let focus = shell
-                    .update(cx, |shell, cx| shell.open_document_tab(path.clone(), cx))
-                    .ok()
-                    .flatten();
-                if let Some(focus) = focus {
-                    window.focus(&focus, cx);
-                }
+                // #575：ShellApp 面 → open_file 钩子（bin 注入——lib 化）。
+                let hook = this.hooks.open_file.clone();
+                hook(path.clone(), window, cx);
             }
         }))
         // 右键：上下文菜单（#166 接线保持——菜单在 shell 状态上，位置取
@@ -383,17 +496,9 @@ impl FileTree {
         // ListItem.on_secondary_mouse_down——组件内 MouseButton::Right）。
         .on_secondary_mouse_down(
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                let pos =
-                    context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
-                let _ = this.shell.update(cx, |shell, cx| {
-                    shell.open_file_tree_context_menu(
-                        pos,
-                        path_for_menu.clone(),
-                        is_dir,
-                        window,
-                        cx,
-                    )
-                });
+                // #575：ShellApp 面 → context_menu 钩子（坐标转换收 bin）。
+                let hook = this.hooks.context_menu.clone();
+                hook(event.position, path_for_menu.clone(), is_dir, window, cx);
             }),
         )
         .start_slot(
@@ -411,9 +516,10 @@ impl FileTree {
                 .size(LabelSize::Small)
                 .when(row.is_active, |l| l.color(ui::Color::Accent)),
         )
-        // 当前打开文件高亮（组件 selected 语系——ghost_element_selected
-        // 通栏底色 + 上方 Label::Accent 文字色）。
-        .toggle_state(row.is_active)
+        // 当前打开文件高亮 + #575 键盘光标行（组件 selected 语系——
+        // ghost_element_selected 通栏底色 + 上方 Label::Accent 文字色；
+        // 两态同面：光标与激活文件共用选中底，Label::Accent 区分后者）。
+        .toggle_state(row.is_active || selected == Some(index))
         .into_any_element()
     }
 }
@@ -450,7 +556,7 @@ pub fn workspace_display(root: &Path) -> String {
 mod tests {
     use super::*;
 
-    fn temp_fixture(tag: &str) -> PathBuf {
+    pub(super) fn temp_fixture(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mang-ft-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub").join("deep")).unwrap();
@@ -666,5 +772,144 @@ mod tests {
             .filter(|r| r.path.parent() == Some(dir))
             .map(|r| r.name.clone())
             .collect()
+    }
+}
+// ---------------------------------------------------------------------------
+// #575 键盘导航无头测试（lib 树——CI 可见；三面：光标移动夹取 /
+// Enter 激活分叉 / 无光标起点语义）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod keyboard_tests {
+    use super::tests::temp_fixture;
+    use super::*;
+    use gpui::Entity;
+    use std::sync::Mutex;
+
+    /// 测试钩子：open_file 捕获触发路径（断言面）；其余为 no-op。
+    fn test_hooks(opened: Arc<Mutex<Vec<PathBuf>>>) -> FileTreeHooks {
+        FileTreeHooks {
+            open_file: Arc::new(move |path, _, _| opened.lock().unwrap().push(path)),
+            context_menu: Arc::new(|_, _, _, _, _| {}),
+            escape: Arc::new(|_, _| {}),
+        }
+    }
+
+    /// 宿主 + 窗口（Host 模式——#571 同款）。
+    struct Host(Entity<FileTree>);
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    fn tree_window(
+        cx: &mut gpui::TestAppContext,
+        root: PathBuf,
+        opened: Arc<Mutex<Vec<PathBuf>>>,
+    ) -> (Entity<FileTree>, gpui::VisualTestContext) {
+        // 主题初始化序列镜像 main.rs（ListItem/Icon 渲染依赖）。
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let tree = cx.update(|cx| cx.new(|cx| FileTree::new(root, test_hooks(opened), cx)));
+        let window = cx.open_window(gpui::size(gpui::px(260.), gpui::px(400.)), {
+            let tree = tree.clone();
+            move |_, _| Host(tree)
+        });
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        (tree, visual)
+    }
+
+    /// 光标面：↓ 入场 = 首行；连续移动到末行；↑ 顶界夹取（不移出）。
+    #[gpui::test]
+    fn cursor_moves_and_clamps_at_both_ends(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("kb-move");
+        let (tree, mut visual) = tree_window(cx, root, Arc::default());
+
+        let len = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert!(len >= 3, "夹具行集 >= 3（实得 {len}）");
+
+        // 无光标 ↓ → 首行。
+        let focus = tree.read_with(&visual, |t, _| t.tree_focus.clone());
+        visual.update(|window, cx| focus.focus(window, cx));
+        visual.dispatch_action(menu::SelectNext);
+        tree.read_with(&visual, |t, _| assert_eq!(t.selected, Some(0)));
+
+        // 连续 ↓ 到末行（不越界）。
+        for _ in 0..len {
+            visual.dispatch_action(menu::SelectNext);
+        }
+        tree.read_with(&visual, |t, _| assert_eq!(t.selected, Some(len - 1)));
+
+        // ↑ 在顶界夹取（len-1 → 0 后继续 ↑ 仍 0）。
+        for _ in 0..len {
+            visual.dispatch_action(menu::SelectPrevious);
+        }
+        tree.read_with(&visual, |t, _| assert_eq!(t.selected, Some(0)));
+    }
+
+    /// 激活面：Enter 目录 = 展开态翻转（可见行数变化）；Enter 文件 =
+    /// open_file 钩子携路径触发。
+    #[gpui::test]
+    fn confirm_toggles_dirs_and_opens_files(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("kb-confirm");
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let (tree, mut visual) = tree_window(cx, root.clone(), opened.clone());
+
+        let (dir_ix, dir_path, file_path) = tree.read_with(&visual, |t, _| {
+            let rows = t.state.visible_rows();
+            // 行 0 = 根自身（默认展开态）——折叠根会清空全部子行，
+            // 选**非根**子目录翻转（夹具 sub/ 在场；展开语义对称可测）。
+            let dir = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.is_dir && r.path != t.state.root())
+                .expect("夹具含非根目录");
+            let file = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| !r.is_dir)
+                .expect("夹具含文件");
+            (dir.0, dir.1.path.clone(), file.1.path.clone())
+        });
+        let before = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+
+        // 光标到目录行 → Enter → 展开翻转。
+        let focus = tree.read_with(&visual, |t, _| t.tree_focus.clone());
+        visual.update(|window, cx| focus.focus(window, cx));
+        tree.update(&mut visual, |t, _| {
+            t.selected = Some(dir_ix);
+        });
+        visual.dispatch_action(menu::Confirm);
+        let after = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_ne!(
+            before, after,
+            "Enter 目录 → 展开态翻转（可见行数 {before} → {after}）"
+        );
+        assert!(opened.lock().unwrap().is_empty(), "目录 Enter 不开文件");
+
+        // 光标到文件行 → Enter → 钩子携路径触发（一次）。注意：目录
+        // 展开后行集位移——文件行序在展开后重定位（不可用展开前序）。
+        let file_path_after = tree.update(&mut visual, |t, _| {
+            let rows = t.state.visible_rows();
+            let (ix, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| !r.is_dir && r.path == file_path)
+                .expect("文件行在展开后行集中");
+            t.selected = Some(ix);
+            row.path.clone()
+        });
+        visual.dispatch_action(menu::Confirm);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [file_path_after],
+            "Enter 文件 → open_file 钩子携该路径触发"
+        );
+        let _ = (dir_ix, dir_path);
     }
 }

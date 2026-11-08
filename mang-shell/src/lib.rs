@@ -105,3 +105,10 @@ pub mod pdf_pages;
 /// GPUI 层编译面验证 + 真机登记——pdf_pages 同纪律）。
 #[path = "xlsx_grid_view.rs"]
 pub mod xlsx_grid_view;
+
+/// #575（#385 批 8）：文件树——ShellApp 耦合经 FileTreeHooks 钩子注入
+/// （open_file / context_menu / escape 三面），本模块 lib+bin 共用源码
+/// （outline_panel #571 先例二次应用）：键盘导航无头测试 CI 可见
+/// （挂 bin 目标 = 假绿）；TreeState 纯状态机单测同树收编。
+#[path = "file_tree.rs"]
+pub mod file_tree;

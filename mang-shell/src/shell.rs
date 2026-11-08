@@ -298,7 +298,7 @@ impl ShellApp {
         }
         let workspace = workspace_root.map(|root| {
             let shell = cx.entity().downgrade();
-            cx.new(|_| FileTree::new(root, shell))
+            cx.new(|cx| FileTree::new(root, Self::file_tree_hooks(shell), cx))
         });
         // F3：启动文档 → 首个标签（未命名草稿取合成身份——CLI 无参
         // 不构造实体，实际不可达；防御完整）。
@@ -604,6 +604,42 @@ impl ShellApp {
     }
 
     /// F7：git 面板实体（烟雾钩子/内部访问）。
+    /// #575：FileTree 的 ShellApp 面收口（lib 化钩子注入——三闭包
+    /// 调既有方法，行为零变化）。
+    fn file_tree_hooks(shell: gpui::WeakEntity<Self>) -> crate::file_tree::FileTreeHooks {
+        use std::sync::Arc;
+        let open_shell = shell.clone();
+        let menu_shell = shell.clone();
+        crate::file_tree::FileTreeHooks {
+            // 文件点击 → open_document_tab + 焦点落位（原链原样）。
+            open_file: Arc::new(move |path, window, cx| {
+                let focus = open_shell
+                    .update(cx, |shell, cx| shell.open_document_tab(path.clone(), cx))
+                    .ok()
+                    .flatten();
+                if let Some(focus) = focus {
+                    window.focus(&focus, cx);
+                }
+            }),
+            // 右键 → 文件树上下文菜单（#166 原链——坐标转换在此收口）。
+            context_menu: Arc::new(move |pos, path, is_dir, window, cx| {
+                let pos = crate::context_menu::Point::new(pos.x.as_f32(), pos.y.as_f32());
+                let _ = menu_shell.update(cx, |shell, cx| {
+                    shell.open_file_tree_context_menu(pos, path, is_dir, window, cx)
+                });
+            }),
+            // Esc → 焦点还激活编辑器（#571 大纲面板同语义）。
+            escape: Arc::new(move |window, cx| {
+                let _ = shell.update(cx, |shell, cx| {
+                    if let Some(ed) = shell.editor() {
+                        let focus = ed.read(cx).focus_handle().clone();
+                        window.focus(&focus, cx);
+                    }
+                });
+            }),
+        }
+    }
+
     pub fn git_panel(&self) -> Option<Entity<GitPanel>> {
         self.git_panel.clone()
     }
@@ -2278,7 +2314,8 @@ impl ShellApp {
         let root = std::path::absolute(&root).unwrap_or(root);
         eprintln!("workspace: {}", root.display());
         let shell = cx.entity().downgrade();
-        let tree = cx.new(|_| FileTree::new(root.clone(), shell.clone()));
+        let tree =
+            cx.new(|cx| FileTree::new(root.clone(), Self::file_tree_hooks(shell.clone()), cx));
         self.workspace = Some(tree);
         // F7：git 面板（工作区打开即建——非 git 目录/缺 git 走提示态，
         // 不崩溃不拦截）。
