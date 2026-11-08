@@ -507,7 +507,7 @@
     "fixed_point": 481,
     "mean_recall": 1.0,
     "ok": 481,
-    "roundtrip_exact": 388,
+    "roundtrip_exact": 387,
     "structure_ok": 481
   },
   "hc_poi_docx": {
@@ -646,7 +646,7 @@
     "fixed_point": 111,
     "mean_recall": 1.0,
     "ok": 111,
-    "roundtrip_exact": 85,
+    "roundtrip_exact": 83,
     "structure_ok": 111
   },
   "hc_xlsx_calamine": {

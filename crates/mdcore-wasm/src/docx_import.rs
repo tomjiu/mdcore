@@ -106,9 +106,11 @@
 //! ## 脚注接入（#485：GFM 脚注语法）
 //!
 //! - **引用位**：段落尾接 ` [^N]`（`ParagraphData::footnote_refs`
-//!   [#19 读面段落粒度标注]——run 级位置引擎模型不承载，尾接是
-//!   诚实近似而非位置保真；表内段引用位读面不标注 = 已知边界）；
-//! - **定义块**：文档尾节（正文之后、页脚尾接之前）`[^N]: 内容`，
+//!   [#19 读面段落粒度标注]——run 级位置引擎模型不承载，尾接前
+//!   `trim_end`（往返分离空格不翻倍）；表内段引用位读面不标注 =
+//!   已知边界）；
+//! - **定义块**：全文档最末尾（页脚尾接之后——md 无页脚概念，往返
+//!   后页脚行降为正文段，定义块放最末 = 定点稳定）`[^N]: 内容`，
 //!   docx id → footnotes.xml 文档序重编号连续小号；多段脚注懒连续
 //!   形（单 `\n`——4 空格缩进会被 mdcore 行级解析误判代码块）；
 //! - **诚实边界**：脚注内非段落块（表/文本框）丢弃计数进
@@ -582,7 +584,15 @@ impl BlockMapper {
                     let text = if p.footnote_refs.is_empty() {
                         text
                     } else {
-                        let mut suffixed = text;
+                        // #485 修：尾接前剥除段尾空白——往返分离空格不翻倍。
+                        // 链路：import 尾接 " [^N]" → export 切分标记后文本
+                        // run 保留分离空格（docx 段文本 "…x "）→ 二轮 import
+                        // 若不 trim 会再接成 "…x  [^N]"（双空格，md1≠md2，
+                        // POI 语料 footnotes.docx 实证）。trim_end 后
+                        // "…x" + " [^N]" == md1，闭环稳定；段尾空白在 md
+                        // 行级无语义（GFM 硬换行双空格面 docx 读面无承载，
+                        // 读面本就不保真该面）。
+                        let mut suffixed = text.trim_end().to_string();
                         for id in &p.footnote_refs {
                             if let Some(label) = self.footnote_labels.get(id) {
                                 suffixed.push_str(" [^");
@@ -764,9 +774,24 @@ fn docx_to_markdown(doc: &DocxDocument) -> (String, serde_json::Value) {
     // word/document.xml，页眉/页脚段不标注）。
     total.footnote_labels = footnote_labels.clone();
     lines.extend(total.map_blocks(&doc.blocks));
-    // #485：脚注定义块（文档尾节——正文之后、页脚尾接之前；
-    // GFM 惯例定义在文档尾。多段脚注 = 懒连续形（单 \n——mdcore
-    // 行级解析不认 4 空格缩进为段落内客，会误判代码块））。
+    // 页脚 → 文档尾接。
+    for part in &doc.footers {
+        let mut m = BlockMapper::default();
+        let section = header_footer_section(part, "footer", &mut m);
+        if !section.is_empty() {
+            footers_imported += 1;
+            lines.extend(section);
+        }
+        total.absorb(m);
+    }
+    // #485：脚注定义块（全文档最末尾——页脚尾接之后；GFM 惯例定义
+    // 在文档尾。多段脚注 = 懒连续形（单 \n——mdcore 行级解析不认
+    // 4 空格缩进为段落内客，会误判代码块））。
+    //
+    // 位置稳定性（docx4j 2010_w14_mcIgnorable 实证）：md 无页脚概念
+    // ——往返后页脚行降为普通正文段，若定义块在页脚尾接之前，二轮
+    // 导入会把它顶到（已变正文的）页脚行之后 → md1≠md2（D5 丢）。
+    // 放全文档最末尾 = 无论往返多少轮位置恒定（定点稳定）。
     let mut footnote_blocks_dropped = 0usize;
     if !doc.footnotes.is_empty() {
         let mut defs: Vec<String> = Vec::with_capacity(doc.footnotes.len());
@@ -799,16 +824,6 @@ fn docx_to_markdown(doc: &DocxDocument) -> (String, serde_json::Value) {
         if !defs.is_empty() {
             lines.extend(defs);
         }
-    }
-    // 页脚 → 文档尾接。
-    for part in &doc.footers {
-        let mut m = BlockMapper::default();
-        let section = header_footer_section(part, "footer", &mut m);
-        if !section.is_empty() {
-            footers_imported += 1;
-            lines.extend(section);
-        }
-        total.absorb(m);
     }
     let images_skipped = doc.images.iter().filter(|a| a.body_uses > 0).count();
     // #14（A2）：表现型域缓存结果剥离计数（段落级聚合——正文 +
@@ -2420,5 +2435,23 @@ mod tests {
         assert!(md.contains("Trailing paragraph"), "{md}");
         assert_eq!(payload["stats"]["footnotes"], 1, "{payload}");
         assert_eq!(payload["stats"]["footnote_refs"], 1, "{payload}");
+    }
+
+    #[test]
+    fn footnote_md_roundtrip_stable_no_separator_duplication() {
+        // #485 修回归锁：import→export→import 的 md1==md2（分离空格
+        // 不翻倍）。POI 语料 footnotes.docx 实证缺陷：import 尾接
+        // " [^N]"，export 切分标记后文本 run 保留分离空格，二轮 import
+        // 再尾接 → 双空格 → hc_poi_docx D5 往返一致 85→82。trim_end
+        // 修复后 md 投影定点稳定（本测试即 D5 单件微缩锁）。
+        let payload = import_json(&build_footnote_sample_docx());
+        let md1 = payload["markdown"].as_str().expect("markdown").to_string();
+        let core = mdcore::Core::from_markdown(&md1);
+        let bytes = crate::docx_export::export_docx_core(&core.tree).expect("export");
+        let json2 = import_json(&bytes);
+        let md2 = json2["markdown"].as_str().expect("markdown 2");
+        assert_eq!(&md1, md2, "分离空格翻倍（双空格）或定义块漂移");
+        // 双空格缺陷的定向断言（即使整体断言被改松也能抓到本缺陷形）。
+        assert!(!md2.contains("  [^"), "标记前双空格：{md2}");
     }
 }
