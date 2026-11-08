@@ -5,8 +5,11 @@ window.__grid* probes, assert virtual-window rendering (pooled DOM, bounded
 node counts), pinned frozen row/col + headers, keyboard navigation, edit
 ledger (commit/undo/delete/paste/copy TSV), evidence highlight, sheet switch,
 read-modify-rebuild export face (skipped as `bridge_absent` while the wasm
-exportWithEdits rebuild is pending), and typed error surfaces (garbage bytes /
-oversized slice). Zero pageerror throughout.
+exportWithEdits rebuild is pending), anonymized-export toggle (#512 — default
+off; checked routes through export_with_edits_anonymized #499: docProps
+canonical-form + byte-divergence lock when the pkg is present, bridge_absent
+graceful-degrade lock when it is not), and typed error surfaces (garbage
+bytes / oversized slice). Zero pageerror throughout.
 Fixture = web/tests/fixtures/grid_sample.xlsx (provenance: office-io
 WorkbookWriter via `cargo run -p mdcore-wasm --example gen_xlsx_grid_fixture`;
 the deterministic value function below mirrors the Rust generator).
@@ -15,11 +18,13 @@ Evidence -> results/results_xlsx_grid.json
 
 import base64
 import http.server
+import io
 import json
 import socketserver
 import subprocess
 import sys
 import threading
+import zipfile
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -496,6 +501,86 @@ def main() -> int:
                           skip=True)
                 else:
                     check("grid_export_edits", False, json.dumps(res))
+
+            # ---- 14b. #512 匿名导出开关（在场+默认关 → 勾选走匿名出口 → 回关复原）----
+            anon_boot = page.evaluate("""() => {
+                const el = document.getElementById('grid-export-anon');
+                return { present: !!el, checked: el ? el.checked : null,
+                         label: el ? (el.parentElement.textContent || '').trim() : '',
+                         title: el ? (el.parentElement.title || '') : '' };
+            }""")
+            check("grid_export_anon_toggle_present",
+                  anon_boot["present"] is True and anon_boot["checked"] is False
+                  and len(anon_boot["label"]) > 0 and len(anon_boot["title"]) > 0,
+                  json.dumps(anon_boot))
+
+            if anon_boot["present"]:
+                page.check("#grid-export-anon")
+                page.wait_for_timeout(50)
+                anon_checked = page.evaluate(
+                    "document.getElementById('grid-export-anon').checked")
+                anon_res = page.evaluate("window.__gridExportEdits()")
+                page.uncheck("#grid-export-anon")
+                if anon_res.get("ok") is True:
+                    raw = base64.b64decode(anon_res["bytes"])
+                    core_xml = app_xml = ""
+                    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                        names = zf.namelist()
+                        if "docProps/core.xml" in names:
+                            core_xml = zf.read("docProps/core.xml").decode("utf-8", "replace")
+                        if "docProps/app.xml" in names:
+                            app_xml = zf.read("docProps/app.xml").decode("utf-8", "replace")
+                    # 匿名规范形（office-io anonymize.rs ANON_* 常量）：unknown
+                    # 作者 + epoch 零时 + revision=1 + app.xml 空骨架（身份字段清空）。
+                    # 明文基线：夹具原 core.xml（空 creator + 2026 时间戳 + 无
+                    # revision）经 raw_copy 文件级字节透传——两条出口必不同字节。
+                    ok_anon = (
+                        anon_checked is True
+                        and anon_res["bytes"].startswith("UEsD")
+                        and "<dc:creator>unknown</dc:creator>" in core_xml
+                        and "<cp:lastModifiedBy>unknown</cp:lastModifiedBy>" in core_xml
+                        and "1970-01-01T00:00:00Z" in core_xml
+                        and "<cp:revision>1</cp:revision>" in core_xml
+                        and "Microsoft Excel" not in app_xml
+                        and (res.get("ok") is not True
+                             or anon_res["bytes"] != res["bytes"])
+                    )
+                    check("grid_export_anonymized_path", ok_anon,
+                          json.dumps({"core": core_xml[:220], "app": app_xml[:140],
+                                      "bytesHead": anon_res["bytes"][:16],
+                                      "plainEq": anon_res["bytes"] == res.get("bytes")}))
+                    # 回关复原：明文出口回归（raw_copy 透传——core.xml 恢复夹具
+                    # 原状：空 creator + 真实时间戳，非匿名规范形）
+                    plain_after = page.evaluate("window.__gridExportEdits()")
+                    if plain_after.get("ok") is True:
+                        praw = base64.b64decode(plain_after["bytes"])
+                        pcore = ""
+                        with zipfile.ZipFile(io.BytesIO(praw)) as zf:
+                            if "docProps/core.xml" in zf.namelist():
+                                pcore = zf.read("docProps/core.xml").decode("utf-8", "replace")
+                        check("grid_export_anon_toggle_reversible",
+                              "<dc:creator>unknown</dc:creator>" not in pcore
+                              and "1970-01-01T00:00:00Z" not in pcore,
+                              json.dumps({"core": pcore[:220]}))
+                    else:
+                        check("grid_export_anon_toggle_reversible", True,
+                              "SKIP (plain face unavailable): " + json.dumps(plain_after),
+                              skip=True)
+                else:
+                    acode = anon_res.get("code", "")
+                    amsg = str(anon_res.get("message", ""))
+                    if acode == "bridge_absent" or "not a function" in amsg:
+                        # pkg 缺 #499 匿名面（未重建）= 优雅降级锁（issue 验收 1
+                        # 的缺席分支——勾选态绝不静默回落明文出口）
+                        check("grid_export_anonymized_path", True,
+                              "SKIP (pkg lacks export_with_edits_anonymized — pending "
+                              "wasm rebuild): " + json.dumps(anon_res), skip=True)
+                        check("grid_export_anon_toggle_reversible", True,
+                              "SKIP (anonymized face absent in pkg)", skip=True)
+                    else:
+                        check("grid_export_anonymized_path", False, json.dumps(anon_res))
+                        check("grid_export_anon_toggle_reversible", True,
+                              "SKIP (anonymized face errored)", skip=True)
 
             # ---- 15. 错误面（垃圾字节 / 切片超限 → typed 码，现状零触碰）----
             bad = page.evaluate(OPEN_JS, base64.b64encode(b"hi").decode())

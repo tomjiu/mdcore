@@ -101,6 +101,10 @@ type EditPayload = { sheet: number; r: number; c: number; k: EditKind; v?: EditV
  */
 type WasmBookEdits = {
   export_with_edits(j: string): Uint8Array;
+  /** #499/#512: dark-label anonymized export face. Optional on the wire —
+   * probed by duck-typing at runtime; a pkg build predating #499 degrades
+   * to the typed `bridge_absent` surface (never a silent plain fallback). */
+  export_with_edits_anonymized?(j: string): Uint8Array;
   last_rebuild_stats_json(): string;
 };
 
@@ -259,6 +263,9 @@ export class XlsxGridUI {
   // edit ledger (ordered log + latest-record index; keys `${sheet}:${r}:${c}`)
   private editLog: EditRecord[] = [];
   private editsMap = new Map<string, EditRecord>();
+  /** #512: anonymized-export session toggle (grid lifecycle only — default
+   * off; persistence deliberately out of scope, lands with #385 settings). */
+  private anonExport = false;
   // evidence overlay: sheet -> set of "r:c"
   private evidenceSets = new Map<number, Set<string>>();
 
@@ -329,11 +336,29 @@ export class XlsxGridUI {
     exportBtn.className = 'grid-btn';
     exportBtn.textContent = t('grid.exportEdited');
 
+    // #512: anonymized-export toggle — session-level checkbox between the
+    // sheet select and the export button (mirrors the DOCX deo.anonymize
+    // wording pair: short label + explanatory hover title). Default off:
+    // plain export stays the primary path, anonymity is an explicit act.
+    const anonLabel = document.createElement('label');
+    anonLabel.className = 'grid-anon-toggle';
+    anonLabel.title = t('grid.exportAnonymizedTitle');
+    const anonChk = document.createElement('input');
+    anonChk.type = 'checkbox';
+    anonChk.id = 'grid-export-anon';
+    anonChk.checked = false;
+    const anonText = document.createElement('span');
+    anonText.textContent = t('grid.exportAnonymized');
+    anonLabel.append(anonChk, anonText);
+    anonChk.addEventListener('change', () => {
+      this.anonExport = anonChk.checked;
+    });
+
     this.statusEl = document.createElement('span');
     this.statusEl.id = 'grid-status';
     this.statusEl.textContent = t('grid.openToStart');
 
-    toolbar.append(select, exportBtn, this.statusEl);
+    toolbar.append(select, anonLabel, exportBtn, this.statusEl);
 
     const viewport = document.createElement('div');
     viewport.id = 'grid-viewport';
@@ -1118,15 +1143,25 @@ export class XlsxGridUI {
     this.render();
   }
 
-  /** Direct wasm read-modify-rebuild call (no download path). */
+  /** Direct wasm read-modify-rebuild call (no download path). #512: with the
+   * anonymize toggle on, the call routes through the anonymized face
+   * (#499 `export_with_edits_anonymized`). A pkg build without that method
+   * degrades to the same typed `bridge_absent` surface — it must NEVER fall
+   * back to the plain face: a silent fallback would ship unanonymized bytes
+   * under an "anonymized" promise (worse than an honest degrade). */
   private exportEdits(): { ok: true; bytes: Uint8Array; stats: Record<string, unknown> } | WasmFail {
     if (!this.book) return { ok: false, code: 'no_book', message: 'no workbook open' };
     const editsFace = this.book as unknown as WasmBookEdits;
-    if (typeof (editsFace as { export_with_edits?: unknown }).export_with_edits !== 'function') {
+    const anonymize = this.anonExport;
+    const face: unknown = anonymize
+      ? editsFace.export_with_edits_anonymized
+      : editsFace.export_with_edits;
+    if (typeof face !== 'function') {
       return {
         ok: false,
         code: 'bridge_absent',
-        message: 'export_with_edits not present in pkg (pending wasm rebuild)',
+        message: (anonymize ? 'export_with_edits_anonymized' : 'export_with_edits')
+          + ' not present in pkg (pending wasm rebuild)',
       };
     }
     const payload: EditPayload[] = this.editLog.map((rec): EditPayload =>
@@ -1135,7 +1170,7 @@ export class XlsxGridUI {
         : { sheet: rec.sheet, r: rec.r, c: rec.c, k: rec.k, v: rec.v },
     );
     try {
-      const bytes = editsFace.export_with_edits(JSON.stringify(payload));
+      const bytes = (face as (j: string) => Uint8Array).call(editsFace, JSON.stringify(payload));
       let stats: Record<string, unknown> = {};
       try {
         stats = JSON.parse(editsFace.last_rebuild_stats_json()) as Record<string, unknown>;
