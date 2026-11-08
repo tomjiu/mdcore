@@ -2586,12 +2586,6 @@ mod tests {
     // 完整产品面。
     // -----------------------------------------------------------------------
 
-    /// smoke.pdf 夹具字节（两页——与 #336 控制器测试同源夹具）。
-    fn smoke_pdf_bytes() -> Vec<u8> {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.pdf");
-        std::fs::read(&p).unwrap_or_else(|e| panic!("夹具不可读（{}）：{e}", p.display()))
-    }
-
     /// 临时落盘路径守卫（Drop 清理——panic 也清）。
     struct TempPdf(PathBuf);
     impl Drop for TempPdf {

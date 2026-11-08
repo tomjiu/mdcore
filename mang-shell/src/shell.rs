@@ -473,7 +473,6 @@ impl ShellApp {
                     || self.xlsx_dirty_at(&tab.path, cx)
                     || self.pdf_view_dirty(cx, &tab.path)
             })
-            .map(|tab| tab.editor.read(cx).is_modified() || self.pdf_view_dirty(cx, &tab.path))
     }
 
     /// #386：指定路径的 pdf 页视图是否有未落盘批注（Shell 持有的
