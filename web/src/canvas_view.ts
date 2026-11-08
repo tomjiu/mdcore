@@ -278,6 +278,11 @@ const CC_SLOT = clientSlot();
 const MAIN_CLIENT_ID = 7_200_001 + CC_SLOT * 10;
 const AI_CLIENT_ID = 7_200_002 + CC_SLOT * 10;
 const RESTORE_CLIENT_BASE = 7_200_100 + CC_SLOT * 10;
+/** #451：AI 镜像恢复段（restore 双端重建——镜像会话的新 client id 段；
+ * 050 段为 web 面空白区，与 RESTORE_CLIENT_BASE 同为 slot×10 平移 +
+ * 每次恢复 +1，页生命周期内不复用——镜像新操作会经 pump 汇入 main
+ * 后随差量外泄到跨页对端，id 复用 = 时钟分叉）。 */
+const AI_RESTORE_CLIENT_BASE = 7_200_050 + CC_SLOT * 10;
 /** 事件日志容量（__canvasEvents 面）。 */
 const EVENT_LOG_CAP = 200;
 /** 泵收敛轮上限（一次变更的跨实例回声 ≤ 2 轮——防御性上限）。 */
@@ -2024,7 +2029,24 @@ export class CanvasViewUI {
     }
   }
 
-  /** 快照恢复 + 对端追赶（encode_diff state-vector 差分——协同恢复语义）。 */
+  /** 快照恢复（#451 方案 A——快照恢复优先）：main 与 AI 镜像双端都从
+   * 快照重建，恢复会话不追赶对端差分。
+   *
+   * 原实现（缺陷）：restore 后用 `ai.encode_diff(box_sv)` 让恢复会话
+   * 追赶 AI 端快照后的进展——clear 的删除 tombstone 随差分灌回，刚
+   * 从快照复活的对象被再次删除（恢复后 0 objects）。快照恢复的产品
+   * 语义（回到 T1）与 CRDT 收敛语义（收敛到最新）在同一按钮上冲突，
+   * 收敛赢——本修复让恢复赢。
+   *
+   * 为什么 AI 镜像也重建：镜像持着 tombstone 就等于页内留着回灌源
+   * （镜像新操作汇入 main 无害，但镜像自身视图与 main 永久发散——
+   * `__canvasSyncState().converged` 不变量破坏）。从同一快照重建后
+   * 页内 tombstone 清零，双端同回 T1；恢复后的新本地编辑经 pump 正常
+   * 互通（对快照存活 id 的再编辑 = Yjs 重新 insert，跨页对端亦复活）。
+   *
+   * 边界（有意不做，登记在 #451）：跨页 sync_resp 携带他页 tombstone
+   * 时仍会覆盖本页恢复态——跨页「快照恢复 vs 收敛」需产品级裁定
+   * （镜像不跨页，collab_channel 只走 main 实例，见其文件头纪律）。 */
   private toolbarRestore(): void {
     if (!this.main || !this.ctor) { this.showBridgeAbsent(); return; }
     if (!this.lastSnapshot) {
@@ -2035,12 +2057,11 @@ export class CanvasViewUI {
       this.restoreSeq += 1;
       const clientId = RESTORE_CLIENT_BASE + this.restoreSeq;
       const box = new SessionBox(this.ctor.restore(BigInt(clientId), UNDO_LIMIT, this.lastSnapshot));
-      // 对端追赶：AI 端可能有快照后的新进展（差分应用——两端重收敛）
-      try {
-        const diff = this.ai!.face.encode_diff(box.face.state_vector());
-        if (diff.length > 0) box.face.apply_update(diff);
-      } catch {
-        // 追赶失败不阻断恢复（本地会话已就位——下轮同步自愈）
+      // AI 镜像同快照重建（不追赶——差分回灌即 #451 缺陷本体）。
+      if (this.ai) {
+        const aiClientId = AI_RESTORE_CLIENT_BASE + this.restoreSeq;
+        this.ai = new SessionBox(
+          this.ctor.restore(BigInt(aiClientId), UNDO_LIMIT, this.lastSnapshot));
       }
       this.main = box;
       this.selected.clear();
