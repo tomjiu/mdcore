@@ -36,7 +36,6 @@
 
 // #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
 #![cfg(feature = "engine-lopdf")]
-
 #![cfg(feature = "engine-lopdf")]
 
 use mdc_pdf::command::CommandError;

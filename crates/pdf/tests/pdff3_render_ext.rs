@@ -22,7 +22,6 @@
 
 // #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
 #![cfg(all(feature = "engine-lopdf", feature = "engine-pdfium"))]
-
 #![cfg(feature = "engine-lopdf")]
 
 use std::path::Path;

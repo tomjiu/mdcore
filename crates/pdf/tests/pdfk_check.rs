@@ -23,7 +23,6 @@
 
 // #469:本文件消费特性门后模块——裸 crate 调用编译门(CI 恒带特性,零行为变化)。
 #![cfg(feature = "engine-pdfium")]
-
 // feature 门（默认构建零引擎依赖——本文件整体退化为空目标，跨环境
 // 可构建纪律保持）。
 #![cfg(feature = "engine-pdfium")]
