@@ -126,8 +126,8 @@ Wayland：     cage：WLR_BACKENDS=headhead WLR_RENDERER=pixman cage -- AppRun -
 截图链：      xwd → xwdtopnm → pnmtopng（sysroot netpbm；须带其 LD_LIBRARY_PATH）
 ```
 
-取证产物（本报告引用的全部日志/截图）在本机
-`/home/z/my-project/acceptance/`：`app_launch.log`、`wininfo.txt`、
+取证产物（本报告引用的全部日志/截图）在本机验收工作目录
+`acceptance/`（审计者本机，未入库）：`app_launch.log`、`wininfo.txt`、
 `wmclass.txt`、`window_all_props.txt`、`screenshot_x11_window.png`、
 `mouse-smoke/stage{1..5}-*.png`、`app_wayland*.log`、`wayland_globals.txt`、
 `appimage_build.log` 等；分支内不含（体积/非代码资产），PR 合并后按需补传。

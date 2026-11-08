@@ -5,7 +5,7 @@
 > playwright chromium（真实交互驱动）。**夹具独立性**：全部由 LO 独立
 > 生成（不依赖被测引擎构造——首轮手搓最小 OOXML 被 docx-rs 正确拒绝
 > `docx_parse: Failed to read from zip`，本身即容器门的一次跨层验证）。
-> 驱动脚本：`/home/z/my-project/scripts/testround_{a,b,cd,ef,gj}.py`。
+> 驱动脚本：`scripts/testround_{a,b,cd,ef,gj}.py`（审计者本机，未入库）。
 
 ## 总览
 
@@ -71,11 +71,11 @@
 ## 复现
 
 ```bash
-python3 /home/z/my-project/scripts/testround_a.py     # A 组
-python3 /home/z/my-project/scripts/testround_b.py     # B 组
-python3 /home/z/my-project/scripts/testround_cd.py    # C+D 组（需 /tmp/tr-cd LO 夹具）
-python3 /home/z/my-project/scripts/testround_ef.py    # E+F 组（需 LO）
-python3 /home/z/my-project/scripts/testround_gj.py    # G-J 组
+python3 scripts/testround_a.py     # A 组
+python3 scripts/testround_b.py     # B 组
+python3 scripts/testround_cd.py    # C+D 组（需 /tmp/tr-cd LO 夹具）
+python3 scripts/testround_ef.py    # E+F 组（需 LO）
+python3 scripts/testround_gj.py    # G-J 组
 ```
 
 产物：`mdcore/test-artifacts/testround/{A,B,CD,EF,GJ}/findings.json` +

@@ -1,6 +1,6 @@
 # C4 — web/ 前端 TS 深审（全量正确性与安全面）
 
-- 仓库：`/home/z/my-project/mdcore-audit`（audit 分支，源码 = main@6322f86）
+- 仓库：mdcore 仓 audit 分支（源码 = main@6322f86）
 - 范围：`web/src/` 全部 13 个 .ts（含 i18n 3 件）、`web/index.html`、`web/build.mjs`；`web/tests/` 29 个 .py 摸覆盖面（docstring 级）
 - 方式：纯静态逐行深读（沙箱不可构建：`node_modules/` 与 `web/pkg/` 均缺席，CM6 内部行为按 @codemirror/view ^6.36.5 公开语义推演）
 - 置信四档：**已确认**（代码结构直接可证）/ **高度怀疑**（结构清晰但依赖运行时数据形态）/ **需外部环境验证**（需构建+浏览器/CDP）/ **设计偏好**（有意的取舍，非缺陷）

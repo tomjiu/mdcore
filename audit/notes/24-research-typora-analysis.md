@@ -99,7 +99,7 @@
 - **B｜`File.toggleReadonlyMode` 方向反了**【已确认】：报告将其列为差集中"可辨识的业务增量"（暗示 beta 新接口）；实测该串在 stable（jsc_strings_stable_1.14.10.txt:131）而 **beta 为 0 命中**——它是 stable 侧增量（1.14.10 > 1.14.1-dev 版本序），报告未标方向。
 - **C｜附录 A 路径漂移**【已确认】：报告（build_report_body.py:492-494）写 `versions/1.14.10-stable/beautified/`，实际仓内无 `beautified/` 层（直接是 `versions/1.14.10-stable/asar_app` 等）——报告索引不可按图索骥。
 - **D｜实质性覆盖缺口：0.11.18 AWS Pinpoint 遥测模块未入报告**【已确认存在，活跃性需真机验证】：`0.11.18/appsrc/window/frame.js:19333-19455` 完整在档——硬编码 Cognito IdentityPoolId（:19344 `us-west-2:146e5a95-...`）、`new AWS.Pinpoint`（:19349）、`updateEndpoint`/`putEvents`（:19437/:19455）、门控 `File.option.sendAnonymousUsage`（:19137 `a = () => !window.debugMode && ... sendAnonymousUsage`）、macOS 侧 `Analytics.record` bridge（:19353）。报告第五章只覆盖 Sentry，**对 Pinpoint 零提及**；该通道由 typora-re-analysis/analysis/privacy_findings.md 补位（15-benchmark:158 引证「0.11.18 AWS Pinpoint 默认开」）。本子仓报告的"0.11.18 隐私画像"因此不完整；其 9 分钟动态观测跑在 1.14.9 Linux 上，对 0.11.18 无动态发言权。
-- **E｜"脚本可独立复跑"不成立**【已确认】：beautify_all.py:5-6、extract_endpoints.py:5、perf_statics.py:5、make_charts.py:11、cdp_fast.py:7、race_capture.py:7 均硬编码 `/home/z/my-project/typora_analysis`（原始工作区绝对路径），且依赖不入库的 `extracted/` 树——在本仓（mang-research-archive）内不可原位复跑。
+- **E｜"脚本可独立复跑"不成立**【已确认】：beautify_all.py:5-6、extract_endpoints.py:5、perf_statics.py:5、make_charts.py:11、cdp_fast.py:7、race_capture.py:7 均硬编码 `<本机>/typora_analysis` 形态的原始工作区绝对路径（审计时原文引述，此处脱敏），且依赖不入库的 `extracted/` 树——在本仓（mang-research-archive）内不可原位复跑。
 - **F｜报告数据链是手抄而非管道**【已确认】：build_report_body.py 全部表格/叙事为字面量内联（:263-265、:431）；make_charts.py:22-23 图表数据同样手工内联（71.4/116.5/113.6 与 228.1/413.6/405.3）。与 perf_statics.json 的一致性靠人肉对齐（本次抽验全对，但无再生成保障）。
 - **G｜次要**：报告称 appsrc 下 frame.js 为 1.7MB（原始压缩态），beautified 后实为约 2.4MB/60K 行——口径未注明。【设计偏好级瑕疵】
 

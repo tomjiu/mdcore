@@ -1,6 +1,6 @@
 # 11 · 横切代码质量审计（unsafe / panic 面 / 内存 / 错误 / 并发 / 体积 / 抽象 / 依赖）
 
-- 审计对象：`/home/z/my-project/mdcore-audit` main@96596d7（只读）。覆盖 16 个 workspace crate + mang-shell（交叉引用级抽查，非其专项）；third_party/zed 为 vendored 闭包不计入。
+- 审计对象：mdcore 仓 audit 分支 main@96596d7（只读）。覆盖 16 个 workspace crate + mang-shell（交叉引用级抽查，非其专项）；third_party/zed 为 vendored 闭包不计入。
 - 方法：独立重计（python3 静态切分产品码/测试码/文档注释）+ 逐站点源码核验 + 调用路径推演。不重复分域笔记 01~06 的结论，仅引用与交叉验证。
 - 与 loc-stats 的口径差：本笔记把 `unwrap/expect/panic!/unreachable!/todo!/unimplemented!` 统称 **panic 站点**，并剔除文档注释里的字面命中（loc-stats 未剔除——office-io 的 "616 unwrap" 里含 doc 注释提及与 doctest 示例，见 §2.1）。
 

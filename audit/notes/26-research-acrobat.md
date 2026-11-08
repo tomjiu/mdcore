@@ -1,7 +1,7 @@
 # 审计笔记 26：研究仓 acrobat-pro-audit 全量审计
 
 > Task ID：R5-c（mdcore 全仓代码审计 · 研究仓全覆盖系列）。日期：2026-11-05。
-> 审计对象：`/home/z/my-project/mang-research-archive/acrobat-pro-audit`（Adobe Acrobat
+> 审计对象：mang-research-archive 仓 `acrobat-pro-audit`（Adobe Acrobat
 > Pro DC 26.002.21931 安装包架构级审计：数据库取证 / 安装行为 / 网络遥测 / 二进制
 > 能力面 / AGS 取证）。只读审计：未执行任何 .exe/.msi/二进制（仅 ls/sha256sum 指纹）；
 > Python 仅 py_compile；未使用网络；未做任何写入型 git 操作。

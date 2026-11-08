@@ -1,6 +1,6 @@
 # C1 — sdk/（mcp + python）深审笔记：协议一致性 + MCP 攻击面
 
-- 审计对象：`/home/z/my-project/mdcore-audit/sdk/`（检出 = audit 分支，源码同步 main@6322f86，已核对 `git merge-base HEAD main` = 6322f86）
+- 审计对象：mdcore 仓 audit 分支 `sdk/`（源码同步 main@6322f86，已核对 `git merge-base HEAD main` = 6322f86）
 - 协议对端：`mang-shell/src/rpc.rs`（3071 行，27 命令）
 - 审计性质：只读静态深审 + **沙箱外复跑验证**（sdk 拷贝到 /tmp 跑通 pytest/mypy/ruff/black，未触碰仓库本体）
 - 本轮目标：补上终稿盲区「P3 观察——协议一致性未验证」；对照已知问题 P1-9（rpc.rs:959,1213 任意路径读写、socket 无认证、/tmp 回退端点）

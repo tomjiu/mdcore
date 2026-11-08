@@ -1,7 +1,7 @@
 # 审计笔记 27：研究仓 cleanroom-analysis 全量审计（mdcore 决策谱系验证）
 
 > Task ID：R5-d ｜ 日期：2026-11-05 ｜ 性质：只读审计（源码零改动，本文件为唯一新增产出）。
-> 审计对象：`/home/z/my-project/mang-research-archive/cleanroom-analysis`（归档快照；外层仓
+> 审计对象：mang-research-archive 仓 cleanroom-analysis（归档快照；外层仓
 > git log 头部 = `e625568`，其中 `88d1206`「archive: 并入 cleanroom-analysis —— mdcore 的
 > 设计决策来源」即本子仓的归档动作——原独立仓 main 引用（HANDOFF 内 `141c482`/`b3d5237`）
 > 在归档仓历史中不可直接验证，内容以快照为准）。

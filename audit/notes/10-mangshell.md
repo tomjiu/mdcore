@@ -73,7 +73,7 @@ Apache 侧（无闭源阻塞）：gpui 102,096 + gpui_macros 3,631 + sum_tree 3,
 
 ### 2.4 与 Zed 上游的跟随维护成本
 
-- **无 upstream 跟踪机制**：无 .gitmodules、无 git remote；上游钉死在 `1663af4`（2026-10-29 快照，PROVENANCE.md:11）。升级 = 手工四步（PROVENANCE.md:164-170：fetch → 改 `zed_port.py` 顶部 `ZED` 指针（默认 `/home/z/my-project/zed-upstream` 本地克隆，scripts/zed_port.py:16）→ `--clean` 重建 → 全绿后更新 PROVENANCE）。
+- **无 upstream 跟踪机制**：无 .gitmodules、无 git remote；上游钉死在 `1663af4`（2026-10-29 快照，PROVENANCE.md:11）。升级 = 手工四步（PROVENANCE.md:164-170：fetch → 改 `zed_port.py` 顶部 `ZED` 指针（默认 `zed-upstream` 本地克隆，scripts/zed_port.py:16）→ `--clean` 重建 → 全绿后更新 PROVENANCE）。
 - 风险面：Zed 上游日更，快照必然老化；消费面越宽老化越痛——text 窄口（低风险）vs ui/theme 宽口（~190 使用点，上游 API 变更直接红）。1 个登记源码补丁（gpui_windows zoom）有重放文件与上游修复观测点（PROVENANCE.md:108-115）。`third_party/zed` 独立 workspace **不在任何 CI 内**（编译证据是人工贴的 2026-10-30 `cargo check` 输出，PROVENANCE.md:134-155）；mang-shell 自身有 Windows CI job（windows-test.yml，见 01-structure §1.3）但 Linux 基线无 CI。
 
 ---

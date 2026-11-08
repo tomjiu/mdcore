@@ -1,7 +1,7 @@
 # 审计笔记 25：研究仓 typora-re-analysis 全量审计（R5-b，2026-11-05）
 
 > Task ID：**R5-b**（mdcore 全仓代码审计项目 · 研究仓全量覆盖 · typora-re-analysis 子仓）。
-> 审计对象：`/home/z/my-project/mang-research-archive/typora-re-analysis`（只读）。
+> 审计对象：mang-research-archive 仓 typora-re-analysis（只读）。
 > 铁律执行：两仓全程零写入、零 git 操作、零二进制执行；Python 仅 `py_compile`（24/24 通过）；
 > JS/TS/Rust 全静态阅读。本文件为唯一写动作产出。
 > 证据口径：`路径:行号` 均为本次实测；LOC/文件数为 `find`+`wc` 实测。
@@ -147,9 +147,9 @@ typora-re-analysis/
 |---|---|
 | scripts/decrypt_01118.py | 质量高：argparse CLI、pycryptodome 缺失时纯 Python 回退、12/12 文件验证记载于 docstring；含硬编码 AES 钥（研究性质使然） |
 | scripts/jsc_analyzer.py | 质量高：V8 code-cache 头部解析（magic/version-hash/source-hash 被 bytenode 劫持为源长度的发现）+ 字符串分类器，--json/--md 双输出 |
-| scripts/classify_dev_stable.py | **P3**：`DIFF = "/home/z/my-project/typora_work/dev_stable.diff"`（:7）硬编码一次性路径，仓外不可复跑（属一次性研究脚本自认范畴） |
+| scripts/classify_dev_stable.py | **P3**：`DIFF = "<本机一次性路径>/dev_stable.diff"`（:7）硬编码一次性路径（原始值含开发者本机目录，已中性化），仓外不可复跑（属一次性研究脚本自认范畴） |
 | compliance_fullcross/scripts/fc_*.py ×5 | 质量高：针集合构建/流式扫描/自动分桶/分层/反查定位五件套，可复跑，命中落 出处:行号 tsv |
-| compliance_fullcross/scripts/update_mdcore_compliance.py | **写入型脚本**（向 /home/z/my-project/mdcore compliance/ 注入 evidence/COMPLIANCE 增补节）——合规卷宗工作流的自动化件；本次审计**未执行**，仅 py_compile |
+| compliance_fullcross/scripts/update_mdcore_compliance.py | **写入型脚本**（向 mdcore 仓 compliance/ 注入 evidence/COMPLIANCE 增补节）——合规卷宗工作流的自动化件；本次审计**未执行**，仅 py_compile |
 | projects/delta/deep_dive/data/*.py ×7 | 数据分析件（符号盘点/DDL 提取与校验）；d4_binding_inventory 有 __pycache__/*.pyc 执行痕迹 |
 | projects/prototype/web/tests/*.py ×7 | 浏览器门禁（playwright/CDP：contract_gate/web_smoke/ime_cdp/diag_heap 等），results/*.json 为运行证据（475 行 W1-W12+G1/G2） |
 | projects/spike/tests/runner.py | Spike 场景 runner（results.json 284 行为 A/B 裁决原始数据） |
