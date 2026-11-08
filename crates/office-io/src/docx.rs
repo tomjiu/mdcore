@@ -6672,6 +6672,13 @@ impl DocxWriter {
         &mut self.docx
     }
 
+    /// 粘性校验错误落账（#556：docx_revision.rs 分文件 impl 桥——
+    /// get_or_insert 首错留存语义，与 `table_advanced` V10 落账同
+    /// 纪律：发射照常进行，save 漏斗零产物）。
+    pub(crate) fn note_validation_error(&mut self, msg: String) {
+        self.validation_error.get_or_insert(msg);
+    }
+
     /// 自定义样式 id 账本（只读）。
     pub(crate) fn defined_styles(&self) -> &std::collections::HashSet<String> {
         &self.defined_styles
@@ -8117,6 +8124,39 @@ pub(crate) fn specs_to_paragraph(runs: &[RunSpec]) -> docx_rs::Paragraph {
     p
 }
 
+/// RunSpec → 引擎 RunProperty 翻译单点（#556 桥——docx_revision.rs
+/// 修订容器多 run 发射复用面，[`add_spec_to_paragraph`] 原内联路径
+/// 提取，逐指令一致零行为变化）。
+///
+/// 属性序：字符样式（w:rStyle）先落，后续直接格式位（b/i/strike/u/
+/// mono rFonts）后覆——序即语义（引擎 RunProperty 后设置者胜）。
+/// link/anchor 包裹与脚注/域分支不在本面（段落级/特殊 child 形态
+/// ——修订容器边界见 docx_revision.rs V13）。
+pub(crate) fn spec_run_property(spec: &RunSpec) -> docx_rs::RunProperty {
+    let mut rp = docx_rs::RunProperty::new();
+    // #196 任务 3：字符样式引用（w:rStyle）——引擎 RunProperty::style
+    //（设置在 rp 内；先于此处构造后续格式位后赋值，避免覆盖）。
+    if let Some(cs) = &spec.char_style {
+        rp = rp.style(cs);
+    }
+    if spec.bold {
+        rp = rp.bold();
+    }
+    if spec.italic {
+        rp = rp.italic();
+    }
+    if spec.strike {
+        rp = rp.strike();
+    }
+    if spec.underline {
+        rp = rp.underline("single");
+    }
+    if spec.mono {
+        rp = rp.fonts(mono_fonts(MONO_FONT));
+    }
+    rp
+}
+
 /// 单个 [`RunSpec`] 的 run 构造挂接（[`specs_to_paragraph`] 的逐 spec
 /// 步进——t22 抽出共享：脚注 marker / 简单域三连 / 普通 run + 链接
 /// 包裹三分支原样搬移，行为零变化）。
@@ -8185,28 +8225,7 @@ fn add_spec_to_paragraph(p: docx_rs::Paragraph, spec: &RunSpec) -> docx_rs::Para
             .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false));
     }
     let mut run = docx_rs::Run::new().add_text(spec.text.as_str());
-    let mut rp = docx_rs::RunProperty::new();
-    // #196 任务 3：字符样式引用（w:rStyle）——引擎 RunProperty::style
-    //（设置在 rp 内；先于此处构造后续格式位后赋值，避免覆盖）。
-    if let Some(cs) = &spec.char_style {
-        rp = rp.style(cs);
-    }
-    if spec.bold {
-        rp = rp.bold();
-    }
-    if spec.italic {
-        rp = rp.italic();
-    }
-    if spec.strike {
-        rp = rp.strike();
-    }
-    if spec.underline {
-        rp = rp.underline("single");
-    }
-    if spec.mono {
-        rp = rp.fonts(mono_fonts(MONO_FONT));
-    }
-    run.run_property = rp;
+    run.run_property = spec_run_property(spec);
     // office-g Phase 1 发射分支：anchor 赢、link 忽略（V8 优先序——
     // 读面 HyperlinkData 解析顺序镜像[r5-t2 探针②]）；anchor 形 =
     // w:anchor 属性（零 rels 面）；悬空锚点发射不拒（T3 合法形）。
