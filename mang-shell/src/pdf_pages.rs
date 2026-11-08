@@ -110,9 +110,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, DispatchPhase, FocusHandle, Focusable, ImageSource, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollEvent, StyledText,
-    UniformListScrollHandle, Window, px,
+    AnyElement, App, ClickEvent, Context, DispatchPhase, FocusHandle, Focusable, ImageSource,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollEvent,
+    StyledText, UniformListScrollHandle, Window, px,
 };
 use image::{Frame, ImageBuffer};
 use mdc_pdf::engine::DocumentEngine;
