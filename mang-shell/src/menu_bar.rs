@@ -117,6 +117,10 @@ pub enum MenuAction {
     /// PDF 文本层经 mdc-pdf 引擎提取 + office-io 写面构造；仅 pdf 标签
     /// 启用；扫描件零文本显式拒（OCR 面 #306））。
     ExportDocx,
+    /// #507 / #240 任务②：打印当前 PDF（壳面系统打印流——方案 C：
+    /// Windows 打印动词 / macOS `open -p` / CUPS `lp`；设置面由系统
+    /// 对话框或 lp 参数承载；仅 pdf 标签启用）。
+    Print,
     /// 退出（与标题栏 × 钮同一条 `cx.quit` 既有路径）。
     Quit,
     /// 关于（既有提示横幅 `show_notice` 承载——层 3 可发现性验收项）。
@@ -285,6 +289,9 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                     .with_enabled(ctx.active_is_docx),
                 MenuEntry::item("file-export-docx", "导出为 DOCX（文本版）")
                     .act(MenuAction::ExportDocx)
+                    .with_enabled(ctx.active_is_pdf),
+                MenuEntry::item("file-print", "打印…")
+                    .act(MenuAction::Print)
                     .with_enabled(ctx.active_is_pdf),
                 MenuEntry::Separator,
                 MenuEntry::submenu("最近打开", recent_entries(ctx)),
@@ -1151,25 +1158,26 @@ mod tests {
         let menus = build_menus(&full_ctx());
         let mut state = MenuBarState::default();
         state.open_menu(0, 0., &menus);
-        // 文件菜单条目：新建0 打开1 打开文件夹2 保存3 另存为4 导出PDF5 导出DOCX6 |sep7| 最近打开8 |sep9| 退出10
+        // 文件菜单条目：新建0 打开1 打开文件夹2 保存3 另存为4 导出PDF5 导出DOCX6 打印7 |sep8| 最近打开9 |sep10| 退出11
         assert_eq!(state.selected, 0);
         state.move_vertical(&menus, true);
         assert_eq!(state.selected, 1);
-        // 步进到子菜单标题（8）再下一步是 10（跳过 9 分隔线）。新条目
-        // （导出DOCX6）使得到达「最近打开」需 7 步（1+6——含首步）。
+        // 步进到子菜单标题（9）再下一步是 11（跳过 10 分隔线）。新条目
+        //（打印7）使得到达「最近打开」需 8 步（1+7——含首步）。
         state.move_vertical(&menus, true);
         state.move_vertical(&menus, true);
         state.move_vertical(&menus, true);
         state.move_vertical(&menus, true);
         state.move_vertical(&menus, true);
         state.move_vertical(&menus, true);
-        assert_eq!(state.selected, 8, "停在「最近打开」");
         state.move_vertical(&menus, true);
-        assert_eq!(state.selected, 10, "跳过分隔线 9 到「退出」");
+        assert_eq!(state.selected, 9, "停在「最近打开」");
+        state.move_vertical(&menus, true);
+        assert_eq!(state.selected, 11, "跳过分隔线 10 到「退出」");
         state.move_vertical(&menus, true);
         assert_eq!(state.selected, 0, "wrap 回首项");
         state.move_vertical(&menus, false);
-        assert_eq!(state.selected, 10, "反向 wrap 回末项（退出）");
+        assert_eq!(state.selected, 11, "反向 wrap 回末项（退出）");
     }
 
     /// Enter 在子菜单标题上：展开子菜单；↓ 移动后再次 Enter 激活子菜单
@@ -1302,12 +1310,12 @@ mod tests {
         let menus = build_menus(&full_ctx());
         let entries = &menus[0].entries;
         assert_eq!(row_y_offset(entries, 0), context_menu::MENU_PADDING_Y);
-        // idx 8（最近打开）之前有七项普通条目（0..6，含导出PDF5/导出
-        // DOCX6）+ 一条分隔线（7）——#384 菜单项后基线同步。
+        // idx 9（最近打开）之前有八项普通条目（0..8，含导出PDF5/导出
+        // DOCX6/打印7）+ 一条分隔线（8）——#507 菜单项后基线同步。
         let expect = context_menu::MENU_PADDING_Y
-            + context_menu::ITEM_HEIGHT * 7.
+            + context_menu::ITEM_HEIGHT * 8.
             + context_menu::ITEM_HEIGHT * context_menu::SEPARATOR_UNITS;
-        assert_eq!(row_y_offset(entries, 8), expect);
+        assert_eq!(row_y_offset(entries, 9), expect);
     }
 
     /// 锚点估算随菜单序单调递增（下拉往右跟着标题走）。
