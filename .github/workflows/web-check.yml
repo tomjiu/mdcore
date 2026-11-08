@@ -1,0 +1,119 @@
+name: web-check
+
+# #570：web 面 CI 门——#561/#562 类残留（diff3 基线标记 / CSS 规则
+# 腐蚀）曾直接进 main：三 windows workflow 零覆盖 web/，红了没人看得
+# 见。本门三步：
+#   1. wasm 双包构建（mdcore-wasm + mdc-pdf-wasm——wasm-bindgen 版本
+#      与 Cargo.lock 精确一致纪律，见 build-wasm.sh 头注）
+#   2. node build + tsc --noEmit（build.mjs 对 pkg/ 在场有硬校验）
+#   3. e2e（playwright/chromium）——#561 修复轮实证过的三套件：
+#      pdf_links（9 测）+ pdf_outline（11 测）+ pdf_view（16 测）
+#      ——#549 整合合并的直接损伤区（PDF 视图链）。其余 web 套件
+#      待逐套核实后扩容（防把未知态测试当门禁 = 天线误报）。
+# runner：ubuntu-latest（node/python/chromium 原生面；wasm 构建走
+# 仓库 rust-toolchain.toml 钉住的工具链 + wasm32 target——targets 行
+# 已声明，rustup 自动补装）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # #548：types 显式化（同 windows-check 口径）。
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# #548/#550 同款队列深度防线：同 workflow + 同 ref 只保留最新 run。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+  # wasm-bindgen CLI 与 Cargo.lock 精确一致（0.2.129——build-wasm.sh
+  # 头注纪律；版本漂移 = 运行期 link 失败）。
+  WASM_BINDGEN_VERSION: "0.2.129"
+
+jobs:
+  web:
+    name: web / build + typecheck + e2e
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── wasm 工具链 ─────────────────────────────────────────────
+      # rust-toolchain.toml 钉 1.99.0 + wasm32 target（rustup 按文件
+      # 自动补装组件；Swatinem 缓存按 target 键控）。
+      - name: Rust cache (wasm32)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: wasm32
+
+      # wasm-bindgen CLI：发行版二进制直取（cargo install 编译 ~3 分钟
+      # 且每 run 重付；musl 静态链接面 ubuntu 可直接跑）。
+      - name: Install wasm-bindgen CLI (pinned)
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          ver="${WASM_BINDGEN_VERSION}"
+          base="https://github.com/rustwasm/wasm-bindgen/releases/download"
+          curl -fsSL "$base/${ver}/wasm-bindgen-${ver}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz --strip-components=1
+          ./wasm-bindgen --version
+
+      # ── 第 1 步：wasm 双包 ──────────────────────────────────────
+      - name: Build wasm packages (mdcore-wasm + mdc-pdf-wasm)
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          bash web/build-wasm.sh
+          bash web/build-pdf-wasm.sh
+
+      # ── 第 2 步：bundle + typecheck ────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Build web bundle (build.mjs)
+        run: node build.mjs
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      # ── 第 3 步：e2e（playwright/chromium）──────────────────────
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install playwright + chromium
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: e2e pdf_links（#466 链接导航 + 外链安全策略）
+        run: python3 tests/pdf_links.py
+
+      - name: e2e pdf_outline（大纲树接线）
+        run: python3 tests/pdf_outline.py
+
+      - name: e2e pdf_view（页面视图）
+        run: python3 tests/pdf_view.py
+
+      # 结果工件（e2e JSON 证据——失败时留档对账）。
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-results
+          path: web/tests/results/
+          if-no-files-found: ignore
+          retention-days: 7
