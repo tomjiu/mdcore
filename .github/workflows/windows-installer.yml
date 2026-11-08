@@ -9,12 +9,19 @@ name: windows-installer
 # 分钟数可控——windows-test.yml 的「云端也扛不住」教训不重蹈）；
 # 正式出包 = BUILD-VERIFY §3 的 --release 命令（Lead 实机）。
 
+# #548 方案 B：打包是发布面——PR 阶段不再跑 nsis（每个 PR push 少 1 个
+# run，单 run 50-110 分钟）；main 合并后仍跑一次兜底 + 手动 dispatch 保留。
+# PR 面的编译/测试覆盖不缩水（windows-check / windows-test 照跑）。
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+
+# #548：队列深度防线——同 workflow + 同 ref 只保留最新 run
+#（详见 windows-check.yml 同款注释）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
