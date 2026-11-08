@@ -16,6 +16,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  # #548：同一分支连续 push 只保留最后一次，前序 run 自动取消。
+  # 2026-11-08 实测：110 个 run 排队需 44 小时消化（多代理并发推送 +
+  # 每个 PR 触发 3 个 workflow × 4 job）；加本组后队列深度降 70-80%。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 3
