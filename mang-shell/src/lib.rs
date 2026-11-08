@@ -121,3 +121,25 @@ pub mod button_ext;
 /// （Theme 进出），lib 树零额外依赖。
 #[path = "theme_switch.rs"]
 pub mod theme_switch;
+
+/// #571（#385 批 7）：大纲面板键盘导航——OutlinePanel 实体（行焦点
+/// 句柄按行号差量复用 + ui::Navigable 接线 + menu::Confirm 激活）。
+/// lib 树纪律：#289-④ pdf 页滚等 bin 面副作用经 ActivateHook 注入
+/// （不引用 shell——palette_view 同型）；#[gpui::test] 三面测试挂
+/// bin 目标 = CI 永不运行（假绿）。
+#[path = "outline_panel.rs"]
+pub mod outline_panel;
+
+/// #575（#385 批 8）：文件树——ShellApp 耦合经 FileTreeHooks 钩子注入
+/// （open_file / context_menu / escape 三面），本模块 lib+bin 共用源码
+/// （outline_panel #571 先例二次应用）：键盘导航无头测试 CI 可见
+/// （挂 bin 目标 = 假绿）；TreeState 纯状态机单测同树收编。
+#[path = "file_tree.rs"]
+pub mod file_tree;
+
+/// #577（#385 批 9）：git 面板——ShellApp 耦合经 GitPanelHooks 钩子
+/// 注入（open_readonly / escape），lib+bin 共用源码（#575 先例三次
+/// 应用）：键盘导航无头测试 CI 可见；git 纯逻辑单测（parse_porcelain/
+/// parse_log 等）随模块进 lib 树（原挂 bin = 假绿——本批修复）。
+#[path = "git_panel.rs"]
+pub mod git_panel;

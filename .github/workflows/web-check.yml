@@ -135,3 +135,12 @@ jobs:
           python3 tests/pdf_outline.py
           python3 tests/pdf_view.py
           python3 tests/i18n_ui.py
+
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-results
+          path: web/tests/results/
+          if-no-files-found: ignore
+          retention-days: 7

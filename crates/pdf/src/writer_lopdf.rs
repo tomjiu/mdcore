@@ -22,6 +22,11 @@
 //! - `from_bytes` 拒绝加密档：**仍加密**（口令不可得——lopdf 以未解密
 //!   形态装载）与**曾加密**（空口令可解——文件本体仍是加密档）两形态
 //!   均拒（`SecurityDeny`，与 S5 同理由码）；
+//! - **xref 链守卫**（2026-10-31 行尾污染事故防线，#573 扩两档）：
+//!   lopdf 装载期**任何修复动作**（`Document::xref_recovery`）都标记
+//!   「档字节与 xref 记录不一致」的既往史——扫描重建（Reconstructed）
+//!   与偏移修正（OffsetCorrected）两档一律拒增量写（判定共享单点
+//!   [`xref_chain_untrusted_reason`]，anonymize/forms 写面同款接线）；
 //! - 载荷健全性（annotation.rs 在档的「落盘时由引擎侧校验」承诺）：
 //!   空 quads / 空 strokes / 空笔划 / 非有限坐标（NaN/Inf——serde 面
 //!   已拒，Rust 直构面兜底）→ `Engine` 错误，不产出非法 PDF。
@@ -50,6 +55,43 @@ use crate::writer::{encode_author, pdf_date_string, AnnotationWriter, Incrementa
 /// FreeText 默认外观（/DA）：`/Helv 12 Tf 0 g`——Acrobat 对无 /AP 的
 /// FreeText 按 /DA 免外观流渲染（v0 不生成 /AP 的前提）。
 pub const FREETEXT_DEFAULT_DA: &str = "/Helv 12 Tf 0 g";
+
+/// xref 链可信档判定（2026-10-31 行尾污染事故防线；#573 升级 lopdf
+/// 0.46 后扩为「装载期修复动作」全档位判定）。
+///
+/// lopdf 0.46 起在 [`Document::xref_recovery`] 上如实报告装载期的修复
+/// 动作——两档都意味着「档字节与 xref 记录曾不一致」：
+///
+/// - [`Reconstructed`](lopdf::xref::XrefRecovery::Reconstructed)：xref
+///   不可读，全文件扫描重建（`xref_start == 0`）——事故原档（行尾
+///   污染/真损坏的烈性形态）；
+/// - [`OffsetCorrected`](lopdf::xref::XrefRecovery::OffsetCorrected)：
+///   `startxref`//`/Prev`//`/XRefStm` 偏移未命中 xref 节，装载改用
+///   邻近节——**温和触发面**：能读且 `xref_start != 0`，旧守卫（仅查
+///   `xref_start == 0`）放行此档，增量写产物健康度押注在「修正后的
+///   偏移恰好正确」上（#573 盲区收口——保守拒绝）。
+///
+/// 枚举 `#[non_exhaustive]`：未来新增修复档位一律按「不可信」处理
+/// （保守默认——增量写合同只认零修复装载态）。
+///
+/// 返回 `Some(档位描述)` = 不可信（调用方响亮拒绝并携指引）；
+/// `None` = 零修复装载，增量写前置条件成立。三个增量写面共用
+/// （writer_lopdf / anonymize / forms——同一纪律单点实现）。
+pub(crate) fn xref_chain_untrusted_reason(doc: &Document) -> Option<&'static str> {
+    if doc.xref_start == 0 || doc.xref_recovery.is_some() {
+        let kind = match doc.xref_recovery {
+            Some(lopdf::xref::XrefRecovery::OffsetCorrected) => {
+                "偏移修正档（OffsetCorrected：startxref//Prev//XRefStm 未命中 \
+                 xref 节，装载改用邻近节）"
+            }
+            Some(_) => "扫描重建档（Reconstructed：xref 不可读，全文件扫描重建）",
+            None => "未知起点档（xref_start = 0，无已知 xref 起点）",
+        };
+        Some(kind)
+    } else {
+        None
+    }
+}
 
 /// lopdf 增量写器（产物取回见 [`LopdfWriter::into_bytes`]）。
 #[derive(Debug)]
@@ -91,9 +133,10 @@ impl LopdfWriter {
     /// - 解析失败（垃圾字节等）→ `Engine`；
     /// - 加密档（仍加密或曾加密）→ `SecurityDeny`（S5 引擎侧独立防线，
     ///   先于一切写入——与会话层 S5 判定双防线）；
-    /// - **xref 链不可信档**（lopdf 以扫描重建装载，`xref_start=0`）→
-    ///   `Engine`（2026-10-31 行尾污染事故防线——见
-    ///   [`LopdfWriter::from_bytes_with_limits`] 内联注释）。
+    /// - **xref 链不可信档**（lopdf 装载期有修复动作：扫描重建
+    ///   `xref_start=0` 或偏移修正 `xref_recovery=Some(..)`）→ `Engine`
+    ///   （2026-10-31 行尾污染事故防线，#573 扩两档——见
+    ///   [`xref_chain_untrusted_reason`]）。
     pub fn from_bytes(pdf: Vec<u8>) -> Result<Self, CommandError> {
         Self::from_bytes_with_limits(pdf, Limits::default())
     }
@@ -116,24 +159,24 @@ impl LopdfWriter {
                 reason: REASON_ENCRYPTED_WRITE,
             });
         }
-        // xref 链守卫（2026-10-31 行尾污染事故）：lopdf 对 xref 不可解析
-        // 的档退化为**全文件扫描重建**装载——能读（宽容），但
-        // `Document::xref_start == 0` 标记「无已知 xref 起点」。在其上
-        // 做增量写是静默产毒：`new_from_prev` 无从回指（lopdf 对
-        // xref_start=0 刻意省略 /Prev——写 0 会把链指到文件头），产物
-        // xref 只覆盖本轮新对象，目录/页树经链不可达——严格阅读器打
-        // 不开，宽容阅读器靠再次扫描重建才可见（实测事故形态：
-        // read_annotations 静默 parsed:0，「写入成功但读不回来」）。
-        // 增量语义要求前序 xref 链可信——重建装载档在入口响亮拒绝，
-        // 不静默产出结构损坏的产物。常见成因：二进制 PDF 被行尾转换
-        // 污染（Windows git autocrlf 检出未标 binary 的文件——仓内已
-        // 加 .gitattributes 防复发）或 xref 表真损坏（修复源文件后重试）。
-        if doc.xref_start == 0 {
-            return Err(CommandError::engine(
-                "xref 链不可信：档以扫描重建装载（无已知 xref 起点），增量写产物将丢失 \
-                 /Prev 链导致页树不可达。常见成因：二进制被行尾转换污染（如 Windows \
-                 git autocrlf）或 xref 损坏。请重取未污染原件或修复源文件后重试",
-            ));
+        // xref 链守卫（2026-10-31 行尾污染事故，#573 扩两档）：lopdf
+        // 装载期有修复动作的档（全文件扫描重建——`xref_start=0`，
+        // `new_from_prev` 无从回指 /Prev，产物 xref 只覆盖本轮新对象、
+        // 目录/页树经链不可达，实测事故形态 = read_annotations 静默
+        // parsed:0「写入成功但读不回来」；或偏移修正——startxref/
+        // /Prev//XRefStm 未命中、装载改用邻近节，产物健康度押注在修正
+        // 后偏移恰好正确上）一律入口响亮拒绝，不静默产出结构存疑的
+        // 产物。判定与 anonymize/forms 写面共享单点
+        // （xref_chain_untrusted_reason——三面同一纪律）。常见成因：
+        // 二进制 PDF 被行尾转换污染（Windows git autocrlf 检出未标
+        // binary 的文件——仓内已加 .gitattributes 防复发）或 xref 真
+        // 损坏（修复源文件后重试）。
+        if let Some(kind) = xref_chain_untrusted_reason(&doc) {
+            return Err(CommandError::engine(format!(
+                "xref 链不可信：{kind}，前序链经修复，增量写安全性未验证，按保守策略拒绝。\
+                 常见成因：二进制被行尾转换污染（如 Windows git autocrlf）或 xref \
+                 损坏。请重取未污染原件或修复源文件后重试"
+            )));
         }
         // S2/S6 扫描（装载后——告警/表单探针随写器携带；加密拒在前，
         // 携带的 assessment 恒为非加密态）。

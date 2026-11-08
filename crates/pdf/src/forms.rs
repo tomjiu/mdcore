@@ -1169,9 +1169,11 @@ impl PdfForm {
     ///
     /// # 语义（与 [`crate::writer_lopdf`] 同一纪律，三层守卫）
     ///
-    /// 1. **xref 链守卫**：档以扫描重建装载（`xref_start == 0`，常见于
-    ///    行尾污染/真损坏）时拒绝写——追加修订无从回指 `/Prev`，产物
-    ///    页树不可达（2026-10-31 事故防线，详见 `writer_lopdf.rs`）；
+    /// 1. **xref 链守卫**：档装载期有修复动作（扫描重建
+    ///    `xref_start == 0`，常见于行尾污染/真损坏；或偏移修正
+    ///    `xref_recovery = Some(..)`，#573 扩面——判定与
+    ///    `crate::writer_lopdf` 共享单点）时拒绝写——追加修订无从
+    ///    回指 `/Prev`，产物页树不可达（2026-10-31 事故防线）；
     /// 2. **前缀逐位不变断言**：产物必须以保存前字节为逐位相同前缀，
     ///    违约 = typed 错误而非产出损坏文件——已签名文档的 `/ByteRange`
     ///    覆盖段因此不变，既有数字签名保持有效（PAdES 硬约束）；
@@ -1189,14 +1191,15 @@ impl PdfForm {
         crate::docmdp::ensure_write_allowed(&self.doc, crate::docmdp::WriteOp::FormFill)
             .map_err(FormError::DocMdp)?;
         self.build_appearances()?;
-        // 守卫 1：xref 链可信（扫描重建档上做增量写 = 静默产毒，入口响亮拒绝）。
-        if self.doc.xref_start == 0 {
-            return Err(FormError::Save(
-                "xref 链不可信：档以扫描重建装载（无已知 xref 起点），增量写产物将丢失 \
-                 /Prev 链导致页树不可达。常见成因：二进制被行尾转换污染（如 Windows \
-                 git autocrlf）或 xref 损坏。请重取未污染原件或修复源文件后重试"
-                    .into(),
-            ));
+        // 守卫 1：xref 链可信（装载期有修复动作的档上做增量写 =
+        // 静默产毒，入口响亮拒绝——两档判定与 writer_lopdf/anonymize
+        // 共享单点，#573 扩面）。
+        if let Some(kind) = crate::writer_lopdf::xref_chain_untrusted_reason(&self.doc) {
+            return Err(FormError::Save(format!(
+                "xref 链不可信：{kind}，前序链经修复，增量写安全性未验证，按保守策略拒绝。\
+                 常见成因：二进制被行尾转换污染（如 Windows git autocrlf）或 xref \
+                 损坏。请重取未污染原件或修复源文件后重试"
+            )));
         }
         let original = std::mem::take(&mut self.original);
         let dirty = std::mem::take(&mut self.dirty);

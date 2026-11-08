@@ -411,6 +411,9 @@ fn editor_context_menu_actions_all_wired() {
 /// 方法名 + 既有通道名，语义不变（左键展开/打开、右键菜单）。
 #[test]
 fn file_tree_row_clicks_wired() {
+    // #575 锚点更新：lib 化钩子注入后，行点击的两条 shell 通道调用
+    // 移入 shell.rs 的 file_tree_hooks（bin 面）——本测三段两文件
+    // 锚定（render_row 组件面 + 钩子消费面 + bin 注入面）。
     let file = src("file_tree.rs");
     let body = fn_body(&file, "fn render_row(");
     assert!(
@@ -418,17 +421,30 @@ fn file_tree_row_clicks_wired() {
         "文件树行无左键处理（ListItem.on_click——展开/打开）"
     );
     assert!(
-        body.contains("open_document_tab"),
-        "文件树左键未接 F1 打开通道（open_document_tab）"
+        body.contains("hooks.open_file"),
+        "文件树左键未接打开通道（#575 open_file 钩子——lib 化后的 \
+         render_row 消费面）"
     );
     assert!(
-        body.contains(".on_secondary_mouse_down(") && body.contains("open_file_tree_context_menu"),
+        body.contains(".on_secondary_mouse_down(") && body.contains("hooks.context_menu"),
         "文件树右键未接上下文菜单（ListItem.on_secondary_mouse_down → \
-         open_file_tree_context_menu）——ft-reveal 等六项菜单动作的入口"
+         #575 context_menu 钩子——ft-reveal 等六项菜单动作的入口）"
     );
     assert!(
         body.contains("ListItem::new"),
         "文件树行未走 ui::ListItem（#385 批 5b 迁移目标——手写行退役）"
+    );
+    // bin 注入面：钩子闭包含两条既有通道调用（open_document_tab /
+    // open_file_tree_context_menu）——迁移后链路完整性的另一半锚点。
+    let shell_hooks = fn_body(&src("shell.rs"), "fn file_tree_hooks(");
+    assert!(
+        shell_hooks.contains("open_document_tab"),
+        "file_tree_hooks 的 open_file 闭包缺 open_document_tab（F1 通道断链）"
+    );
+    assert!(
+        shell_hooks.contains("open_file_tree_context_menu"),
+        "file_tree_hooks 的 context_menu 闭包缺 open_file_tree_context_menu \
+         （右键菜单通道断链）"
     );
     assert!(
         dead_closures(&file).is_empty(),
