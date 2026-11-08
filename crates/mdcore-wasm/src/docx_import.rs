@@ -2346,7 +2346,10 @@ mod tests {
         );
         // 定义块：文档尾节，多段懒连续形。
         assert!(md.contains("[^1]: First note"), "{md}");
-        assert!(md.contains("[^2]: Second note first para\nSecond note second para"), "{md}");
+        assert!(
+            md.contains("[^2]: Second note first para\nSecond note second para"),
+            "{md}"
+        );
         assert!(md.contains("[^3]: Orphan note"), "{md}");
         // stats：发射数（3 个 marker）+ 承载量（3 条）。
         assert_eq!(stats["footnote_refs"], 3, "{stats}");
