@@ -12,7 +12,7 @@
 
 #![cfg(feature = "engine-lopdf")]
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use mdc_pdf::annotate::read_annotations;
 use mdc_pdf::security::Limits;
@@ -31,16 +31,36 @@ fn minimal_pdf() -> Vec<u8> {
         out.extend_from_slice(b"\nendobj\n");
     };
     out.extend_from_slice(b"%PDF-1.4\n");
-    obj(&mut out, 1, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
-    obj(&mut out, 2, &mut offsets, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    obj(
+        &mut out,
+        1,
+        &mut offsets,
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    obj(
+        &mut out,
+        2,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
     obj(
         &mut out,
         3,
         &mut offsets,
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
     );
-    obj(&mut out, 4, &mut offsets, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
-    obj(&mut out, 5, &mut offsets, b"<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 720 Td (hello) Tj ET\nendstream");
+    obj(
+        &mut out,
+        4,
+        &mut offsets,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    obj(
+        &mut out,
+        5,
+        &mut offsets,
+        b"<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 720 Td (hello) Tj ET\nendstream",
+    );
     let xref_at = out.len();
     out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
     for off in offsets {
