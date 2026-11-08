@@ -71,6 +71,7 @@ mod document;
 mod editor;
 mod file_tree;
 mod git_panel;
+mod git_repo;
 mod outline_panel;
 mod panels;
 mod recent;
@@ -553,7 +554,7 @@ fn main() {
                             let Some((root, path)) = panel.read(cx).first_change() else {
                                 return;
                             };
-                            let Some(text) = git_panel::git_diff(&root, &path) else {
+                            let Some(text) = git_repo::git_diff(&root, &path) else {
                                 return;
                             };
                             if let Some(focus) =

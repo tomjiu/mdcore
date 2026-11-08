@@ -27,6 +27,14 @@ pub mod document;
 #[path = "editor/mod.rs"]
 pub mod editor;
 
+/// git 仓库纯数据层（#588 从 git_panel 拆出——context_menu/context_menu_view
+/// 分层先例）：结构/命令/解析 + 单测。进 lib 树的理由与 document.rs 同款：
+/// CI 的 mang-shell job 只跑 `--lib`/`--tests`（bin 单测不执行），纯函数
+/// 挂 bin = 假绿；且 #588 验收要求集成测试（tests/git_diff_real_repo.rs）
+/// 调用生产公开 `git_diff`。视图面（GitPanel 实体）留 bin 的 git_panel.rs。
+#[path = "git_repo.rs"]
+pub mod git_repo;
+
 /// 右键菜单数据/几何面（#63 打磨项）：纯数据，零 GPUI 依赖——菜单摆放
 /// 算法（边缘翻转/夹紧）必须能脱离窗口单测，见模块文档。
 #[path = "context_menu.rs"]
