@@ -21,16 +21,21 @@
 //! 打开（F1 通道复用）；右键 = 上下文菜单（#166 接线——新建/打开/
 //! 重命名/删除/在资源管理器中显示；菜单本体在 `context_menu.rs`，动作
 //! 派发在 `shell.rs`）。
+//!
+//! #385 批 5b：行渲染迁 `ui::ListItem`（zed ui 组件族——缩进/hover/
+//! 选中/左右键接线经组件语义，非手写仿制）。**uniform_list 虚拟化保
+//! 留**（ui::List 为非虚拟化容器，「1000+ 文件只布局可视行」不变量
+//! 不动）；TreeViewItem 经评估不适用（非根行仅单级缩进线 + 无图标
+//! 位——深度嵌套可读性回归），偏离登记在
+//! `docs/ui-component-migration.md` 批 5b 落地记录。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gpui::{
-    App, Context, IntoElement, MouseButton, MouseDownEvent, Render, WeakEntity, px, uniform_list,
-};
+use gpui::{App, Context, IntoElement, MouseDownEvent, Render, Role, WeakEntity, px, uniform_list};
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, ListItem};
 
 use crate::context_menu;
 use crate::shell::ShellApp;
@@ -311,13 +316,12 @@ impl FileTree {
     }
 
     fn render_row(&self, row: &TreeRow, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let colors = cx.theme().colors().clone();
-        let hover = colors.element_hover;
-        let selected = colors.element_selected;
-        let indent = px(4. + row.depth as f32 * 14.);
         let is_dir = row.is_dir;
         let path = row.path.clone();
 
+        // 折叠箭头 + 类型图标：目录两态动态（开/闭），文件静态右指箭头
+        // （行首对齐占位——与迁移前语系一致）。#385 批 5b：箭头落
+        // start_slot、类型图标与标签落 children（ListItem 内容槽）。
         let (chevron, icon) = if is_dir {
             (
                 if row.expanded {
@@ -338,72 +342,73 @@ impl FileTree {
         // #166：右键目标（目录本身 / 文件所在目录）与菜单位置随行携带。
         let path_for_menu = row.path.clone();
 
-        h_flex()
-            .id(gpui::SharedString::from(format!(
-                "ft-{}-{}",
-                row.depth,
-                row.path.display()
-            )))
-            .pl(indent)
-            .pr_2()
-            .gap_1()
-            .h(px(22.))
-            .flex_none()
-            .items_center()
-            .rounded_sm()
-            .when(row.is_active, |el| el.bg(selected))
-            .hover(move |el| el.bg(hover))
-            // 左键：目录展开/折叠；文件经 F1 通道打开（shell 跨实体经
-            // Entity::update 进入，焦点句柄返回后在监听器 window 域落焦
-            //——update_in 在派生上下文解析不到窗口，F7 实测）。
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    if is_dir {
-                        this.state.toggle(&path);
-                        cx.notify();
-                    } else {
-                        let shell = this.shell.clone();
-                        let focus = shell
-                            .update(cx, |shell, cx| shell.open_document_tab(path.clone(), cx))
-                            .ok()
-                            .flatten();
-                        if let Some(focus) = focus {
-                            window.focus(&focus, cx);
-                        }
-                    }
-                }),
-            )
-            // 右键：上下文菜单（#166 接线——菜单在 shell 状态上，位置取
-            // 按下点的窗口坐标；动作派发回 shell 的 activate_context_menu_item）。
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    let pos = context_menu::Point::new(
-                        event.position.x.as_f32(),
-                        event.position.y.as_f32(),
-                    );
-                    let _ = this.shell.update(cx, |shell, cx| {
-                        shell.open_file_tree_context_menu(pos, path_for_menu.clone(), is_dir, cx)
-                    });
-                }),
-            )
-            .child(
-                Icon::new(chevron)
-                    .size(IconSize::XSmall)
-                    .color(ui::Color::Muted),
-            )
-            .child(
-                Icon::new(icon)
-                    .size(IconSize::XSmall)
-                    .color(ui::Color::Muted),
-            )
-            .child(
-                Label::new(row.name.as_str())
-                    .size(LabelSize::Small)
-                    .when(row.is_active, |l| l.color(ui::Color::Accent)),
-            )
-            .into_any_element()
+        // #385 批 5b：手写行（h_flex + 手动 pl/hover/选中/id）迁
+        // ui::ListItem——非 inset 模式（缩进画行内、hover/选中底色通栏，
+        // 与迁移前语系一致）；深度缩进经组件 indent_level（14px 步进 =
+        // 旧 depth*14 口径）；行高钉 22px。左/右键经组件 on_click /
+        // on_secondary_mouse_down（MouseButton 枚举在组件内部接线）。
+        ListItem::new(gpui::SharedString::from(format!(
+            "ft-{}-{}",
+            row.depth,
+            row.path.display()
+        )))
+        .indent_level(row.depth)
+        .indent_step_size(px(14.))
+        .height(px(22.))
+        // 无障碍升级：树行语义（Role::TreeItem + 行名播报；选中态随
+        // 组件 selected → aria_selected 自动播报）。
+        .aria_role(Role::TreeItem)
+        .aria_label(row.name.as_str())
+        // 左键：目录展开/折叠；文件经 F1 通道打开（ListItem.on_click——
+        // 组件内 MouseButton::Left 接线；shell 跨实体经 Entity::update
+        // 进入，焦点句柄返回后在监听器 window 域落焦——update_in 在派生
+        // 上下文解析不到窗口，F7 实测）。
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if is_dir {
+                this.state.toggle(&path);
+                cx.notify();
+            } else {
+                let shell = this.shell.clone();
+                let focus = shell
+                    .update(cx, |shell, cx| shell.open_document_tab(path.clone(), cx))
+                    .ok()
+                    .flatten();
+                if let Some(focus) = focus {
+                    window.focus(&focus, cx);
+                }
+            }
+        }))
+        // 右键：上下文菜单（#166 接线保持——菜单在 shell 状态上，位置取
+        // 按下点坐标；动作派发回 shell 的 activate_context_menu_item。
+        // ListItem.on_secondary_mouse_down——组件内 MouseButton::Right）。
+        .on_secondary_mouse_down(
+            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                let pos =
+                    context_menu::Point::new(event.position.x.as_f32(), event.position.y.as_f32());
+                let _ = this.shell.update(cx, |shell, cx| {
+                    shell.open_file_tree_context_menu(pos, path_for_menu.clone(), is_dir, cx)
+                });
+            }),
+        )
+        .start_slot(
+            Icon::new(chevron)
+                .size(IconSize::XSmall)
+                .color(ui::Color::Muted),
+        )
+        .child(
+            Icon::new(icon)
+                .size(IconSize::XSmall)
+                .color(ui::Color::Muted),
+        )
+        .child(
+            Label::new(row.name.as_str())
+                .size(LabelSize::Small)
+                .when(row.is_active, |l| l.color(ui::Color::Accent)),
+        )
+        // 当前打开文件高亮（组件 selected 语系——ghost_element_selected
+        // 通栏底色 + 上方 Label::Accent 文字色）。
+        .toggle_state(row.is_active)
+        .into_any_element()
     }
 }
 
