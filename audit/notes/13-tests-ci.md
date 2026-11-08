@@ -69,7 +69,7 @@
 | **Word/WPS/Acrobat** | **不存在于任何测试套件**（rg 全仓除 third_party 零调用） | — | 0 |
 
 ### 1.7 性能测试 —— 存在但三种互不一致的纪律（T-7）
-- 硬阈值断言：mang-shell buffer.rs:2315-2317（千处批量替换 <100ms + 千处撤销验收线）、CI 以 `--test-threads=1` 防抖动（windows-test.yml:132-135 注释自认「4 核 runner 会抖动」）。
+- 硬阈值断言：mang-shell `g1_find_replace_tests::replace_batch_thousand_matches_under_100ms`（千处批量替换保留 #91 的 <100ms 原目标；撤销独立计量并断言一次恢复原文）。#547 方案 B 采用三个独立、等价样本的最小替换耗时排除单次调度抖动，每轮新建 Buffer 与完整编辑列表、验证1000处正文替换及撤销；构建/匹配不计时，所有耗时留痕。持续负载若三样本均超目标仍失败，不宣称放宽阈值不会漏抓退化。CI 仍以 `--test-threads=1` 控制测试间调度干扰（windows-test.yml）。
 - 计量留痕无断言：mdcore r14_gates.rs（头注明示「不做脆弱的时间硬断言」）、r11_stress；pdfc_perf.rs `#[ignore]`（「阈值=实测×3」人工口径）。
 - py 侧宽松护栏：web_smoke.py G1 `cursor_p95 < 1000ms`（:767）——gates.md 的「<16ms 硬门 PASS」是人工判读。
 - R6 B-1..B-10 MD 面基准大部分空位（01 笔记已登记）。
