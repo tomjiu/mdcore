@@ -127,6 +127,7 @@ pub mod docx_revision;
 // 独立 profile/超时/分类错误含无 LO 安装指引）。
 pub mod anonymize;
 pub mod convert;
+pub mod dark_scan;
 pub mod io;
 pub mod numbering;
 // #307 ②功能独立项：PDF→DOCX 文本版导出桥（纯数据边界模型 + 段落

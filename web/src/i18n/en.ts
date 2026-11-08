@@ -185,6 +185,17 @@ export const en = {
   'grid.guideHint1': 'Drop a .xlsx on this panel to open',
   'grid.guideHint2': 'or use the top-bar “open .xlsx grid” button',
 
+  // ---- dark-label scan verification face (dark_scan.ts, #520) ----
+  'darkscan.scan': 'dark-label scan',
+  'darkscan.scanTitle': 'Scan any .docx/.xlsx artifact for identity residue (author/company/commenters — no assumption the artifact came from this engine)',
+  'darkscan.title': 'dark-label scan result',
+  'darkscan.clean': '0 identity residuals — artifact is clean',
+  'darkscan.found': '{n} identity residual(s)',
+  'darkscan.bridgeAbsent': 'scan face not ready (wasm dark_scan absent — pending rebuild); not verified this run',
+  'darkscan.unsupportedKind': 'unsupported file type (.docx / .xlsx only): {name}',
+  'darkscan.scanFailed': 'scan failed ({code}): {message}',
+  'darkscan.close': 'close',
+
   // ---- PDF 面板（pdf_view.ts）----
   'pdf.open': 'open .pdf',
   'pdf.openTitle': 'Open a PDF in this panel (pdf.js display + wasm session model)',
