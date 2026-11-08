@@ -259,6 +259,24 @@ pub fn export_with_edits_core(
     Ok((bytes, export_stats_json(&stats)))
 }
 
+/// #499：读-改-写 + 暗标匿名导出（纯内核——wasm 方法薄委托，原生
+/// cargo test 面）。编辑/统计语义与 [`export_with_edits_core`] 完全
+/// 一致，仅追加导出后清理：docProps 三件套匿名 + 批注作者名清空 +
+/// 其余部件字节级透传（office-io anonymize 模块）。
+pub fn export_with_edits_anonymized_core(
+    book: &Book,
+    bytes: &[u8],
+    edits_json: &str,
+) -> Result<(Vec<u8>, String), GridError> {
+    let (out, stats) = export_with_edits_core(book, bytes, edits_json)?;
+    let out =
+        mdc_office_io::anonymize::anonymize_xlsx_props(&out).map_err(|e| GridError::Rebuild {
+            code: "xlsx_anonymize",
+            message: format!("{e}"),
+        })?;
+    Ok((out, stats))
+}
+
 pub fn sheets_core(book: &Book) -> String {
     let sheets: Vec<String> = book
         .sheets
@@ -410,6 +428,18 @@ impl WasmBook {
     pub fn export_with_edits(&self, edits_json: &str) -> Result<Vec<u8>, JsValue> {
         let (bytes, stats) =
             export_with_edits_core(&self.book, &self.bytes, edits_json).map_err(|e| e.to_js())?;
+        *self.last_stats.borrow_mut() = stats;
+        Ok(bytes)
+    }
+
+    /// #499：读-改-写**暗标匿名**导出——产物过
+    /// `anonymize_xlsx_props`（docProps 三件套匿名 + 批注作者名清空 +
+    /// 其余部件字节级透传；细节见 office-io anonymize 模块文档）。
+    /// 编辑/统计语义与 [`Self::export_with_edits`] 完全一致——仅追加
+    /// 导出后清理（既有方法签名零变化）。
+    pub fn export_with_edits_anonymized(&self, edits_json: &str) -> Result<Vec<u8>, JsValue> {
+        let (bytes, stats) = export_with_edits_anonymized_core(&self.book, &self.bytes, edits_json)
+            .map_err(|e| e.to_js())?;
         *self.last_stats.borrow_mut() = stats;
         Ok(bytes)
     }

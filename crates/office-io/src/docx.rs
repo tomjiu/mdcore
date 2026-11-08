@@ -8109,38 +8109,9 @@ fn replace_slot_footer(docx: &mut docx_rs::Docx, slot: SlotKind, f: docx_rs::Foo
 // G3 暗标元数据匿名化（issue #6 / 标书 R-11 BLOCKER——2026-10-26）
 // ---------------------------------------------------------------------------
 
-/// 匿名 core.xml（与引擎新建面 `DocxWriter::save_to_vec` 产物**逐字节
-/// 同构**——探针 g3_docx_docprops_inventory 实测锚点。「新建」与
-/// 「匿名导出」元数据面一致 = 单一真源语义：unknown 作者 + epoch
-/// 零时 + revision=1）。
-const ANON_CORE_XML: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-    r#"<cp:coreProperties"#,
-    r#" xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties""#,
-    r#" xmlns:dc="http://purl.org/dc/elements/1.1/""#,
-    r#" xmlns:dcterms="http://purl.org/dc/terms/""#,
-    r#" xmlns:dcmitype="http://purl.org/dc/dcmitype/""#,
-    r#" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
-    r#"<dcterms:created xsi:type="dcterms:W3CDTF">1970-01-01T00:00:00Z</dcterms:created>"#,
-    r#"<dc:creator>unknown</dc:creator>"#,
-    r#"<cp:lastModifiedBy>unknown</cp:lastModifiedBy>"#,
-    r#"<dcterms:modified xsi:type="dcterms:W3CDTF">1970-01-01T00:00:00Z</dcterms:modified>"#,
-    r#"<cp:revision>1</cp:revision>"#,
-    r#"</cp:coreProperties>"#,
-);
-
-/// 匿名 app.xml / custom.xml（空骨架——与引擎新建面同构；custom 的
-/// Company/Sender 等 VT 自定义属性整面清空）。
-const ANON_APP_XML: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-    r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties""#,
-    r#" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>"#,
-);
-const ANON_CUSTOM_XML: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-    r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties""#,
-    r#" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>"#,
-);
+// #499：docProps 三件套匿名常量上移 anonymize.rs（OPC schema 跨
+// OOXML 通用——DOCX/XLSX 两面共享单一真源；字节不变，仅搬家）。
+use crate::anonymize::{ANON_APP_XML, ANON_CORE_XML, ANON_CUSTOM_XML};
 
 /// 匿名 people.xml（批注人员名单部件——存在即清空）。
 const ANON_PEOPLE_XML: &str = concat!(

@@ -125,6 +125,7 @@ mod docx_panic_guard;
 pub mod docx_revision;
 // #307 阶段①：DOCX → PDF 导出桥（LibreOffice headless 通道——探测/
 // 独立 profile/超时/分类错误含无 LO 安装指引）。
+pub mod anonymize;
 pub mod convert;
 pub mod io;
 pub mod numbering;

@@ -7,7 +7,8 @@
 use mdc_office_io::io::{read_book_from_bytes, CellData};
 use mdc_office_io::write::{CellValue, FormulaCache, WorkbookWriter};
 use mdcore_wasm::xlsx_grid::{
-    export_with_edits_core, parse_edits_core, sheets_core, slice_core, GridError, MAX_EDIT_CELLS,
+    export_with_edits_anonymized_core, export_with_edits_core, parse_edits_core, sheets_core,
+    slice_core, GridError, MAX_EDIT_CELLS,
 };
 
 fn sample_book() -> Vec<u8> {
@@ -300,4 +301,102 @@ fn parse_edits_accepts_all_kinds() {
         mdc_office_io::rebuild::EditValue::Boolean(true)
     );
     assert_eq!(edits[3].value, mdc_office_io::rebuild::EditValue::Empty);
+}
+
+// ---------------------------------------------------------------------------
+// #499：读-改-写 + 暗标匿名导出（export_with_edits_anonymized_core）
+// ---------------------------------------------------------------------------
+
+/// 脏 fixture（身份元数据面——rust_xlsxwriter 新建面没有身份字段，
+/// 手工注入 docProps 三件套模拟真实投标件）。以 sample_book 为底，
+/// 追加脏 docProps 部件。
+fn dirty_book_with_identities() -> Vec<u8> {
+    use std::io::Write as _;
+    let base = sample_book();
+    let cursor = std::io::Cursor::new(base);
+    let mut za = zip::ZipArchive::new(cursor).unwrap();
+    let buf = std::io::Cursor::new(Vec::new());
+    let mut zw = zip::ZipWriter::new(buf);
+    let opts = zip::write::SimpleFileOptions::default();
+    let core = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>张三（某某建设集团）</dc:creator><cp:lastModifiedBy>李四</cp:lastModifiedBy></cp:coreProperties>"#;
+    let app = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Company>某某建设集团有限公司</Company></Properties>"#;
+    let mut injected_core = false;
+    let mut injected_app = false;
+    for i in 0..za.len() {
+        let item = za.by_index_raw(i).unwrap();
+        let name = item.name().to_string();
+        match name.as_str() {
+            "docProps/core.xml" => {
+                zw.start_file::<_, ()>(&name, opts).unwrap();
+                zw.write_all(core.as_bytes()).unwrap();
+                injected_core = true;
+            }
+            "docProps/app.xml" => {
+                zw.start_file::<_, ()>(&name, opts).unwrap();
+                zw.write_all(app.as_bytes()).unwrap();
+                injected_app = true;
+            }
+            _ => {
+                zw.raw_copy_file(item).unwrap();
+            }
+        }
+    }
+    // 底簿无 docProps 时补注（两种形态都覆盖：替换 / 追加）。
+    if !injected_core {
+        zw.start_file::<_, ()>("docProps/core.xml", opts).unwrap();
+        zw.write_all(core.as_bytes()).unwrap();
+    }
+    if !injected_app {
+        zw.start_file::<_, ()>("docProps/app.xml", opts).unwrap();
+        zw.write_all(app.as_bytes()).unwrap();
+    }
+    zw.finish().unwrap().into_inner()
+}
+
+fn part(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut za = zip::ZipArchive::new(cursor).ok()?;
+    let mut f = za.by_name(name).ok()?;
+    let mut out = Vec::new();
+    f.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+#[test]
+fn export_with_edits_anonymized_e2e() {
+    let bytes = dirty_book_with_identities();
+    let book = read_book_from_bytes(&bytes).unwrap();
+    let edits = r#"[{"sheet":0,"r":1,"c":1,"k":"number","v":99.5}]"#;
+
+    let (out, stats) = export_with_edits_anonymized_core(&book, &bytes, edits).unwrap();
+
+    // 编辑语义与既有出口完全一致（统计形态同 export_with_edits）。
+    for key in ["\"cells_written\":1", "\"edits_applied\":1"] {
+        assert!(stats.contains(key), "stats 缺 {key}: {stats}");
+    }
+    // 编辑落位（读面重开可见）。
+    let reread = read_book_from_bytes(&out).unwrap();
+    assert_eq!(
+        reread.sheets[0].typed.get_abs(1, 1),
+        Some(&CellData::Number(99.5))
+    );
+
+    // 暗标清理面：身份清零 + unknown 常量。
+    let core = String::from_utf8(part(&out, "docProps/core.xml").unwrap()).unwrap();
+    assert!(!core.contains("张三"), "{core}");
+    assert!(!core.contains("李四"), "{core}");
+    assert!(core.contains("<dc:creator>unknown</dc:creator>"), "{core}");
+    let app = String::from_utf8(part(&out, "docProps/app.xml").unwrap()).unwrap();
+    assert!(!app.contains("某某建设集团"), "{app}");
+    // 非 docProps 部件（worksheet 手术部件）不受清理影响——编辑值已断言。
+}
+
+#[test]
+fn export_with_edits_anonymized_error_surface() {
+    // 坏编辑账本 JSON → 既有错误面（清理不遮蔽编辑错误）。
+    let bytes = sample_book();
+    let book = read_book_from_bytes(&bytes).unwrap();
+    let err = export_with_edits_anonymized_core(&book, &bytes, "not json").unwrap_err();
+    assert!(matches!(err, GridError::EditsJson(_)), "{err:?}");
 }
