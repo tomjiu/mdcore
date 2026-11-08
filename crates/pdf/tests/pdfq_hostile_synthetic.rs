@@ -87,12 +87,12 @@ fn sweep(label: &str, input: &[u8]) -> (String, String, String) {
         Err(e) => format!("err({:?})", e),
     }))
     .unwrap_or_else(|_| panic!("[{label}] open_scan panic"));
-    let writer = catch_unwind(AssertUnwindSafe(|| {
-        match LopdfWriter::from_bytes_with_limits(input.to_vec(), limits) {
+    let writer = catch_unwind(AssertUnwindSafe(
+        || match LopdfWriter::from_bytes_with_limits(input.to_vec(), limits) {
             Ok(_) => "ok".to_string(),
             Err(e) => format!("err({:?})", e),
-        }
-    }))
+        },
+    ))
     .unwrap_or_else(|_| panic!("[{label}] from_bytes_with_limits panic"));
     let annots = catch_unwind(AssertUnwindSafe(|| {
         match read_annotations(input.to_vec(), limits) {
@@ -187,16 +187,16 @@ fn huge_declared_count_stays_bounded() {
         .windows(9)
         .position(|w| w == b"/Count 1 ")
         .expect("pages count");
-    pdf.splice(
-        count_at..count_at + 9,
-        b"/Count 4294967295 ".to_vec(),
-    );
+    pdf.splice(count_at..count_at + 9, b"/Count 4294967295 ".to_vec());
     let (scan, writer, annots) = sweep("huge-count", &pdf);
     // 合同:typed 结果 + **有界**——任何 Ok 面的计数不得吞下宣称值
     // (三入口的计数口径 = 实际遍历对象,非声明值;此处锁「不 panic +
     // 结果字符串为有限格式」)。
     assert!(!scan.contains("4294967295"), "扫描面吞下巨 Count:{scan}");
-    assert!(!annots.contains("4294967295"), "标注面吞下巨 Count:{annots}");
+    assert!(
+        !annots.contains("4294967295"),
+        "标注面吞下巨 Count:{annots}"
+    );
     let _ = writer;
 }
 
@@ -229,7 +229,10 @@ fn deep_nested_dictionary_is_bounded() {
     }
     let mut pdf = minimal_pdf();
     // 注入进 catalog 对象体(替换 /Catalog 键段)。
-    let cat_at = pdf.windows(9).position(|w| w == b"/Catalog ").expect("catalog");
+    let cat_at = pdf
+        .windows(9)
+        .position(|w| w == b"/Catalog ")
+        .expect("catalog");
     let injected = format!("/Deep {}", body);
     pdf.splice(cat_at..cat_at + 9, injected.into_bytes());
     let (scan, writer, annots) = sweep("deep-nest", &pdf);
