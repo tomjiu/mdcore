@@ -473,10 +473,12 @@ pub struct Editor {
     locked_notice: Option<LockedNotice>,
 }
 
-/// #179：右键菜单上抛回调（shell 注入——闭包内持 ShellApp 弱句柄）。
-/// 参数：(窗口坐标, 是否有选区, 是否只读)；在编辑器的右键 listener
-/// 里同步调用，菜单状态落在 shell 上（ed-* 动作派发回 shell）。
-pub type MenuOpener = Box<dyn Fn(context_menu::Point, bool, bool, &mut App) + 'static>;
+/// #179（#385 批 1）：右键菜单上抛回调（shell 注入——闭包内持
+/// ShellApp 弱句柄）。参数：(窗口坐标, 是否有选区, 是否只读, 窗口)；
+/// 在编辑器的右键 listener 里同步调用，菜单实体构建在 shell 上
+/// （ed-* 动作派发回 shell）。#385 批 1 起 shell 侧用 `ui::ContextMenu`
+/// 组件构建菜单，需要 Window（组件内部要订阅焦点/blur）。
+pub type MenuOpener = Box<dyn Fn(context_menu::Point, bool, bool, &mut Window, &mut App) + 'static>;
 
 /// #178：锁定行拒改提示（状态栏消费）。
 ///
@@ -3317,7 +3319,7 @@ impl Editor {
         //（闭包里是 shell.open_editor_context_menu——菜单状态与
         // ed-* 动作派发面都在 shell）。
         if let Some(opener) = self.menu_opener.as_deref() {
-            opener(pos, has_selection, read_only, cx);
+            opener(pos, has_selection, read_only, window, cx);
         } else {
             cx.notify();
         }
