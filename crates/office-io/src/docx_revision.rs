@@ -41,7 +41,11 @@
 //! 3. **`date` 为 `String`（ISO 8601）而非 `chrono::DateTime<Utc>`**——
 //!    office-io 依赖闭包 = calamine/serde_json/zip/docx-rs（零 chrono，
 //!    依赖纪律），OOXML `w:date` 本就是 W3CDTF 字符串面（schema
-//!    ST_DateTime），字符串承载无损。
+//!    ST_DateTime），字符串承载无损。**#586 补面**：docx-rs `date()`
+//!    原始字节拼入 XML 属性（无第二层转义——研究仓 round47 源级证据），
+//!    含 `"` 的串可闭合属性注入伪造属性——发射前经
+//!    [`validate_revision_date`] 共享边界把关（语法白名单，非法
+//!    拒入粘性错误漏斗，save 零产物）。
 //!
 //! ## 边界（issue「不做」清单 + 本模块补充）
 //!
@@ -56,20 +60,26 @@ use crate::docx::DocxWriter;
 
 /// 修订标记元数据（`w:ins`/`w:del` 的 `w:author` + `w:date` 承载）。
 ///
-/// `author`/`date` 直落 OOXML 属性（XML 转义由 docx-rs 构造器内聚）；
-/// `w:id` 由 docx-rs HistoryId 自动分配（见模块文档偏差 2）。
+/// `author` 落 OOXML 属性（XML 转义由 docx-rs `author()` 构造器内聚
+/// ——escape_owned 源级在档）；`date` 经 [`validate_revision_date`]
+/// 共享边界把关（#586：docx-rs `date()` 无第二层转义，语法白名单
+/// 拒注入面字符）；`w:id` 由 docx-rs HistoryId 自动分配（见模块文档
+/// 偏差 2）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionMark {
     /// 修订作者（`w:author`——Word 审阅窗格显示名）。
     pub author: String,
-    /// 修订时间（`w:date`——W3CDTF / ISO 8601 字符串，如
-    /// `2026-11-07T08:30:00Z`）。
+    /// 修订时间（`w:date`——W3CDTF / ISO 8601 完整形态，如
+    /// `2026-11-07T08:30:00Z`；#586 起发射前校验，非法拒入
+    /// 粘性错误漏斗——**空串拒绝**：「不关心时间」用
+    /// [`RevisionMark::default`] 的 epoch 兜底，不用空串占位）。
     pub date: String,
 }
 
 impl RevisionMark {
-    /// 构造（author/date 直入——空串合法但 Word 显示面为空，
-    /// 调用方自证；缺省面见 [`RevisionMark::default`]）。
+    /// 构造（author 直入 / date 发射前经共享边界校验——构造期不拒，
+    /// 违规在 [`DocxWriter::insert_run_revised`] /
+    /// [`DocxWriter::delete_run_revised`] 落粘性错误，save 零产物）。
     pub fn new(author: impl Into<String>, date: impl Into<String>) -> Self {
         Self {
             author: author.into(),
@@ -97,9 +107,19 @@ impl DocxWriter {
     /// 时正常提取且 run 带 `revision_inserted = true`（Word 显示为
     /// 插入修订，带下划线着色）。
     ///
+    /// #586：`mark.date` 发射前经 [`validate_revision_date`] 共享边界
+    /// 把关——非法拒入粘性错误（save 漏斗零产物，V7 同纪律）。
+    ///
     /// r4-t2 计数：1 段 + 1 run（与 [`DocxWriter::page_break`] 同为
     /// 非 RunSpec 发射面——按发射面诚实计数，走 save 漏斗上限）。
     pub fn insert_run_revised(&mut self, text: &str, mark: &RevisionMark) {
+        // #586：共享日期边界（ins/del × 纯文本/富文本四调用点同源）。
+        if let Err(msg) = validate_revision_date(&mark.date) {
+            self.record_validation_error(format!(
+                "修订日期非法（insert_run_revised：author={:?} date={:?}）：{msg}",
+                mark.author, mark.date
+            ));
+        }
         let run = docx_rs::Run::new().add_text(text);
         let ins = docx_rs::Insert::new(run)
             .author(&mark.author)
@@ -118,8 +138,18 @@ impl DocxWriter {
     /// 删除线修订）。注意 run 内是 `w:delText` 而非 `w:t`（OOXML
     /// 删除修订的承载约定——`w:t` 在 `w:del` 内是非法形态）。
     ///
+    /// #586：`mark.date` 发射前经 [`validate_revision_date`] 共享边界
+    /// 把关——与 [`Self::insert_run_revised`] 同源同语义。
+    ///
     /// r4-t2 计数：1 段 + 1 run（同 [`DocxWriter::insert_run_revised`]）。
     pub fn delete_run_revised(&mut self, text: &str, mark: &RevisionMark) {
+        // #586：共享日期边界（首错落账——两法互不覆盖）。
+        if let Err(msg) = validate_revision_date(&mark.date) {
+            self.record_validation_error(format!(
+                "修订日期非法（delete_run_revised：author={:?} date={:?}）：{msg}",
+                mark.author, mark.date
+            ));
+        }
         let run = docx_rs::Run::new().add_delete_text(text);
         let del = docx_rs::Delete::new()
             .add_run(run)
@@ -129,6 +159,151 @@ impl DocxWriter {
         let docx = std::mem::take(self.docx_mut());
         *self.docx_mut() = docx.add_paragraph(p);
         self.count_raw_emission(1, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #586：修订日期共享校验边界（纯文本 ins/del 与富文本 ins/del 四
+// 调用点同源把关——富文本面 [#556/#580] 合入时在同 impl 内加调用
+// 即可，无需复制逻辑）。
+// ---------------------------------------------------------------------------
+
+/// #586：修订日期 W3CDTF 语法级校验（共享边界）。
+///
+/// **威胁模型**：`w:date` 经 docx-rs `date()` 原始字节拼入 XML 属性
+/// （无第二层转义——研究仓 round47 源级证据，主 f36b40e 生产写面
+/// 实证：`2026-…Z" injected="yes` 产出 `w:date="…Z" injected="yes"
+/// 伪造属性）。语法白名单从源头拒绝（属性面字符集 ∈ 安全面）。
+///
+/// 接受（**无损保留原文**——大小写/时区形态原样落 `w:date`）：
+///
+/// ```text
+/// YYYY-MM-DDThh:mm:ss[.f+][Z|z|±HH:MM]
+/// ```
+///
+/// - 年 4 位数字（`0000`-`9999`——ISO 8601:2019 容忍 `0000`，
+///   XSD 1.0 不允许——按模块声明的双标准取宽容面）；
+/// - 月 `01`-`12` / 日 `01`-`31` / 时 `00`-`23` / 分 `00`-`59` /
+///   秒 `00`-`60`（`60` = 闰秒，XSD 惯例）；
+/// - 小数秒：`.` + ≥1 位数字（不封顶——纳秒面无损）；
+/// - 时区：缺省（XSD 合法）| `Z`/`z` | `±HH:MM`（偏移时 `00`-`23`、
+///   分 `00`-`59`）；
+/// - `T` 分隔大小写均收（ISO 8601 容忍 `t`，保留原样）。
+///
+/// 拒绝（→ 粘性错误 + save 零产物）：
+///
+/// - **空串**（显式选择：W3CDTF 无空形态——「不关心时间」面用
+///   [`RevisionMark::default`] 的 epoch 兜底，不用空串占位）；
+/// - XML 属性面危险字符（`"` `'` `<` `>` `&`、控制字符、空白、
+///   非 ASCII——注入面 + Word 解析面双拒；结构校验逐字节把关，
+///   任何未预期字符必落拒绝）；
+/// - 结构错位（长度不足 / 分隔位错 / 非数字位）与域越界
+///   （月 `13`、时 `24`、秒 `61`、偏移 `+25:00`…）。
+///
+/// 边界如实登记：**语法级**校验（非日历级——`02-30`/`02-31` 等月末
+/// 语义不在本层，由消费端 Word/LO 承载；office-io 依赖闭包零
+/// chrono，语法白名单是无重型依赖下的安全承载）。
+pub(crate) fn validate_revision_date(date: &str) -> Result<(), String> {
+    let b = date.as_bytes();
+    // 完整形态固定前缀长度：YYYY-MM-DDThh:mm:ss = 19 字节。
+    if b.len() < 19 {
+        return Err(format!(
+            "长度 {} < 19（W3CDTF 完整形态 YYYY-MM-DDThh:mm:ss）",
+            b.len()
+        ));
+    }
+    // 数字位（年 4 + 月 2 + 日 2 + 时 2 + 分 2 + 秒 2 = 14 位——逐位
+    // is_ascii_digit，多字节 UTF-8 的字节必非数字位落拒；错误消息用
+    // 字节而非 str 切片（非字符边界切片会 panic——防御面）。
+    for (label, start, width) in [
+        ("年", 0usize, 4usize),
+        ("月", 5, 2),
+        ("日", 8, 2),
+        ("时", 11, 2),
+        ("分", 14, 2),
+        ("秒", 17, 2),
+    ] {
+        for k in 0..width {
+            let pos = start + k;
+            if !b[pos].is_ascii_digit() {
+                return Err(format!(
+                    "{}域第 {} 字节非数字（字节 0x{:02X}——结构/字符白名单违规）",
+                    label, pos, b[pos]
+                ));
+            }
+        }
+    }
+    // 分隔位：- - T : :（T 大小写均收）。
+    if b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
+        return Err("分隔符错位（须 YYYY-MM-DDThh:mm:ss）".into());
+    }
+    if b[10] != b'T' && b[10] != b't' {
+        return Err("日期时间分隔须为 T/t（位置 10）".into());
+    }
+    // 域越界（语法级——日上限 31，月末语义由消费端承载）。
+    let two = |i: usize| (b[i] - b'0') as u32 * 10 + (b[i + 1] - b'0') as u32;
+    let month = two(5);
+    let day = two(8);
+    let hour = two(11);
+    let minute = two(14);
+    let second = two(17);
+    if !(1..=12).contains(&month) {
+        return Err(format!("月域 {month:02} 超界（须 01-12）"));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(format!("日域 {day:02} 超界（须 01-31）"));
+    }
+    if hour > 23 {
+        return Err(format!("时域 {hour:02} 超界（须 00-23）"));
+    }
+    if minute > 59 {
+        return Err(format!("分域 {minute:02} 超界（须 00-59）"));
+    }
+    if second > 60 {
+        return Err(format!("秒域 {second:02} 超界（须 00-60，60 = 闰秒）"));
+    }
+    // 尾部：小数秒和/或时区（逐字节把关——任何未预期字符拒绝）。
+    let mut rest = &b[19..];
+    if rest.first() == Some(&b'.') {
+        let frac_len = rest[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if frac_len == 0 {
+            return Err("小数秒须至少 1 位数字（`.` 后无数字）".into());
+        }
+        rest = &rest[1 + frac_len..];
+    }
+    match rest.first() {
+        None => Ok(()), // 时区缺省（XSD 合法）。
+        Some(b'Z') | Some(b'z') => {
+            if rest.len() != 1 {
+                return Err(format!("Z 后尾随 {} 字节（须恰为 Z）", rest.len() - 1));
+            }
+            Ok(())
+        }
+        Some(b'+') | Some(b'-') => {
+            if rest.len() != 6 || rest[3] != b':' {
+                return Err("时区偏移须为 ±HH:MM（恰 6 字节）".into());
+            }
+            if !rest[1].is_ascii_digit()
+                || !rest[2].is_ascii_digit()
+                || !rest[4].is_ascii_digit()
+                || !rest[5].is_ascii_digit()
+            {
+                return Err("时区偏移 HH/MM 须为数字".into());
+            }
+            let tz_h = (rest[1] - b'0') as u32 * 10 + (rest[2] - b'0') as u32;
+            let tz_m = (rest[4] - b'0') as u32 * 10 + (rest[5] - b'0') as u32;
+            if tz_h > 23 {
+                return Err(format!("时区偏移时 {tz_h:02} 超界（须 00-23）"));
+            }
+            if tz_m > 59 {
+                return Err(format!("时区偏移分 {tz_m:02} 超界（须 00-59）"));
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!(
+            "尾部非法字符 {:?}（仅允许小数秒/时区 Z|±HH:MM）",
+            *other as char
+        )),
     }
 }
 
@@ -145,6 +320,117 @@ mod tests {
         assert_eq!(
             RevisionMark::default(),
             RevisionMark::new("unnamed", "1970-01-01T00:00:00Z")
+        );
+    }
+
+    // ── #586：共享日期边界（语法白名单——合法面） ──────────────
+
+    #[test]
+    fn revision_date_accepts_w3cdtf_forms() {
+        // UTC（既有夹具同款）。
+        assert!(validate_revision_date("2026-11-07T08:30:00Z").is_ok());
+        // 时区偏移（正负两侧）。
+        assert!(validate_revision_date("2026-11-07T08:30:00+08:00").is_ok());
+        assert!(validate_revision_date("2026-11-07T08:30:00-05:30").is_ok());
+        // 小数秒（毫秒/微秒/纳秒——不封顶无损）。
+        assert!(validate_revision_date("2026-11-07T08:30:00.5Z").is_ok());
+        assert!(validate_revision_date("2026-11-07T08:30:00.123456Z").is_ok());
+        assert!(validate_revision_date("2026-11-07T08:30:00.123456789+08:00").is_ok());
+        // 时区缺省（XSD 合法）。
+        assert!(validate_revision_date("2026-11-07T08:30:00").is_ok());
+        // 小写 t/z（ISO 8601 容忍——保留原样）。
+        assert!(validate_revision_date("2026-11-07t08:30:00z").is_ok());
+        // 域边界：秒 60（闰秒）/ 日 31 / 时 23 / 偏移 23:59。
+        assert!(validate_revision_date("2026-12-31T23:59:60Z").is_ok());
+        assert!(validate_revision_date("2024-01-31T00:00:00Z").is_ok());
+        assert!(validate_revision_date("2026-01-01T23:00:00+23:59").is_ok());
+        // 年 0000（ISO 8601:2019 容忍——模块声明双标准取宽容面）。
+        assert!(validate_revision_date("0000-01-01T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn revision_date_rejects_injection_and_structural_violations() {
+        // 注入面（issue 实证载荷 + 属性面危险字符族）。
+        let payload = "2026-11-08T00:00:00Z\" injected=\"yes";
+        assert!(
+            validate_revision_date(payload).is_err(),
+            "属性注入载荷必须拒"
+        );
+        for bad in [
+            "2026-11-08T00:00:00Z<x/>",
+            "2026-11-08T00:00:00Z&amp;",
+            "2026-11-08T00:00:00Z'",
+            "2026-11-08T00:00:00\nZ",
+            "2026-11-08T00:00:00 Z",
+            "2026-11-08T00:00:00\tZ",
+        ] {
+            assert!(
+                validate_revision_date(bad).is_err(),
+                "危险字符面须拒：{bad:?}"
+            );
+        }
+        // 空（显式选择——见 RevisionMark 文档）。
+        assert!(validate_revision_date("").is_err(), "空串拒绝");
+        // 结构错位。
+        for bad in [
+            "2026-11-08",                // 日期面
+            "2026-11-08 00:00:00Z",      // 空格代 T
+            "2026-11-08T00:00Z",         // 缺秒
+            "26-11-08T00:00:00Z",        // 年 2 位
+            "2026/11/08T00:00:00Z",      // 斜杠分隔
+            "2026-13-08T00:00:00Z",      // 月 13
+            "2026-00-08T00:00:00Z",      // 月 00
+            "2026-11-32T00:00:00Z",      // 日 32
+            "2026-11-00T00:00:00Z",      // 日 00
+            "2026-11-08T24:00:00Z",      // 时 24
+            "2026-11-08T00:60:00Z",      // 分 60
+            "2026-11-08T00:00:61Z",      // 秒 61
+            "2026-11-08T00:00:00.Z",     // 小数秒无数字
+            "2026-11-08T00:00:00+8:00",  // 偏移时 1 位
+            "2026-11-08T00:00:00+25:00", // 偏移时 25
+            "2026-11-08T00:00:00+08:60", // 偏移分 60
+            "2026-11-08T00:00:00ZZ",     // 双 Z
+            "2026-11-08T00:00:00Z ",     // 尾随空白
+            "中文日期",                  // 非 ASCII
+        ] {
+            assert!(
+                validate_revision_date(bad).is_err(),
+                "结构/域违规须拒：{bad:?}"
+            );
+        }
+    }
+
+    /// 粘性首错语义：第一个违规落账，后续（含合法发射）不覆盖。
+    #[test]
+    fn revision_date_sticky_first_error_wins() {
+        let mut w = DocxWriter::new();
+        let bad = RevisionMark::new("甲", "2026-11-08T00:00:00Z\" injected=\"yes");
+        w.insert_run_revised("a", &bad);
+        // 合法发射不覆盖粘性错误。
+        w.insert_run_revised("b", &RevisionMark::default());
+        let err = w.save_to_vec().expect_err("粘性错误必须令 save 恒拒");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("insert_run_revised"),
+            "错误含接口上下文：{msg}"
+        );
+        assert!(msg.contains("date"), "错误含字段上下文：{msg}");
+        assert!(
+            !msg.contains("delete_run_revised"),
+            "首错（ins 面）不被后错覆盖的语义面——错误唯一起点：{msg}"
+        );
+    }
+
+    /// del 面同源把关（接口上下文区分 ins/del）。
+    #[test]
+    fn revision_date_delete_face_rejects() {
+        let mut w = DocxWriter::new();
+        let bad = RevisionMark::new("甲", "2026-11-08T00:00:00<x>");
+        w.delete_run_revised("a", &bad);
+        let err = w.save_to_vec().expect_err("del 面非法 date 必拒");
+        assert!(
+            err.to_string().contains("delete_run_revised"),
+            "del 面错误含接口上下文"
         );
     }
 }

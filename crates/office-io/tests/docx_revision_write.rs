@@ -282,3 +282,114 @@ fn lo_headless_conversion_smoke() {
     assert!(pdf.len() > 500, "PDF 非空（{} 字节）", pdf.len());
     println!("LO 探针通过：revision.pdf {} 字节", pdf.len());
 }
+
+// ------------------------------------------------- #586 日期共享边界
+
+/// #586 验收 1：恶意 date（属性注入载荷）经生产写面 → save_to_vec 与
+/// save_to_path 双拒且零产物（解包面此前实证：修复前 document.xml 含
+/// `injected="yes"` 伪造属性——先红后绿在案）。
+#[test]
+fn malicious_date_rejected_with_no_artifact() {
+    let payload = "2026-11-08T00:00:00Z\" injected=\"yes";
+    let bad = RevisionMark::new(AUTHOR, payload);
+
+    // ins + del 双面（共享边界四调用点的纯文本两翼）。
+    let mut w = DocxWriter::new();
+    w.insert_run_revised(INS_TEXT, &bad);
+    w.delete_run_revised(DEL_TEXT, &bad);
+    let err = w.save_to_vec().expect_err("注入载荷必须拒绝");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("insert_run_revised"),
+        "错误含接口上下文：{msg}"
+    );
+    assert!(msg.contains("date"), "错误含字段上下文：{msg}");
+    // 违规原值可诊断（{:?} 转义形态在场——含注入载荷本体）。
+    assert!(msg.contains("injected"), "错误含违规原值（可诊断）：{msg}");
+
+    // save_to_path 同漏斗 + 无目标产物（零产物语义）。
+    let dir = std::env::temp_dir().join(format!("mdc-586-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("out.docx");
+    let mut w2 = DocxWriter::new();
+    w2.insert_run_revised(INS_TEXT, &bad);
+    assert!(
+        w2.save_to_path(target.to_str().unwrap()).is_err(),
+        "save_to_path 同漏斗拒绝"
+    );
+    assert!(!target.exists(), "无目标产物（半合法文件零产出）");
+    // 临时区无残留（写器内部不落盘——save_to_path 先 vec 后写）。
+    let residue: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(residue.is_empty(), "目录零残留：{residue:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #586 验收 2：有效形态（UTC / 时区偏移 / 小数秒 / 缺省时区）无损
+/// 保留——`w:date` 属性逐字节等于原文（写面不改写合法输入）+ 读回
+/// 往返不回归。
+#[test]
+fn valid_date_forms_preserved_byte_exact() {
+    for date in [
+        "2026-11-07T08:30:00Z",
+        "2026-11-07T08:30:00+08:00",
+        "2026-11-07T08:30:00-05:30",
+        "2026-11-07T08:30:00.123456789Z",
+        "2026-11-07T08:30:00",
+    ] {
+        let mut w = DocxWriter::new();
+        w.insert_run_revised(INS_TEXT, &RevisionMark::new(AUTHOR, date));
+        w.delete_run_revised(DEL_TEXT, &RevisionMark::new(AUTHOR, date));
+        let bytes = w.save_to_vec().expect("合法形态必须可保存");
+        let xml = document_xml(&bytes);
+        // ins + del 两处 w:date 逐字节无损（原文属性值精确匹配）。
+        let expect = format!("w:date=\"{date}\"");
+        let hits = xml.matches(&expect).count();
+        assert_eq!(hits, 2, "ins+del 双处 w:date 逐字节等于原文（{date}）");
+        // 无注入残留面（修复前形态不回归的负证据）。
+        assert!(!xml.contains("injected"), "无伪造属性");
+
+        // 读回往返（验收 3 面：本 crate 读面消费合法产物）。
+        let doc = read_docx_from_bytes_with_options(&bytes, &ReadOptions { compat: true })
+            .expect("合法修订文档应可读回");
+        let mut flagged = String::new();
+        for b in &doc.blocks {
+            if let Block::Paragraph(p) = b {
+                for r in &p.runs {
+                    if r.revision_inserted {
+                        flagged.push_str(&r.text);
+                    }
+                }
+            }
+        }
+        assert_eq!(flagged, INS_TEXT, "ins 文本读回不回归（{date}）");
+    }
+}
+
+/// #586 验收 3：空串显式拒绝（「不关心时间」用 default epoch 兜底，
+/// 不用空串占位——兼容选择见 RevisionMark 文档）+ 粘性不被合法发射
+/// 覆盖（首错语义）。
+#[test]
+fn empty_date_rejected_and_sticky_error_survives_valid_emission() {
+    let mut w = DocxWriter::new();
+    w.insert_run_revised(INS_TEXT, &RevisionMark::new(AUTHOR, ""));
+    let err = w.save_to_vec().expect_err("空串拒绝（W3CDTF 无空形态）");
+    assert!(err.to_string().contains("长度 0"), "空串诊断可读：{err}");
+
+    // 粘性：违规后的合法发射不覆盖（save 恒拒直至重建写器）。
+    let mut w2 = DocxWriter::new();
+    w2.delete_run_revised(DEL_TEXT, &RevisionMark::new(AUTHOR, "2026-13-01T00:00:00Z"));
+    w2.insert_run_revised(INS_TEXT, &mark()); // 合法
+    let err2 = w2.save_to_vec().expect_err("粘性错误持续（首错不被覆盖）");
+    assert!(
+        err2.to_string().contains("delete_run_revised"),
+        "首错接口上下文保持：{err2}"
+    );
+
+    // 对照：全新写器 + 合法 mark 正常产出（重建 = 唯一解，非全局禁写）。
+    mixed_revision_docx();
+}
