@@ -237,11 +237,21 @@ fn face3_panel_toggle_changes_state() {
 /// 线（MouseButton 枚举在组件内部——锚点改钉组件方法名）。
 #[test]
 fn face4_file_tree_click_opens_document() {
+    // #575 锚点更新：钩子化后行点击链 = render_row 的 ListItem.on_click
+    // → hooks.open_file（file_tree.rs 面）→ shell.rs file_tree_hooks 的
+    // open_document_tab 调用（bin 面）——三段两文件锚定（原单文件
+    // 锚点随 lib 化拆两处）。
     let row = fn_body(&src("file_tree.rs"), "fn render_row(");
     assert!(
-        row.contains(".on_click(") && row.contains("open_document_tab"),
+        row.contains(".on_click(") && row.contains("hooks.open_file"),
         "【面 4：文件树点击 → 打开文件】行点击断链——render_row 缺 ListItem.on_click 或\
-         open_document_tab 调用（实装口径：单击打开）"
+         open_file 钩子调用（实装口径：单击打开；#575 lib 化后经钩子）"
+    );
+    let hooks = fn_body(&src("shell.rs"), "fn file_tree_hooks(");
+    assert!(
+        hooks.contains("open_document_tab"),
+        "【面 4：文件树点击 → 打开文件】bin 面断链——file_tree_hooks 的 open_file \
+         闭包缺 open_document_tab 调用（#575 钩子注入点）"
     );
     chain(
         "文件树点击 → 打开文件",
