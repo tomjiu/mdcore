@@ -151,6 +151,11 @@ pub mod signature;
 // 级不可解析按 P=1。
 #[cfg(feature = "engine-lopdf")]
 pub mod docmdp;
+// #505 / #161 P0-2：PDF /Info + XMP 暗标元数据清理（增量修订面——
+// docmdp 写前门 + S5 加密拒 + xref 链守卫；DOCX/XLSX 姊妹件见
+// office-io anonymize/dark_scan 模块）。
+#[cfg(feature = "engine-lopdf")]
+pub mod anonymize;
 
 #[cfg(feature = "engine-lopdf")]
 pub use annotate::{read_annotations, PdfAnnotator, ReadReport};
