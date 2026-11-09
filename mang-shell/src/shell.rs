@@ -69,6 +69,30 @@ const CONFIRM_BUTTONS: [&str; 3] = ["保存", "不保存", "取消"];
 /// 按钮集属于动作语义（保存三选 / 删除二选），不是全局常量。
 const DELETE_BUTTONS: [&str; 2] = ["删除", "取消"];
 
+/// #306 ①：OCR 识别线程 → 前台回流消息（16ms 轮询 drain——
+/// pdf_pages::SearchIndexMsg 同款纪律）。
+#[derive(Debug)]
+enum OcrProgressMsg {
+    /// 单页完成（done/total 1 基；words = 累计词数）。
+    Page {
+        done: usize,
+        total: usize,
+        words: usize,
+    },
+    /// 全量完成（error = 环境性失败[首页即败，结果不应用]；failed_pages
+    /// = 逐页失败清单——空词占位，完成横幅诚实计数）。
+    Done {
+        error: Option<String>,
+        pages: Vec<Vec<mdc_pdf::OcrWord>>,
+        word_count: usize,
+        failed_pages: Vec<usize>,
+        lang: String,
+    },
+}
+
+/// #306 ①：OCR 进度轮询间隔（pdf_pages::POLL_INTERVAL 同款 16ms）。
+const OCR_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 /// F4：待确认动作（脏标签关闭 / 退出 / #166 文件树删除）。
 #[derive(Clone, Debug)]
 enum ConfirmAction {
@@ -171,6 +195,11 @@ pub struct ShellApp {
     /// 文本行模型 fallback。状态栏「网格/文本」钮切换——pdf 页面/文本
     /// 先例同构）。
     xlsx_grid_view_mode: bool,
+    /// #306 ①：OCR 识别回流通道（专用线程 → 逐页进度；Done 携全量词
+    /// 表——pdf_pages 搜索索引同款纪律：通道 + 16ms 轮询 drain）。
+    ocr_rx: Option<std::sync::mpsc::Receiver<OcrProgressMsg>>,
+    /// #306 ①：OCR 轮询循环在跑（Done 消费即停——防重复起循环）。
+    ocr_polling: bool,
     /// #164 1c：首帧计时基点（ShellApp 构造时置 = perf::boot()，首个
     /// render 呈现时消费——`perf: first-frame` 证据行；MANG_PERF 未开
     /// 恒 None，零开销）。
@@ -409,6 +438,8 @@ impl ShellApp {
             git_view: false,
             settings_open: false,
             pdf_pages: None,
+            ocr_rx: None,
+            ocr_polling: false,
             pdf_view_mode: true,
             xlsx_grid: None,
             xlsx_sessions: std::collections::HashMap::new(),
@@ -1378,6 +1409,10 @@ impl ShellApp {
             // #307 ②：「导出为 DOCX」门槛（仅 pdf 形态提供；文本版导出
             // 读 PDF 文本层——扫描件零文本在转换内显式拒）。
             active_is_pdf: tab.is_some_and(|t| t.editor.read(cx).doc_kind() == "pdf"),
+            // #306 ①：「OCR 识别扫描件」门槛（pdf 态 + 扫描件 + 未识别）。
+            pdf_ocr_pending: tab.is_some_and(|t| t.editor.read(cx).pdf_ocr_pending()),
+            // #306 ②：「另存为可搜索 PDF」门槛（pdf 态 + OCR 词表在位）。
+            pdf_ocr_ready: tab.is_some_and(|t| t.editor.read(cx).pdf_ocr_ready()),
             recent_files: self.recent.recent_files().to_vec(),
         }
     }
@@ -1508,6 +1543,10 @@ impl ShellApp {
             // #307 ②功能独立项：导出为 DOCX（PDF 文本层 → office-io
             // 写面——纯 Rust 链路，无外部工具依赖）。
             Act::ExportDocx => self.export_active_docx(window, cx),
+            // #306 ①：OCR 识别扫描件（后台逐页 tesseract 词级识别）。
+            Act::OcrPdf => self.ocr_active_pdf(window, cx),
+            // #306 ②：另存为可搜索 PDF（OCR 词 → 隐形文本层写回）。
+            Act::SaveSearchablePdf => self.save_searchable_pdf(window, cx),
             // #507 / #240 任务②：壳面系统打印流（方案 C——Windows 打印
             // 动词 / macOS open -p / CUPS lp；设置面由系统对话框或 lp
             // 参数承载）。
@@ -2328,6 +2367,367 @@ impl ShellApp {
             Err(_canceled) => {}
         })
         .detach();
+    }
+
+    /// #306 ①：OCR 识别扫描件（菜单「文件 → OCR 识别扫描件…」）。
+    ///
+    /// 流：pdf+扫描件+未识别门槛（双保险——菜单灰显外方法再验）→
+    /// 读盘 → tesseract 环境探针（二进制缺席 = 原生错误对话框 + 指引；
+    /// 语言面：chi_sim+eng > chi_sim > eng，全缺 = 对话框指引装包）→
+    /// **专用线程逐页词级识别**（`ocr_page_words`——引擎面每页独立
+    /// 装载/渲染/识别；mpsc 回流进度，前台 16ms 轮询 drain 更新横幅
+    /// ——UI 零卡顿面，大文档逐页推进）→ Done 携全量词表 →
+    /// `PdfPayload::with_ocr` 落 Editor（文本视图即读面）→ 完成横幅
+    /// （词数 + 失败页诚实计数 + 可搜索/另存指引）。
+    ///
+    /// 失败面（诚实语义）：第 1 页即失败 = 环境性失败（语言包/引擎）→
+    /// 不应用任何结果，错误横幅；后续页失败 = 单页识别失败 → 该页
+    /// 记空（行模型占位「本页识别无词」），继续后续页，完成横幅带
+    /// 失败页清单。
+    fn ocr_active_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let editor = tab.editor.clone();
+        if !editor.read(cx).pdf_ocr_pending() {
+            self.show_notice(
+                "OCR 仅支持未识别的扫描件 PDF（当前标签不适用）。".to_string(),
+                cx,
+            );
+            return;
+        }
+        let path = tab.path.clone();
+        if !path.exists() {
+            self.show_notice(
+                format!("源文件不在磁盘上：{}（先确保文件已保存）", path.display()),
+                cx,
+            );
+            return;
+        }
+        let Some(page_count) = editor.read(cx).pdf_props().map(|p| p.pages) else {
+            return;
+        };
+        if page_count == 0 {
+            self.show_notice("PDF 页数为 0——无 OCR 对象。".to_string(), cx);
+            return;
+        }
+        // tesseract 环境探针（引擎面单一真源——ocr_available）。
+        let env = mdc_pdf::ocr::ocr_available();
+        if !env.binary_ok {
+            let message = "OCR 识别需要 tesseract（未探测到）。安装示例（Debian/Ubuntu）：\n\
+                 sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim\n\
+                 或经 MDC_OCR_BIN 指定可执行路径。";
+            let shown = crate::native_dialog::show_error(&crate::native_dialog::DialogSpec {
+                title: "OCR 需要 tesseract".to_string(),
+                message: message.to_string(),
+            });
+            if !shown {
+                self.show_notice(message.to_string(), cx);
+            }
+            return;
+        }
+        let lang: &'static str = if env.has_lang("chi_sim") && env.has_lang("eng") {
+            "chi_sim+eng"
+        } else if env.has_lang("chi_sim") {
+            "chi_sim"
+        } else if env.has_lang("eng") {
+            "eng"
+        } else {
+            let message = format!(
+                "tesseract 无可用语言包（探测：{:?}）。中文识别请取件：\n\
+                 test-artifacts/ocr-tessdata/README.md（chi_sim 取件脚本）",
+                env.languages
+            );
+            let shown = crate::native_dialog::show_error(&crate::native_dialog::DialogSpec {
+                title: "OCR 缺语言包".to_string(),
+                message: message.clone(),
+            });
+            if !shown {
+                self.show_notice(message, cx);
+            }
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.show_notice(format!("读取源文件失败（{}）：{e}", path.display()), cx);
+                return;
+            }
+        };
+        if self.ocr_rx.is_some() {
+            self.show_notice("OCR 识别正在进行中——请等待完成。".to_string(), cx);
+            return;
+        }
+        // 专用线程（pdf_pages 搜索索引同款纪律：线程 + mpsc + 轮询 drain）。
+        let (tx, rx) = std::sync::mpsc::channel::<OcrProgressMsg>();
+        let lang_owned = lang.to_string();
+        std::thread::spawn(move || {
+            let mut pages: Vec<Vec<mdc_pdf::OcrWord>> = Vec::with_capacity(page_count);
+            let mut word_count = 0usize;
+            let mut failed_pages: Vec<usize> = Vec::new();
+            for page in 0..page_count {
+                match mdc_pdf::ocr::ocr_page_words(&bytes, page, &lang_owned) {
+                    Ok(words) => {
+                        word_count += words.len();
+                        pages.push(words);
+                    }
+                    Err(e) if page == 0 => {
+                        // 首页即失败 = 环境性（语言包/引擎）——不应用任何
+                        // 结果，错误直报（Done.error 面）。
+                        let _ = tx.send(OcrProgressMsg::Done {
+                            error: Some(format!("{e:?}")),
+                            pages: Vec::new(),
+                            word_count: 0,
+                            failed_pages: Vec::new(),
+                            lang: lang_owned,
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("ocr: 第 {} 页识别失败：{e:?}", page + 1);
+                        failed_pages.push(page);
+                        pages.push(Vec::new()); // 失败页占位（行模型空页标记）
+                    }
+                }
+                let _ = tx.send(OcrProgressMsg::Page {
+                    done: page + 1,
+                    total: page_count,
+                    words: word_count,
+                });
+            }
+            let _ = tx.send(OcrProgressMsg::Done {
+                error: None,
+                pages,
+                word_count,
+                failed_pages,
+                lang: lang_owned,
+            });
+        });
+        self.ocr_rx = Some(rx);
+        self.show_notice(format!("OCR 识别中（{lang}）：0/{page_count} 页…"), cx);
+        if !self.ocr_polling {
+            self.ocr_polling = true;
+            Self::spawn_ocr_progress_loop(window, cx);
+        }
+    }
+
+    /// #306 ①：OCR 进度轮询循环（16ms 定时 drain——pdf_pages 搜索索引
+    /// 同款；Done 消费即止。`spawn_in`/`update_in` 携窗口句柄——Done
+    /// 应用面的视图切换需要 window [#604 后 toggle_pdf_view_mode
+    /// 重聚焦需窗口]）。
+    fn spawn_ocr_progress_loop(window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(OCR_POLL_INTERVAL).await;
+                let mut stop = false;
+                let _ = this.update_in(cx, |shell, window, cx| {
+                    shell.drain_ocr_progress(window, cx);
+                    if shell.ocr_rx.is_none() {
+                        shell.ocr_polling = false;
+                        stop = true;
+                    }
+                });
+                if stop {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// #306 ①：OCR 回流消费（进度横幅更新 / Done 应用 + 终态横幅）。
+    fn drain_ocr_progress(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rx) = self.ocr_rx.take() else {
+            return;
+        };
+        let mut done: Option<OcrProgressMsg> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, OcrProgressMsg::Done { .. }) {
+                done = Some(msg);
+            } else if let OcrProgressMsg::Page {
+                done: d,
+                total,
+                words,
+            } = msg
+            {
+                self.show_notice(format!("OCR 识别中：{d}/{total} 页（{words} 词）…"), cx);
+            }
+        }
+        self.ocr_rx = if done.is_some() { None } else { Some(rx) };
+        let Some(OcrProgressMsg::Done {
+            error,
+            pages,
+            word_count,
+            failed_pages,
+            lang,
+        }) = done
+        else {
+            return;
+        };
+        if let Some(err) = error {
+            self.show_notice(format!("OCR 识别失败（环境性）：{err}"), cx);
+            return;
+        }
+        // 应用面：活动标签仍是识别发起的 pdf（防御——识别期间可能切
+        // 标签；标签不在/形态变 = 丢弃结果 + 诚实横幅）。
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.show_notice(
+                "OCR 完成，但发起标签已关闭——识别结果未应用（重开文件可重识别）。".to_string(),
+                cx,
+            );
+            return;
+        };
+        let editor = tab.editor.clone();
+        if !editor.read(cx).pdf_ocr_pending() {
+            self.show_notice(
+                "OCR 完成，但活动标签已不是未识别扫描件——结果未应用。".to_string(),
+                cx,
+            );
+            return;
+        }
+        let page_total = pages.len();
+        editor.update(cx, |ed, cx| {
+            let Some(payload) = ed.pdf_payload().cloned() else {
+                return;
+            };
+            let outcome = crate::editor::pdf_doc::PdfOcrOutcome {
+                lang,
+                pages,
+                word_count,
+            };
+            ed.apply_pdf_ocr(payload.with_ocr(outcome), cx);
+        });
+        // 文本视图是读面宿主——页视图态切到文本（识别文本即读即搜；
+        // #604 后 toggle 需 window 重聚焦——update_in 携窗口句柄）。
+        if self.pdf_view_mode {
+            self.toggle_pdf_view_mode(window, cx);
+        }
+        let failed_note = if failed_pages.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "；{} 页识别失败（{}——空页处理）",
+                failed_pages.len(),
+                failed_pages
+                    .iter()
+                    .map(|p| (p + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        self.show_notice(
+            format!(
+                "OCR 完成：{} 页 {} 词{failed_note}——文本可读可搜（Ctrl+F）；\
+                 如需任何阅读器可搜，用「文件 → 另存为可搜索 PDF…」。",
+                page_total, word_count
+            ),
+            cx,
+        );
+    }
+
+    /// #306 ②：另存为可搜索 PDF（菜单「文件 → 另存为可搜索 PDF…」）。
+    ///
+    /// 流：pdf+已识别门槛（双保险）→ 输出路径对话框（建议名
+    /// `<原名>_可搜索.pdf`）→ 后台写回（读盘 → `write_searchable_pdf`
+    /// [3 Tr 隐形文本层] → 写盘 → **重开验证**[pdf_doc::load_from_bytes
+    /// ——文本层非空即通过；写回产物自证]）→ 成功横幅（词数 + 验证
+    /// 结论）/ 失败横幅（typed 错误不静默）。
+    fn save_searchable_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let editor = tab.editor.clone();
+        if !editor.read(cx).pdf_ocr_ready() {
+            self.show_notice(
+                "另存为可搜索 PDF 需先识别（文件 → OCR 识别扫描件…）。".to_string(),
+                cx,
+            );
+            return;
+        }
+        let src = tab.path.clone();
+        if !src.exists() {
+            self.show_notice(
+                format!("源文件不在磁盘上：{}（先确保文件已保存）", src.display()),
+                cx,
+            );
+            return;
+        }
+        // 词表随 payload 携带（Editor 单一真源——克隆即快照）。
+        let Some(outcome) = editor.read(cx).pdf_payload().and_then(|p| p.ocr.clone()) else {
+            self.show_notice("OCR 词表不在位（请重新识别）。".to_string(), cx);
+            return;
+        };
+        let directory = src
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let suggested = src
+            .file_stem()
+            .map(|n| format!("{}_可搜索.pdf", n.to_string_lossy()));
+        let rx = cx.prompt_for_new_path(&directory, suggested.as_deref());
+        cx.spawn_in(window, async move |this, cx| match rx.await {
+            Ok(Ok(Some(out_path))) => {
+                // 后台写回 + 重开验证（IO + 引擎全离主线程——核心链路
+                // = [`Self::write_searchable_to`]，对话框闭包外独立函数
+                // = 手势级 e2e 可测面）。
+                let src_clone = src.clone();
+                let out_clone = out_path.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(
+                        async move { Self::write_searchable_to(&src_clone, &out_clone, &outcome) },
+                    )
+                    .await;
+                let _ = this.update_in(cx, |shell, _window, cx| match result {
+                    Ok((words, chars)) => {
+                        shell.show_notice(
+                            format!(
+                                "已另存为可搜索 PDF（注入 {} 词，重开验证文本层 {} 字）：{}",
+                                words,
+                                chars,
+                                out_path.display()
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(message) => {
+                        shell.show_notice(format!("另存可搜索 PDF 失败：{message}"), cx);
+                    }
+                });
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                let message = format!("另存对话框不可用：{err}");
+                let _ = this.update_in(cx, |shell, _window, cx| {
+                    shell.show_notice(message, cx);
+                });
+            }
+            Err(_canceled) => {}
+        })
+        .detach();
+    }
+
+    /// #306 ②：另存核心链路（读盘 → 写回[3 Tr 隐形文本层] → 落盘 →
+    /// **重开验证**[pdf_doc::load_from_bytes——文本层非空即闭环；引擎面
+    /// 双引擎提取已由 pdff4_ocr 锁 7 背书]）。
+    ///
+    /// 对话框闭包外的独立函数 = 手势级 e2e 可测面（`prompt_for_new_path`
+    /// 在 TestAppContext 不可用——核心链路经此直接验证，对话框层是薄壳）。
+    fn write_searchable_to(
+        src: &Path,
+        out_path: &Path,
+        outcome: &crate::editor::pdf_doc::PdfOcrOutcome,
+    ) -> Result<(usize, usize), String> {
+        let pdf = std::fs::read(src).map_err(|e| format!("读取源文件失败：{e}"))?;
+        let (out, report) = mdc_pdf::ocr_writeback::write_searchable_pdf(&pdf, &outcome.pages)
+            .map_err(|e| format!("写回失败：{e:?}"))?;
+        std::fs::write(out_path, &out).map_err(|e| format!("写出 PDF 失败：{e}"))?;
+        let payload = crate::editor::pdf_doc::load_from_bytes(out)
+            .map_err(|e| format!("重开验证失败：{e}"))?;
+        if payload.props.scanned {
+            return Err("重开验证失败：写出文件仍无文本层".to_string());
+        }
+        Ok((report.words_written, payload.props.chars))
     }
 
     /// F4：Ctrl+Shift+S 另存为对话框（prompt_for_new_path——
@@ -3575,6 +3975,231 @@ mod tab_workflow_tests {
         });
 
         let _ = std::fs::remove_dir_all(&tag_dir);
+    }
+
+    // ── #306：OCR 读面 + 可搜索写回（手势级 e2e） ──────────────────
+
+    /// 引擎仓扫描件夹具（跨 crate 同仓引用——pdf_annotate_e2e 的签名
+    /// 夹具同款纪律）。
+    fn scanned_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/pdf/fixtures/scanned_mixed.pdf")
+            .to_path_buf()
+    }
+
+    /// #306 ①（合成面）：开扫描件 → 前置态（暂不支持横幅/pending）→
+    /// 合成 OCR 结果落读面（`apply_pdf_ocr`——真实词来自真 tesseract 的
+    /// 链路见 [`Self::ocr_scan_gesture_e2e`]）→ 读面断言：OCR 横幅 +
+    /// CJK 连接（招标文件无空格）+ 拉丁空格 + find 引擎命中 + **不置脏**
+    /// （派生态非文件变更）+ 菜单门槛翻转。
+    ///
+    /// 环境门（AGENTS 13.1）：libpdfium 缺席 → pdf 打开失败态 → SKIP
+    /// 横幅（本测试不依赖 tesseract——合成词）。
+    #[gpui::test]
+    fn ocr_payload_face_synthetic(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = shell_window(cx);
+        let scanned = scanned_fixture();
+        window.update(cx, |_host, _window, cx| {
+            open(&shell, cx, scanned.clone());
+        });
+        let pending = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell
+                        .editor()
+                        .is_some_and(|ed| ed.read(cx).pdf_ocr_pending())
+                })
+            })
+            .expect("前置态读");
+        if !pending {
+            eprintln!(
+                "[SKIP] ocr_payload_face_synthetic：扫描件未成待识别态 \
+                 （libpdfium 缺席或夹具缺席——pdf 打开走失败态）"
+            );
+            return;
+        }
+        window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                let ed = shell.editor().unwrap().clone();
+                // 前置态：暂不支持横幅 + pending + 非 ready。
+                {
+                    let e = ed.read(cx);
+                    assert!(e.pdf_ocr_pending(), "扫描件待识别");
+                    assert!(!e.pdf_ocr_ready());
+                    let text = e.buffer_text_for_probe();
+                    assert!(
+                        text.contains("渲染需要 OCR，当前版本暂不支持"),
+                        "扫描件横幅在位（得：{text:?}）"
+                    );
+                }
+                // 合成 OCR（CJK 词行 + 拉丁词行——pdf_doc::with_ocr 的
+                // 词→行分组面由 pdf_doc 单测背书）。
+                let words = vec![
+                    mdc_pdf::OcrWord {
+                        text: "招标".into(),
+                        bbox: [50.0, 700.0, 90.0, 730.0],
+                        line: (1, 1, 1),
+                    },
+                    mdc_pdf::OcrWord {
+                        text: "文件".into(),
+                        bbox: [95.0, 700.0, 135.0, 730.0],
+                        line: (1, 1, 1),
+                    },
+                    mdc_pdf::OcrWord {
+                        text: "Specification".into(),
+                        bbox: [50.0, 640.0, 150.0, 670.0],
+                        line: (2, 1, 1),
+                    },
+                ];
+                let outcome = crate::editor::pdf_doc::PdfOcrOutcome {
+                    lang: "chi_sim+eng".into(),
+                    word_count: words.len(),
+                    pages: vec![words],
+                };
+                ed.update(cx, |ed, cx| {
+                    let payload = ed.pdf_payload().cloned().unwrap();
+                    ed.apply_pdf_ocr(payload.with_ocr(outcome), cx);
+                });
+                // 读面断言。
+                let e = ed.read(cx);
+                assert!(!e.pdf_ocr_pending(), "已识别：pending 翻转");
+                assert!(e.pdf_ocr_ready(), "已识别：ready 置位");
+                assert!(!e.is_modified(), "OCR 是派生态——不置脏（保存手势不被触发）");
+                let text = e.buffer_text_for_probe();
+                assert!(text.contains("【OCR】识别完成"), "OCR 横幅（得：{text:?}）");
+                assert!(
+                    text.contains("招标文件"),
+                    "CJK 词无空格直连（得：{text:?}）"
+                );
+                assert!(text.contains("Specification"), "拉丁词在位（得：{text:?}）");
+                assert!(!text.contains("暂不支持"), "扫描件横幅退役（得：{text:?}）");
+                // find 面：产品同源 Buffer find 引擎命中（可搜索性的
+                // 引擎级证明——查找条走同一 Buffer::find 面）。
+                let probe = crate::editor::buffer::Buffer::from_plain_text(&text);
+                let hits = probe.find_matches("招标文件");
+                assert!(!hits.is_empty(), "识别文本可搜索（产品 find 引擎命中）");
+                // 菜单门槛翻转（menu_context 快照）。
+                let menu = shell.menu_context(cx);
+                assert!(!menu.pdf_ocr_pending, "菜单：OCR 项灰显");
+                assert!(menu.pdf_ocr_ready, "菜单：另存可搜索项点亮");
+            });
+        });
+    }
+
+    /// #306 ①+②（真链路主锁）：开扫描件 → 菜单动作 OCR（真 tesseract
+    /// 逐页识别——专用线程 + mpsc + 轮询）→ advance_clock 驱动 Done
+    /// 消费 → 真识别词断言（中文词条级）→ 另存核心（`write_searchable_to`
+    /// ——真写回 + 重开验证）。
+    ///
+    /// 环境门（AGENTS 13.1）：tesseract/chi_sim/libpdfium 任一缺席 →
+    /// SKIP 横幅（真链路在 pdff4_ocr 锁 7 有双引擎面背书；本测试是
+    /// 壳面手势链——从菜单动作到 payload 落位的全链）。
+    #[gpui::test]
+    fn ocr_scan_gesture_e2e(cx: &mut gpui::TestAppContext) {
+        // tessdata 注入（pdff4_ocr 同款——本地携带目录在位时）。
+        // SAFETY（edition 2024）：仅测试面、单线程序（此刻 OCR 线程尚未
+        // spawn、TestAppContext 无并发读 env 面）；设置先于一切识别调用。
+        let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-artifacts/ocr-tessdata");
+        if std::env::var_os("MDC_OCR_TESSDATA").is_none()
+            && local.join("chi_sim.traineddata").exists()
+        {
+            unsafe { std::env::set_var("MDC_OCR_TESSDATA", &local) };
+        }
+        let ocr_env = mdc_pdf::ocr::ocr_available();
+        if !ocr_env.binary_ok || !ocr_env.has_lang("chi_sim") {
+            eprintln!(
+                "[SKIP] ocr_scan_gesture_e2e：tesseract/chi_sim 缺席 \
+                 （binary={} langs={:?}——取件见 test-artifacts/ocr-tessdata/README.md）",
+                ocr_env.binary_ok, ocr_env.languages
+            );
+            return;
+        }
+        let (shell, window) = shell_window(cx);
+        let scanned = scanned_fixture();
+        window.update(cx, |_host, _window, cx| {
+            open(&shell, cx, scanned.clone());
+        });
+        let pending = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell
+                        .editor()
+                        .is_some_and(|ed| ed.read(cx).pdf_ocr_pending())
+                })
+            })
+            .expect("前置态读");
+        if !pending {
+            eprintln!("[SKIP] ocr_scan_gesture_e2e：libpdfium 缺席（扫描件打开失败态）");
+            return;
+        }
+        // 手势：菜单动作（真实菜单同一分派键——activate_menu_action）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.activate_menu_action(crate::menu_bar::MenuAction::OcrPdf, window, cx);
+            });
+        });
+        // 真线程 + 虚拟时钟轮询：advance_clock 驱动 16ms 定时器，真实
+        // tesseract 需要真实墙钟（页均秒级）——虚进 + 实睡混合直到
+        // Done 消费（payload.ocr 落位）；上限 180s 实钟（防挂死）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut applied = false;
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            applied = cx.update(|app| {
+                shell
+                    .read(app)
+                    .editor()
+                    .is_some_and(|ed| ed.read(app).pdf_ocr_ready())
+            });
+            if applied {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(applied, "OCR Done 应在实钟内消费（真 tesseract 识别）");
+
+        // 读面断言（真识别词——词条级锚点，与 pdff4_ocr 同口径）。
+        let outcome = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    let ed = shell.editor().unwrap().clone();
+                    {
+                        let e = ed.read(cx);
+                        assert!(e.pdf_ocr_ready());
+                        assert!(!e.is_modified(), "识别结果不置脏");
+                        let text = e.buffer_text_for_probe();
+                        assert!(text.contains("【OCR】识别完成"), "横幅在位");
+                        assert!(
+                            text.contains("招标"),
+                            "真识别中文词（得头：{:?}）",
+                            text.lines().take(8).collect::<Vec<_>>()
+                        );
+                        let probe = crate::editor::buffer::Buffer::from_plain_text(&text);
+                        assert!(!probe.find_matches("招标").is_empty(), "真识别文本可搜索");
+                    }
+                    ed.read(cx)
+                        .pdf_payload()
+                        .and_then(|p| p.ocr.clone())
+                        .unwrap()
+                })
+            })
+            .expect("读面断言");
+        // ② 另存核心（真写回 + 重开验证——对话框层是薄壳，
+        // prompt_for_new_path 在 TestAppContext 不可用）。
+        let dir = fixture_dir("ocr-save");
+        let out_path = dir.join("scanned_可搜索.pdf");
+        let (words, chars) = ShellApp::write_searchable_to(&scanned, &out_path, &outcome)
+            .expect("另存核心链路（写回 + 重开验证）");
+        assert!(words >= 10, "注入词量级（得 {words}）");
+        assert!(chars >= 20, "重开验证文本量级（得 {chars}）");
+        // 重开验证第二断言：产品打开面读到非扫描态。
+        let written = std::fs::read(&out_path).unwrap();
+        let payload = crate::editor::pdf_doc::load_from_bytes(written).unwrap();
+        assert!(!payload.props.scanned, "写出档有文本层（非扫描态）");
+        assert!(payload.text.contains("招标"), "产品打开面读到识别词");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #219 验收③/边界：关闭邻位规则（右邻优先/末位回左）、关非活动

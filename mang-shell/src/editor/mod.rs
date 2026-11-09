@@ -1140,6 +1140,12 @@ impl Editor {
         self.pdf.as_ref().map(|p| &p.props)
     }
 
+    /// #306：pdf payload 引用（OCR 结果应用的源数据面——
+    /// `pdf_ocr_pending` / `pdf_ocr_ready` 判据 + `with_ocr` 入口）。
+    pub fn pdf_payload(&self) -> Option<&PdfPayload> {
+        self.pdf.as_ref()
+    }
+
     /// xlsx 工档属性（右栏属性面板；G6）。
     pub fn xlsx_props(&self) -> Option<&XlsxProps> {
         self.xlsx.as_ref().map(|x| &x.props)
@@ -1175,6 +1181,48 @@ impl Editor {
     /// 非 pdf 态 / 行不在页表 → `None`。
     pub fn pdf_page_for_line(&self, line: usize) -> Option<usize> {
         self.pdf.as_ref()?.page_of_line(line)
+    }
+
+    /// #306 ①：OCR 结果落读面（payload 换血——buffer/样式/页表/书签全量
+    /// 重建；路径/显示名/只读态不变；新 Buffer 无编辑记录 → 不置脏）。
+    ///
+    /// 词随 [`PdfPayload::ocr`] 持有——「另存为可搜索 PDF」（#306 ②）
+    /// 的数据源。状态重置面 = `new_pdf` 构造面 minus 身份字段（buffer
+    /// 换血后围栏/括号/断行/光标/字数缓存全失效——`refresh_caches`
+    /// 重算前的防御性重置）。
+    pub fn apply_pdf_ocr(&mut self, payload: PdfPayload, cx: &mut Context<Self>) {
+        debug_assert!(payload.ocr.is_some(), "OCR payload 必须携带词表");
+        let line_count = payload.text.lines().count().max(1);
+        self.buffer = Buffer::from_plain_text(&payload.text);
+        self.pdf = Some(payload);
+        // 派生缓存全量重置（new_pdf 同款面）。
+        self.fence_cache = vec![false; line_count];
+        self.fence_lang_cache = vec![None; line_count];
+        self.fence_cache_valid = false;
+        self.bracket_cache = BracketCache::default();
+        self.display_map = DisplayMap::default();
+        self.cursors = Cursors::single(Point::new(0, 0));
+        self.char_count_cache = RefCell::new((u64::MAX, 0));
+        self.row_bounds = Rc::new(RefCell::new(Vec::new()));
+        self.scroll = UniformListScrollHandle::new();
+        self.find = None;
+        self.goto = None;
+        self.autoscroll_target = None;
+        self.marked = None;
+        self.refresh_caches();
+        cx.notify();
+    }
+
+    /// #306 ①：OCR 可接判定（菜单/命令门槛）：pdf 态 + 扫描件 + 未识别。
+    pub fn pdf_ocr_pending(&self) -> bool {
+        self.pdf
+            .as_ref()
+            .is_some_and(|p| p.props.scanned && p.ocr.is_none())
+    }
+
+    /// #306 ②：可搜索写回可接判定：pdf 态 + 已识别（词表在位）。
+    pub fn pdf_ocr_ready(&self) -> bool {
+        self.pdf.as_ref().is_some_and(|p| p.ocr.is_some())
     }
 
     /// 标题树（左栏「文档结构」）；md 态为空。

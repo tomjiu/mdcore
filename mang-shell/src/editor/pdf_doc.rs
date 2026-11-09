@@ -121,6 +121,21 @@ pub struct PdfPayload {
     pub pages: Vec<PageEntry>,
     /// 文档属性。
     pub props: PdfProps,
+    /// #306 ①：OCR 结果（`None` = 未识别；`Some` = 识别文本已落
+    /// `text`，词随行携带——「另存为可搜索 PDF」（#306 ②）的数据源）。
+    pub ocr: Option<PdfOcrOutcome>,
+}
+
+/// #306 ①：OCR 会话产物（读面结果 + 写回面数据源——随
+/// [`PdfPayload`] 持有，Editor 零新字段）。
+#[derive(Clone, Debug)]
+pub struct PdfOcrOutcome {
+    /// 识别语言（tesseract lang 串——报告/复跑展示面）。
+    pub lang: String,
+    /// 逐页词（页序对齐 [`PdfPayload::pages`]——空页 = 空列表）。
+    pub pages: Vec<Vec<mdc_pdf::OcrWord>>,
+    /// 词总数（报告展示面）。
+    pub word_count: usize,
 }
 
 /// 引擎抽取中转（`load` 的产物 = `convert` 的纯函数输入——单测锚点）。
@@ -370,6 +385,8 @@ pub fn convert(raw: &PdfRaw) -> PdfPayload {
         headings,
         pages,
         props,
+        // #306：未识别态（OCR 词表仅在 with_ocr 产物中携带）。
+        ocr: None,
     }
 }
 
@@ -449,6 +466,152 @@ impl PdfPayload {
         }
         cur.or_else(|| self.pages.first().map(|p| p.index + 1))
     }
+
+    /// #306 ①：OCR 结果落读面（新 payload——原扫描件提示行由 OCR 横幅
+    /// 替换，逐页占位行由识别文本行替换；页分隔行保持；书签树清空
+    /// [扫描件本无书签——props.bookmarks 同步]）。
+    ///
+    /// 纯函数面（`convert` 的姊妹——单测锚点；词 → 行的分组规则见
+    /// [`ocr_page_lines`]）。
+    pub fn with_ocr(&self, outcome: PdfOcrOutcome) -> PdfPayload {
+        let total = self.props.pages.max(outcome.pages.len());
+        let mut ctx = Ctx::default();
+        // 原安全评估提示行保持（扫描件提示行[「暂不支持」]退役——OCR
+        // 横幅接任；其余 notice 原样保留在首行区）。
+        for line in self.text.lines().take_while(|l| {
+            // 首行区 = 首个页分隔行之前的 notice 行；「暂不支持」横幅退役。
+            !l.starts_with("── 第") && !l.contains("渲染需要 OCR，当前版本暂不支持")
+        }) {
+            if !line.is_empty() {
+                ctx.push(line.to_string(), Some(TokenKind::Quote));
+            }
+        }
+        // OCR 横幅（Quote 整行——诚实面：语言 + 词数 + 可搜索指引）。
+        let banner = format!(
+            "【OCR】识别完成（语言：{}，{} 页 {} 词）——识别文本如下；查找（Ctrl+F）可搜，另存为可搜索 PDF 可携带到任何阅读器。",
+            outcome.lang,
+            outcome.pages.len(),
+            outcome.word_count
+        );
+        ctx.push(banner, Some(TokenKind::Quote));
+
+        let mut pages: Vec<PageEntry> = Vec::new();
+        let mut empty_pages = 0usize;
+        let mut chars = 0usize;
+        let mut content_lines = 0usize;
+        for i in 0..total {
+            let sep = format!("── 第 {} / {} 页 ──", i + 1, total);
+            let first_line = ctx.lines.len();
+            ctx.push(sep, Some(TokenKind::Quote));
+            let words = outcome.pages.get(i).map(|w| w.as_slice()).unwrap_or(&[]);
+            let body = ocr_page_lines(words);
+            if body.is_empty() {
+                empty_pages += 1;
+                ctx.push(
+                    "（本页识别无词——空扫描页或图形页）".to_string(),
+                    Some(TokenKind::Quote),
+                );
+            } else {
+                for l in body {
+                    if l.is_empty() {
+                        ctx.push(l, None);
+                    } else {
+                        chars += l.chars().filter(|c| !c.is_whitespace()).count();
+                        content_lines += 1;
+                        ctx.push(l, None);
+                    }
+                }
+            }
+            ctx.push(String::new(), None);
+            pages.push(PageEntry {
+                index: i,
+                first_line,
+                last_line: ctx.lines.len() - 1,
+            });
+        }
+
+        PdfPayload {
+            text: ctx.lines.join("\n"),
+            spans: ctx.spans,
+            headings: Vec::new(),
+            pages,
+            props: PdfProps {
+                pages: total,
+                chars,
+                content_lines,
+                empty_pages,
+                bookmarks: 0,
+                // scanned 保持 true（文件本体仍是扫描件——OCR 是识别
+                // 层叠加，不是文本层改写；ocr.is_some() 是「已识别」判据）。
+                scanned: self.props.scanned,
+            },
+            ocr: Some(outcome),
+        }
+    }
+}
+
+/// #306 ①：页词 → 正文行集（词按 `(block, par, line)` 锚分组——
+/// 行序 = 首词文档序；段间空行呼吸；行内 CJK 感知连接）。
+///
+/// 连接规则（读面可读性）：相邻词若**边界两侧至少一侧为 CJK 字符**，
+/// 无空格直连（tesseract 把中文切成 2 字词——空格连接会把「招标文件」
+/// 拆成「招标 文件」四字噪声）；否则（拉丁/数字）单空格连接。
+fn ocr_page_lines(words: &[mdc_pdf::OcrWord]) -> Vec<String> {
+    // 行分组（保序——首见序；锚 (block, par, line)）。
+    let mut line_order: Vec<(u32, u32, u32)> = Vec::new();
+    let mut by_line: std::collections::HashMap<(u32, u32, u32), Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut par_of: std::collections::HashMap<(u32, u32, u32), (u32, u32)> =
+        std::collections::HashMap::new();
+    for w in words {
+        let key = w.line;
+        if !by_line.contains_key(&key) {
+            line_order.push(key);
+            par_of.insert(key, (key.0, key.1));
+        }
+        by_line.entry(key).or_default().push(w.text.as_str());
+    }
+    // 行文本 + 段界（par 变更 → 空行呼吸）。
+    let mut out: Vec<String> = Vec::new();
+    let mut last_par: Option<(u32, u32)> = None;
+    for key in line_order {
+        let parts = &by_line[&key];
+        let par = par_of[&key];
+        if last_par.is_some() && last_par != Some(par) {
+            if !out.last().is_some_and(|l: &String| l.is_empty()) {
+                out.push(String::new());
+            }
+        }
+        last_par = Some(par);
+        let mut line = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 0 {
+                line.push_str(part);
+                continue;
+            }
+            let left_cjk = parts[i - 1].chars().last().is_some_and(is_cjk);
+            let right_cjk = part.chars().next().is_some_and(is_cjk);
+            if !(left_cjk || right_cjk) {
+                line.push(' ');
+            }
+            line.push_str(part);
+        }
+        let trimmed = line.trim_end().to_string();
+        if !trimmed.is_empty() {
+            out.push(trimmed);
+        }
+    }
+    out
+}
+
+/// CJK 判定（统一表意文字区 + 扩展 A——词连接面的宽判定）。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF      // CJK 统一表意
+        | 0x3400..=0x4DBF    // 扩展 A
+        | 0xF900..=0xFAFF    // 兼容表意
+        | 0x3000..=0x303F    // CJK 标点
+    )
 }
 
 // =============================================================================
@@ -997,4 +1160,141 @@ mod tests {
         }
         s
     }
+}
+
+// ── #306 ①：OCR 读面（with_ocr / ocr_page_lines 纯函数面） ─────────
+
+/// OCR 词构造（紧凑夹具）。
+fn ocr_word(text: &str, line: (u32, u32, u32)) -> mdc_pdf::OcrWord {
+    mdc_pdf::OcrWord {
+        text: text.into(),
+        bbox: [50.0, 700.0, 150.0, 730.0],
+        line,
+    }
+}
+
+/// OCR 读面主锁：扫描件 payload（暂不支持横幅）→ with_ocr → 横幅退役 +
+/// OCR 横幅在位 + CJK 连接/拉丁空格 + 页表重建 + 词随 payload 携带 +
+/// props 同步（chars/content_lines/empty_pages/bookmarks）。
+#[test]
+fn with_ocr_rebuilds_line_model() {
+    let raw = PdfRaw {
+        pages: vec![PdfTextPage {
+            index: 0,
+            text: String::new(), // 零文本层 → 扫描件
+        }],
+        outline: vec![],
+        security_notices: vec![],
+    };
+    let scanned = convert(&raw);
+    assert!(scanned.props.scanned, "前置：扫描件判定");
+    assert!(scanned.ocr.is_none(), "前置：未识别态");
+    assert!(
+        scanned.text.contains("渲染需要 OCR，当前版本暂不支持"),
+        "前置：暂不支持横幅"
+    );
+
+    let outcome = PdfOcrOutcome {
+        lang: "chi_sim+eng".into(),
+        word_count: 4,
+        pages: vec![vec![
+            ocr_word("招标", (1, 1, 1)),
+            ocr_word("文件", (1, 1, 1)),
+            ocr_word("Bid", (2, 1, 1)),
+            ocr_word("Document", (2, 1, 1)),
+        ]],
+    };
+    let applied = scanned.with_ocr(outcome);
+    // 横幅交替。
+    assert!(!applied.text.contains("暂不支持"), "扫描件横幅退役");
+    assert!(applied.text.contains("【OCR】识别完成"), "OCR 横幅在位");
+    assert!(applied.text.contains("chi_sim+eng"), "语言诚实展示");
+    // CJK 连接 + 拉丁空格。
+    assert!(
+        applied.text.contains("招标文件"),
+        "CJK 词无空格直连（得：{:?}）",
+        applied.text
+    );
+    assert!(
+        applied.text.contains("Bid Document"),
+        "拉丁词单空格连接（得：{:?}）",
+        applied.text
+    );
+    assert!(
+        applied.text.contains("── 第 1 / 1 页 ──"),
+        "页分隔行保持（得：{:?}）",
+        applied.text
+    );
+    // 段间空行（par 1 → par 2）。
+    let lines: Vec<&str> = applied.text.lines().collect();
+    let bid_line = lines.iter().position(|l| l.contains("Bid")).unwrap();
+    assert!(bid_line >= 2, "段间有空行呼吸（行序：{lines:?}）");
+    // props 同步。
+    assert_eq!(
+        applied.props.content_lines, 2,
+        "两正文行（CJK 行 + 拉丁行）"
+    );
+    assert_eq!(applied.props.empty_pages, 0, "无空文本页");
+    assert_eq!(applied.props.bookmarks, 0, "扫描件书签清空");
+    assert!(applied.props.scanned, "文件本体仍是扫描件（props 语义）");
+    // 词随 payload（另存数据源）。
+    let ocr = applied.ocr.as_ref().expect("OCR 词表携带");
+    assert_eq!(ocr.pages.len(), 1);
+    assert_eq!(ocr.pages[0].len(), 4);
+    assert_eq!(ocr.word_count, 4);
+}
+
+/// 词 → 行分组：段界空行 + 行序保持 + 空词组滤除 + 空页 → 空行集。
+#[test]
+fn ocr_page_lines_groups_by_line_anchor() {
+    let words = vec![
+        ocr_word("第二章", (3, 1, 1)),
+        ocr_word("验收", (3, 1, 1)),
+        ocr_word("标准", (3, 1, 1)),
+        ocr_word("OCR", (3, 2, 1)),
+        ocr_word("accuracy", (3, 2, 1)),
+        ocr_word("95", (3, 2, 2)),
+        ocr_word("percent", (3, 2, 2)),
+    ];
+    let lines = ocr_page_lines(&words);
+    assert_eq!(
+        lines,
+        vec![
+            "第二章验收标准".to_string(), // CJK 直连
+            String::new(),                // 段界空行（par 1 → par 2）
+            "OCR accuracy".to_string(),   // 拉丁空格
+            "95 percent".to_string(),     // 第二行（line 2）
+        ],
+        "行分组 + 段界空行"
+    );
+    // 空页。
+    assert!(ocr_page_lines(&[]).is_empty());
+}
+
+/// 安全评估提示行保持（扫描件横幅退役、其余 notice 原样保留）。
+#[test]
+fn with_ocr_preserves_security_notices() {
+    let raw = PdfRaw {
+        pages: vec![PdfTextPage {
+            index: 0,
+            text: String::new(),
+        }],
+        outline: vec![],
+        security_notices: vec!["【安全】检测到 JavaScript 嵌入（S2 只读告警）。".into()],
+    };
+    let scanned = convert(&raw);
+    assert!(scanned.text.contains("JavaScript"), "前置：安全提示在位");
+    let outcome = PdfOcrOutcome {
+        lang: "eng".into(),
+        word_count: 1,
+        pages: vec![vec![ocr_word("Scanned", (1, 1, 1))]],
+    };
+    let applied = scanned.with_ocr(outcome);
+    assert!(
+        applied.text.contains("JavaScript"),
+        "安全提示保持（得：{:?}）",
+        applied.text
+    );
+    assert!(!applied.text.contains("暂不支持"), "扫描件横幅退役");
+    assert!(applied.text.contains("Scanned"), "识别词在位");
 }

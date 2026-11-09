@@ -44,6 +44,7 @@ use std::process::Command;
 use crate::command::CommandError;
 use crate::engine::DocumentEngine;
 use crate::engine_pdfium::PdfiumEngine;
+use crate::ocr_word::OcrWord;
 use crate::page::PageIndex;
 use crate::render::{Rasterizer, RenderRequest};
 use crate::security::Limits;
@@ -158,6 +159,142 @@ pub fn ocr_page(pdf: &[u8], page: usize, lang: &str) -> Result<String, CommandEr
 }
 
 // ---------------------------------------------------------------------------
+// #306 ①：词级识别面（读面 + 写回面的共同上游）
+// ---------------------------------------------------------------------------
+
+/// 扫描件 OCR 单页·词级（#306 ①读面/②写回的上游）。
+///
+/// 与 [`ocr_page`] 同一管线（同渲染宽、同 PGM 中转、同环境旋钮），
+/// 区别在 tesseract 输出面：**TSV**（`-c tessedit_create_tsv=1`——
+/// 直通参数而非 `tsv` 配置名：自定义 `TESSDATA_PREFIX` 目录无
+/// `configs/` 子目录时配置名解析失败，直通参数两态恒稳）→ 词行
+/// （level 5）解析为 [`OcrWord`]：
+///
+/// - 坐标：图像像素（原点左上）→ PDF 用户空间 pt（原点左下）——
+///   单一换算点（[`OcrWord`] 文档），消费方零换算；
+/// - 行锚 `(block, par, line)` 保留（读面行重建用）；
+/// - conf ≥ 0 且文本非空的词行全保留（tesseract 结构行 conf = -1
+///   天然滤除；低置信词不滤——搜索面宁多勿漏，见 [`OcrWord::text`]）。
+pub fn ocr_page_words(pdf: &[u8], page: usize, lang: &str) -> Result<Vec<OcrWord>, CommandError> {
+    // ① 光栅化（与 ocr_page 同款——同钳制、同几何面）。
+    let limits = Limits::default();
+    limits.check_open_input_bytes(pdf.len() as u64)?;
+    let mut engine = PdfiumEngine::open(pdf.to_vec())?;
+    let count = engine.page_count();
+    if page >= count as usize {
+        return Err(CommandError::InvalidPage(PageIndex(page as u32)));
+    }
+    let geometry = engine.page_geometry(PageIndex(page as u32))?;
+    let width_px = (geometry.effective_width() / 72.0 * 200.0).round() as u32;
+    let width_px = width_px.clamp(200, 4000);
+    let rendered = engine.rasterize(RenderRequest {
+        page: PageIndex(page as u32),
+        width_px,
+    })?;
+    let page_w_pt = geometry.effective_width();
+    let page_h_pt = geometry.effective_height();
+    let (img_w, img_h) = (rendered.width_px, rendered.height_px);
+
+    // ② BGRA → PGM（复用 ocr_page 的零依赖路径）。
+    let pgm = bgra_to_pgm(&rendered.bgra, img_w, img_h);
+
+    // ③ tesseract TSV（临时文件中转——与 ocr_page 同理由）。
+    let bin = tesseract_binary();
+    let dir =
+        std::env::temp_dir().join(format!("mdc-ocrw-{}-{}", std::process::id(), line_nonce()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CommandError::engine(format!("OCR 临时目录建立失败：{e}")))?;
+    let img_path = dir.join("page.pgm");
+    std::fs::write(&img_path, pgm)
+        .map_err(|e| CommandError::engine(format!("OCR 图像写入失败：{e}")))?;
+    let output = Command::new(&bin)
+        .arg(&img_path)
+        .arg("stdout")
+        .arg("-l")
+        .arg(lang)
+        .arg("--psm")
+        .arg("3")
+        .arg("-c")
+        .arg("tessedit_create_tsv=1")
+        .env("TESSDATA_PREFIX", tessdata_dir())
+        .output()
+        .map_err(|e| CommandError::engine(format!("tesseract 启动失败（{bin}）：{e}")))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CommandError::engine(format!(
+            "tesseract 词级识别失败（exit {:?}）：{}",
+            output.status.code(),
+            stderr.chars().take(300).collect::<String>()
+        )));
+    }
+    let tsv = String::from_utf8_lossy(&output.stdout);
+
+    // ④ TSV → 词模型（px → pt 翻 Y；同一换算面，双轴独立缩放——
+    // 等比渲染下两轴同率，独立算防未来非等比面错位）。
+    let scale_x = page_w_pt / img_w as f32;
+    let scale_y = page_h_pt / img_h as f32;
+    Ok(parse_tsv_words(&tsv, img_h, scale_x, scale_y))
+}
+
+/// tesseract TSV → [`OcrWord`] 列表（纯函数——单测锚点）。
+///
+/// 列序（tesseract 5 固定）：level page block par line word left top
+/// width height conf text。词行 = level 5 + conf ≥ 0 + 文本非空。
+fn parse_tsv_words(tsv: &str, img_h: u32, scale_x: f32, scale_y: f32) -> Vec<OcrWord> {
+    let mut out = Vec::new();
+    for row in tsv.lines() {
+        let cols: Vec<&str> = row.split('\t').collect();
+        if cols.len() < 12 || cols[0] != "5" {
+            continue; // 表头 / 结构行（level 1-4）
+        }
+        let text = cols[11].trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (Ok(left), Ok(top), Ok(w), Ok(h)): (
+            Result<i64, _>,
+            Result<i64, _>,
+            Result<i64, _>,
+            Result<i64, _>,
+        ) = (
+            cols[6].parse(),
+            cols[7].parse(),
+            cols[8].parse(),
+            cols[9].parse(),
+        ) else {
+            continue; // 数值面异常行——tesseract 输出合同外的防御跳过
+        };
+        let conf: f32 = cols[10].parse().unwrap_or(-1.0);
+        if conf < 0.0 {
+            continue; // 结构/无效词标记
+        }
+        let (Ok(block), Ok(par), Ok(line)): (Result<u32, _>, _, _) =
+            (cols[2].parse(), cols[3].parse(), cols[4].parse())
+        else {
+            continue;
+        };
+        // px（原点左上）→ pt（原点左下）：x 同向缩放；y 翻轴
+        // （图像 top → 用户空间 img_h - top，再缩放）。
+        let x0 = left as f32 * scale_x;
+        let x1 = (left + w) as f32 * scale_x;
+        let y_top = (img_h as f32 - top as f32) * scale_y;
+        let y_bottom = (img_h as f32 - (top + h) as f32) * scale_y;
+        out.push(OcrWord {
+            text: text.to_string(),
+            bbox: [
+                x0.min(x1),
+                y_bottom.min(y_top),
+                x1.max(x0),
+                y_top.max(y_bottom),
+            ],
+            line: (block, par, line),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // 内部
 // ---------------------------------------------------------------------------
 
@@ -192,4 +329,33 @@ fn line_nonce() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 纯函数锚点（#306 ①）：翻轴方向 + 结构行/负 conf/空词滤除 +
+    /// 行锚透传——无 tesseract 环境依赖（识别面真跑见
+    /// tests/pdff4_ocr.rs 的环境门形态）。
+    #[test]
+    fn parse_tsv_words_flips_y_and_filters() {
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   1\t1\t0\t0\t0\t0\t0\t0\t1700\t2200\t-1\t\n\
+                   5\t1\t1\t1\t1\t1\t100\t200\t300\t80\t95.5\t招标\n\
+                   5\t1\t1\t1\t1\t2\t500\t200\t300\t80\t-1\tBAD\n\
+                   5\t1\t1\t1\t2\t1\t100\t400\t300\t80\t80.0\t\n\
+                   5\t1\t2\t1\t1\t1\t100\t600\t300\t80\t90.0\t文件\n\
+                   5\t1\t2\t1\t1\t2\tabc\t600\t300\t80\t90.0\t坏行\n";
+        let words = parse_tsv_words(tsv, 2200, 0.36, 0.36);
+        assert_eq!(words.len(), 2, "结构行/负 conf/空词/坏数值行全滤");
+        // (left=100, top=200, w=300, h=80) on img_h=2200 →
+        // y_top = (2200-200)*0.36 = 720；y_bottom = (2200-280)*0.36 = 691.2
+        assert!((words[0].bbox[3] - 720.0).abs() < 0.01, "y 翻轴：top→上缘");
+        assert!((words[0].bbox[1] - 691.2).abs() < 0.01, "y 翻轴：底缘");
+        assert!((words[0].bbox[0] - 36.0).abs() < 0.01, "x 同向缩放");
+        assert!((words[0].bbox[2] - 144.0).abs() < 0.01, "x 宽缩放");
+        assert_eq!(words[0].text, "招标");
+        assert_eq!(words[1].line, (2, 1, 1), "行锚透传（block 2）");
+    }
 }
