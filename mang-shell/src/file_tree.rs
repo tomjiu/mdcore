@@ -331,7 +331,9 @@ impl FileTree {
             cx.notify();
         } else {
             let hook = self.hooks.open_file.clone();
-            hook(row.path, window, cx);
+            // Opening a tab writes the active path back to this tree. Wait
+            // until this listener has returned the borrowed entity to App.
+            window.defer(cx, move |window, cx| hook(row.path, window, cx));
         }
     }
 
@@ -488,7 +490,8 @@ impl FileTree {
             } else {
                 // #575：ShellApp 面 → open_file 钩子（bin 注入——lib 化）。
                 let hook = this.hooks.open_file.clone();
-                hook(path.clone(), window, cx);
+                let path = path.clone();
+                window.defer(cx, move |window, cx| hook(path, window, cx));
             }
         }))
         // 右键：上下文菜单（#166 接线保持——菜单在 shell 状态上，位置取
