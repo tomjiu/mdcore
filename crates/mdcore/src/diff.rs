@@ -1,13 +1,18 @@
-//! #414 —— MD 文档 diff 引擎：块级对齐（L1）+ 行内 diff（L2）。
+//! #414 —— MD 文档 diff 引擎：块级对齐（L1）+ 行内 diff（L2）+ mark 感知 diff（L3，#600）。
 //!
 //! ## 定位：redline 与「改了哪里」的结构基座
 //!
-//! mang 此前没有任何文档比较能力。本模块提供两层：
+//! mang 此前没有任何文档比较能力。本模块提供三层：
 //!
 //! - **L1 块级对齐** [`diff_documents`] / [`diff_markdown`]：两版文档
 //!   的块序列对齐——新增/删除/移动/修改/未变 五分类（[`BlockDiff`]）；
 //! - **L2 行内 diff** [`diff_inline`]：修改块内的文字级定位
 //!   （[`InlineDiff`] run 序）。
+//! - **L3 mark 感知 diff** [`diff_documents_l3`] / [`diff_markdown_l3`]
+//!   （#600）：可选 marks 比较——同文本块的样式变化可观察（去粗/
+//!   加斜体不再「文本 Unchanged」吞掉；「重要 重要」位置互换报
+//!   Moved）。签名基 = **归一净文本**（行内投影后），与 L1 原入口的
+//!   归一源文本口径不同——旧入口语义零漂移（r29/r30 不回归）。
 //!
 //! 与 #413（DOCX 修订写面）组成 redline 链：L1 产 Added/Removed/
 //! Modified 块 → #413 `insert_run_revised`/`delete_run_revised` 落成
@@ -134,6 +139,64 @@ pub struct InlineDiff {
     pub text: String,
 }
 
+// ---------------------------------------------------------------------------
+// L3：mark 感知 diff（#600）
+// ---------------------------------------------------------------------------
+
+/// #600 L3：mark 变更种类（[`MarkChange`] 的分类面）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkChangeKind {
+    /// 新侧独有（旧侧无同签名实例）——样式新增。
+    Added,
+    /// 旧侧独有（新侧无同签名实例）——样式移除。
+    Removed,
+    /// 同签名实例双侧均在但位置不同——「重要 重要」互换面。
+    Moved,
+}
+
+/// #600 L3：单条 mark 变更事件（同文本配对块内）。
+///
+/// 坐标基 = 该块 [`BlockDiffL3::base`] 携带的**归一净文本** char 偏移
+/// （Unicode 码点——不做字节索引切片）。`text` 为区间文本快照（钳制
+/// 后的可观察凭据——位置互换判定与消费方展示的依据）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkChange {
+    /// mark 类型（[`crate::tree::MarkSpan::kind`] 原样——markdown 面
+    /// em/strong/code/del/math/u，op 面自定义串）。
+    pub kind: String,
+    /// 变更种类。
+    pub change: MarkChangeKind,
+    /// 旧侧 char 区间（Added 为 None）。
+    pub old_range: Option<(usize, usize)>,
+    /// 新侧 char 区间（Removed 为 None）。
+    pub new_range: Option<(usize, usize)>,
+    /// 区间文本快照（Removed/Moved 取旧侧、Added 取新侧）。
+    pub text: String,
+}
+
+/// #600 L3：块级 diff + mark 变更（可选 marks 比较面——wire 形）。
+///
+/// - **基座兼容**：`#[serde(flatten)]` 内联 [`BlockDiff`] 全字段——
+///   旧 L1 JSON（无 `mark_changes` 键）可直读本结构（`serde(default)`
+///   补空）；Rust 构造点仍须全字面量（AGENTS 0.0.5——serde 宽容不
+///   替代构造检查）。
+/// - **口径声明**：L3 入口的 `text_old`/`text_new` 为**归一净文本**
+///   （行内投影后）——与 L1 原入口的归一源文本不同基，字段同名、
+///   语义面在此标注。
+/// - **marks 比较面**：仅同文本配对块（Unchanged/Moved）参与——
+///   Added/Removed/Modified 的样式随块级事件表达（Modified 的
+///   L2×mark 联合坐标映射另排，见 #600 任务边界）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockDiffL3 {
+    /// L1 基座原样携带（注意上述口径声明）。
+    #[serde(flatten)]
+    pub base: BlockDiff,
+    /// 本块 mark 变更事件（空 = 无样式变化——双侧 marks 等价或非比较面）。
+    #[serde(default)]
+    pub mark_changes: Vec<MarkChange>,
+}
+
 /// 相似度配对阈值（归一 Levenshtein：1 - dist/max_len；≥ 阈值视为
 /// 同块修改，< 阈值视为无关块）。0.5 = 中改；重写块按 Added/Removed
 /// 报告（保守——不把不相关的块硬配成「修改」）。
@@ -189,6 +252,72 @@ pub fn diff_markdown(old_md: &str, new_md: &str) -> Vec<BlockDiff> {
     diff_documents(&old, &new)
 }
 
+/// #600 L3：mark 感知块级 diff（内容锚——默认入口的净文本增强面）。
+///
+/// 与 [`diff_documents`] 的差异（其余语义含 LIS/Moved 判定全部同构）：
+///
+/// 1. **签名基 = 归一净文本**：每块先做行内投影（markdown 面
+///    `parse_inline_marks` 剥定界符 / op 面 `Node.marks` 权威）再对齐
+///    ——`**重要** 事项` → `重要 事项` 配对为同文本，样式差异落
+///    [`BlockDiffL3::mark_changes`] 而非 Modified 文本差；
+/// 2. **marks 比较**（同文本配对块——Unchanged/Moved）：同签名实例
+///    互配（精确位 → 文本签名+序位两 pass），位置差异显式报
+///    [`MarkChangeKind::Moved`]（「重要 重要」互换可观察），独有端报
+///    Added/Removed；
+/// 3. **wire**：[`BlockDiffL3`]（flatten 基座——旧 L1 JSON 可直读）。
+///
+/// 边界（#600 任务面登记）：Modified 块不做 mark 坐标映射（L2×mark
+/// 联合另排）；Table/CodeBlock/Math 无行内投影（Table 逐格坐标基不
+/// 可复合——样式随文本事件表达）；谱系 ID pass 面未接（同谱系调用方
+/// 可先 L1 lineage 后续轮接线）。
+pub fn diff_documents_l3(old: &Core, new: &Core) -> Vec<BlockDiffL3> {
+    let old_blocks = flatten_l3(old);
+    let new_blocks = flatten_l3(new);
+    // 对齐视图：FlatBlock 文本槽装净文本（私有结构——语义面按本入口
+    // 口径），复用 align_impl 全部步序（精确/相似/LIS/组装）。
+    let old_view: Vec<FlatBlock> = old_blocks
+        .iter()
+        .map(|b| FlatBlock {
+            id: b.id,
+            kind: b.kind,
+            text: b.net.clone(),
+        })
+        .collect();
+    let new_view: Vec<FlatBlock> = new_blocks
+        .iter()
+        .map(|b| FlatBlock {
+            id: b.id,
+            kind: b.kind,
+            text: b.net.clone(),
+        })
+        .collect();
+    let base = align_impl(&old_view, &new_view, false);
+    // 后处理：同文本配对块做 marks 比较（坐标基 = 净文本——即基座
+    // 携带的 text_old/text_new）。
+    base.into_iter()
+        .map(|d| {
+            let mark_changes = match (d.kind, d.old_index, d.new_index) {
+                (DiffKind::Unchanged | DiffKind::Moved, Some(i), Some(j)) => {
+                    let text = d.text_new.as_deref().unwrap_or("");
+                    mark_changes_between(&old_blocks[i].marks, &new_blocks[j].marks, text)
+                }
+                _ => Vec::new(),
+            };
+            BlockDiffL3 {
+                base: d,
+                mark_changes,
+            }
+        })
+        .collect()
+}
+
+/// #600 L3：MD 文本直 diff（`from_markdown` 双侧 + [`diff_documents_l3`]）。
+pub fn diff_markdown_l3(old_md: &str, new_md: &str) -> Vec<BlockDiffL3> {
+    let old = Core::from_markdown(old_md);
+    let new = Core::from_markdown(new_md);
+    diff_documents_l3(&old, &new)
+}
+
 /// 先序扁平块（跳过虚根 Document；父先子后同层按序——与
 /// `preorder_block_ids` 同序）。
 struct FlatBlock {
@@ -230,6 +359,295 @@ fn normalize_block_text(text: &str) -> String {
         lines.pop();
     }
     lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// #600 L3 内部：行内投影（净文本 + marks 坐标基）
+// ---------------------------------------------------------------------------
+
+/// L3 扁平块（净文本坐标基——对齐签名与 marks 比较共用同一基）。
+struct FlatBlockL3 {
+    id: BlockId,
+    kind: BlockKind,
+    /// 归一净文本（行内投影 + 行尾归一后）。
+    net: String,
+    /// 净文本坐标基上的有效 marks。
+    marks: Vec<crate::tree::MarkSpan>,
+}
+
+/// #600 L3 扁平（先序——与 [`flatten`] 同序；每块带行内投影）。
+fn flatten_l3(core: &Core) -> Vec<FlatBlockL3> {
+    let tree = &core.tree;
+    let mut out = Vec::new();
+    fn walk(tree: &crate::tree::BlockTree, node: crate::tree::NodeId, out: &mut Vec<FlatBlockL3>) {
+        let n = tree.node(node);
+        let (net, marks) = effective_inline(n.kind, &n.text.to_string(), &n.marks);
+        out.push(FlatBlockL3 {
+            id: n.id,
+            kind: n.kind,
+            net,
+            marks,
+        });
+        for &c in &n.children {
+            walk(tree, c, out);
+        }
+    }
+    let top: Vec<crate::tree::NodeId> = tree.node(tree.root()).children.clone();
+    for t in top {
+        walk(tree, t, &mut out);
+    }
+    out
+}
+
+/// 块的行内有效投影（#600 L3 坐标基单点）。
+///
+/// 两来源面（沿 `word_count::net_text` 同款约定）：
+/// - **markdown 面**（`marks` 空——`from_markdown` 树）：先
+///   [`normalize_block_text`] 归一（坐标基稳定），再
+///   [`crate::inline::parse_inline_marks`] 剥定界符——marks 天然落在
+///   归一净文本坐标上；
+/// - **op 面**（`marks` 非空——SetMark 路径，text 已净）：归一剥尾随
+///   空白引起的坐标漂移按 [`normalize_with_map`] 幸存者映射重定位。
+///
+/// 非投影面：CodeBlock/Math（定界即内容，逐字）与 Table（逐格坐标基
+/// 不可复合——word_count 逐格同规，L3 整块不投影）恒返回
+/// 归一原文 + 空 marks。ThematicBreak 无文本面。
+fn effective_inline(
+    kind: BlockKind,
+    text: &str,
+    marks: &[crate::tree::MarkSpan],
+) -> (String, Vec<crate::tree::MarkSpan>) {
+    if matches!(
+        kind,
+        BlockKind::CodeBlock | BlockKind::Math | BlockKind::Table
+    ) {
+        return (normalize_block_text(text), Vec::new());
+    }
+    if marks.is_empty() {
+        let norm = normalize_block_text(text);
+        let (net, marks) = crate::inline::parse_inline_marks(&norm);
+        (net, marks)
+    } else {
+        let (norm, map) = normalize_with_map(text);
+        let n = norm.chars().count();
+        let remapped = marks
+            .iter()
+            .filter_map(|m| {
+                // 越界端点钳制到文本长（敌意/漂移面——不 panic）；
+                // start > end 的敌意形态（钳后仍倒挂）剔除。
+                let s = map[m.start.min(n)];
+                let e = map[m.end.min(n)];
+                (s <= e).then(|| crate::tree::MarkSpan {
+                    start: s,
+                    end: e,
+                    kind: m.kind.clone(),
+                })
+            })
+            .collect();
+        (norm, remapped)
+    }
+}
+
+/// 归一 + char 索引映射（#600 L3 op 面坐标重定位）。
+///
+/// 语义与 [`normalize_block_text`] 逐字符等价（单测锁）；额外产出
+/// `map[i]` = 原始前 i 个 char 中**幸存者个数**（= 原始索引 i 的归一
+/// 位点——被剥字符向内钳制到其前幸存尾部）。map 长度 = char 数 + 1
+/// （含末位哨兵——end 边界可直索引）。
+fn normalize_with_map(text: &str) -> (String, Vec<usize>) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    // 行切分（'\n' 为行界符——不属行内容；空文本 = 单空行）。
+    let mut line_content: Vec<(usize, usize)> = Vec::new();
+    let mut line_nl: Vec<Option<usize>> = Vec::new();
+    let mut i = 0;
+    loop {
+        let start = i;
+        while i < n && chars[i] != '\n' {
+            i += 1;
+        }
+        line_content.push((start, i));
+        if i < n {
+            line_nl.push(Some(i));
+            i += 1;
+        } else {
+            line_nl.push(None);
+            break;
+        }
+    }
+    // 每行剥尾随 [' ', '\r']（normalize 的 trim_end 面）。
+    let kept: Vec<(usize, usize)> = line_content
+        .iter()
+        .map(|&(s, e)| {
+            let mut ce = e;
+            while ce > s && matches!(chars[ce - 1], ' ' | '\r') {
+                ce -= 1;
+            }
+            (s, ce)
+        })
+        .collect();
+    // 尾部空行剥除（内容为空——normalize 的 pop 语义；中段空行保留）。
+    let mut last = kept.len();
+    while last > 0 && kept[last - 1].0 == kept[last - 1].1 {
+        last -= 1;
+    }
+    // 幸存掩码：保留行内容 + 行间 '\n'（最后一保留行的 '\n' 不存活——
+    // join 不产尾换行）。
+    let mut survivor = vec![false; n];
+    for li in 0..last {
+        let (s, ce) = kept[li];
+        for cell in survivor.iter_mut().take(ce).skip(s) {
+            *cell = true;
+        }
+        if let Some(nl) = line_nl[li] {
+            if li + 1 < last {
+                survivor[nl] = true;
+            }
+        }
+    }
+    // 组装：净文本 + 前缀幸存计数。
+    let mut norm = String::new();
+    let mut map = Vec::with_capacity(n + 1);
+    let mut count = 0usize;
+    map.push(0);
+    for k in 0..n {
+        if survivor[k] {
+            norm.push(chars[k]);
+            count += 1;
+        }
+        map.push(count);
+    }
+    (norm, map)
+}
+
+/// #600 L3：mark 区间文本快照（char 流钳制切片——**不做字节索引**；
+/// 越界端点按 skip/take 自然截断，start ≥ end 为空）。
+fn span_text(text: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    text.chars().skip(start).take(end - start).collect()
+}
+
+/// #600 L3：同文本块的两版 marks 比较（事件推导——纯函数）。
+///
+/// 两 pass 配对（`text` = 该块净文本，双侧同基）：
+/// 1. **精确三元组**（kind, start, end）互配——零事件（「两处相同样式
+///    删一处只报对应变化」：位相合者互消，仅剩端报 Removed/Added）；
+/// 2. **同 kind + 文本签名**按双侧序位互配（左 ↔ 左）——位置差异
+///    显式报 [`MarkChangeKind::Moved`]（「重要 重要」互换面：不签名
+///    消除位置差异）。
+///
+/// 剩余：旧侧独有 → Removed；新侧独有 → Added。
+///
+/// 事件序 = 起始位置字典序（Removed/Moved 取旧侧起点、Added 取新侧
+/// 起点；同位按 Removed → Moved → Added 稳定序）——确定可复现。
+/// 重叠 marks 逐条独立比较（不合并、不互斥）；空区间（start == end）
+/// 参与比较（事件可观察——不静默剔除）。
+fn mark_changes_between(
+    old: &[crate::tree::MarkSpan],
+    new: &[crate::tree::MarkSpan],
+    text: &str,
+) -> Vec<MarkChange> {
+    if old.is_empty() && new.is_empty() {
+        return Vec::new();
+    }
+    let mut old_used = vec![false; old.len()];
+    let mut new_used = vec![false; new.len()];
+    // Pass 1：精确三元组互配。
+    for i in 0..old.len() {
+        if old_used[i] {
+            continue;
+        }
+        for j in 0..new.len() {
+            if !new_used[j]
+                && old[i].kind == new[j].kind
+                && old[i].start == new[j].start
+                && old[i].end == new[j].end
+            {
+                old_used[i] = true;
+                new_used[j] = true;
+                break;
+            }
+        }
+    }
+    // Pass 2：同 kind + 同文本签名按双侧序位互配 → Moved。
+    let mut events: Vec<MarkChange> = Vec::new();
+    for i in 0..old.len() {
+        if old_used[i] {
+            continue;
+        }
+        let old_txt = span_text(text, old[i].start, old[i].end);
+        for j in 0..new.len() {
+            if new_used[j] || old[i].kind != new[j].kind {
+                continue;
+            }
+            let new_txt = span_text(text, new[j].start, new[j].end);
+            if old_txt == new_txt {
+                old_used[i] = true;
+                new_used[j] = true;
+                events.push(MarkChange {
+                    kind: old[i].kind.clone(),
+                    change: MarkChangeKind::Moved,
+                    old_range: Some((old[i].start, old[i].end)),
+                    new_range: Some((new[j].start, new[j].end)),
+                    text: old_txt,
+                });
+                break;
+            }
+        }
+    }
+    // 剩余：Removed（旧侧独有）/ Added（新侧独有）。
+    for i in 0..old.len() {
+        if !old_used[i] {
+            events.push(MarkChange {
+                kind: old[i].kind.clone(),
+                change: MarkChangeKind::Removed,
+                old_range: Some((old[i].start, old[i].end)),
+                new_range: None,
+                text: span_text(text, old[i].start, old[i].end),
+            });
+        }
+    }
+    for j in 0..new.len() {
+        if !new_used[j] {
+            events.push(MarkChange {
+                kind: new[j].kind.clone(),
+                change: MarkChangeKind::Added,
+                old_range: None,
+                new_range: Some((new[j].start, new[j].end)),
+                text: span_text(text, new[j].start, new[j].end),
+            });
+        }
+    }
+    // 起始位置字典序 + 同位种类稳定序（removed < moved < added）。
+    events.sort_by(|a, b| {
+        let pa = a
+            .old_range
+            .map(|(s, _)| s)
+            .unwrap_or_else(|| a.new_range.map(|(s, _)| s).unwrap_or(0));
+        let pb = b
+            .old_range
+            .map(|(s, _)| s)
+            .unwrap_or_else(|| b.new_range.map(|(s, _)| s).unwrap_or(0));
+        let ra = rank_of(a.change);
+        let rb = rank_of(b.change);
+        pa.cmp(&pb)
+            .then(ra.cmp(&rb))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.old_range.cmp(&b.old_range))
+            .then(a.new_range.cmp(&b.new_range))
+    });
+    events
+}
+
+/// 事件种类排序秩（Removed → Moved → Added——同位稳定序）。
+fn rank_of(c: MarkChangeKind) -> u8 {
+    match c {
+        MarkChangeKind::Removed => 0,
+        MarkChangeKind::Moved => 1,
+        MarkChangeKind::Added => 2,
+    }
 }
 
 /// 对齐主体（纯函数——旧/新扁平块 → diff 序）。
@@ -968,5 +1386,152 @@ mod tests {
                 text: "90".into()
             }
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #600 L3 内部件
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalize_with_map_equivalence() {
+        // 与 normalize_block_text 逐字符等价（代表性向量：尾空白/CRLF/
+        // 尾空行/中段空行/空文本）。
+        for t in [
+            "hello \r\nworld  \n",
+            "code\n  keep  indent\n\n",
+            "",
+            "a\n\nb",
+            "a\n\n\n",
+            "单行尾空  ",
+            "行尾\r\n混合 \r\n\n",
+        ] {
+            let (norm, map) = normalize_with_map(t);
+            assert_eq!(norm, normalize_block_text(t), "等价面: {t:?}");
+            assert_eq!(map.len(), t.chars().count() + 1, "映射长度: {t:?}");
+            assert!(map.windows(2).all(|w| w[0] <= w[1]), "单调不减: {t:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_with_map_remaps_marks() {
+        // "重要  "（尾随 2 空格）→ "重要"；mark(0,4) 覆盖 "重要  " →
+        // 收拢到 (0,2)。
+        let (norm, map) = normalize_with_map("重要  ");
+        assert_eq!(norm, "重要");
+        assert_eq!((map[0], map[4]), (0, 2), "尾随被剥端点向内收拢");
+        // 多行：首行尾剥使跨行坐标前移；第二行 "cd" 的 mark(4,6) 重定位
+        // 到 (3,5)（'c' 在 "ab\ncd" 的 norm 索引 3）。
+        let (norm, map) = normalize_with_map("ab \ncd");
+        assert_eq!(norm, "ab\ncd");
+        assert_eq!((map[0], map[3]), (0, 2), "首行 mark 含被剥尾空格 → 收拢");
+        assert_eq!((map[4], map[6]), (3, 5), "第二行 mark 平移一位");
+    }
+
+    #[test]
+    fn span_text_char_slicing() {
+        // char 坐标（非字节）：emoji（👍🏻 = 基字符+肤色修饰 = 2 char）+ CJK。
+        let text = "👍🏻重要 事项";
+        assert_eq!(text.chars().count(), 7, "char 计数基线");
+        assert_eq!(span_text(text, 0, 2), "👍🏻".to_string());
+        assert_eq!(span_text(text, 2, 4), "重要".to_string());
+        // 越界端点自然截断（不 panic）。
+        assert_eq!(span_text(text, 3, 99), "要 事项".to_string());
+        assert_eq!(span_text(text, 99, 199), "");
+        // 空区间。
+        assert_eq!(span_text(text, 2, 2), "");
+    }
+
+    #[test]
+    fn mark_changes_swap_and_dedup() {
+        use crate::tree::MarkSpan;
+        let mk = |kind: &str, s: usize, e: usize| MarkSpan {
+            start: s,
+            end: e,
+            kind: kind.into(),
+        };
+        // 「重要 重要」互换：old(0,2) → new(3,5) 报 Moved（位置可观察）。
+        let text = "重要 重要";
+        let ev = mark_changes_between(&[mk("em", 0, 2)], &[mk("em", 3, 5)], text);
+        assert_eq!(
+            ev,
+            vec![MarkChange {
+                kind: "em".into(),
+                change: MarkChangeKind::Moved,
+                old_range: Some((0, 2)),
+                new_range: Some((3, 5)),
+                text: "重要".into(),
+            }]
+        );
+        // 两处相同样式删一处：精确位互消 + 剩余 Removed（只报对应变化）。
+        let ev = mark_changes_between(&[mk("em", 0, 2), mk("em", 3, 5)], &[mk("em", 0, 2)], text);
+        assert_eq!(
+            ev,
+            vec![MarkChange {
+                kind: "em".into(),
+                change: MarkChangeKind::Removed,
+                old_range: Some((3, 5)),
+                new_range: None,
+                text: "重要".into(),
+            }]
+        );
+        // 双侧完全相同 → 零噪声。
+        assert!(mark_changes_between(
+            &[mk("em", 0, 2), mk("strong", 3, 5)],
+            &[mk("strong", 3, 5), mk("em", 0, 2)],
+            text
+        )
+        .is_empty());
+        // 重叠 marks 逐条独立比较（不 panic 不合并）。
+        let ev = mark_changes_between(
+            &[mk("em", 0, 4), mk("strong", 2, 6)],
+            &[mk("em", 0, 4), mk("strong", 2, 6)],
+            "abcd ef",
+        );
+        assert!(ev.is_empty(), "重叠双侧等价 → 零事件");
+        // 空区间参与比较（不静默剔除）。
+        let ev = mark_changes_between(&[], &[mk("em", 2, 2)], "ab");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].change, MarkChangeKind::Added);
+        assert_eq!(ev[0].text, "");
+    }
+
+    #[test]
+    fn effective_inline_hostile_marks_clamped_not_panicking() {
+        use crate::tree::MarkSpan;
+        // 敌意 marks（越界 end / 倒挂 start>end）——op 面防御：钳制、
+        // 剔除倒挂，不 panic。
+        let (net, marks) = effective_inline(
+            BlockKind::Paragraph,
+            "重要",
+            &[
+                MarkSpan {
+                    start: 0,
+                    end: 99, // 越界
+                    kind: "bold".into(),
+                },
+                MarkSpan {
+                    start: 5,
+                    end: 1, // 倒挂
+                    kind: "em".into(),
+                },
+            ],
+        );
+        assert_eq!(net, "重要");
+        assert_eq!(marks.len(), 1, "倒挂剔除、越界保留");
+        assert_eq!((marks[0].start, marks[0].end), (0, 2), "越界端点钳制");
+        // 字面块：marks 恒空（代码/数学/表格非投影面）。
+        for kind in [BlockKind::CodeBlock, BlockKind::Math, BlockKind::Table] {
+            let (net, marks) = effective_inline(
+                kind,
+                "a `x` **b** |",
+                &[MarkSpan {
+                    start: 0,
+                    end: 1,
+                    kind: "em".into(),
+                }],
+            );
+            assert!(marks.is_empty(), "{kind:?} 非投影面");
+            assert_eq!(net, "a `x` **b** |", "{kind:?} 逐字保留");
+        }
     }
 }
