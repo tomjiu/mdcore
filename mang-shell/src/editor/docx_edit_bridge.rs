@@ -173,6 +173,10 @@ pub trait DocxPort {
     fn blocked_reason(&self, idx: usize) -> Option<ReadOnlyLine>;
     /// 设置段落文本（待落账）。
     fn set_text(&mut self, idx: usize, text: &str) -> Result<(), String>;
+    /// 撤销回打开态时清该段 pending，保留原始 XML；不能以 set 原文代替。
+    fn reset_text(&mut self, _idx: usize) -> Result<(), String> {
+        Err("port 未提供段落 pending 清除，拒绝不确定保存".into())
+    }
     /// 落账并产出完整 docx 字节。
     fn save(&self) -> Result<Vec<u8>, String>;
     /// 表格栅格（**权威坐标**——引擎扫描 `document.xml` 得出，桥侧不推断）。
@@ -267,11 +271,8 @@ pub fn insert_rows(rows: &mut Vec<LineBlock>, anchor: usize, new_rows: usize, so
 /// 编辑后的行归属重排（纯函数——[EditHook] 的实现体）。
 ///
 /// 三种形态：
-/// - **删除**（`start..end` 非空、未插入）：逐行退位（同段且序号更大者
-///   −1）；合并「甲乙」时首删行（段 0）的剩余正文转入下一删行（段 1）→
-///   段 1 吃下合并文本，段 0 变为「空段落行」由段 1 行承接；
-/// - **纯插入**（段内拆分/回车）：新行归**上一行**所属段（段内序号按
-///   位置重排）；
+/// - 删除原区间起点后的行，保留起点行的段身份；跨段落合并由门禁拒绝；
+/// - 纯插入/软换行：新行归**起点所在行**所属段，重新编号本段续行；
 /// - **原位替换**（如缩进只动行首）：归属不变。
 pub fn remap_after_edit(
     rows: &mut Vec<LineBlock>,
@@ -280,121 +281,30 @@ pub fn remap_after_edit(
     inserted_lines: usize,
     _newline_removed: bool,
 ) {
-    let a = start.0.min(rows.len());
-    let b = end.0.min(rows.len());
-    let removed: Vec<LineBlock> = if a < b {
-        rows[a..b].to_vec()
-    } else {
-        Vec::new()
-    };
-    // 插入锚点：删除 → 被删首行归属；纯插入 → 上一行归属。
-    let anchor = if removed.is_empty() {
-        rows.get(a.saturating_sub(1).min(rows.len().saturating_sub(1)))
-            .copied()
-            .and_then(|r| r.sum_anchor(&[]))
-            .or_else(|| removed.first().copied())
-    } else {
-        a.sum_anchor(&removed)
-    };
-    delete_rows(rows, a, b - a);
-    for _ in 0..inserted_lines {
-        let row = match anchor {
-            Some(LineBlock::Para {
-                paragraph,
-                idx,
-                cont,
-            }) => LineBlock::Para {
-                paragraph,
-                idx,
-                cont,
-            },
-            // 单元格不是可复制的插入单位（同 insert_rows 口径）。
-            Some(other) => other,
-            None => LineBlock::User { join: false },
-        };
-        let at = a.min(rows.len());
-        rows.insert(at, row);
+    if rows.is_empty() {
+        return;
     }
-    // 删除的 Para/Foreign 行：同段更靠后的行逐行退位。
-    for r in &removed {
-        match *r {
-            LineBlock::Para { paragraph, idx, .. }
-            | LineBlock::Foreign {
-                id: (paragraph, idx),
-                ..
-            } => {
-                for row in rows.iter_mut() {
-                    match row {
-                        LineBlock::Para {
-                            paragraph: p2,
-                            idx: i2,
-                            ..
-                        } if *p2 == paragraph && *i2 > idx => *i2 -= 1,
-                        LineBlock::Foreign { id: (p2, i2), .. }
-                            if *p2 == paragraph && *i2 > idx =>
-                        {
-                            *i2 -= 1
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // 纯插入落在段内：本段行按位置重排（新行的段内序号看**上一行**在哪）。
-    if let Some(LineBlock::Para { paragraph, .. }) = anchor
-        && inserted_lines > 0
-    {
-        let mut k = 0usize;
-        for row in rows.iter_mut() {
+    let a = start.0.min(rows.len() - 1);
+    let b = end.0.min(rows.len() - 1).max(a);
+    // Buffer 保留编辑起点行，删除其后的旧行；新增续行属于起点所在段。
+    // end 是旧删除终点，不能使用插入后的 cursor。
+    let owner = rows[a];
+    rows.splice(a..=b, std::iter::repeat_n(owner, inserted_lines + 1));
+    if let LineBlock::Para { paragraph, .. } = owner {
+        let mut idx = 0;
+        for row in rows {
             if let LineBlock::Para {
-                paragraph: p2,
-                idx,
+                paragraph: p,
+                idx: i,
                 cont,
             } = row
-                && *p2 == paragraph
+                && *p == paragraph
             {
-                *idx = k;
-                *cont = k > 0;
-                k += 1;
+                *i = idx;
+                *cont = idx > 0;
+                idx += 1;
             }
         }
-    }
-}
-
-/// 删除锚点（`removed` 的行实际属于哪个段——决定插入行的身份）。
-trait SumAnchor {
-    fn sum_anchor(self, removed: &[LineBlock]) -> Option<LineBlock>;
-}
-
-impl SumAnchor for LineBlock {
-    fn sum_anchor(self, _removed: &[LineBlock]) -> Option<LineBlock> {
-        match self {
-            LineBlock::Para { .. } | LineBlock::User { .. } | LineBlock::Foreign { .. } => {
-                Some(self)
-            }
-            // 单元格行是**可编辑**的，但它不是段落续接的锚（在格子里敲
-            // Enter 不该把正文段落拉进来）：插入锚退化为用户行。
-            LineBlock::Cell { .. } | LineBlock::Locked(_) => None,
-        }
-    }
-}
-
-impl SumAnchor for usize {
-    fn sum_anchor(self, removed: &[LineBlock]) -> Option<LineBlock> {
-        let _ = self;
-        removed.iter().find_map(|b| match b {
-            LineBlock::Para { .. } | LineBlock::User { .. } => Some(*b),
-            // 删掉的是「外段行」：插入应仍在原段位置（本段后续行承接）。
-            LineBlock::Foreign { id, idx } => Some(LineBlock::Para {
-                paragraph: id.0,
-                idx: *idx,
-                cont: false,
-            }),
-            // 单元格行不做段落续接锚（同 SumAnchor for LineBlock 口径）。
-            LineBlock::Cell { .. } | LineBlock::Locked(_) => None,
-        })
     }
 }
 
@@ -641,6 +551,13 @@ impl DocxBridge {
     ///    列表的编号定义/缩进属性本身不动——登记）。
     pub fn compute(&self, lines: &[String]) -> Writeback {
         let n = self.proj.len();
+        if lines.len() != self.rows.len() {
+            return Writeback {
+                unchanged: n,
+                dropped: lines.len().abs_diff(self.rows.len()),
+                ..Default::default()
+            };
+        }
         let mut slots: Vec<Vec<(usize, String)>> = vec![Vec::new(); n];
         // 段落里「打开态单元格文本」的**回写口径槽位**（含空单元格）：
         let mut dropped = 0usize;
@@ -703,13 +620,26 @@ impl DocxBridge {
             // 相同就零 set（下面那条分支已覆盖），故此处只需保证单元格
             // 的投影/兜底登记**与行文本同口径**（由 docx_doc 负责）。
             if model_same || body_same {
-                // 未动（或只动了标记/缩进这类行模型装饰）——不写。
-                unchanged += 1;
+                if self.pending[p]
+                    .as_deref()
+                    .is_some_and(|t| Some(t) != self.orig[p].as_deref())
+                {
+                    sets.push((p, self.orig[p].clone().unwrap_or_default()));
+                } else {
+                    unchanged += 1;
+                }
             } else if as_body == self.orig[p].clone().unwrap_or_default() {
                 // 与**原文装配文本**逐字相同（投影是行模型的近似、原文
                 // 没变）——写回去也是零语义变化，不写（避免引擎把它当成
                 // 一次手术：多 run 段合并、xml:space 改写）。
-                unchanged += 1;
+                if self.pending[p]
+                    .as_deref()
+                    .is_some_and(|t| Some(t) != self.orig[p].as_deref())
+                {
+                    sets.push((p, self.orig[p].clone().unwrap_or_default()));
+                } else {
+                    unchanged += 1;
+                }
             } else {
                 sets.push((p, as_body));
             }
@@ -803,14 +733,31 @@ fn nearest_paragraph(rows: &[LineBlock], i: usize) -> Option<(usize, usize)> {
 pub type Verdict = Result<(), String>;
 
 impl DocxBridge {
-    /// 编辑门禁：起点/终点行都必须是可编辑行（锁定行 → 拒）。
+    /// 编辑门禁：整个旧区间都可编辑且属于同一段；单元格只允许单行改值。
     pub fn before_edit(&self, c: Coalesce) -> Verdict {
-        for line in [c.start.0, c.end.0] {
-            if let Some(LineBlock::Locked(kind)) = self.rows.get(line).copied() {
+        let (a, b) = (c.start.0, c.end.0);
+        if a > b || b >= self.rows.len() {
+            return Err("编辑区间与 DOCX 行映射不一致".into());
+        }
+        for row in &self.rows[a..=b] {
+            if let LineBlock::Locked(kind) = row {
                 return Err(kind.reason().to_string());
             }
         }
-        let _ = c.inserted_lines;
+        match self.rows[a] {
+            LineBlock::Para { paragraph, .. } => {
+                if self.rows[a..=b].iter().any(
+                    |row| !matches!(row, LineBlock::Para { paragraph: p, .. } if *p == paragraph),
+                ) {
+                    return Err("跨 DOCX 段落合并尚不支持，不能改写相邻段".into());
+                }
+            }
+            LineBlock::Cell { .. } if a == b && c.inserted_lines == 0 => {}
+            LineBlock::Cell { .. } => {
+                return Err("单元格内换行/跨单元格编辑尚不支持".into());
+            }
+            _ => return Err("无法确定该行的 DOCX 段落归属".into()),
+        }
         Ok(())
     }
 }
@@ -835,10 +782,16 @@ impl EditHook for DocxBridge {
         remap_after_edit(
             &mut self.rows,
             (summary.start.line, summary.start.col),
-            (summary.end.line, summary.end.col),
+            (summary.before_end.line, summary.before_end.col),
             summary.inserted_lines,
             summary.newline_removed,
         );
+    }
+
+    fn after_batch(&mut self, edits: &[EditSummary], _: &EditSummary) {
+        for edit in edits {
+            self.after_edit(edit);
+        }
     }
 }
 
@@ -851,6 +804,70 @@ impl EditHook for DocxBridge {
 /// Buffer 持有它的**句柄**（唯一可变通路），桥本体与引擎留在 `Editor`
 /// 里——「Buffer 每次变更 → 桥改行归属 + **当场节流回写**」在
 /// [`EditHook::after_edit`] 里完成；保存只需把已落账的引擎字节落盘。
+#[derive(Clone)]
+struct RowHistory {
+    at: usize,
+    before: Vec<LineBlock>,
+    after: Vec<LineBlock>,
+    before_lines: usize,
+    after_lines: usize,
+}
+
+struct CheckedPort {
+    inner: Box<dyn DocxPort>,
+    failure: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+}
+
+impl DocxPort for CheckedPort {
+    fn paragraph_count(&self) -> usize {
+        self.inner.paragraph_count()
+    }
+    fn paragraph_text(&self, idx: usize) -> String {
+        self.inner.paragraph_text(idx)
+    }
+    fn blocked_reason(&self, idx: usize) -> Option<ReadOnlyLine> {
+        self.inner.blocked_reason(idx)
+    }
+    fn set_text(&mut self, idx: usize, text: &str) -> Result<(), String> {
+        if let Some(reason) = self.failure.borrow().clone() {
+            return Err(reason);
+        }
+        self.inner.set_text(idx, text)
+    }
+    fn reset_text(&mut self, idx: usize) -> Result<(), String> {
+        self.inner.reset_text(idx)
+    }
+    fn save(&self) -> Result<Vec<u8>, String> {
+        if let Some(reason) = self.failure.borrow().clone() {
+            return Err(reason);
+        }
+        self.inner.save()
+    }
+    fn table_cells(&self) -> Vec<Vec<Vec<usize>>> {
+        self.inner.table_cells()
+    }
+    fn sdt_paragraphs(&self) -> Vec<usize> {
+        self.inner.sdt_paragraphs()
+    }
+    fn fields(&self) -> Vec<mdc_office_io::docx_edit::FieldInfo> {
+        self.inner.fields()
+    }
+    fn set_field_value(
+        &mut self,
+        para: usize,
+        field_idx: usize,
+        value: &str,
+    ) -> Result<(), String> {
+        self.inner.set_field_value(para, field_idx, value)
+    }
+    fn comments(&self) -> Vec<mdc_office_io::docx_edit::CommentInfo> {
+        self.inner.comments()
+    }
+    fn set_comment_text(&mut self, id: usize, text: &str) -> Result<(), String> {
+        self.inner.set_comment_text(id, text)
+    }
+}
+
 pub struct DocxEditing {
     /// 映射桥本体（Editor 持有）。
     pub bridge: DocxBridge,
@@ -862,48 +879,116 @@ pub struct DocxEditing {
     pub edits_since_flush: usize,
     /// 累计回写统计（apply 的 (成功, 同值, 失败)——诊断/证据行用）。
     pub stats: (usize, usize, usize),
-    /// 最近一次编辑起点（撤销后据此精确重排行归属）。
+    /// 最近一次编辑起点（仅诊断；撤销身份由 history_id 对应片段决定）。
     pub last_edit: Option<(usize, usize)>,
+    history: HashMap<u64, Vec<RowHistory>>,
+    failure: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl UndoHook for std::rc::Rc<std::cell::RefCell<DocxEditing>> {
-    fn before_history(&mut self, _redo: bool, delta: i64) -> Result<(), String> {
-        // 行数先对齐（变化量来自撤销记录本身——精确），精确归属等
-        // `after_history` 拿到 Buffer 实际行数后再从最近编辑点重排。
-        let mut e = self.borrow_mut();
-        let want = (e.bridge.line_count() as i64 + delta).max(1) as usize;
-        let near = e.last_edit;
-        reshape_rows(e.bridge.rows_mut(), want, near);
-        Ok(())
+    fn before_history(&mut self, _: bool, _: i64) -> Result<(), String> {
+        let mut editing = self.borrow_mut();
+        editing.reject_mapping("撤销通知缺少对应历史 ID");
+        Err("撤销通知缺少对应历史 ID".into())
     }
 
-    fn after_history(&mut self, _redo: bool, lines: usize) {
-        let mut e = self.borrow_mut();
-        let near = e.last_edit;
-        reshape_rows(e.bridge.rows_mut(), lines, near);
+    fn before_history_at(&mut self, redo: bool, _: i64, id: u64) -> Result<(), String> {
+        self.borrow_mut().restore_history(redo, id)
+    }
+
+    fn after_history(&mut self, _: bool, lines: usize) {
+        let mut editing = self.borrow_mut();
+        if editing.bridge.line_count() != lines {
+            editing.reject_mapping("撤销后 Buffer 行数与 DOCX 映射不一致");
+        }
     }
 }
 
 impl DocxEditing {
     /// 由桥 + 引擎构造。
     pub fn new(bridge: DocxBridge, engine: Box<dyn DocxPort>) -> Self {
+        let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
         Self {
             bridge,
-            engine,
+            engine: Box::new(CheckedPort {
+                inner: engine,
+                failure: failure.clone(),
+            }),
             edits_since_flush: 0,
             stats: (0, 0, 0),
             last_edit: None,
+            history: HashMap::new(),
+            failure,
         }
+    }
+
+    fn reject_mapping(&mut self, reason: &str) {
+        self.failure
+            .borrow_mut()
+            .get_or_insert_with(|| reason.to_string());
+        eprintln!("docx-edit: 拒绝保存——{reason}");
+    }
+
+    fn restore_history(&mut self, redo: bool, id: u64) -> Result<(), String> {
+        let Some(patches) = self.history.get(&id).cloned() else {
+            self.reject_mapping("找不到该撤销条目的 DOCX 行映射");
+            return Err("找不到该撤销条目的 DOCX 行映射".into());
+        };
+        let ordered: Vec<_> = if redo {
+            patches.iter().collect()
+        } else {
+            patches.iter().rev().collect()
+        };
+        for patch in ordered {
+            let (from, to, before_lines) = if redo {
+                (&patch.before, &patch.after, patch.before_lines)
+            } else {
+                (&patch.after, &patch.before, patch.after_lines)
+            };
+            if self.bridge.line_count() != before_lines
+                || self.bridge.rows().get(patch.at..patch.at + from.len()) != Some(from.as_slice())
+            {
+                self.reject_mapping("撤销条目与当前 DOCX 行映射不匹配");
+                return Err("撤销条目与当前 DOCX 行映射不匹配".into());
+            }
+            self.bridge
+                .rows_mut()
+                .splice(patch.at..patch.at + from.len(), to.iter().copied());
+        }
+        Ok(())
     }
 
     /// 按当前 Buffer 行文本回写（Buffer 侧钩子自动喂——这里只做计划与
     /// 落账）。返回本次计划（无变更时 `sets` 为空）。
     pub fn flush(&mut self, lines: &[String]) -> Writeback {
+        if self.bridge.line_count() != lines.len() {
+            self.reject_mapping("Buffer 行数与 DOCX 行映射不一致");
+            return Writeback::default();
+        }
         let plan = self.bridge.compute(lines);
+        let reset: std::collections::HashSet<_> = plan
+            .sets
+            .iter()
+            .filter(|(p, text)| self.bridge.original(*p) == Some(text.as_str()))
+            .map(|(p, _)| *p)
+            .collect();
+        let mut reset_done = Vec::new();
         let engine = &mut self.engine;
-        let (applied, skipped, failures) = self
-            .bridge
-            .apply(plan.clone(), |p, t| engine.set_text(p, t));
+        let (applied, skipped, failures) = self.bridge.apply(plan.clone(), |p, t| {
+            if reset.contains(&p) {
+                engine.reset_text(p)?;
+                reset_done.push(p);
+                Ok(())
+            } else {
+                engine.set_text(p, t)
+            }
+        });
+        for p in reset_done {
+            self.bridge.pending[p] = None;
+        }
+        if !failures.is_empty() {
+            self.reject_mapping(&failures.join("; "));
+        }
         self.stats.0 += applied;
         self.stats.1 += skipped;
         self.stats.2 += failures.len();
@@ -932,17 +1017,72 @@ impl EditHook for DocxEditing {
     }
 
     fn after_edit(&mut self, summary: &EditSummary) {
-        // 行归属已由 `DocxBridge::after_edit` 系语义的 remap 在同一钩子里
-        // 完成？——否：本类型自己是钩子，故在此显式重排。
+        let before_lines = self.bridge.line_count();
+        if let Err(reason) = self.bridge.before_edit(Coalesce {
+            start: (summary.start.line, summary.start.col),
+            end: (summary.before_end.line, summary.before_end.col),
+            inserted_lines: summary.inserted_lines,
+        }) {
+            self.reject_mapping(&reason);
+            return;
+        }
+        let row = self.bridge.rows()[summary.start.line];
+        let (at, end) = match row {
+            LineBlock::Para { paragraph, .. } => {
+                let first = self
+                    .bridge
+                    .rows()
+                    .iter()
+                    .position(
+                        |r| matches!(r, LineBlock::Para { paragraph: p, .. } if *p == paragraph),
+                    )
+                    .unwrap();
+                let last = self
+                    .bridge
+                    .rows()
+                    .iter()
+                    .rposition(
+                        |r| matches!(r, LineBlock::Para { paragraph: p, .. } if *p == paragraph),
+                    )
+                    .unwrap()
+                    + 1;
+                (first, last)
+            }
+            _ => (summary.start.line, summary.start.line + 1),
+        };
+        let before = self.bridge.rows()[at..end].to_vec();
         remap_after_edit(
             self.bridge.rows_mut(),
             (summary.start.line, summary.start.col),
-            (summary.end.line, summary.end.col),
+            (summary.before_end.line, summary.before_end.col),
             summary.inserted_lines,
             summary.newline_removed,
         );
+        if self.bridge.line_count() != summary.lines {
+            self.reject_mapping("编辑摘要与实际 DOCX 行数不一致");
+            return;
+        }
+        let after_end =
+            end - (summary.before_end.line - summary.start.line) + summary.inserted_lines;
+        let after = self.bridge.rows()[at..after_end].to_vec();
+        self.history
+            .entry(summary.history_id)
+            .or_default()
+            .push(RowHistory {
+                at,
+                before,
+                after,
+                before_lines,
+                after_lines: summary.lines,
+            });
         self.last_edit = Some((summary.start.line, summary.start.col));
         self.edits_since_flush += 1;
+    }
+
+    fn after_batch(&mut self, edits: &[EditSummary], _: &EditSummary) {
+        for edit in edits {
+            self.after_edit(edit);
+        }
     }
 }
 
@@ -955,43 +1095,9 @@ impl EditHook for std::rc::Rc<std::cell::RefCell<DocxEditing>> {
     fn after_edit(&mut self, summary: &EditSummary) {
         self.borrow_mut().after_edit(summary)
     }
-}
 
-// ---------------------------------------------------------------------------
-// 撤销/重做后的行归属兜底重排
-// ---------------------------------------------------------------------------
-
-/// 把行归属表调整到 `want` 行；从 `near`（最近编辑点）起按上下文的段
-/// 身份逐行重排，收敛不了的行退化为 `User`。
-///
-/// 撤销/重做是物理回放，钩子看不到「哪一段」——但**精确归属**其实有
-/// 替代真源：保存时逐段做「正文比对」，拿不对的段按原文写回（绝不误改）。
-/// 这里只保证**行数守恒 + 段身份不越界**，避免行数漂移导致整篇错位。
-fn reshape_rows(rows: &mut Vec<LineBlock>, want: usize, near: Option<(usize, usize)>) {
-    while rows.len() < want {
-        let idx = near.map(|(l, _)| l.min(rows.len())).unwrap_or(rows.len());
-        let src = rows
-            .get(idx.saturating_sub(1))
-            .copied()
-            .unwrap_or(LineBlock::User { join: false });
-        let row = match src {
-            LineBlock::Para {
-                paragraph, idx: i, ..
-            } => LineBlock::Para {
-                paragraph,
-                idx: i,
-                cont: true,
-            },
-            LineBlock::Cell { .. } | LineBlock::Locked(_) => LineBlock::User { join: false },
-            other => other,
-        };
-        rows.insert(idx.min(rows.len()), row);
-    }
-    while rows.len() > want {
-        let idx = near
-            .map(|(l, _)| l.min(rows.len().saturating_sub(1)))
-            .unwrap_or(rows.len() - 1);
-        rows.remove(idx);
+    fn after_batch(&mut self, edits: &[EditSummary], aggregate: &EditSummary) {
+        self.borrow_mut().after_batch(edits, aggregate)
     }
 }
 
@@ -1242,26 +1348,21 @@ mod tests {
     }
 
     #[test]
-    fn user_rows_join_nearest_paragraph() {
+    fn insertion_at_paragraph_start_does_not_steal_previous_paragraph() {
         // 在第 1 行（段 1 首行）之前插入用户行 → 本段行（承接续行）。
         let mut rows = vec![para(0, 0), para(1, 0)];
         remap_after_edit(&mut rows, (1, 0), (1, 0), 1, false);
         assert_eq!(rows.len(), 3, "行数 +1");
-        // 行归属：新行由上一行（段 0）承接（正文比对负责最终归位）。
-        assert!(
-            matches!(rows[1], LineBlock::Para { paragraph: 0, .. })
-                || matches!(rows[1], LineBlock::User { .. }),
-            "新行承接上一行归属：{:?}",
-            rows[1]
-        );
+        // Buffer 在段1的起点插入；新行与原段1正文同属段1，不能借给段0。
+        assert_eq!(rows, vec![para(0, 0), para(1, 0), para(1, 1)]);
         let mut b = DocxBridge::new(rows, vec![Some("甲".into()), Some("乙".into())]);
         b.note_projection(0, "甲");
         b.note_projection(1, "乙");
         b.note_fallback(0, "甲");
         b.note_fallback(1, "乙");
         let wb = b.compute(&texts(&["甲", "新行", "乙"]));
-        // 新行由上一行（段 0）承接 → 段 0 变成两行；段 1 原样不动。
-        assert_eq!(wb.sets, vec![(0, "甲\n新行".to_string())]);
+        // 前一段逐字节未变；只写入实际被编辑的第二段。
+        assert_eq!(wb.sets, vec![(1, "新行\n乙".to_string())]);
     }
 
     #[test]

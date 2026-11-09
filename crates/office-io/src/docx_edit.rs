@@ -429,8 +429,26 @@ impl DocxEditor {
             }
         }
         check_edit_text(idx, text)?;
-        self.pending[idx] = Some(text.to_string());
+        // 返回打开态文本时撤销这次段落手术；保护域/越界/字符校验仍先执行。
+        // set 原文再保存不能合并原始 runs 或添加 xml:space。
+        self.pending[idx] = if text == p.text {
+            None
+        } else {
+            Some(text.to_string())
+        };
         Ok(())
+    }
+
+    /// 清除指定段的待编辑文本，恢复打开态原文与原始 XML。
+    /// 通过同一 setter 的索引/保护域/字符校验，不能借此改写只读段。
+    pub fn reset_paragraph_text(&mut self, idx: usize) -> Result<(), DocxError> {
+        let original = self
+            .paragraphs
+            .get(idx)
+            .ok_or_else(|| DocxError::InvalidInput(format!("paragraph {idx} out of range")))?
+            .text
+            .clone();
+        self.set_paragraph_text(idx, &original)
     }
 
     /// 当前修订策略。
