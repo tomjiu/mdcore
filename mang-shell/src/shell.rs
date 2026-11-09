@@ -49,6 +49,7 @@ use crate::outline_panel::OutlinePanel;
 use crate::keymap::{self, ShellAction};
 use crate::panels;
 use crate::pdf_pages::PdfPagesView;
+use crate::pdf_thumbs::{PdfThumbnailsView, PdfThumbsHooks};
 use crate::recent::RecentStore;
 use crate::right_dock;
 use crate::settings_panel;
@@ -154,6 +155,11 @@ pub struct ShellApp {
     /// #289-④：pdf 页面视图（当前 pdf 标签的位图渲染实体 + 归属路径
     /// ——切到不同 pdf 标签时重建；关闭该标签时丢弃）。
     pdf_pages: Option<(PathBuf, Entity<PdfPagesView>)>,
+    /// #420：pdf 缩略图侧栏（与 pdf_pages 实体同生命周期：同路径重建/
+    /// 关标签/装载失败一并丢弃；主视图 error 态不挂——缺 pdfium 环境
+    /// 无空壳侧栏）。联动经 PdfThumbsHooks 双向钩子（点击跳页/高亮
+    /// 跟随——见 ensure_pdf_pages 接线）。
+    pdf_thumbs: Option<Entity<PdfThumbnailsView>>,
     /// #289-④：pdf 显示模式（true = 页面位图视图——缺省；false =
     /// 文本行模型。状态栏「页面/文本」钮切换；两视图各有查找面
     /// （#422：页面视图内查找条，不再强制切文本）。
@@ -408,6 +414,7 @@ impl ShellApp {
             git_view: false,
             settings_open: false,
             pdf_pages: None,
+            pdf_thumbs: None,
             pdf_view_mode: true,
             xlsx_grid: None,
             xlsx_sessions: std::collections::HashMap::new(),
@@ -881,16 +888,39 @@ impl ShellApp {
                 let message = format!("页面视图装载失败（{}）：{err}", path.display());
                 self.show_notice(message, cx);
                 self.pdf_pages = None;
+                self.pdf_thumbs = None;
                 return;
             }
         };
         if bytes.len() as u64 > 100 * 1024 * 1024 {
             self.show_notice("页面视图仅支持 ≤100MB 文件（文本视图不受限）".into(), cx);
             self.pdf_pages = None;
+            self.pdf_thumbs = None;
             return;
         }
         let entity = cx.new(|cx| PdfPagesView::new(bytes, cx));
-        self.pdf_pages = Some((path, entity));
+        self.pdf_pages = Some((path, entity.clone()));
+        // #420：缩略图侧栏——与页视图同源字节/几何；error 态（缺
+        // pdfium/引擎失败）不挂空壳。联动钩子：点击 → scroll_to_page；
+        // 高亮 ← top_visible_page（#420 新读数面）。
+        let engine_ok = entity.read(cx).page_count() > 0;
+        self.pdf_thumbs = engine_ok.then(|| {
+            let pages_jump = entity.clone();
+            let pages_read = entity.clone();
+            cx.new(|cx| {
+                PdfThumbnailsView::new(
+                    entity.read(cx).bytes(),
+                    entity.read(cx).page_aspect(),
+                    PdfThumbsHooks {
+                        jump_to_page: Arc::new(move |page, _window, cx| {
+                            pages_jump.update(cx, |v, _| v.scroll_to_page(page));
+                        }),
+                        current_page: Arc::new(move |app| pages_read.read(app).top_visible_page()),
+                    },
+                    cx,
+                )
+            })
+        });
         cx.notify();
     }
 
@@ -1662,6 +1692,8 @@ impl ShellApp {
         if let Some((owned, _)) = &self.pdf_pages {
             if *owned == closed_path {
                 self.pdf_pages = None;
+                // #420：侧栏与页视图同生命周期（同路径丢弃）。
+                self.pdf_thumbs = None;
             }
         }
         // #389 阶段 1：网格视图同款生命周期（关标签丢弃）。
@@ -3080,8 +3112,23 @@ fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoEle
         .and_then(|_| shell.xlsx_grid_view_mode.then(|| ()))
         .and_then(|_| shell.xlsx_grid.as_ref().map(|(_, e)| e.clone()));
     let active_editor = shell.editor().cloned();
+    // #420：缩略图侧栏（与页视图同生命周期；页视图在位才挂——文本
+    // 模式/无 pdfium 不出空壳）。
+    let pdf_thumbs_entity = pdf_pages_entity
+        .as_ref()
+        .and_then(|_| shell.pdf_thumbs.clone());
     match (pdf_pages_entity, xlsx_grid_entity, active_editor) {
-        (Some(pages), _, _) => pages.into_any_element(),
+        (Some(pages), _, _) => match pdf_thumbs_entity {
+            Some(thumbs) => h_flex()
+                .id("pdf-view-with-thumbs")
+                .size_full()
+                .child(thumbs)
+                // 主视图占满余幅（min_w_0 防溢出挤压；size_full 的页根
+                // 在此容器内重定尺寸）。
+                .child(div().flex_1().min_w_0().h_full().child(pages))
+                .into_any_element(),
+            None => pages.into_any_element(),
+        },
         (None, Some(grid), _) => grid.into_any_element(),
         (None, None, Some(editor)) => editor.into_any_element(),
         (None, None, None) => {

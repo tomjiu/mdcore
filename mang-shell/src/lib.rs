@@ -108,6 +108,12 @@ pub mod pdf_export_docx;
 #[path = "pdf_pages.rs"]
 pub mod pdf_pages;
 
+/// #420：PDF 页面缩略图侧栏（低 dpi 光栅化 → uniform_list 虚拟化懒加载
+/// ——≤60 页首批全量、>60 页只染可见窗；点击跳页 + 主视图滚动高亮
+/// 联动经壳注入钩子，与 pdf_pages 零写面耦合）。
+#[path = "pdf_thumbs.rs"]
+pub mod pdf_thumbs;
+
 /// #389 阶段 1：XLSX 网格视图（真网格渲染骨架——列头/行号槽固定 +
 /// 双向虚拟化 + 单元格点选；数据面/几何纯函数零 GPUI 依赖可测，
 /// GPUI 层编译面验证 + 真机登记——pdf_pages 同纪律）。
