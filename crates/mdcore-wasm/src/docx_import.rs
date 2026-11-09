@@ -107,8 +107,12 @@
 //!
 //! - **引用位**：段落尾接 ` [^N]`（`ParagraphData::footnote_refs`
 //!   [#19 读面段落粒度标注]——run 级位置引擎模型不承载，尾接前
-//!   `trim_end`（往返分离空格不翻倍）；表内段引用位读面不标注 =
-//!   已知边界）；
+//!   `trim_end`（往返分离空格不翻倍）；
+//! - **表内段引用位**（#517 层 2）：`TableData::footnote_refs`
+//!   （层 1 三维键数据面）→ cell 文本尾接 ` [^N]`（同 body 段口径
+//!   ——trim_end + 标签查表 + 未知 id 跳过不计数）。粒度边界：数据
+//!   面是 cell 段级（`para`），GFM 单元格单行面（换行展平）下 marker
+//!   落 cell 文本尾——与 body 段「尾接是诚实近似」同一登记类；
 //! - **定义块**：全文档最末尾（页脚尾接之后——md 无页脚概念，往返
 //!   后页脚行降为正文段，定义块放最末 = 定点稳定）`[^N]: 内容`，
 //!   docx id → footnotes.xml 文档序重编号连续小号；多段脚注懒连续
@@ -298,11 +302,14 @@ fn sanitize_cell(cell: &str) -> String {
 
 /// 表 → GFM 管道表（表头 + `---` 分隔行 + 体行；与 mdcore Table 块
 /// 规范文本同构）。空表 → None（跳过）；短行补空格到全表最大列宽。
-fn render_table(table: &TableData) -> Option<String> {
-    if table.rows.is_empty() {
+/// #517 层 2：入参从 `&TableData` 收窄为行栅格——cell 引用位尾接
+/// 由调用方（[`BlockMapper::suffix_table_cells`）先行完成，本函数
+/// 只管管道形状渲染（职责分离）。
+fn render_table(rows: &[Vec<String>]) -> Option<String> {
+    if rows.is_empty() {
         return None;
     }
-    let width = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
     if width == 0 {
         return None;
     }
@@ -316,10 +323,10 @@ fn render_table(table: &TableData) -> Option<String> {
         }
         line
     };
-    let mut lines = vec![render_row(&table.rows[0])];
+    let mut lines = vec![render_row(&rows[0])];
     let sep_cells: Vec<String> = std::iter::repeat_n(String::from("---"), width).collect();
     lines.push(render_row(&sep_cells));
-    for row in &table.rows[1..] {
+    for row in &rows[1..] {
         lines.push(render_row(row));
     }
     Some(lines.join("\n"))
@@ -664,7 +671,10 @@ impl BlockMapper {
                     // P2-2：合并区域计数（表未渲染[空表]时 merges 恒空
                     // ——栅格展开形下两者同源，无口径差）。
                     self.merged_ranges += t.merges.len();
-                    if let Some(md) = render_table(t) {
+                    // #517 层 2：表内段引用位 → cell 文本尾接 ` [^N]`
+                    //（层 1 数据面消费点——与 body 段同口径）。
+                    let rows = self.suffix_table_cells(t);
+                    if let Some(md) = render_table(&rows) {
                         lines.push(md);
                         self.tables += 1;
                     }
@@ -674,6 +684,51 @@ impl BlockMapper {
             }
         }
         lines
+    }
+
+    /// #517 层 2：表内段引用位 → cell 文本尾接 ` [^N]`。
+    ///
+    /// 与 body 段同口径（#485）：尾接前 `trim_end`（往返分离空格不
+    /// 翻倍）+ `footnote_labels` 查表（未知 id 跳过不计数——致档防御
+    /// 面）+ 每个发射 marker 计入 `footnote_refs_emitted`。
+    ///
+    /// **粒度边界（如实登记）**：层 1 数据面是 cell 段级
+    /// （`TableCellNoteRef::para`——cell 内段序）；GFM 单元格是单行面
+    /// （`sanitize_cell` 换行展平），段内位置不可渲染——marker 落
+    /// cell 文本尾（同 cell 多段引用按条目序顺次尾接）。与 body 段
+    /// 「尾接是诚实近似而非位置保真」同一登记类（模块文档 §引用位）。
+    ///
+    /// 坐标口径：`row` = 栅格行，`col` = 栅格原点格列（gridSpan 展开
+    /// 前——层 1 登记口径），与 `rows` 栅格直接对位；越界坐标静默跳过
+    /// （防御面——引擎记录实际 cell，越界即引擎/消费面漂移，不崩）。
+    fn suffix_table_cells(&mut self, t: &TableData) -> Vec<Vec<String>> {
+        if t.footnote_refs.is_empty() {
+            return t.rows.clone();
+        }
+        let mut rows = t.rows.clone();
+        for r in &t.footnote_refs {
+            // 先查标签（未知 id 跳过不计数——body 段同口径）。
+            let labels: Vec<&str> = r
+                .ids
+                .iter()
+                .filter_map(|id| self.footnote_labels.get(id).map(String::as_str))
+                .collect();
+            if labels.is_empty() {
+                continue;
+            }
+            let Some(cell) = rows.get_mut(r.row).and_then(|row| row.get_mut(r.col)) else {
+                continue;
+            };
+            let mut suffixed = cell.trim_end().to_string();
+            for label in labels {
+                suffixed.push_str(" [^");
+                suffixed.push_str(label);
+                suffixed.push(']');
+                self.footnote_refs_emitted += 1;
+            }
+            *cell = suffixed;
+        }
+        rows
     }
 
     /// 聚合另一映射器的计数（部件级独立映射 → 文档级单一 stats 面）。
@@ -1011,7 +1066,8 @@ pub fn build_footnote_sample_docx() -> Vec<u8> {
 mod tests {
     use super::*;
     use mdc_office_io::docx::{
-        BlockSource, HeaderFooterData, HeaderFooterVariant, MergeRange, ParagraphData,
+        BlockSource, FootnoteData, HeaderFooterData, HeaderFooterVariant, MergeRange,
+        ParagraphData, TableCellNoteRef,
     };
 
     fn para(style: Option<&str>, runs: Vec<RunData>) -> Block {
@@ -1790,6 +1846,188 @@ mod tests {
         })]));
         assert_eq!(md2, "");
         assert_eq!(stats2["tables"], 0);
+    }
+
+    // ── #517 层 2：表内段引用位 → cell 文本尾接 [^N] ──────────────
+
+    /// 带脚注条目的文档（id 任意 i64——GFM 标签按 footnotes.xml 文档
+    /// 序重编号为 1..N；引用位与定义共享同一映射）。
+    fn noted_doc(blocks: Vec<Block>, note_ids: &[i64]) -> DocxDocument {
+        let mut doc = doc_of(blocks);
+        doc.footnotes = note_ids
+            .iter()
+            .map(|&id| FootnoteData {
+                id,
+                blocks: vec![para(None, vec![run("note")])],
+            })
+            .collect();
+        doc
+    }
+
+    /// 主路径：两个 cell 各带一条引用位（原点格坐标）→ cell 文本尾接
+    /// ` [^N]`（trim_end 口径）+ stats `footnote_refs` 计数。
+    #[test]
+    fn table_cell_refs_append_markers() {
+        let doc = noted_doc(
+            vec![Block::Table(TableData {
+                rows: vec![
+                    vec!["表头A ".to_string(), "B".to_string()],
+                    vec!["体1".to_string(), "体2".to_string()],
+                ],
+                merges: vec![],
+                source: BlockSource::Body,
+                nested: false,
+                footnote_refs: vec![
+                    TableCellNoteRef {
+                        row: 0,
+                        col: 0,
+                        para: 0,
+                        ids: vec![3],
+                    },
+                    TableCellNoteRef {
+                        row: 1,
+                        col: 1,
+                        para: 0,
+                        ids: vec![7],
+                    },
+                ],
+            })],
+            &[3, 7],
+        );
+        let (md, stats) = docx_to_markdown(&doc);
+        // 尾接前 trim_end（「表头A 」尾空格不翻倍——body 段 #485 同口径）。
+        assert_eq!(
+            md,
+            "| 表头A [^1] | B |\n| --- | --- |\n| 体1 | 体2 [^2] |\n\n[^1]: note\n\n[^2]: note"
+        );
+        assert_eq!(stats["footnote_refs"], 2, "两条引用位计数: {stats}");
+        // 定义块随引用位在场（id 3/7 → 标签 1/2）。
+        assert!(
+            md.contains("[^1]: note") && md.contains("[^2]: note"),
+            "{md}"
+        );
+    }
+
+    /// 未知 id（引用无对应 footnotes 条目——致档防御面）跳过不计数，
+    /// cell 文本零变化（body 段同口径）。
+    #[test]
+    fn table_cell_refs_unknown_id_skipped() {
+        let doc = noted_doc(
+            vec![Block::Table(TableData {
+                rows: vec![vec!["x".to_string()]],
+                merges: vec![],
+                source: BlockSource::Body,
+                nested: false,
+                footnote_refs: vec![TableCellNoteRef {
+                    row: 0,
+                    col: 0,
+                    para: 0,
+                    ids: vec![99],
+                }],
+            })],
+            &[5],
+        );
+        let (md, stats) = docx_to_markdown(&doc);
+        assert_eq!(
+            md, "| x |\n| --- |\n\n[^1]: note",
+            "未知 id 不发射 marker（孤儿定义照发）: {md}"
+        );
+        assert_eq!(stats["footnote_refs"], 0, "未知 id 不计数: {stats}");
+        // 已知 id 5 无引用位 → 孤儿定义照发（#485 验收 1 契约）。
+        assert!(md.contains("[^1]: note"), "{md}");
+    }
+
+    /// 同 cell 多条引用位（段序两条 + 单条多 id）→ 按条目序顺次尾接；
+    /// 多段 cell（换行）GFM 单行面下 marker 落 cell 文本尾（粒度边界
+    /// ——模块文档 §引用位登记）。
+    #[test]
+    fn table_cell_refs_multi_entry_and_multiline_cell() {
+        let doc = noted_doc(
+            vec![Block::Table(TableData {
+                rows: vec![vec!["l1\nl2".to_string(), "y".to_string()]],
+                merges: vec![],
+                source: BlockSource::Body,
+                nested: false,
+                footnote_refs: vec![
+                    TableCellNoteRef {
+                        row: 0,
+                        col: 0,
+                        para: 0,
+                        ids: vec![1],
+                    },
+                    TableCellNoteRef {
+                        row: 0,
+                        col: 0,
+                        para: 1,
+                        ids: vec![2, 3],
+                    },
+                ],
+            })],
+            &[1, 2, 3],
+        );
+        let (md, stats) = docx_to_markdown(&doc);
+        // 换行展平为空格（sanitize_cell 既有面）+ 三条 marker 顺次尾接。
+        assert_eq!(
+            md,
+            "| l1 l2 [^1] [^2] [^3] | y |\n| --- | --- |\n\n[^1]: note\n\n[^2]: note\n\n[^3]: note"
+        );
+        assert_eq!(stats["footnote_refs"], 3, "三条引用位计数: {stats}");
+    }
+
+    /// 越界坐标（行/列超栅格——引擎与消费面漂移的防御面）静默跳过
+    /// 不崩；在界 cell 零影响。
+    #[test]
+    fn table_cell_refs_out_of_bounds_skipped() {
+        let doc = noted_doc(
+            vec![Block::Table(TableData {
+                rows: vec![vec!["a".to_string()]],
+                merges: vec![],
+                source: BlockSource::Body,
+                nested: false,
+                footnote_refs: vec![
+                    TableCellNoteRef {
+                        row: 5,
+                        col: 0,
+                        para: 0,
+                        ids: vec![1],
+                    },
+                    TableCellNoteRef {
+                        row: 0,
+                        col: 9,
+                        para: 0,
+                        ids: vec![1],
+                    },
+                ],
+            })],
+            &[1],
+        );
+        let (md, stats) = docx_to_markdown(&doc);
+        assert_eq!(
+            md, "| a |\n| --- |\n\n[^1]: note",
+            "越界坐标零发射（孤儿定义照发）: {md}"
+        );
+        assert_eq!(stats["footnote_refs"], 0, "越界坐标不计数: {stats}");
+    }
+
+    /// 零引用位表（绝大多数表——回归锁）：footnote_refs 空 Vec 时
+    /// rows 原样直通（clone 路径），渲染与计数零变化。
+    #[test]
+    fn table_without_refs_unchanged() {
+        let doc = noted_doc(
+            vec![Block::Table(TableData {
+                rows: vec![vec!["plain".to_string(), "cell".to_string()]],
+                merges: vec![],
+                source: BlockSource::Body,
+                nested: false,
+                footnote_refs: Vec::new(),
+            })],
+            &[1],
+        );
+        let (md, stats) = docx_to_markdown(&doc);
+        // 孤儿定义照发（#485 契约——脚注条目在场即发射定义块）；
+        // 表渲染零变化是本断言面（无 marker、无计数）。
+        assert_eq!(md, "| plain | cell |\n| --- | --- |\n\n[^1]: note");
+        assert_eq!(stats["footnote_refs"], 0);
     }
 
     /// #22 P2-2 单元级：merges 清单 → stats `merged_ranges` 计数 +
