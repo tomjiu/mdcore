@@ -7078,12 +7078,13 @@ impl DocxWriter {
         self.runs += 7;
     }
 
-    /// **#617：TOC 重算发射**（[`crate::docx_toc`] 重算产物的写面消费
+    /// **#617/#627：TOC 重算发射**（[`crate::docx_toc`] 重算产物的写面消费
     /// ——与 [`Self::toc_entries`] 同构三段式跨段域，三处差异）：
     ///
-    /// - **书签名**：取 [`TocRecompute::names`]（内容寻址稳定名
-    ///   `toc_h<hex>`——重算后同标题同名，跳转配对不漂移；静态面的
-    ///   `toc_N` 计数器名域零碰撞）。**生成侧不注册**纪律与
+    /// - **书签名**：取 [`TocRecompute::names`]（#627 书签保真——
+    ///   存续标题**复用旧 `toc_N` 锚名**（改文/改层级不换名，旧引用
+    ///   不悬空）；新标题内容寻址名 `toc_h<hex>` 且避让文档全部已
+    ///   存在书签）。**生成侧不注册**纪律与
     ///   [`Self::toc_entries`] 同——注册/定义发生在调用方
     ///   `heading_bookmarked` 携同名注册时。
     /// - **PAGEREF 缓存值**：按 [`TocRecompute::cached_pages`] 逐项——
@@ -7093,10 +7094,12 @@ impl DocxWriter {
     ///   M1-M4（明确排除）。
     /// - **begin 不置 dirty**：#309③ 打开即显缓存语义维持（零漂移）。
     ///
-    /// 校验（save 漏斗粘性，V8/V8'/V1-V6 同纪律——首错落账零产物拒）：
-    /// `heading_range` 1-9 且 lo ≤ hi；entry 层级 1-9；names 与
-    /// entries/cached_pages 等长且逐名过 [`validate_bookmark_name`]
-    /// 域校验（V1-V6——计划是公开输入，域校验兜底）+ 计划内重名拒。
+    /// 校验（save 漏斗粘性，V8/V8'/V14/V1-V6 同纪律——首错落账零产物
+    /// 拒）：`heading_range` 1-9 且 lo ≤ hi；entry 层级 1-9；entry 文本
+    /// 非法 XML 字符拒（#627 V14——控制字符/非字符；已转义字面不拒）；
+    /// names 与 entries/cached_pages 等长且逐名过
+    /// [`validate_bookmark_name`] 域校验（V1-V6——计划是公开输入，
+    /// 域校验兜底）+ 计划内重名拒。
     ///
     /// **entries 空 = 旧形态退化**：与 [`Self::toc_entries`] 同（占位
     /// 提示五连域段，静态面既有行为零漂移）。
@@ -7128,6 +7131,26 @@ impl DocxWriter {
             if let Some(bad) = entries.iter().find(|e| !(1..=9).contains(&e.level)) {
                 self.validation_error =
                     Some(format!("V8: TOC 目录项层级越界（{}——须 1-9）", bad.level));
+            }
+        }
+        // #627 V14：目录项**文本**非法 XML 字符拒（计划为公开输入——
+        // 手工构造的 plan 可能携带控制字符/非字符；发射面 docx_rs 只
+        // 转义实体，裸控制字符会产出非法 XML）。与 check_edit_text 同
+        // 口径（控制字符拒 \\t\\n\\r 外全集 + U+FFFE/U+FFFF 非字符）；
+        // **合法字面文本（含 &amp; 等已转义形态）不拒**——那是文本
+        // 数据非非法字符（审核钉定：不得把已转义当非法拒）。
+        if self.validation_error.is_none() {
+            let bad = entries.iter().find_map(|e| {
+                e.text.chars().find(|c| {
+                    matches!(c, '\u{FFFE}' | '\u{FFFF}')
+                        || ((*c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r'))
+                })
+            });
+            if let Some(c) = bad {
+                self.validation_error = Some(format!(
+                    "V14: TOC 目录项文本含 XML 1.0 非法字符 U+{:04X}（控制字符仅 \\t\\n\\r 合法；非字符拒）",
+                    c as u32
+                ));
             }
         }
         // #617 计划一致性：names / cached_pages 与 entries 等长。

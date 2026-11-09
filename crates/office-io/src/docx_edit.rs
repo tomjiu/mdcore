@@ -115,6 +115,11 @@ pub struct FieldInfo {
     /// begin 所在段落号（文档序扁平坐标系——与 `paragraphs()` 同源；
     /// 跨段域挂 begin 段，end 可能在后段）。
     pub para: usize,
+    /// #627：end 所在段落号——跨段域的实际组范围 = `para..=end_para`
+    ///（fldSimple / 单段域 = para 同值）。TOC 型域的旧目录项提取按
+    /// 此区间读取（Word 真机形态结果段无段内域标记，不能按 field_code
+    /// 猜范围）。
+    pub end_para: usize,
     /// 段内域序（0 基，按 begin 在段内的文档序）。
     pub field_idx: usize,
     /// 域类型。
@@ -263,6 +268,10 @@ pub struct DocxEditor {
     fields_idx: Vec<FieldScan>,
     /// 待落账域编辑（与 fields_idx 等长平行数组；None = 未编辑）。
     field_edits: Vec<Option<String>>,
+    /// #627：书签表（open 时与段落同趟扫描落账——`w:bookmarkStart`
+    /// name + 段落号，文档序；原文坐标系 open 后不变）。TOC 重算的
+    /// 书签保真配对数据源。
+    bookmarks: Vec<BookmarkScan>,
     /// #141 批注脚注：两部件（footnotes.xml / comments.xml——在场
     /// 则扫描，缺席 = None = 该面空集恒保真透传）。
     notes: NoteParts,
@@ -325,7 +334,7 @@ impl DocxEditor {
                 }));
             }
         }
-        let (paragraphs, tables, fields_idx, note_anchors) = scan_paragraphs(&xml)?;
+        let (paragraphs, tables, fields_idx, note_anchors, bookmarks) = scan_paragraphs(&xml)?;
         let notes = NoteParts::scan(&mut za)?;
         let n = paragraphs.len();
         let pending_footnotes = notes.pending_len(NotePartKind::Footnotes);
@@ -339,6 +348,7 @@ impl DocxEditor {
             tables,
             field_edits: vec![None; fields_idx.len()],
             fields_idx,
+            bookmarks,
             note_anchors,
             pending_footnotes,
             pending_comments,
@@ -427,6 +437,7 @@ impl DocxEditor {
             .iter()
             .map(|f| FieldInfo {
                 para: f.begin_para,
+                end_para: f.end_para,
                 field_idx: f.seq_in_para,
                 kind: f.kind.clone(),
                 instr: f.instr.clone(),
@@ -437,32 +448,39 @@ impl DocxEditor {
             .collect()
     }
 
-    // #617 TOC 自动重算（加性扩展——读面派生 + 稳定名 + 缓存语义）
+    // #617 TOC 自动重算（加性扩展——读面派生 + 书签保真 + 缓存语义）
     // -----------------------------------------------------------------------
 
-    /// **#617：TOC 重算**——从当前文档标题树重新派生目录项集，差分旧
-    /// 目录项，产出内容寻址稳定书签名与 PAGEREF 缓存语义。
+    /// **#617/#627：TOC 重算**——从文档**当前状态**（含未保存的 pending
+    /// 编辑）的标题树重新派生目录项集，差分旧目录项，产出**书签保真**
+    /// 名单（存续标题复用旧锚，新项内容寻址避让）与 PAGEREF 缓存语义。
     ///
     /// 数据流（两模型各取所长，**不做段落序跨模型连接**——sdt 盲区
     /// 下两侧段落序发散，见 [`ParagraphRef::in_sdt`] 登记）：
     ///
-    /// - **标题树**：`read_docx_from_bytes`（读面单一真源
-    ///   `ParagraphData::heading_level`——含样式表解析链）；表内标题
-    ///   为读面已登记盲区（cell 段扁平化）。
-    /// - **旧目录项**：本编辑面原文坐标（`fields()` 定位 TOC 域 begin
-    ///   段 → `paragraphs()`/`paragraph_text()` 提取目录项段——**含
-    ///   sdt 包裹形态与 PAGEREF 缓存值**，不受读模型对 sdt 容器的
-    ///   结构性丢弃影响）。
+    /// - **标题树**：#627——不再读 open 时的旧字节，而是读**当前快照**
+    ///   （`save_to_vec()` 纯函数产物——同编辑器同一实例上未保存的
+    ///   `set_paragraph_text` 修改即时反映；无 pending 时直接用原字节
+    ///   免重打包）。存盘前后重算结果一致（快照 = 存盘字节）；失败
+    ///   语义：快照/解析失败透传，编辑器状态零变化（无隐式落账）。
+    /// - **旧目录项**：本编辑面原文坐标（`fields()` 定位 TOC 域的
+    ///   begin..end 实际组范围——#627：按域结束标记划界，不按段内
+    ///   field_code 猜——Word 真机形态的纯文本/超链接结果段无段内
+    ///   域标记也能完整提取）；提取含 sdt 包裹形态与 PAGEREF 缓存值。
+    /// - **书签保真（#627）**：存续标题按**当前文本**多重集配对已有
+    ///   `toc_N` 锚（段落文本 pending 感知——改文/改层级后的标题仍配
+    ///   自己的旧锚，层级变化不再改名）；新标题内容寻址新名，且
+    ///   `used` 预置文档全部已存在书签名（含用户书签）——零碰撞。
     /// - **配对**：按文本多重集（增/删/缓存保留），无段落序耦合。
     ///
     /// 返回 [`TocRecompute`]——写面经
     /// [`crate::docx::DocxWriter::toc_entries_recomputed`] 消费（同构
-    /// 三段式发射 + 稳定名 + 逐项缓存值）。产品接线（触发命令/
+    /// 三段式发射 + 逐项名/缓存值）。产品接线（触发命令/
     /// mang-shell/web 入口）不在本面。
     ///
     /// 拒面（typed `DocxError::InvalidInput`，fail-closed）：
-    /// `heading_range` 越域（V8 同判据——1-9 且 lo ≤ hi）。读模型
-    /// 解析失败透传（容器门语义不变）。
+    /// `heading_range` 越域（V8 同判据——1-9 且 lo ≤ hi）。快照/读
+    /// 模型解析失败透传（容器门语义不变——状态零变化）。
     pub fn recompute_toc(
         &self,
         heading_range: Option<(u8, u8)>,
@@ -475,18 +493,41 @@ impl DocxEditor {
                 )));
             }
         }
-        // 标题树（读模型——bytes 为 open 时的原始字节，容器门内）。
-        let doc = crate::docx::read_docx_from_bytes(&self.bytes)?;
+        // #627：标题树读**当前快照**——同编辑器未保存的 pending 修改
+        //（标题改文）即时反映；无 pending 直接用原字节（免重打包）。
+        // save_to_vec 是纯函数（&self）：重算不落账、不修改 pending
+        //（无隐式保存）；失败透传且状态零变化。
+        let snapshot: Vec<u8> = if self.has_pending_edits() {
+            self.save_to_vec()?
+        } else {
+            self.bytes.clone()
+        };
+        let doc = crate::docx::read_docx_from_bytes(&snapshot)?;
         let entries = crate::docx_toc::heading_entries(&doc, heading_range);
-        // 旧目录项提取（编辑面原文坐标）。
+        // 旧目录项提取（编辑面原文坐标——begin..end 实际组范围）。
         let old = self.extract_old_toc_entries();
         let old_toc_present = old.is_some();
         let old_entries = old.unwrap_or_default();
-        // 稳定名（内容寻址——同标题跨重算同名）。
-        let mut used = std::collections::HashSet::new();
+        // #627 书签保真：存续标题复用旧 toc_N 锚（按当前文本多重集
+        // 配对——pending 感知段落文本）；新项内容寻址新名。
+        // `used` 预置**全部**已存在书签名（含用户书签与未配对的
+        // toc_N）——新名零碰撞（V6 域外预防）。
+        let reuse_pool: Vec<(String, String)> = self
+            .bookmarks
+            .iter()
+            .filter(|b| crate::docx_toc::is_engine_toc_bookmark(&b.name))
+            .map(|b| (b.name.clone(), self.paragraph_text(b.para).to_string()))
+            .collect();
+        let reused = crate::docx_toc::reuse_bookmark_names(&entries, &reuse_pool);
+        let mut used: std::collections::HashSet<String> =
+            self.bookmarks.iter().map(|b| b.name.clone()).collect();
         let names = entries
             .iter()
-            .map(|e| crate::docx_toc::stable_bookmark_name(e.level, &e.text, &mut used))
+            .zip(reused)
+            .map(|(e, reused)| match reused {
+                Some(old_name) => old_name,
+                None => crate::docx_toc::stable_bookmark_name(e.level, &e.text, &mut used),
+            })
             .collect();
         // 缓存配对 + 差分（按文本多重集）。**无基线语义**：无旧 TOC
         // = 初次生成而非增量编辑——差分全空（「added」指相对既有
@@ -508,45 +549,44 @@ impl DocxEditor {
         })
     }
 
-    /// #617：旧目录项提取（私有——编辑面原文坐标）。
+    /// #627：待落账编辑在场判定（重算快照路径选择——有 pending 才
+    /// 重打包，免无谓全包拷贝）。
+    fn has_pending_edits(&self) -> bool {
+        self.pending.iter().any(|p| p.is_some())
+            || self.field_edits.iter().any(|p| p.is_some())
+            || self.pending_footnotes.iter().any(|p| p.is_some())
+            || self.pending_comments.iter().any(|p| p.is_some())
+    }
+
+    /// #617/#627：旧目录项提取（私有——编辑面原文坐标）。
     ///
-    /// 定位：`fields()` 首个 [`FieldKind::Toc`] 域的 begin 段；从该段
-    /// 起解析「`文本\t缓存页`」形态的目录项段（rsplit `\t`——标题文本
-    /// 自带 `\t` 时缓存值取末段，中段归文本）。终止条件（三态）：
-    /// 域头自身含目录项（Word 真机形态 begin/separate 与首项同段）→
-    /// 从头段起解析；空文本域段（域尾 end）或非域段（TOC 结束后的
-    /// 正文）→ 止。**无 TOC 域 → None**（`old_toc_present = false`，
-    /// 全量待重算）。
+    /// 定位：`fields()` 首个 [`FieldKind::Toc`] 域的 **begin..end 实际
+    /// 组范围**（#627：跨段域的 end 段由域扫描落账——不按段内
+    /// field_code 猜范围。Word 真机形态的 TOC 结果段是纯文本/
+    /// 超链接段，**无段内域标记**，按 field_code 推进会在首个结果段
+    /// 提前截断丢后续项）。范围内容按「`文本\t缓存页`」形态解析
+    ///（rsplit `\t`——标题文本自带 `\t` 时缓存值取末段，中段归
+    /// 文本）；不可解析段（域头 instr 段/空尾段/separate 占位段）
+    /// **跳过不终止**——只有域组结束才终止。**无 TOC 域 → None**
+    ///（`old_toc_present = false`，全量待重算）。
     fn extract_old_toc_entries(&self) -> Option<Vec<(String, String)>> {
         let toc_field = self
             .fields()
             .into_iter()
             .find(|f| f.kind == FieldKind::Toc)?;
         let begin = toc_field.para;
+        let end = toc_field
+            .end_para
+            .max(begin) // 防御：end 不在 begin 后（理论不可达——扫描序保证）
+            .min(self.paragraphs.len().saturating_sub(1));
         let mut out: Vec<(String, String)> = Vec::new();
-        // 域头段自身可能承载首目录项（begin+separate+首项同段——
-        // Word 真机形态；引擎发射形态为独立头段，文本为空自然跳过）。
-        if let Some((entry, cached)) =
-            crate::docx_toc::parse_old_toc_entry(self.paragraph_text(begin))
-        {
-            out.push((entry.to_string(), cached.to_string()));
-        }
-        // 后续段：域段且含 `\t` = 目录项；空文本域段（域尾）/非域段 → 止。
-        let mut i = begin + 1;
-        while i < self.paragraphs.len() {
-            let pref = &self.paragraphs[i];
-            if !pref.field_code {
-                break;
-            }
+        // 整个域组范围（含两端）：域头段自身可承载首目录项（Word 真机
+        // 形态 begin/separate/首项同段；引擎形态独立头段文本空自然跳过）。
+        for i in begin..=end {
             let text = self.paragraph_text(i);
-            if text.is_empty() {
-                break;
+            if let Some((entry, cached)) = crate::docx_toc::parse_old_toc_entry(text) {
+                out.push((entry.to_string(), cached.to_string()));
             }
-            match crate::docx_toc::parse_old_toc_entry(text) {
-                Some((entry, cached)) => out.push((entry.to_string(), cached.to_string())),
-                None => break,
-            }
-            i += 1;
         }
         Some(out)
     }
@@ -854,6 +894,10 @@ fn local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
 struct FieldScan {
     /// begin（或 fldSimple）所在段落号。
     begin_para: usize,
+    /// #627：end（fldChar end）所在段落号（fldSimple = begin 同段）。跨段域的
+    /// 实际组范围 = `begin_para..=end_para`——旧 TOC 提取的区间数据源
+    ///（Word 真机形态的结果段无段内域标记，不能按段内 field_code 猜范围）。
+    end_para: usize,
     /// 段内域序（0 基，按 begin 在段内文档序——finish 统一分配）。
     seq_in_para: usize,
     /// begin 节点 '<' 字节位（同段多域的段内排序锚）。
@@ -1033,8 +1077,13 @@ fn finalize_scan(open: OpenField, end_para: Option<usize>) -> FieldScan {
     };
     let kind = field_kind_from_instr(&open.instr);
     let editable = same_para && !open.nested && open.has_separate && !open.result_spans.is_empty();
+    let begin_para = open.begin_para.unwrap_or(usize::MAX);
+    // #627：end 段缺失（畸形未闭合被丢弃前防御位 / begin 段外）→ 收敛
+    // begin 段（退化单段域语义——不虚报范围）。
+    let end_para = end_para.filter(|_| !open.is_simple).unwrap_or(begin_para);
     FieldScan {
-        begin_para: open.begin_para.unwrap_or(usize::MAX),
+        begin_para,
+        end_para,
         seq_in_para: 0,
         begin_byte: open.begin_byte,
         kind,
@@ -1294,14 +1343,26 @@ fn scan_note_entries(xml: &str, kind: NotePartKind) -> Result<Vec<NoteEntry>, Do
     Ok(out)
 }
 
-/// scan_paragraphs 返回形（段落表 / 表格栅格 / 域索引 / 正文锚——
-/// #140 与 #141 各加一元）。
+/// scan_paragraphs 返回形（段落表 / 表格栅格 / 域索引 / 正文锚 / 书签表
+/// —— #140 / #141 / #627 各加一元）。
 type ScanTuple = (
     Vec<ParagraphRef>,
     Vec<TableGrid>,
     Vec<FieldScan>,
     NoteAnchors,
+    Vec<BookmarkScan>,
 );
+
+/// #627：书签扫描落账（原文坐标系——open 后不变；`w:bookmarkStart`
+/// 的 name 属性 + 所在段落号）。TOC 重算的书签保真配对数据源：存续
+/// 标题复用旧锚名（避免内容寻址重命名导致旧引用悬空）。
+#[derive(Debug, Clone)]
+struct BookmarkScan {
+    name: String,
+    /// 所在段落号（文档序扁平坐标系——与 `paragraphs()` 同源；
+    /// 段落外孤立书签不落账）。段内多书签按文档序全部保留。
+    para: usize,
+}
 
 fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -1312,6 +1373,8 @@ fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
     // 开启中的段落（内层最尾——文本/旗标只记 innermost；嵌套文本框段落
     // 各自独立索引，外层不吃内层文本）。
     let mut para_stack: Vec<usize> = Vec::new();
+    // #627：书签落账（w:bookmarkStart name → 段落号，文档序）。
+    let mut bookmarks: Vec<BookmarkScan> = Vec::new();
     // 开启中 w:t 的 (节点 '<' 位, 内容区 open 端)（w:t 恒为叶——单槽；
     // #140：节点位供域结果区收集，内容端供段落文本装配）。
     let mut wt_open: Option<(usize, usize)> = None;
@@ -1430,6 +1493,16 @@ fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
                     "ins" | "del" | "moveFrom" | "moveTo" if !para_stack.is_empty() => {
                         if let Some(&i) = para_stack.last() {
                             out[i].revision = true;
+                        }
+                    }
+                    "bookmarkStart" if !para_stack.is_empty() => {
+                        // #627：开形书签（罕见——规范形为自闭合，防御
+                        // 同收；闭事件不重复落账）。name 属性缺席畸形跳过。
+                        if let (Some(&p), Some(name)) = (para_stack.last(), attr_named(&e, "name"))
+                        {
+                            if !name.is_empty() {
+                                bookmarks.push(BookmarkScan { name, para: p });
+                            }
                         }
                     }
                     "fldChar" | "instrText" | "fldSimple" if !para_stack.is_empty() => {
@@ -1586,6 +1659,15 @@ fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
                             out[i].revision = true;
                         }
                     }
+                    "bookmarkStart" if !para_stack.is_empty() => {
+                        // #627：自闭合规范形书签落账。
+                        if let (Some(&p), Some(name)) = (para_stack.last(), attr_named(&e, "name"))
+                        {
+                            if !name.is_empty() {
+                                bookmarks.push(BookmarkScan { name, para: p });
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1703,7 +1785,7 @@ fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
             }
         }
     }
-    Ok((out, tables, fbuild.finish(), note_anchors))
+    Ok((out, tables, fbuild.finish(), note_anchors, bookmarks))
 }
 
 /// 表栅格扫描累积态（扫描期）。

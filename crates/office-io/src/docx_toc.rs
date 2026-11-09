@@ -29,14 +29,19 @@
 //!   写面发射落 `"—"` 显式未知——不沿用静态面的 `"1"` 占位（那是
 //!   假页码；本面从数据上拒绝）。
 //!
-//! ## 稳定名设计（内容寻址——`toc_h<hex>`）
+//! ## 书签保真（#627——存续标题复用旧锚，新项内容寻址避让）
 //!
 //! [`stable_bookmark_name`]：`fnv1a64(level, text)` → `toc_h{7 hex}`。
-//! 同内容（层级+文本）→ 同名——重算后名字稳定。与既有 `toc_N` 计数器
-//! 名域**零碰撞**（`_` 后首字符 `h` vs 纯数字）；V1-V6 域全过（首字符
-//! 字母 / `[A-Za-z0-9_]` / 非 `_Toc` / ≤40 字符——发射侧再校验兜底，
-//! 见 [`crate::docx::DocxWriter::toc_entries_recomputed`]）。同文重复
-//! 标题以 `_2`/`_3` 后缀去重（先现者得基名）。
+//! 同内容（层级+文本）→ 同名；`_` 后首字符 `h` 与 `toc_N` 计数器名域
+//! 零碰撞；V1-V6 域全过；同文重复标题 `_2`/`_3` 后缀去重。
+//!
+//! **#627 语义**：重算时**先配对后分配**——存续标题按**当前文本**
+//! 多重集配对已有 `toc_N` 锚（段落文本 pending 感知——改文/改层级
+//! 后的标题仍配自己的旧锚，书签节点在段落树手术中原样保留），
+//! 配对成功者复用旧名（旧引用不悬空）；只有新标题（无同文旧锚）
+//! 才分配内容寻址名，且 `used` 预置文档全部已存在书签名（含用户
+//! 书签）——新名零碰撞。Word `_Toc…` 锚因 V5 保留名不可再发射——
+//! 复用域不含，悬空为已登记局限。
 //!
 //! ## 已登记局限（诚实降级，不静默）
 //!
@@ -270,4 +275,92 @@ pub(crate) fn diff_and_cache(
         level_changed: 0,
     };
     (cached_pages, diff)
+}
+
+// ---------------------------------------------------------------------------
+// #627 —— 书签保真配对（存续标题复用旧锚名）
+// ---------------------------------------------------------------------------
+
+/// 引擎 TOC 书签模式判定——引擎两种发射形的精确名域：
+///
+/// - 静态面 [`crate::docx::DocxWriter::toc_entries`]：`toc_` + 纯数字
+///   （计数器名 `toc_12`）；
+/// - 重算面 [`stable_bookmark_name`]：`toc_h` + 恰 7 位小写 hex
+///   （28 位掩码），可选 `_N` 去重后缀（`toc_h8e11da8` /
+///   `toc_h8e11da8_2`）。
+///
+/// 只复用引擎域的原因：Word `_Toc…` 前缀是写面 V5 保留名（不可再
+/// 发射——复用会在 save 漏斗拒收）；用户书签（含 `toc_hello` 等
+/// 任意 `toc_` 前缀但非引擎形态的名）不属 TOC 机制——不消费，仅
+/// 避让。旧 `_Toc` 锚在重算后悬空为已登记局限（V5 域约束）。
+pub(crate) fn is_engine_toc_bookmark(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("toc_") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    // 静态形：纯数字。
+    if rest.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // 重算形：h + 7 位小写 hex（可选 _N 数字后缀）。
+    let Some(hex_part) = rest.strip_prefix('h') else {
+        return false;
+    };
+    let hex = match hex_part.split_once('_') {
+        Some((h, suffix)) => {
+            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            h
+        }
+        None => hex_part,
+    };
+    hex.len() == 7
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// 书签复用配对（#627 存续标题保真）：新目录项按**当前文本**多重集、
+/// 文档序配对同文本的未消费 TOC 书签——配对成功者**复用旧锚名**。
+///
+/// 配对键说明：
+/// - `pool` 项为 `(书签名, 所在段落当前文本)`——段落文本是 pending
+///   感知的（编辑后的标题文本即时反映），因此**改文/改层级的存续
+///   标题仍能配上自己的旧锚**（书签节点在段落树手术中原样保留——
+///   见 `process_children`「其余面：原样」登记）：这是段落身份语义
+///   的文本投影，非单纯文本匹配；
+/// - 同文重复标题按文档序先现先配（确定性——重复面锚身份天然歧义，
+///   顺序规则钉死）；
+/// - 未配对项（新标题 / 重复溢出）→ `None`（调用方分配内容寻址新名，
+///   `used` 预置全部已存在书签名后避让）。
+pub(crate) fn reuse_bookmark_names(
+    entries: &[TocEntry],
+    pool: &[(String, String)],
+) -> Vec<Option<String>> {
+    // 文本 → 未消费书签池（文档序）。
+    let mut by_text: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (name, para_text) in pool {
+        by_text
+            .entry(para_text.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
+    entries
+        .iter()
+        .map(|e| {
+            by_text
+                .get_mut(e.text.as_str())
+                .and_then(|names| {
+                    if names.is_empty() {
+                        None
+                    } else {
+                        Some(names.remove(0))
+                    }
+                })
+                .map(str::to_string)
+        })
+        .collect()
 }
