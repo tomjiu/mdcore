@@ -843,6 +843,21 @@ impl PdfPagesView {
         Some(RenderKey::new(key.0, key.1, height, self.annotate_rev))
     }
 
+    /// #637：未就绪臂的回退键选择（纯函数）——同页条目中
+    /// annotation_rev 最大者优先（防闪回旧批注态），同 rev 取
+    /// |width_px - fit_w| 最近（视觉尺寸最接近=缩放伪影最小）。
+    /// 空/无同页 → None（调用方保持占位框）。
+    fn nearest_fallback_key(keys: &[RenderKey], page: u32, fit_w: u32) -> Option<RenderKey> {
+        keys.iter()
+            .filter(|k| k.page == page)
+            .max_by(|a, b| {
+                a.annotation_rev
+                    .cmp(&b.annotation_rev)
+                    .then_with(|| b.width_px.abs_diff(fit_w).cmp(&a.width_px.abs_diff(fit_w)))
+            })
+            .cloned()
+    }
+
     /// 回执轮询循环（16ms 定时 try_recv——待办清空退出；实体释放自然止）。
     fn spawn_poll_loop(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -908,9 +923,10 @@ impl PdfPagesView {
     }
 
     /// 可见页元素（uniform_list 回调——读缓存出位图，未就绪出占位框：
-    /// 渲染中 / 失败两态）。#302④：页面槽上叠透明 canvas——paint 期
-    /// 注册右键拖框观察器（窗口级 on_mouse_event + 自身 bounds 过滤，
-    /// 与 shell 面板拖拽收尾钩同模式；无命中区不挡滚动）。
+    /// 渲染中 / 失败两态；pending 态先走 #637 同页旧宽回退）。#302④：
+    /// 页面槽上叠透明 canvas——paint 期注册右键拖框观察器（窗口级
+    /// on_mouse_event + 自身 bounds 过滤，与 shell 面板拖拽收尾钩同
+    /// 模式；无命中区不挡滚动）。
     fn render_page_slot(&mut self, idx: usize, cx: &App) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let (vw, vh) = self.viewport_size;
@@ -948,6 +964,31 @@ impl PdfPagesView {
             }
             None => {
                 let failed = self.failed.contains(&key);
+                // #637：pending 态回退同页旧宽位图（LRU 预算内最近好图
+                // 按槽尺寸缩放）——消除缩放/改窗时的闪白帧；failed 态
+                // 不回退（诚实失败面：显式错误标签不被旧图掩盖——
+                // A11 fail-closed 同哲）。选择器纯函数可测。
+                let stale = if failed {
+                    None
+                } else {
+                    let keys: Vec<RenderKey> =
+                        self.cache.entries().into_iter().map(|(k, _)| k).collect();
+                    Self::nearest_fallback_key(&keys, idx as u32, fit_w)
+                        .and_then(|k| self.cache.get(&k).cloned())
+                };
+                if let Some(image) = stale {
+                    return gpui::img(ImageSource::Render(image))
+                        .id(gpui::ElementId::NamedInteger(
+                            "pdf-page-stale".into(),
+                            idx as u64,
+                        ))
+                        .w(px(fit_w as f32))
+                        .h(px(slot_h))
+                        .flex_none()
+                        .rounded_sm()
+                        .shadow_md()
+                        .into_any_element();
+                }
                 div()
                     .id(gpui::SharedString::from(format!("pdf-page-pending-{idx}")))
                     .w(px(fit_w as f32))
@@ -2188,6 +2229,41 @@ mod tests {
         assert_eq!(PdfPagesView::fit_width(1024.), 1024);
         // 极窄视口 → 下限。
         assert_eq!(PdfPagesView::fit_width(10.), WIDTH_MIN);
+    }
+
+    /// #637：回退键选择器——同页多宽择最近、rev 优先、异页不取、
+    /// 空缓存 None（四例齐）。
+    #[test]
+    fn nearest_fallback_key_picks_same_page_nearest_width() {
+        let mk = |page: u32, w: u32, rev: u64| RenderKey::new(page, w, w * 2, rev);
+        let keys = vec![mk(0, 320, 1), mk(0, 800, 1), mk(1, 640, 1)];
+        // 同页两条（320/800）目标 700 → 800 更近。
+        let pick = PdfPagesView::nearest_fallback_key(&keys, 0, 700).unwrap();
+        assert_eq!(pick.width_px, 800, "同页择宽最近");
+        // 异页不取：页 2 无条目 → None。
+        assert!(
+            PdfPagesView::nearest_fallback_key(&keys, 2, 700).is_none(),
+            "异页不取"
+        );
+        // 空缓存 → None。
+        assert!(
+            PdfPagesView::nearest_fallback_key(&[], 0, 700).is_none(),
+            "空缓存 None"
+        );
+    }
+
+    #[test]
+    fn nearest_fallback_key_rev_wins_over_width() {
+        let mk = |page: u32, w: u32, rev: u64| RenderKey::new(page, w, w * 2, rev);
+        // rev=2 的 320 宽 vs rev=1 的 800 宽：目标 700——宽近者 800 但
+        // rev 旧；rev 最大者优先（防闪回旧批注态）。
+        let keys = vec![mk(0, 320, 2), mk(0, 800, 1)];
+        let pick = PdfPagesView::nearest_fallback_key(&keys, 0, 700).unwrap();
+        assert_eq!(
+            (pick.width_px, pick.annotation_rev),
+            (320, 2),
+            "rev 优先于宽近"
+        );
     }
 
     /// 尺寸/缓冲不一致 → None（failed 面，不 panic）。
