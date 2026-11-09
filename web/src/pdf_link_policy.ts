@@ -13,6 +13,12 @@
  *      不做双重解码（%25E2%80%8B 双编形态解码一次后是字面
  *      `%E2%80%8B` 文本，无控制码——不误伤，浏览器同款语义）。
  * 3. 绝对 URL + scheme 白名单 http/https/mailto（#466 语义原样）。
+ * 4. #601：mailto 附件参数拒绝——attach/insert 键可携带本地文件路径
+ *    交给本机邮件客户端（文件外带面）。键大小写不敏感；URLSearchParams
+ *    单次解码（%61ttach → attach——与 ③ 控制码检查同解码口径，不双重
+ *    解码：%2561ttach 解码一次后是字面 %61ttach，非附件键，不误伤）。
+ *    空值也拒（键在场即附件引用语义）；合法参数（subject/body/cc/bcc/to
+ *    等）与纯地址零影响。
  *
  * 拒绝语义（pdf_view 消费侧）：不生成外链热区 + reason 纳入
  * linkPolicySkipped 可观察计数——不静默、不让整份 PDF 打开失败。
@@ -54,11 +60,16 @@ function decodePercentOnce(s: string): string {
 /** #466 外链 scheme 白名单（http/https/mailto——阅读器惯例）。 */
 const URL_SCHEME_ALLOW = new Set(['http:', 'https:', 'mailto:']);
 
+/** #601：mailto 附件引用键（Thunderbird/Apple Mail 等支持 attach/insert
+ * 参数携带本地文件路径——阅读器场景无理由转发本机文件面）。 */
+const MAILTO_ATTACHMENT_KEYS = new Set(['attach', 'insert']);
+
 /** 拒绝原因（可观察契约——进 linkPolicySkipped 计数）。 */
 export type LinkPolicyReason =
   | 'url-over-budget' // 原始或规范化超 2048
   | 'zero-width-bidi' // 原始控制码形态
   | 'zero-width-bidi-encoded' // 百分号编码形态的控制码
+  | 'mailto-attachment' // #601：mailto attach/insert 附件参数
   | 'relative-url' // 非绝对 URL（#466：PDF 注释上下文无基准）
   | string; // scheme 不在白名单——值 = scheme 名（#446→#466 可观察惯例保持）
 
@@ -100,6 +111,16 @@ export function policyExternalUrl(raw: string): LinkPolicyVerdict {
   //    既有 e2e 断言 policySkipped == ["javascript"] 口径不变）
   if (!URL_SCHEME_ALLOW.has(u.protocol)) {
     return { ok: false, url: null, reason: u.protocol.replace(/:$/, '') || 'bad-scheme' };
+  }
+  // ⑤.5 #601：mailto 附件参数——searchParams 单次解码逐键枚举（重复键
+  //     逐一可见；空值键在场即拒；不检查值——键即附件引用语义）。
+  //     仅 mailto 面（http/https 的 attach/insert 是普通业务参数，不拦）。
+  if (u.protocol === 'mailto:') {
+    for (const key of u.searchParams.keys()) {
+      if (MAILTO_ATTACHMENT_KEYS.has(key.toLowerCase())) {
+        return { ok: false, url: null, reason: 'mailto-attachment' };
+      }
+    }
   }
   // ⑥ 输入预算——规范化串（与原始串一致上限：膨胀面在此拦截）
   if (u.href.length > URL_INPUT_BUDGET) {
