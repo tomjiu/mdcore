@@ -22,12 +22,12 @@
 
 用法（仓根执行；BUILD-VERIFY §3 同口径）：
     python3 packaging/nsis/build-installer.py \\
-        [--exe target/release/mang-shell.exe] \\
+        [--exe mang-shell/target/release/mang-shell.exe] \\
         [--pdfium bin/lib/pdfium.dll] \\
         [--makensis <makensis 路径>] [--skip-makensis] [--out-dir build/nsis]
 
     默认 --exe/--pdfium 为正式出包口径（release + 定位序取件位）；
-    CI 内测口径显式传 debug 路径（windows-installer.yml）。
+    CI 与本地正式出包均使用 release（Windows shader 在构建时嵌入）。
     --skip-makensis：只做 staging+渲染+校验（本地模板验证用，不产安装包）。
 """
 from __future__ import annotations
@@ -109,8 +109,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
         "--exe",
-        default="target/release/mang-shell.exe",
-        help="mang-shell 可执行文件路径（默认 release 正式口径；CI 内测传 debug）",
+        default="mang-shell/target/release/mang-shell.exe",
+        help="mang-shell 可执行文件路径（默认独立 workspace 的 release 发行产物）",
     )
     ap.add_argument(
         "--pdfium",

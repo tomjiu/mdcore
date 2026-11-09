@@ -182,8 +182,12 @@ python packaging/nsis/build-installer.py
 - **本地（Linux，Debian nsis 3.11 + NSISDIR 指路）**：stub 载荷全链绿
   ——版本提取 0.1.0 → staging → 渲染（占位符零残留）→ makensis 编译 →
   产物 `mdcore-setup-0.1.0.exe`（109,192 B，stub）+ SHA256；
-- **CI（`windows-installer.yml`）**：debug 内测口径（restore 复用
-  test-shell 的 mang-shell 缓存面控分钟数）产 installer artifact；
+- **CI（`windows-installer.yml`）**：release 构建、独立发行缓存，产
+  `windows-installer-release`；最终 NSIS 先经 7-Zip 解包并与 staging
+  比对 exe/DLL 哈希，再搬到 checkout 外的临时目录，隐藏
+  `gpui_windows/src` 后运行真实 GPUI 窗口与 Markdown/PDF/标签烟雾。
+  `portable-smoke/report.json` 记录窗口 HWND/响应、版本/head、退出码；
+  启动失败阻止安装包上传，失败日志仍作为独立 artifact 保留；
 - **待 Lead Windows 实机复核清单**：安装/卸载走查；注册表
   `DisplayName=mang` / `DisplayVersion=<版本>` / `InstallDir`；开始菜单
   快捷方式；.md 关联；安装后自检弹窗（拔掉 `pdfium.dll` 复跑安装应见
@@ -191,7 +195,14 @@ python packaging/nsis/build-installer.py
 
 ### 登记边界（诚实面）
 
-- CI 内测包 = **debug** 构建（正式出包走上文 release 命令）；
+- Windows 分发必须使用 **release**。GPUI Windows 的 debug_assertions
+  分支在运行时读取编译机源码目录中的 HLSL；release 在构建时用
+  Windows SDK `fxc.exe` 编译并嵌入 shader bytes（保留调试符号与
+  debug_assertions 是不同设置）。不要通过用户机器上的盘符映射修补分发。
+- 真实启动门无需人工操作显示器，使用隐藏进程与 Win32 窗口消息验证，
+  不依赖 screenshot/pywin32/Playwright；Windows 必须有可用 window
+  station 和 Direct3D adapter，缺图形能力是明示失败，不算 SKIP/PASS。
+  该门验证的是解包载荷启动；注册表、快捷方式与系统关联仍需实机安装验收。
 - mang-shell 为独立 workspace，版本号未接入根 `[workspace.package]`
   单源机制（结构上无法 `version.workspace` 继承）——当前两值一致
   （0.1.0）；若根版本 bump 后漂移，安装包版本以 mdcore::VERSION
