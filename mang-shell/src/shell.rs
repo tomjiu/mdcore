@@ -1780,7 +1780,15 @@ impl ShellApp {
                     // 失败已 toast 示警——与旧编辑器路径同语义：
                     // 尽力保存后退出）。
                     for i in 0..self.tabs.len() {
-                        self.save_tab(i, cx);
+                        let outcome = self.save_tab(i, cx);
+                        if !matches!(outcome, SaveOutcome::Saved | SaveOutcome::Unmodified) {
+                            // A failed write must not turn "save and quit" into
+                            // an implicit discard. Keep the dialog for retry.
+                            self.confirm = Some(confirm);
+                            window.focus(&self.confirm_focus, cx);
+                            cx.notify();
+                            return;
+                        }
                     }
                     cx.quit();
                 }
@@ -6108,5 +6116,50 @@ mod xlsx_save_close_tests {
         assert!(edited.contains("135"), "{a1} 跨标签保存落盘（得 {edited}）");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[gpui::test]
+    fn xlsx_quit_write_failure_keeps_retry_confirmation(cx: &mut gpui::TestAppContext) {
+        let path = xlsx_fixture("quit-fail");
+        let (shell, window) = shell_window(cx);
+        window
+            .update(cx, |_, _, app| {
+                shell.update(app, |shell, cx| {
+                    shell.open_document_tab(path.clone(), cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        real_grid_edit(&shell, &window, cx, "321").expect("real grid edit");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        window
+            .update(cx, |_, _, app| {
+                shell.update(app, |shell, cx| {
+                    shell.confirm = Some(ConfirmState {
+                        message: "有未保存的文档".into(),
+                        detail: "退出前保存？".into(),
+                        action: ConfirmAction::Quit,
+                        selected: 0,
+                        buttons: CONFIRM_BUTTONS.to_vec(),
+                    });
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        press_key(cx, &window, "enter", None, false);
+        window
+            .update(cx, |_, _, app| {
+                shell.update(app, |shell, cx| {
+                    assert_eq!(shell.tab_count(), 1);
+                    assert!(shell.tab_is_modified(0, cx).unwrap());
+                    assert!(
+                        shell
+                            .confirm
+                            .as_ref()
+                            .is_some_and(|c| matches!(c.action, ConfirmAction::Quit)),
+                        "failed save must retain the quit dialog for retry rather than quit"
+                    );
+                });
+            })
+            .unwrap();
     }
 }
