@@ -63,6 +63,7 @@ pub fn title_bar(
     let colors = cx.theme().colors().clone();
     h_flex()
         .id("title-bar")
+        .debug_selector(|| "title-bar".into())
         .h(TITLE_BAR_HEIGHT)
         .flex_none()
         .w_full()
@@ -100,6 +101,17 @@ pub fn title_bar(
                         window.start_window_move();
                     })
                 }),
+        )
+        .child(
+            div()
+                .id("document-info-toggle")
+                .debug_selector(|| "document-info-toggle".into())
+                .flex_none()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_document_info(cx)))
+                .child(Label::new("文档信息").size(LabelSize::Small)),
         )
         .child(window_controls())
 }

@@ -51,6 +51,7 @@ pub fn activity_bar(
     let colors = cx.theme().colors().clone();
     v_flex()
         .id("activity-bar")
+        .debug_selector(|| "activity-bar".into())
         .w(ACTIVITY_BAR_WIDTH)
         .flex_none()
         .h_full()
@@ -121,6 +122,7 @@ pub(crate) fn bar_button(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .size(BUTTON_SIZE)
         .flex()
         .flex_none()
@@ -133,6 +135,7 @@ pub(crate) fn bar_button(
         .child(
             Icon::new(icon)
                 .size(IconSize::Medium)
+                .color(Color::Default)
                 .when(selected, |el| el.color(Color::Selected)),
         )
         .on_click(on_click)

@@ -128,6 +128,7 @@ struct ConfirmState {
 pub struct ShellApp {
     left_open: bool,
     right_open: bool,
+    document_info_open: bool,
     /// G4：左右栏宽度（拖拽热区调整；settings `panel_widths` 持久化，
     /// 缺省 [`panels::LEFT_PANEL_WIDTH`] / [`panels::RIGHT_PANEL_WIDTH`]）。
     left_width: Pixels,
@@ -389,6 +390,7 @@ impl ShellApp {
         let mut this = Self {
             left_open: true,
             right_open: true,
+            document_info_open: false,
             // G4：面板宽度记忆恢复（无记忆 = 缺省宽；手改配置越界时
             // 载入即钳制到拖拽域——不信任磁盘值）。
             left_width: crate::settings::load_panel_widths()
@@ -819,6 +821,11 @@ impl ShellApp {
     /// 触发（#289-⑤：右栏开关归右缘——不再占用左图标条）。
     pub fn toggle_right(&mut self, cx: &mut Context<Self>) {
         self.right_open = !self.right_open;
+        cx.notify();
+    }
+
+    pub fn toggle_document_info(&mut self, cx: &mut Context<Self>) {
+        self.document_info_open = !self.document_info_open;
         cx.notify();
     }
 
@@ -2522,6 +2529,13 @@ impl Render for ShellApp {
                 let ctrl = ks.modifiers.control || ks.modifiers.platform;
                 let key = ks.key.to_lowercase();
 
+                if key == "escape" && this.document_info_open {
+                    this.document_info_open = false;
+                    this.focus_active(window, cx);
+                    cx.notify();
+                    return;
+                }
+
                 // #209（#385 批 4）：菜单栏 Esc 兑底关闭。菜单焦点在
                 // `ui::ContextMenu` 时组件自身的 Cancel 已处理（→
                 // DismissEvent → close_menu_bar_internal）；此处保留作为
@@ -2721,24 +2735,14 @@ impl Render for ShellApp {
                 }
             }))
             .child(title_bar::title_bar(&title, &menus, self.menu_bar_open, cx))
-            // F3：标签栏（有标签才渲染；标题栏与主体之间）。
-            .when(!self.tabs.is_empty(), |el| {
-                let ws_root = self
-                    .workspace
-                    .as_ref()
-                    .map(|tree| tree.read(cx).root().to_path_buf());
-                el.child(tab_bar::tab_bar(
-                    &self.tabs,
-                    self.active,
-                    ws_root.as_deref(),
-                    cx,
-                ))
-            })
             .child(
                 h_flex()
                     .id("shell-body")
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
+                    .w_full()
+                    .overflow_hidden()
                     .child(activity_bar::activity_bar(
                         self.left_open,
                         self.git_view,
@@ -2755,20 +2759,20 @@ impl Render for ShellApp {
                             self.left_width,
                             // #571：大纲面板实体（键盘导航 + #289-④
                             // 页滚钩子在实体构造时注入）。
-                            self.outline.as_ref(),
+                            None,
                             cx,
                         ))
                         // G4：左栏右缘 4px 拖拽热区
                         .child(self.panel_resize_handle(PanelSide::Left, cx))
                     })
-                    .child(editor_area(self, cx))
+                    .child(editor_column(self, cx))
                     .when(self.right_open, |el| {
                         // G4：右栏左缘 4px 拖拽热区
                         el.child(self.panel_resize_handle(PanelSide::Right, cx))
                             // #289-⑤：右栏单一视图——属性/来源（设置已改
                             // 弹窗，不再占右栏位）。
                             .child(panels::right_panel(
-                                self.editor().cloned().as_ref(),
+                                self.outline.as_ref(),
                                 self.right_width,
                                 cx,
                             ))
@@ -2796,6 +2800,9 @@ impl Render for ShellApp {
                     self.indent_unit,
                     cx,
                 ))
+            })
+            .when(self.document_info_open, |el| {
+                el.child(document_info_overlay(self, cx))
             })
             .child(status_bar::status_bar(
                 self.editor().cloned().as_ref(),
@@ -2978,6 +2985,83 @@ fn notice_bar(message: &str, colors: &theme::ThemeColors) -> impl IntoElement {
 /// 编辑区：当前标签的 `Editor` 实体；无标签 → 引导空态 + 最近打开
 /// 列表（F5——文件点击打开 / 工作区点击打开；已删除文件置灰不可点，
 /// 点击提示「文件不存在」）。
+fn editor_column(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoElement {
+    let workspace = shell
+        .workspace
+        .as_ref()
+        .map(|tree| tree.read(cx).root().to_path_buf());
+    v_flex()
+        .id("editor-column")
+        .debug_selector(|| "editor-column".into())
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .h_full()
+        .overflow_hidden()
+        .when(!shell.tabs.is_empty(), |el| {
+            el.child(
+                div()
+                    .id("editor-tabs")
+                    .debug_selector(|| "editor-tabs".into())
+                    .w_full()
+                    .flex_none()
+                    .child(tab_bar::tab_bar(
+                        &shell.tabs,
+                        shell.active,
+                        workspace.as_deref(),
+                        cx,
+                    )),
+            )
+        })
+        .child(
+            div()
+                .id("editor-content")
+                .debug_selector(|| "editor-content".into())
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .w_full()
+                .overflow_hidden()
+                .child(editor_area(shell, cx)),
+        )
+}
+
+fn document_info_overlay(shell: &ShellApp, cx: &mut Context<ShellApp>) -> impl IntoElement {
+    let colors = cx.theme().colors().clone();
+    div()
+        .id("document-info-backdrop")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black().opacity(0.25))
+        .child(
+            v_flex()
+                .id("document-info")
+                .debug_selector(|| "document-info".into())
+                .w(px(440.))
+                .h(px(540.))
+                .rounded_md()
+                .overflow_hidden()
+                .bg(colors.elevated_surface_background)
+                .child(
+                    h_flex().w_full().justify_end().p_2().child(
+                        div()
+                            .id("document-info-close")
+                            .debug_selector(|| "document-info-close".into())
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_document_info(cx)))
+                            .child(ui::Label::new("关闭")),
+                    ),
+                )
+                .child(panels::document_information(shell.editor(), px(440.), cx)),
+        )
+}
+
 fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
     // #289-④：pdf 标签的页面视图（位图渲染主显示面）——模式开且有
@@ -3029,39 +3113,44 @@ fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoEle
                 .gap_3()
                 .child(ui::Headline::new("mang").size(ui::HeadlineSize::Large))
                 .child(
-                    ui::Label::new(
-                        "打开 .md 可编辑；.docx/.pdf 只读渲染——Ctrl+O 打开文件 / Ctrl+K Ctrl+O 打开文件夹（多标签已接线：Ctrl+Tab 切换）",
-                    )
-                    .color(ui::Color::Muted),
+                    ui::Label::new("Ctrl+O 打开文档 · Ctrl+K Ctrl+O 打开文件夹")
+                        .color(ui::Color::Muted),
                 )
-                .when(!recent_files.is_empty() || !recent_workspaces.is_empty(), |el| {
-                    el.child(
-                        v_flex()
-                            .id("recent-list")
-                            .gap_1()
-                            .mt_4()
-                            .w(px(420.))
-                            .child(
-                                ui::Label::new("最近打开")
-                                    .size(ui::LabelSize::Small)
-                                    .color(ui::Color::Muted),
-                            )
-                            .children(recent_files.iter().map(|path| {
-                                recent_row(path, false, hover, cx)
-                            }))
-                            .when(!recent_workspaces.is_empty(), |el| {
-                                el.child(
-                                    ui::Label::new("最近的工作区")
+                .when(
+                    !recent_files.is_empty() || !recent_workspaces.is_empty(),
+                    |el| {
+                        el.child(
+                            v_flex()
+                                .id("recent-list")
+                                .gap_1()
+                                .mt_4()
+                                .w(px(420.))
+                                .child(
+                                    ui::Label::new("最近打开")
                                         .size(ui::LabelSize::Small)
-                                        .color(ui::Color::Muted)
-                                        .mt_2(),
+                                        .color(ui::Color::Muted),
                                 )
-                                .children(recent_workspaces.iter().map(|path| {
-                                    recent_row(path, true, hover, cx)
-                                }))
-                            }),
-                    )
-                })
+                                .children(
+                                    recent_files
+                                        .iter()
+                                        .map(|path| recent_row(path, false, hover, cx)),
+                                )
+                                .when(!recent_workspaces.is_empty(), |el| {
+                                    el.child(
+                                        ui::Label::new("最近的工作区")
+                                            .size(ui::LabelSize::Small)
+                                            .color(ui::Color::Muted)
+                                            .mt_2(),
+                                    )
+                                    .children(
+                                        recent_workspaces
+                                            .iter()
+                                            .map(|path| recent_row(path, true, hover, cx)),
+                                    )
+                                }),
+                        )
+                    },
+                )
                 .into_any_element()
         }
     }
@@ -5336,3 +5425,7 @@ mod confirm_lifecycle_tests {
         assert_eq!(std::fs::read_to_string(&fixture.path).unwrap(), "L0\n");
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_layout_tests.rs"]
+mod workspace_layout_tests;
