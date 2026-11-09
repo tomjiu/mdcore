@@ -1,0 +1,32 @@
+[package]
+name = "mdc-lok"
+version.workspace = true
+edition = "2021"
+publish = false
+description = "LibreOfficeKit 隔离 worker 原型（#633）：动态加载（钉定头 0d51fdc + nSize 运行时成员检查）、单文档 worker 子进程（stdio 帧协议：请求 ID / 帧长上限 / 超时 / 事件回传）、unipoll 主循环集成（键鼠/UNO 同步分发）、保存安全链（临时产物 + 结构校验后替换、源文件永不动）与冒烟全链。真实运行时门见 docs/lok-runtime.md；产品接线（页面/输入/IME/保存关闭闭环）由 #616 接续。"
+
+# 依赖卫生（循根 Cargo.toml #633 增补注释与 mdc-pdf sha2 先例）：
+#   serde / serde_json —— workspace 单源继承（帧 JSON 头）。
+#   libloading 0.9.0 / flate2 1.1.10 —— 取 Cargo.lock 现解析版本作
+#   直依赖（pdfium-render / lopdf 传递引入，零新编译单元）。libloading
+#   只做 dlopen/LoadLibraryExW；flate2 仅用于 verify.rs 的 zip 条目
+#   inflate（校验保存产物，非通用 zip 实现）。
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+libloading = "0.9.0"
+flate2 = "1.1.10"
+
+# 冒烟示例的诊断 PNG 输出复用 mdc-canvas 的零依赖编码器
+# （encode_png：8 位 RGBA + 自实现 CRC/zlib，仓内既定纪律不引 png/image）。
+[dev-dependencies]
+mdc-canvas = { path = "../canvas" }
+
+# worker 是被宿主 spawn 的真实子进程目标（非 demo），#616 将继续以
+# 二进制路径拉起；冒烟链为 examples/smoke.rs（cargo run --example）。
+[[bin]]
+name = "mdc-lok-worker"
+path = "src/bin/mdc_lok_worker.rs"
+
+[features]
+default = []

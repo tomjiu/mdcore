@@ -1806,6 +1806,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdc-lok"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libloading",
+ "mdc-canvas",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mdc-mdbridge"
 version = "0.1.0"
 dependencies = [

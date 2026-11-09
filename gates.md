@@ -27,6 +27,7 @@
 | #283 | XLSX 消费倒挂——XlsxEditor 接产品导出路径 | [gates/283.md](gates/283.md) | 🔄 PR 中 |
 | #302 | PDF 消费倒挂——桌面标注接线（阶段 2·④） | [gates/302.md](gates/302.md) | 🔄 PR 中 |
 | #305 | 渲染缓存标注失效（RenderKey 键控 + 显式失效双轨） | [gates/305.md](gates/305.md) | 🔄 PR 中 |
+| #633 | LibreOfficeKit 隔离 worker 原型（unipoll 主循环 + 单文档 worker + smoke 全链） | [gates/633.md](gates/633.md) | 🔄 PR 中 |
 
 
 

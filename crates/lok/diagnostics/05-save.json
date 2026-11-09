@@ -1,0 +1,21 @@
+{
+  "report": {
+    "checks_passed": 4,
+    "document_xml_len": 6681,
+    "entries": [
+      "_rels/.rels",
+      "docProps/core.xml",
+      "docProps/app.xml",
+      "word/document.xml",
+      "word/styles.xml",
+      "word/_rels/document.xml.rels",
+      "word/media/image1.png",
+      "word/fontTable.xml",
+      "word/settings.xml",
+      "word/theme/theme1.xml",
+      "[Content_Types].xml"
+    ],
+    "entry_count": 11
+  },
+  "temp_path": "/tmp/mdc-lok-save-5010-1794232688501345839/saved.docx"
+}

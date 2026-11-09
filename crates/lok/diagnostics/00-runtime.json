@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "kit_nsize": 208,
+    "library": "/usr/lib/libreoffice/program/libmergedlo.so",
+    "mock": false,
+    "profile_dir": "/tmp/mdc-lok-profile-5010-1794232688139971080",
+    "program_dir": "/usr/lib/libreoffice/program",
+    "proto": "MDCLK1",
+    "version_info": "{ \"ProductName\": \"LibreOffice\", \"ProductVersion\": \"25.2\", \"ProductExtension\": \".3.2\", \"BuildId\": \"520(Build:2)\" }"
+  },
+  "ok": true,
+  "rev": 0
+}
