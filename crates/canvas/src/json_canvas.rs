@@ -16,6 +16,7 @@
 //! | node type=group | `Group` + props{label} | 空间区域语义（Group 无显式成员——与 JSON Canvas 同为空间隐含）；#404 frame 合入后可升级映射 |
 //! | edge | `Edge` + props{label/color/jc:fromSide/jc:toSide} | 端点悬空合法（读模型既有纪律） |
 //! | stroke | （导出跳过） | JSON Canvas 无笔迹原语——导出损失面，登记 |
+//! | 边 caption | （导出跳过） | JSON Canvas 边无 caption 原语（仅 label）——产品一等字段 caption（#447 渲染消费）导出即丢，损失面登记（#406 残余；升级路径=裁决位：label 空时 caption→label / `jc:caption` 专键往返） |
 //!
 //! # 兼容纪律
 //!
@@ -226,6 +227,10 @@ pub fn export_json_canvas(objects: &[CanvasObject]) -> String {
                         e.insert(jk.into(), json!(v));
                     }
                 }
+                // #406 残余登记面：产品边 caption（一等字段+渲染消费）
+                // 在此静默丢失——JSON Canvas 边仅 label 无 caption 原语
+                //（损失面登记见模块文档映射表；升级须经裁决，勿顺手
+                // 造伪键）。
                 // #602：side 双通道导出——typed 值优先（SetEdgeRoute 后的
                 // 新值不被旧 props 覆盖）；typed None + 旧快照 props 有值
                 // 时回落（#444 时代快照兼容面）；双缺省不导键（不造伪值）。
