@@ -1,0 +1,2164 @@
+{
+  "face": "geometry_contract",
+  "head": {
+    "mdc_pdfium_lib_env": "/home/z/my-project/cb634/bin/lib/libpdfium.so",
+    "pdfium_lib": {
+      "path": "/home/z/my-project/cb634/target/debug/deps/libpdfium.so",
+      "provenance": "chromium/8086（CI ci-deps-v1 同轨铆定）",
+      "role": "exe 同目录（产品部署位）",
+      "sha256": "e995a89f11d48605a79a0e44f101ca3a621e5c3ef9ee311a1405e03b44dc5b19"
+    },
+    "poppler": null
+  },
+  "pages": [
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "chinese_embedded.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "chinese_embedded.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 2,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "chinese_missing_font.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "chinese_missing_font.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 2,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "scanned_gray.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "vector_graphics.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "transparency_blend.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": [
+        101.0,
+        51.0,
+        741.0,
+        545.0
+      ],
+      "display_size_pt": [
+        640.0,
+        494.0
+      ],
+      "file": "cropped_mediabox.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        842.0,
+        596.0
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        841.8897705078125,
+        595.2755737304688
+      ],
+      "file": "rotation_matrix.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 90
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "rotation_matrix.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 2,
+      "rotate": 180
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "landscape_mixed.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        841.8897705078125,
+        595.2755737304688
+      ],
+      "file": "landscape_mixed.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        841.8897705078125,
+        595.2755737304688
+      ],
+      "page": 2,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        600.0,
+        600.0
+      ],
+      "file": "landscape_mixed.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        600.0,
+        600.0
+      ],
+      "page": 3,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 1,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 2,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 3,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 4,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 5,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 6,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 7,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 8,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 9,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 10,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 11,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 12,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 13,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 14,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 15,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 16,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 17,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 18,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 19,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 20,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 21,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 22,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 23,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 24,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 25,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 26,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 27,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 28,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 29,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 30,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 31,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 32,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 33,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 34,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 35,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 36,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 37,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 38,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 39,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 40,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 41,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 42,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 43,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 44,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 45,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 46,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 47,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 48,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 49,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 50,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 51,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 52,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 53,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 54,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 55,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 56,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 57,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 58,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 59,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 60,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 61,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 62,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 63,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 64,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 65,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 66,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 67,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 68,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 69,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 70,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 71,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 72,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 73,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 74,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 75,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 76,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 77,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 78,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 79,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 80,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 81,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 82,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 83,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 84,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 85,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 86,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 87,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 88,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 89,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 90,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 91,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 92,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 93,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 94,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 95,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 96,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 97,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 98,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 99,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 100,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 101,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 102,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 103,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 104,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 105,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 106,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 107,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 108,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 109,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 110,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 111,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 112,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 113,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 114,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 115,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 116,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 117,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 118,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 119,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "file": "multipage_120.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        595.2755737304688,
+        841.8897705078125
+      ],
+      "page": 120,
+      "rotate": 0
+    },
+    {
+      "crop_box": null,
+      "display_size_pt": [
+        40.0,
+        720.0
+      ],
+      "file": "tiny_note.pdf",
+      "media_box": [
+        0.0,
+        0.0,
+        40.0,
+        720.0
+      ],
+      "page": 1,
+      "rotate": 0
+    }
+  ]
+}
