@@ -37,6 +37,9 @@ URL_AT_BUDGET = BASE + "b" * (2048 - len(BASE))            # 恰 2048 → 允
 URL_ZW_ENCODED = BASE + "%E2%80%8Bpath"                     # 编码零宽 → 拒
 URL_ZW_DOUBLE = BASE + "%25E2%80%8Bpath"                    # 双重编码 → 允
 URL_MAILTO = "mailto:user@example.com"                      # 白名单 → 允
+# #601：mailto 附件参数——attach/insert 可携带本地文件路径交给本机邮件
+# 客户端（文件外带面）→ 拒；合法 subject 混入验证「仅附件键触发」。
+URL_MAILTO_ATTACH = "mailto:user@example.com?attach=/etc/passwd&subject=quote"  # 附件键 → 拒
 
 
 
@@ -63,9 +66,9 @@ def build_pdf() -> bytes:
     kids = " ".join(f"{3 + i} 0 R" for i in range(n_pages))
     obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
     obj(2, f"<< /Type /Pages /Kids [{kids}] /Count {n_pages} >>".encode("ascii"))
-    # 第 1 页挂 #466 原三形态；第 2 页挂 #557 策略七形态
+    # 第 1 页挂 #466 原三形态；第 2 页挂 #557 策略七形态 + #601 附件形态
     annots_p1 = b" /Annots [11 0 R 12 0 R 13 0 R]"
-    annots_p2 = b" /Annots [14 0 R 15 0 R 16 0 R 17 0 R 18 0 R]"
+    annots_p2 = b" /Annots [14 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R]"
     for i, (title, extra) in enumerate(PAGE_TEXTS):
         annots = annots_p1 if i == 0 else (annots_p2 if i == 1 else b"")
         obj(3 + i, (
@@ -114,8 +117,13 @@ def build_pdf() -> bytes:
         b"<< /Type /Annot /Subtype /Link /Rect [72 450 540 484] /Border [0 0 0] "
         b"/A << /S /URI /URI (mailto:user@example.com) >> >>"
     ))
+    # #601：mailto attach 形态（Rect 在 18 与 17 之间的空档，互不重叠）
+    obj(19, (
+        b"<< /Type /Annot /Subtype /Link /Rect [72 495 540 529] /Border [0 0 0] "
+        + b"/A << /S /URI /URI (" + URL_MAILTO_ATTACH.encode("ascii") + b") >> >>"
+    ))
 
-    n_objects = 18
+    n_objects = 19
     xref_at = len(out)
     out.extend(f"xref\n0 {n_objects + 1}\n".encode("ascii"))
     out.extend(b"0000000000 65535 f \n")
@@ -146,6 +154,7 @@ def verify(pdf: bytes) -> None:
     assert b"%E2%80%8Bpath" in pdf, "encoded zero-width link"
     assert b"%25E2%80%8Bpath" in pdf, "double-encoded link"
     assert b"(mailto:user@example.com)" in pdf, "mailto link"
+    assert URL_MAILTO_ATTACH.encode("ascii") in pdf, "mailto attach link (#601)"
     assert pdf.rstrip().endswith(b"%%EOF"), "EOF"
 
 

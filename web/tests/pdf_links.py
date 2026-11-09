@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""#466 web PDF 链接点击导航 e2e + #557 外链输入策略面。
+"""#466 web PDF 链接点击导航 e2e + #557 外链输入策略面 + #601 mailto 附件键拒绝。
 
 夹具 web/tests/fixtures/sample_links.pdf（gen_pdf_links_fixture.py：3 页；
 第 1 页 3 条 Link——内链→第 3 页 / 白名单外链 / javascript: 恶意 scheme；
-第 2 页 5 条 #557 策略探针——2049 超限 / 恰 2048 / %E2%80%8B 编码零宽 /
-%25E2%80%8B 双重编码 / mailto。原始控制码形态不经夹具——pdf.js
-bytesToString 对 /URI 无 BOM 解码，由 __pdfLinkPolicy 探针单测直测）。
+第 2 页 6 条 #557/#601 策略探针——2049 超限 / 恰 2048 / %E2%80%8B 编码零宽 /
+%25E2%80%8B 双重编码 / mailto / mailto?attach= 附件键。原始控制码形态不经
+夹具——pdf.js bytesToString 对 /URI 无 BOM 解码，由 __pdfLinkPolicy 探针
+单测直测）。
 
 驱动面：__pdfOpenBytes / __pdfState / __pdfLinks（逐页计数 + 策略拒绝面）
 + __pdfLinkPolicy（#557 策略纯函数单测——不经夹具直测 reason 语义）
@@ -67,6 +68,17 @@ POLICY_CASES: list[tuple[str, str, str]] = [
     ("https://example.com/x", "ok", "url=https://example.com/x"),
     ("http://a.b/c?d=e#f", "ok", "url=http://a.b/c?d=e#f"),
     ("mailto:user@example.com", "ok", "url=mailto:user@example.com"),
+    # #601：mailto 附件参数拒绝（attach/insert——本机邮件客户端文件外带面）
+    ("mailto:user@example.com?attach=/etc/passwd", "rej", "mailto-attachment"),
+    ("mailto:a@b.c?ATTACH=C:/doc.pdf", "rej", "mailto-attachment"),  # 键大小写不敏感
+    ("mailto:a@b.c?InSeRt=C:%5Cdoc.pdf", "rej", "mailto-attachment"),  # insert 键 + 编码值
+    ("mailto:a@b.c?%61ttach=/x", "rej", "mailto-attachment"),  # 百分号编码键（单次解码）
+    ("mailto:a@b.c?attach=", "rej", "mailto-attachment"),  # 空值也拒（键在场即附件语义）
+    ("mailto:a@b.c?subject=x&attach=/f&body=y", "rej", "mailto-attachment"),  # 合法键混入附件键
+    ("mailto:a@b.c?attach=/f&attach=/g", "rej", "mailto-attachment"),  # 重复附件键逐一枚举
+    ("mailto:user@example.com?subject=Hi&body=text", "ok", "url~subject=Hi"),  # 合法参数保留
+    ("mailto:a@b.c?cc=other@x.y&to=user@z.w", "ok", "url~cc=other@x.y"),  # cc/to 合法
+    ("mailto:a@b.c?%2561ttach=/x", "ok", "url~%2561ttach"),  # 双重编码不二次解码（字面键非 attach）
     ("HTTPS://EXAMPLE.COM/X", "ok", "url=https://example.com/X"),  # 规范化大小写
     ("https://例え.jp/パス", "ok", "url~xn--"),  # 中文 IDN → punycode 规范化
     (BASE + "b" * (2048 - len(BASE)), "ok", "len=2048"),  # 预算边界恰好通过
@@ -150,7 +162,7 @@ def main() -> int:
         page.wait_for_function("window.__pdfState().open === true", timeout=10000)
 
         # 1. 链接面计数：第 1 页内 1 外 1（恶意 scheme 不渲染）；策略拒绝面
-        #    （第 1 页 javascript + 第 2 页 2 项 #557 拒绝）
+        #    （第 1 页 javascript + 第 2 页 3 项 #557/#601 拒绝）
         links = page.evaluate("window.__pdfLinks()")
         p1 = links["perPage"][0] if links["perPage"] else {}
         check(
@@ -160,6 +172,7 @@ def main() -> int:
                 "javascript",
                 "url-over-budget",
                 "zero-width-bidi-encoded",
+                "mailto-attachment",
             ],
             json.dumps(links),
         )
@@ -198,7 +211,7 @@ def main() -> int:
         bad = page.query_selector_all('.pdf-page[data-page="0"] a[href^="javascript"]')
         check("links_malicious_not_rendered", len(bad) == 0, f"count={len(bad)}")
 
-        # 6. #557 策略面 e2e（第 2 页=data-page"1"：5 条注释 → 3 热区 + 2 拒绝）
+        # 6. #557/#601 策略面 e2e（第 2 页=data-page"1"：6 条注释 → 3 热区 + 3 拒绝）
         p2 = links["perPage"][1] if len(links["perPage"]) > 1 else {}
         check("policy_page2_counts",
               p2.get("total") == 3 and p2.get("internal") == 0 and p2.get("external") == 3,
@@ -229,6 +242,13 @@ def main() -> int:
         # 6d. mailto 白名单热区（href + noopener）
         mailto = [h for h in hrefs2 if h.startswith("mailto:")]
         check("policy_mailto_hotspot", len(mailto) == 1, f"mailto={mailto}")
+
+        # 6f. #601：mailto attach 被拒——无 href 含 attach 键；合法 mailto
+        #     热区仍完整在场（同页合法/拒绝共存）
+        check("policy_mailto_attach_denied",
+              all("attach" not in h for h in hrefs2) and len(mailto) == 1
+              and all("/etc/passwd" not in h for h in hrefs2),
+              f"hrefs2={[h[:48] for h in hrefs2]}")
 
         # 6e. 全部 href 无控制码残留（含允许面——双编/边界/mailto 均洁净）
         check("policy_raw_controls_not_rendered",
