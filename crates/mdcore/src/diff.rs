@@ -1099,7 +1099,8 @@ fn flush_hunk(out: &mut Vec<DiffOp>, dels: &mut Vec<String>, ins: &mut Vec<Strin
     }
 }
 
-/// 中点蛇形分治递归体。
+/// 中点蛇形分治递归体（每层剥公共前后缀；#624：剥出的后缀在本层
+/// 尾部补报——见函数内注释）。
 fn myers_middle(a: &[String], b: &[String], out: &mut Vec<DiffOp>) {
     let (n, m) = (a.len(), b.len());
     if n == 0 {
@@ -1129,8 +1130,18 @@ fn myers_middle(a: &[String], b: &[String], out: &mut Vec<DiffOp>) {
     if lo > 0 {
         out.push(DiffOp::Equal(a[..lo].concat()));
     }
-    let a = &a[lo..hi_a];
-    let b = &b[lo..hi_b];
+    // #624 修复：剥出的公共后缀必须补报——原实现剥而不报，等值
+    // 词元在递归各层被静默吞掉（双向重建丢串：a 的空格词元 + b 的
+    // 空格词元在 2×2 子问题的后缀剥离中同时消失）。剥壳/补报在
+    // wrapper 统一收口，core 的各早退路径不背尾部。
+    myers_core(&a[lo..hi_a], &b[lo..hi_b], out);
+    if hi_a < n {
+        out.push(DiffOp::Equal(a[hi_a..].concat()));
+    }
+}
+
+/// 剥壳后的中段求解（空早退 + 单边退化收口 + 正反向中点蛇搜索）。
+fn myers_core(a: &[String], b: &[String], out: &mut Vec<DiffOp>) {
     let (n, m) = (a.len(), b.len());
     if n == 0 {
         if m > 0 {
@@ -1191,14 +1202,21 @@ fn myers_middle(a: &[String], b: &[String], out: &mut Vec<DiffOp>) {
     // vf[kf] + vb[kr] >= n（同对角线正反 reach 相遇/穿越）。
     let delta = n as isize - m as isize;
     let odd = delta % 2 != 0;
-    let size = n + m + 2;
-    let offset = (size / 2 + 1) as isize;
+    // #624：k 遍历 ±d 层（d ≤ dmax = ceil((n+m)/2)+1）——数组与偏移
+    // 必须容纳 k ∈ ±dmax 全程读写。原 `size = n + m + 2` / `offset =
+    // size/2 + 1` 在 n+m 奇偶两形态下分别短 2/1 格（d 高层的对角线
+    // idx 越界——`diff_inline("alpha beta", "报价123元")` 的
+    // len9/index9 panic 即此：n+m=7 → size=9、offset=5、d=4 层 k=4 →
+    // idx=9 出界）。中点蛇定理保证 found 于 d = ceil(D/2) ≤
+    // ceil((n+m)/2) = dmax-1 层出现——dmax 层仅余量，但数组必须兜住。
+    let dmax = (n + m).div_ceil(2) + 1;
+    let size = 2 * dmax + 1;
+    let offset = dmax as isize;
     let mut vf = vec![isize::MIN; size];
     let mut vb = vec![isize::MIN; size];
     vf[(offset + 1) as usize] = 0;
     vb[(offset + 1) as usize] = 0;
     let mut found: Option<(usize, usize)> = None; // (x, y) 中点
-    let dmax = (n + m).div_ceil(2) + 1;
     'outer: for d in 0..=dmax as isize {
         // 正向：本层对角线 -d..=d（步 2，同层互不读写）。
         for k in (-d..=d).rev().step_by(2) {
@@ -1388,6 +1406,111 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // #624：Myers 中点蛇形数组边界——常见输入索引越界（先红用例）。
+    // -------------------------------------------------------------------
+
+    /// 严格双向重建不变量（`myers_diff` ops 面——diff_inline 的首尾
+    /// 削除不影响此层）：Equal+Delete 序 == 旧串；Equal+Insert == 新串
+    /// （tokenize 为保序连续覆盖，拼接恒等原文）。
+    fn assert_rebuilds(old: &str, new: &str) {
+        let ops = myers_diff(&tokenize(old), &tokenize(new));
+        let (mut o, mut n) = (String::new(), String::new());
+        for op in &ops {
+            match op {
+                DiffOp::Equal(t) => {
+                    o.push_str(t);
+                    n.push_str(t);
+                }
+                DiffOp::Delete(t) => o.push_str(t),
+                DiffOp::Insert(t) => n.push_str(t),
+            }
+        }
+        assert_eq!(o, old, "Equal+Delete 须重建旧串（{old:?} vs {new:?}）");
+        assert_eq!(n, new, "Equal+Insert 须重建新串（{old:?} vs {new:?}）");
+        // diff_inline 面：不 panic（首尾削除只影响展示，重建在 ops 层钉定）。
+        let _ = diff_inline(old, new);
+    }
+
+    /// #624 最小确定输入（issue 报告原对）：len9/index9 越界——常见
+    /// 输入（拉丁词 vs CJK/数字混排、无公共 token、delta 奇）。
+    #[test]
+    fn inline_diff_reported_pair_no_panic() {
+        assert_rebuilds("alpha beta", "报价123元");
+    }
+
+    /// #624：100 对矩阵——常见输入形态全扫（CJK/拉丁/混排/短长不等/
+    /// 空/全重写/重复词元），逐对不 panic + 严格双向重建。
+    #[test]
+    fn inline_diff_matrix_boundaries_rebuild() {
+        let olds = [
+            "alpha beta",
+            "报价123元",
+            "the quick brown fox",
+            "合同编号：2026-001 号",
+            "",
+            "a",
+            "一二三四五",
+            "hello world 2026",
+            "第一章 概述",
+            "spec_v2_final.docx",
+        ];
+        let news = [
+            "报价123元",
+            "alpha beta",
+            "the slow brown cat",
+            "报价 123 元（含税）",
+            "x",
+            "abcdefghijklmnopqrst",
+            "五 四 三 二 一",
+            "世界你好！2026",
+            "第二章 详细设计说明书",
+            "spec_v3_draft (final).docx",
+        ];
+        for old in olds {
+            for new in news {
+                assert_rebuilds(old, new);
+            }
+        }
+    }
+
+    /// #624 验收：长文性能保持——千词元级混合面（500 CJK 条目 +
+    /// 公共尾段）不 panic、双向重建成立；O((N+M)D) 中点蛇形线性空间
+    /// + 对数递归深度，debug 构建实测毫秒级（慢机 CI 余量充足）。
+    #[test]
+    fn inline_diff_long_text_rebuild() {
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..500 {
+            old.push_str(&format!("第{i}条 报价单 "));
+            new.push_str(&format!("第{i}项 合同 "));
+        }
+        old.push_str("尾部公共段 alpha beta gamma");
+        new.push_str("尾部公共段 alpha beta gamma");
+        assert_rebuilds(&old, &new);
+    }
+
+    /// #624：单边/空串/全重写边界（Myers 正反向蛇形走尽路径）。
+    #[test]
+    fn inline_diff_degenerate_boundaries() {
+        assert_rebuilds("", "");
+        assert_rebuilds("", "报价 123 元");
+        assert_rebuilds("报价 123 元", "");
+        assert_rebuilds("a", "报价123元报价123元报价123元");
+        assert_rebuilds("报价123元报价123元报价123元", "a");
+        assert_rebuilds("aaaa", "bbbb");
+        assert_rebuilds("一词", "一词一词一词");
+        // 全等：单等 run 保留（削除守卫 runs.len() > 1——全等单 run
+        // 是现有产品语义，不削成空）。
+        assert_eq!(
+            diff_inline("same", "same"),
+            vec![InlineDiff {
+                kind: DiffKind::Unchanged,
+                text: "same".into()
+            }]
+        );
+    }
+
     // ------------------------------------------------------------------
     // #600 L3 内部件
     // ------------------------------------------------------------------
@@ -1534,4 +1657,5 @@ mod tests {
             assert_eq!(net, "a `x` **b** |", "{kind:?} 逐字保留");
         }
     }
+
 }

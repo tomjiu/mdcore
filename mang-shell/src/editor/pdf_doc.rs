@@ -76,6 +76,10 @@ use super::highlight::TokenKind;
 /// 引擎层另有 S3-L7 1GiB 双防线（mdc-pdf `Limits`），两层独立。
 const INPUT_CAP_BYTES: u64 = 100 * 1024 * 1024;
 
+/// S2 明细行呈现上限（#409 验收 2「查看详情」：逐项列出但封顶，
+/// 溢出以计数行收口——防大文档告警风暴刷屏行模型首区）。
+const SECURITY_DETAIL_MAX: usize = 8;
+
 // ---------------------------------------------------------------------------
 // 数据面
 // ---------------------------------------------------------------------------
@@ -121,6 +125,24 @@ pub struct PdfPayload {
     pub pages: Vec<PageEntry>,
     /// 文档属性。
     pub props: PdfProps,
+    /// S2 结构化安全明细（#409 typed 透出——未来「查看详情」面板的
+    /// 数据面；与行模型明细行同源派生，两呈现永不漂移）。
+    pub security_findings: Vec<PdfSecurityFinding>,
+    /// #306 ①：OCR 结果（`None` = 未识别；`Some` = 识别文本已落
+    /// `text`，词随行携带——「另存为可搜索 PDF」（#306 ②）的数据源）。
+    pub ocr: Option<PdfOcrOutcome>,
+}
+
+/// #306 ①：OCR 会话产物（读面结果 + 写回面数据源——随
+/// [`PdfPayload`] 持有，Editor 零新字段）。
+#[derive(Clone, Debug)]
+pub struct PdfOcrOutcome {
+    /// 识别语言（tesseract lang 串——报告/复跑展示面）。
+    pub lang: String,
+    /// 逐页词（页序对齐 [`PdfPayload::pages`]——空页 = 空列表）。
+    pub pages: Vec<Vec<mdc_pdf::OcrWord>>,
+    /// 词总数（报告展示面）。
+    pub word_count: usize,
 }
 
 /// 引擎抽取中转（`load` 的产物 = `convert` 的纯函数输入——单测锚点）。
@@ -134,6 +156,9 @@ pub struct PdfRaw {
     /// `load_from_bytes` 经 `open_scan` 产出、convert 落行模型首行区；
     /// 默认空 = 无评估路径行为不变）。
     pub security_notices: Vec<String>,
+    /// S2 结构化安全明细（#409 typed 透出——与 `security_notices`
+    /// 同一 assessment 派生：横幅/明细行是呈现面，本字段是数据面）。
+    pub security_findings: Vec<PdfSecurityFinding>,
 }
 
 /// 单页文本层。
@@ -199,11 +224,51 @@ pub fn load_from_bytes(bytes: Vec<u8>) -> Result<PdfPayload, String> {
             return Err(msg);
         }
     };
-    let notices = assessment
+    let (notices, findings) = assessment
         .as_ref()
-        .map(security_notice_lines)
+        .map(|a| (security_notice_lines(a), security_findings(a)))
         .unwrap_or_default();
-    extract_with(&engine, notices)
+    extract_with(&engine, notices, findings)
+}
+
+/// S2 单项结构化明细（#409 typed 透出——未来「查看详情」面板的
+/// 数据面；行模型明细行与该 typed 面同源派生，两呈现永不漂移）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdfSecurityFinding {
+    /// 用户可读族名（[`family_label`] 同源——与横幅族名呈现一致）。
+    pub family: String,
+    /// 定位细节（引擎 `DangerousHit.detail` 原样——"obj N M: /键"）。
+    pub detail: String,
+    /// 高危级（#409 阻断策略分级：JavaScript/NamesJavaScript/Launch
+    /// Action = 高危——默认不执行+提示；其余 = 提示级，显示放行）。
+    pub high_risk: bool,
+}
+
+/// 族 → 高危级判定（#409 阻断策略：JS 自动执行与外部程序启动为
+/// 高危；桌面视图零执行面，分级作呈现优先级与用户决策提示）。
+fn is_high_risk(family: DangerousFamily) -> bool {
+    matches!(
+        family,
+        DangerousFamily::JavaScript
+            | DangerousFamily::NamesJavaScript
+            | DangerousFamily::LaunchAction
+    )
+}
+
+/// 评估 → typed 明细（#409——高危在前，组内保持引擎报告序：族声明
+/// 序 × 详情字典序的确定性不破坏；稳定排序）。
+fn security_findings(assessment: &OpenAssessment) -> Vec<PdfSecurityFinding> {
+    let mut findings: Vec<PdfSecurityFinding> = assessment
+        .warnings
+        .iter()
+        .map(|hit| PdfSecurityFinding {
+            family: family_label(hit.family),
+            detail: hit.detail.clone(),
+            high_risk: is_high_risk(hit.family),
+        })
+        .collect();
+    findings.sort_by_key(|f| !f.high_risk);
+    findings
 }
 
 /// S2/S6 打开评估 → 行模型全局提示行（S2.4 只读告警——用户可见
@@ -212,7 +277,7 @@ fn security_notice_lines(assessment: &OpenAssessment) -> Vec<String> {
     let mut lines = Vec::new();
     if !assessment.warnings.is_empty() {
         // 族名去重呈现（同族多命中一行；细节对象号不进提示行——
-        // 面向用户可读性优先，结构化细节保留在 assessment 内）。
+        // 面向用户可读性优先，结构化细节见下方明细行与 typed 面）。
         let mut families: Vec<String> = Vec::new();
         for hit in &assessment.warnings {
             let label = family_label(hit.family);
@@ -220,11 +285,30 @@ fn security_notice_lines(assessment: &OpenAssessment) -> Vec<String> {
                 families.push(label);
             }
         }
+        // 横幅行（#277 原格式零变化——回归锁）。
         lines.push(format!(
             "【安全提示】检出 {} 处潜在危险对象（{}）——本视图只读不执行任何动作，请自行确认文件来源可信。",
             assessment.warnings.len(),
             families.join("、")
         ));
+        // 明细行（#409 验收 2「查看详情」——typed 面同源派生，高危在
+        // 前；上限封顶防告警风暴刷屏，溢出计数行收口）。
+        let findings = security_findings(assessment);
+        for f in findings.iter().take(SECURITY_DETAIL_MAX) {
+            let tag = if f.high_risk {
+                "【高危】"
+            } else {
+                "【提示】"
+            };
+            lines.push(format!("  {tag}{}——{}", f.family, f.detail));
+        }
+        if findings.len() > SECURITY_DETAIL_MAX {
+            lines.push(format!(
+                "  …另有 {} 处未列出（共 {} 处）",
+                findings.len() - SECURITY_DETAIL_MAX,
+                findings.len()
+            ));
+        }
     }
     if let Some(probe) = &assessment.form_probe {
         lines.push(format!(
@@ -254,6 +338,7 @@ fn family_label(family: DangerousFamily) -> String {
 fn extract_with(
     engine: &PdfiumEngine,
     security_notices: Vec<String>,
+    security_findings: Vec<PdfSecurityFinding>,
 ) -> Result<PdfPayload, String> {
     let count = engine.page_count();
     if count == 0 {
@@ -286,6 +371,7 @@ fn extract_with(
             })
             .collect(),
         security_notices,
+        security_findings,
     };
     Ok(convert(&raw))
 }
@@ -370,6 +456,9 @@ pub fn convert(raw: &PdfRaw) -> PdfPayload {
         headings,
         pages,
         props,
+        security_findings: raw.security_findings.clone(),
+        // #306：未识别态（OCR 词表仅在 with_ocr 产物中携带）。
+        ocr: None,
     }
 }
 
@@ -449,6 +538,153 @@ impl PdfPayload {
         }
         cur.or_else(|| self.pages.first().map(|p| p.index + 1))
     }
+
+    /// #306 ①：OCR 结果落读面（新 payload——原扫描件提示行由 OCR 横幅
+    /// 替换，逐页占位行由识别文本行替换；页分隔行保持；书签树清空
+    /// [扫描件本无书签——props.bookmarks 同步]）。
+    ///
+    /// 纯函数面（`convert` 的姊妹——单测锚点；词 → 行的分组规则见
+    /// [`ocr_page_lines`]）。
+    pub fn with_ocr(&self, outcome: PdfOcrOutcome) -> PdfPayload {
+        let total = self.props.pages.max(outcome.pages.len());
+        let mut ctx = Ctx::default();
+        // 原安全评估提示行保持（扫描件提示行[「暂不支持」]退役——OCR
+        // 横幅接任；其余 notice 原样保留在首行区）。
+        for line in self.text.lines().take_while(|l| {
+            // 首行区 = 首个页分隔行之前的 notice 行；「暂不支持」横幅退役。
+            !l.starts_with("── 第") && !l.contains("渲染需要 OCR，当前版本暂不支持")
+        }) {
+            if !line.is_empty() {
+                ctx.push(line.to_string(), Some(TokenKind::Quote));
+            }
+        }
+        // OCR 横幅（Quote 整行——诚实面：语言 + 词数 + 可搜索指引）。
+        let banner = format!(
+            "【OCR】识别完成（语言：{}，{} 页 {} 词）——识别文本如下；查找（Ctrl+F）可搜，另存为可搜索 PDF 可携带到任何阅读器。",
+            outcome.lang,
+            outcome.pages.len(),
+            outcome.word_count
+        );
+        ctx.push(banner, Some(TokenKind::Quote));
+
+        let mut pages: Vec<PageEntry> = Vec::new();
+        let mut empty_pages = 0usize;
+        let mut chars = 0usize;
+        let mut content_lines = 0usize;
+        for i in 0..total {
+            let sep = format!("── 第 {} / {} 页 ──", i + 1, total);
+            let first_line = ctx.lines.len();
+            ctx.push(sep, Some(TokenKind::Quote));
+            let words = outcome.pages.get(i).map(|w| w.as_slice()).unwrap_or(&[]);
+            let body = ocr_page_lines(words);
+            if body.is_empty() {
+                empty_pages += 1;
+                ctx.push(
+                    "（本页识别无词——空扫描页或图形页）".to_string(),
+                    Some(TokenKind::Quote),
+                );
+            } else {
+                for l in body {
+                    if l.is_empty() {
+                        ctx.push(l, None);
+                    } else {
+                        chars += l.chars().filter(|c| !c.is_whitespace()).count();
+                        content_lines += 1;
+                        ctx.push(l, None);
+                    }
+                }
+            }
+            ctx.push(String::new(), None);
+            pages.push(PageEntry {
+                index: i,
+                first_line,
+                last_line: ctx.lines.len() - 1,
+            });
+        }
+
+        PdfPayload {
+            text: ctx.lines.join("\n"),
+            spans: ctx.spans,
+            headings: Vec::new(),
+            pages,
+            props: PdfProps {
+                pages: total,
+                chars,
+                content_lines,
+                empty_pages,
+                bookmarks: 0,
+                // scanned 保持 true（文件本体仍是扫描件——OCR 是识别
+                // 层叠加，不是文本层改写；ocr.is_some() 是「已识别」判据）。
+                scanned: self.props.scanned,
+            },
+            security_findings: self.security_findings.clone(),
+            ocr: Some(outcome),
+        }
+    }
+}
+
+/// #306 ①：页词 → 正文行集（词按 `(block, par, line)` 锚分组——
+/// 行序 = 首词文档序；段间空行呼吸；行内 CJK 感知连接）。
+///
+/// 连接规则（读面可读性）：相邻词若**边界两侧至少一侧为 CJK 字符**，
+/// 无空格直连（tesseract 把中文切成 2 字词——空格连接会把「招标文件」
+/// 拆成「招标 文件」四字噪声）；否则（拉丁/数字）单空格连接。
+fn ocr_page_lines(words: &[mdc_pdf::OcrWord]) -> Vec<String> {
+    // 行分组（保序——首见序；锚 (block, par, line)）。
+    let mut line_order: Vec<(u32, u32, u32)> = Vec::new();
+    let mut by_line: std::collections::HashMap<(u32, u32, u32), Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut par_of: std::collections::HashMap<(u32, u32, u32), (u32, u32)> =
+        std::collections::HashMap::new();
+    for w in words {
+        let key = w.line;
+        if !by_line.contains_key(&key) {
+            line_order.push(key);
+            par_of.insert(key, (key.0, key.1));
+        }
+        by_line.entry(key).or_default().push(w.text.as_str());
+    }
+    // 行文本 + 段界（par 变更 → 空行呼吸）。
+    let mut out: Vec<String> = Vec::new();
+    let mut last_par: Option<(u32, u32)> = None;
+    for key in line_order {
+        let parts = &by_line[&key];
+        let par = par_of[&key];
+        if last_par.is_some() && last_par != Some(par) {
+            if !out.last().is_some_and(|l: &String| l.is_empty()) {
+                out.push(String::new());
+            }
+        }
+        last_par = Some(par);
+        let mut line = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 0 {
+                line.push_str(part);
+                continue;
+            }
+            let left_cjk = parts[i - 1].chars().last().is_some_and(is_cjk);
+            let right_cjk = part.chars().next().is_some_and(is_cjk);
+            if !(left_cjk || right_cjk) {
+                line.push(' ');
+            }
+            line.push_str(part);
+        }
+        let trimmed = line.trim_end().to_string();
+        if !trimmed.is_empty() {
+            out.push(trimmed);
+        }
+    }
+    out
+}
+
+/// CJK 判定（统一表意文字区 + 扩展 A——词连接面的宽判定）。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF      // CJK 统一表意
+        | 0x3400..=0x4DBF    // 扩展 A
+        | 0xF900..=0xFAFF    // 兼容表意
+        | 0x3000..=0x303F    // CJK 标点
+    )
 }
 
 // =============================================================================
@@ -495,6 +731,7 @@ mod tests {
                 },
             ],
             security_notices: vec![],
+            security_findings: vec![],
         }
     }
 
@@ -618,6 +855,7 @@ mod tests {
             ],
             outline: vec![],
             security_notices: vec![],
+            security_findings: vec![],
         };
         let out = convert(&raw);
         let lines: Vec<&str> = out.text.split('\n').collect();
@@ -648,6 +886,7 @@ mod tests {
             ],
             outline: vec![],
             security_notices: vec![],
+            security_findings: vec![],
         };
         let out = convert(&raw);
         assert!(out.props.scanned);
@@ -675,6 +914,7 @@ mod tests {
             }],
             outline: vec![],
             security_notices: vec![],
+            security_findings: vec![],
         };
         let out = convert(&raw);
         let lines: Vec<&str> = out.text.split('\n').collect();
@@ -727,7 +967,8 @@ mod tests {
             encryption: None,
         };
         let lines = security_notice_lines(&assessment);
-        assert_eq!(lines.len(), 2, "S2 一行 + S6 一行：{lines:?}");
+        // #409 后行数 = 横幅 1 + 明细 3（1 高危 JS + 2 OpenAction）+ 表单 1。
+        assert_eq!(lines.len(), 5, "横幅 + 明细 + 表单：{lines:?}");
         assert!(
             lines[0].contains("3 处"),
             "命中计数含同族多命中：{}",
@@ -745,11 +986,198 @@ mod tests {
             "同族去重（一处一行）：{}",
             lines[0]
         );
-        assert!(lines[1].contains("3 个字段"), "表单计数：{}", lines[1]);
+        // #409 横幅行零变化（回归锁：#277 原格式逐字节）。
+        assert_eq!(
+            lines[0],
+            "【安全提示】检出 3 处潜在危险对象（打开动作 /OpenAction、JavaScript 动作）——本视图只读不执行任何动作，请自行确认文件来源可信。"
+        );
+        // #409 明细行：高危在前（组内保持报告序），detail 定位透传。
+        assert_eq!(
+            lines[1],
+            "  【高危】JavaScript 动作——obj 7 0: /JavaScript 动作"
+        );
+        assert_eq!(
+            lines[2],
+            "  【提示】打开动作 /OpenAction——obj 5 0: /OpenAction"
+        );
+        assert_eq!(
+            lines[3],
+            "  【提示】打开动作 /OpenAction——obj 9 0: /OpenAction"
+        );
+        assert!(lines[4].contains("3 个字段"), "表单计数：{}", lines[4]);
 
         // 零命中零表单 → 零行（良性文档无提示——误报 = 告警面失效）。
         let clean = security_notice_lines(&OpenAssessment::default());
         assert!(clean.is_empty(), "良性档零提示行：{clean:?}");
+    }
+
+    /// #409 typed 明细：字段/等级/高危在前稳定序（纯函数面——未来
+    /// 「查看详情」面板的数据面）。
+    #[test]
+    fn security_findings_typed_and_high_risk_first() {
+        use mdc_pdf::security::DangerousHit;
+        let hit = |family: DangerousFamily, detail: &str| DangerousHit {
+            family,
+            detail: detail.into(),
+        };
+        // 构造序（security_findings 组内不重排——高危前置为稳定排序，
+        // 组内保持 assessment.warnings 给定序）：OpenAction →
+        // JavaScript → Launch → NamesJavaScript。
+        let assessment = OpenAssessment {
+            warnings: vec![
+                hit(DangerousFamily::OpenAction, "obj 5 0: /OpenAction"),
+                hit(DangerousFamily::JavaScript, "obj 7 0: /S /JavaScript"),
+                hit(DangerousFamily::LaunchAction, "obj 8 0: /S /Launch"),
+                hit(DangerousFamily::NamesJavaScript, "obj 6 0: /JavaScript"),
+            ],
+            ..OpenAssessment::default()
+        };
+        let findings = security_findings(&assessment);
+        assert_eq!(findings.len(), 4);
+        // 高危三族在前（JS/NamesJS/Launch），组内保持报告序。
+        assert!(
+            findings[0].high_risk && findings[1].high_risk && findings[2].high_risk,
+            "高危前置：{findings:?}"
+        );
+        assert!(!findings[3].high_risk, "OpenAction = 提示级");
+        assert_eq!(findings[0].family, "JavaScript 动作");
+        assert_eq!(findings[1].family, "外部程序启动 /Launch");
+        assert_eq!(findings[2].family, "文档级 JavaScript");
+        assert_eq!(findings[3].family, "打开动作 /OpenAction");
+        // detail 原样透传（定位不丢——呈现边界不再吞结构化信息）。
+        assert_eq!(findings[0].detail, "obj 7 0: /S /JavaScript");
+        // 零命中 → 空 typed 面。
+        assert!(security_findings(&OpenAssessment::default()).is_empty());
+    }
+
+    /// #409 明细行上限：超出 SECURITY_DETAIL_MAX 封顶 + 溢出计数行
+    /// （防大文档刷屏——呈现面与 typed 面同源派生）。
+    #[test]
+    fn security_notice_lines_detail_cap_and_overflow() {
+        use mdc_pdf::security::DangerousHit;
+        let hit = |family: DangerousFamily, detail: &str| DangerousHit {
+            family,
+            detail: detail.into(),
+        };
+        let mut many = Vec::new();
+        for i in 0..11 {
+            many.push(hit(DangerousFamily::UriAction, &format!("obj {i} 0: /URI")));
+        }
+        let assessment = OpenAssessment {
+            warnings: many,
+            ..OpenAssessment::default()
+        };
+        let lines = security_notice_lines(&assessment);
+        // 横幅 1 + 明细 8（上限）+ 溢出计数 1。
+        assert_eq!(lines.len(), 1 + SECURITY_DETAIL_MAX + 1, "{lines:?}");
+        assert_eq!(lines[1], "  【提示】外链动作 /URI——obj 0 0: /URI");
+        // 溢出行：剩余计数 + 总数（用户可感知全量）。
+        assert_eq!(
+            lines[SECURITY_DETAIL_MAX + 1],
+            "  …另有 3 处未列出（共 11 处）"
+        );
+    }
+
+    /// #409 真实链路：lopdf 自造敌意/良性夹具 → `open_scan` → 横幅 +
+    /// 明细行 + typed findings 三面（验收 4「自造」路径——纯 lopdf
+    /// 零 pdfium 依赖，默认测试面可跑）。
+    #[test]
+    fn open_scan_fixture_wires_notices_and_findings() {
+        use lopdf::Object;
+        use lopdf::dictionary;
+
+        let name = |v: &str| Object::Name(v.as_bytes().to_vec());
+        let text_string =
+            |v: &str| Object::String(v.as_bytes().to_vec(), lopdf::StringFormat::Literal);
+
+        // 最小文档骨架（1 页 Letter）+ catalog 增补键注入面。
+        let build = |catalog_extra: Vec<(&'static str, Object)>| -> Vec<u8> {
+            let mut doc = lopdf::Document::with_version("1.7");
+            let pages_id = doc.new_object_id();
+            let page_id = doc.add_object(Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Page".to_vec()),
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => vec![
+                    Object::Integer(0), Object::Integer(0),
+                    Object::Integer(612), Object::Integer(792),
+                ],
+            }));
+            doc.set_object(
+                pages_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => Object::Name(b"Pages".to_vec()),
+                    "Kids" => vec![Object::Reference(page_id)],
+                    "Count" => Object::Integer(1),
+                }),
+            );
+            let mut catalog = dictionary! {
+                "Type" => Object::Name(b"Catalog".to_vec()),
+                "Pages" => Object::Reference(pages_id),
+            };
+            for (k, v) in catalog_extra {
+                catalog.set(k, v);
+            }
+            let catalog_id = doc.add_object(Object::Dictionary(catalog));
+            doc.trailer.set("Root", Object::Reference(catalog_id));
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).expect("夹具序列化");
+            bytes
+        };
+
+        // 敌意面：catalog /OpenAction → JS 动作对象（打开即执行 JS）+
+        // 不可达 Launch 动作（对象图全扫可见——不可达敌意对象同样
+        // 可见是引擎侧检测语义，此处顺带锁定）。
+        let js_action = dictionary! {
+            "Type" => name("Action"),
+            "S" => name("JavaScript"),
+            "JS" => text_string("app.alert(1)"),
+        };
+        let js_id = (900, 0);
+        let hostile = build(vec![("OpenAction", Object::Reference(js_id))]);
+        let mut doc = lopdf::Document::load_mem(&hostile).expect("敌意夹具回读");
+        doc.set_object(js_id, Object::Dictionary(js_action));
+        doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => name("Action"),
+            "S" => name("Launch"),
+            "F" => text_string("/usr/bin/curl"),
+        }));
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("敌意夹具序列化");
+
+        let assessment = open_scan(&bytes, &Limits::default()).expect("敌意夹具扫描");
+        // 三族命中：OpenAction（catalog 键）+ JavaScript（动作对象）+
+        // Launch（不可达对象——对象图全扫语义）。
+        let got: Vec<DangerousFamily> = assessment.warnings.iter().map(|h| h.family).collect();
+        assert!(
+            got.contains(&DangerousFamily::OpenAction)
+                && got.contains(&DangerousFamily::JavaScript)
+                && got.contains(&DangerousFamily::LaunchAction),
+            "三族命中：{got:?}"
+        );
+        // 横幅 + 明细行（高危在前；高危组内保持引擎报告序——
+        // LaunchAction 声明序先于 JavaScript）。
+        let lines = security_notice_lines(&assessment);
+        assert!(
+            lines[0].starts_with("【安全提示】检出 3 处"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines.len(), 4, "横幅 + 3 明细：{lines:?}");
+        assert!(lines[1].contains("【高危】") && lines[1].contains("Launch"));
+        assert!(lines[2].contains("【高危】") && lines[2].contains("JavaScript"));
+        assert!(lines[3].contains("【提示】") && lines[3].contains("OpenAction"));
+        // typed 面同源（等级 + 定位）。
+        let findings = security_findings(&assessment);
+        assert_eq!(findings.len(), 3);
+        assert!(findings[0].high_risk && findings[1].high_risk && !findings[2].high_risk);
+        assert!(findings.iter().all(|f| f.detail.starts_with("obj ")));
+
+        // 良性对照：零告警零提示行零 typed（不误报）。
+        let benign = build(vec![]);
+        let clean = open_scan(&benign, &Limits::default()).expect("良性夹具扫描");
+        assert!(clean.warnings.is_empty(), "良性零告警");
+        assert!(security_notice_lines(&clean).is_empty());
+        assert!(security_findings(&clean).is_empty());
     }
 
     /// 提示行落位：安全区最首（先于扫描件提示）+ 页表/书签行号整体
@@ -997,4 +1425,141 @@ mod tests {
         }
         s
     }
+}
+
+// ── #306 ①：OCR 读面（with_ocr / ocr_page_lines 纯函数面） ─────────
+
+/// OCR 词构造（紧凑夹具）。
+fn ocr_word(text: &str, line: (u32, u32, u32)) -> mdc_pdf::OcrWord {
+    mdc_pdf::OcrWord {
+        text: text.into(),
+        bbox: [50.0, 700.0, 150.0, 730.0],
+        line,
+    }
+}
+
+/// OCR 读面主锁：扫描件 payload（暂不支持横幅）→ with_ocr → 横幅退役 +
+/// OCR 横幅在位 + CJK 连接/拉丁空格 + 页表重建 + 词随 payload 携带 +
+/// props 同步（chars/content_lines/empty_pages/bookmarks）。
+#[test]
+fn with_ocr_rebuilds_line_model() {
+    let raw = PdfRaw {
+        pages: vec![PdfTextPage {
+            index: 0,
+            text: String::new(), // 零文本层 → 扫描件
+        }],
+        outline: vec![],
+        security_notices: vec![],
+    };
+    let scanned = convert(&raw);
+    assert!(scanned.props.scanned, "前置：扫描件判定");
+    assert!(scanned.ocr.is_none(), "前置：未识别态");
+    assert!(
+        scanned.text.contains("渲染需要 OCR，当前版本暂不支持"),
+        "前置：暂不支持横幅"
+    );
+
+    let outcome = PdfOcrOutcome {
+        lang: "chi_sim+eng".into(),
+        word_count: 4,
+        pages: vec![vec![
+            ocr_word("招标", (1, 1, 1)),
+            ocr_word("文件", (1, 1, 1)),
+            ocr_word("Bid", (2, 1, 1)),
+            ocr_word("Document", (2, 1, 1)),
+        ]],
+    };
+    let applied = scanned.with_ocr(outcome);
+    // 横幅交替。
+    assert!(!applied.text.contains("暂不支持"), "扫描件横幅退役");
+    assert!(applied.text.contains("【OCR】识别完成"), "OCR 横幅在位");
+    assert!(applied.text.contains("chi_sim+eng"), "语言诚实展示");
+    // CJK 连接 + 拉丁空格。
+    assert!(
+        applied.text.contains("招标文件"),
+        "CJK 词无空格直连（得：{:?}）",
+        applied.text
+    );
+    assert!(
+        applied.text.contains("Bid Document"),
+        "拉丁词单空格连接（得：{:?}）",
+        applied.text
+    );
+    assert!(
+        applied.text.contains("── 第 1 / 1 页 ──"),
+        "页分隔行保持（得：{:?}）",
+        applied.text
+    );
+    // 段间空行（par 1 → par 2）。
+    let lines: Vec<&str> = applied.text.lines().collect();
+    let bid_line = lines.iter().position(|l| l.contains("Bid")).unwrap();
+    assert!(bid_line >= 2, "段间有空行呼吸（行序：{lines:?}）");
+    // props 同步。
+    assert_eq!(
+        applied.props.content_lines, 2,
+        "两正文行（CJK 行 + 拉丁行）"
+    );
+    assert_eq!(applied.props.empty_pages, 0, "无空文本页");
+    assert_eq!(applied.props.bookmarks, 0, "扫描件书签清空");
+    assert!(applied.props.scanned, "文件本体仍是扫描件（props 语义）");
+    // 词随 payload（另存数据源）。
+    let ocr = applied.ocr.as_ref().expect("OCR 词表携带");
+    assert_eq!(ocr.pages.len(), 1);
+    assert_eq!(ocr.pages[0].len(), 4);
+    assert_eq!(ocr.word_count, 4);
+}
+
+/// 词 → 行分组：段界空行 + 行序保持 + 空词组滤除 + 空页 → 空行集。
+#[test]
+fn ocr_page_lines_groups_by_line_anchor() {
+    let words = vec![
+        ocr_word("第二章", (3, 1, 1)),
+        ocr_word("验收", (3, 1, 1)),
+        ocr_word("标准", (3, 1, 1)),
+        ocr_word("OCR", (3, 2, 1)),
+        ocr_word("accuracy", (3, 2, 1)),
+        ocr_word("95", (3, 2, 2)),
+        ocr_word("percent", (3, 2, 2)),
+    ];
+    let lines = ocr_page_lines(&words);
+    assert_eq!(
+        lines,
+        vec![
+            "第二章验收标准".to_string(), // CJK 直连
+            String::new(),                // 段界空行（par 1 → par 2）
+            "OCR accuracy".to_string(),   // 拉丁空格
+            "95 percent".to_string(),     // 第二行（line 2）
+        ],
+        "行分组 + 段界空行"
+    );
+    // 空页。
+    assert!(ocr_page_lines(&[]).is_empty());
+}
+
+/// 安全评估提示行保持（扫描件横幅退役、其余 notice 原样保留）。
+#[test]
+fn with_ocr_preserves_security_notices() {
+    let raw = PdfRaw {
+        pages: vec![PdfTextPage {
+            index: 0,
+            text: String::new(),
+        }],
+        outline: vec![],
+        security_notices: vec!["【安全】检测到 JavaScript 嵌入（S2 只读告警）。".into()],
+    };
+    let scanned = convert(&raw);
+    assert!(scanned.text.contains("JavaScript"), "前置：安全提示在位");
+    let outcome = PdfOcrOutcome {
+        lang: "eng".into(),
+        word_count: 1,
+        pages: vec![vec![ocr_word("Scanned", (1, 1, 1))]],
+    };
+    let applied = scanned.with_ocr(outcome);
+    assert!(
+        applied.text.contains("JavaScript"),
+        "安全提示保持（得：{:?}）",
+        applied.text
+    );
+    assert!(!applied.text.contains("暂不支持"), "扫描件横幅退役");
+    assert!(applied.text.contains("Scanned"), "识别词在位");
 }

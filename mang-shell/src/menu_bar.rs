@@ -94,6 +94,10 @@ pub struct MenuContext {
     pub active_is_docx: bool,
     /// 活动标签是 PDF（#307 ②「导出为 DOCX」门槛——仅 pdf 形态提供）。
     pub active_is_pdf: bool,
+    /// #306 ①：活动 pdf 标签是未识别扫描件（「OCR 识别扫描件」门槛）。
+    pub pdf_ocr_pending: bool,
+    /// #306 ②：活动 pdf 标签已带 OCR 词表（「另存为可搜索 PDF」门槛）。
+    pub pdf_ocr_ready: bool,
     /// 最近打开的文件（路径序 = 子菜单条目序；`OpenRecent(usize)` 按此序回查）。
     pub recent_files: Vec<PathBuf>,
 }
@@ -124,6 +128,12 @@ pub enum MenuAction {
     /// PDF 文本层经 mdc-pdf 引擎提取 + office-io 写面构造；仅 pdf 标签
     /// 启用；扫描件零文本显式拒（OCR 面 #306））。
     ExportDocx,
+    /// #306 ①：OCR 识别扫描件（shell `ocr_active_pdf`——tesseract 词级
+    /// 识别后台执行，识别文本落文本视图；仅未识别扫描件 pdf 标签启用）。
+    OcrPdf,
+    /// #306 ②：另存为可搜索 PDF（shell `save_searchable_pdf`——OCR 词
+    /// 注入隐形文本层（3 Tr）；仅已识别 pdf 标签启用）。
+    SaveSearchablePdf,
     /// #507 / #240 任务②：打印当前 PDF（壳面系统打印流——方案 C：
     /// Windows 打印动词 / macOS `open -p` / CUPS `lp`；设置面由系统
     /// 对话框或 lp 参数承载；仅 pdf 标签启用）。
@@ -279,6 +289,12 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                 MenuEntry::item("file-export-docx", "导出为 DOCX（文本版）")
                     .act(MenuAction::ExportDocx)
                     .with_enabled(ctx.active_is_pdf),
+                MenuEntry::item("file-ocr-scanned", "OCR 识别扫描件…")
+                    .act(MenuAction::OcrPdf)
+                    .with_enabled(ctx.pdf_ocr_pending),
+                MenuEntry::item("file-save-searchable", "另存为可搜索 PDF…")
+                    .act(MenuAction::SaveSearchablePdf)
+                    .with_enabled(ctx.pdf_ocr_ready),
                 MenuEntry::item("file-print", "打印…")
                     .act(MenuAction::Print)
                     .with_enabled(ctx.active_is_pdf),
@@ -455,6 +471,8 @@ mod tests {
             git_view: false,
             active_is_docx: true,
             active_is_pdf: false,
+            pdf_ocr_pending: false,
+            pdf_ocr_ready: false,
             recent_files: vec![
                 PathBuf::from("/tmp/m209-a.md"),
                 PathBuf::from("/tmp/不存在-b.md"),
@@ -474,6 +492,8 @@ mod tests {
             git_view: false,
             active_is_docx: false,
             active_is_pdf: false,
+            pdf_ocr_pending: false,
+            pdf_ocr_ready: false,
             recent_files: Vec::new(),
         }
     }

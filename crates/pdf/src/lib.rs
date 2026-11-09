@@ -129,6 +129,13 @@ pub mod layers;
 // image 依赖）→ tesseract 识别。环境门 ocr_available（bid-parse 式）。
 #[cfg(feature = "engine-pdfium")]
 pub mod ocr;
+// #306：OCR 词模型——读面（ocr）与写回面（ocr_writeback）共享数据
+// 契约（纯数据零引擎依赖，无 feature 门——两门独立组合时恒在位）。
+pub mod ocr_word;
+// #306 ②：可搜索 PDF 写回——OCR 词文本注入内容流（3 Tr 隐形 +
+// Type0/Identity-H 零嵌入 + ToUnicode 直射；另存为全量语义）。
+#[cfg(feature = "engine-lopdf")]
+pub mod ocr_writeback;
 // S2-2（#103 任务 2）：标注写回扩展——外部标注读取 + PdfAnnotator
 // 门面（add/remove/list/save）+ 增量删除面 + 11 kind 模型/写面。
 #[cfg(feature = "engine-lopdf")]
@@ -163,7 +170,10 @@ pub use cache::PageCache;
 pub use command::{Command, CommandError, Outcome, Source};
 pub use document::{AttachEngineError, DocumentMeta, OpenError, PdfDocumentId, PdfSession};
 #[cfg(feature = "engine-pdfium")]
-pub use ocr::{ocr_available, ocr_page, OcrEnv};
+pub use ocr::{ocr_available, ocr_page, ocr_page_words, OcrEnv};
+pub use ocr_word::OcrWord;
+#[cfg(feature = "engine-lopdf")]
+pub use ocr_writeback::{write_searchable_pdf, SearchableWrite};
 #[cfg(feature = "engine-lopdf")]
 pub use organize::{OrganizeReport, PageSize, PdfOrganizer};
 pub use print::{expand_selection, render_for_print, PageSelection, PrintSpec};

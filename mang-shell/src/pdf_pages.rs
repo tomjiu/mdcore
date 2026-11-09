@@ -287,6 +287,9 @@ pub struct PdfPagesView {
     search_rx: Option<Receiver<SearchIndexMsg>>,
     /// #422：索引回流轮询循环在跑（防重复起循环；search 关闭即止）。
     search_polling: bool,
+    /// #420：当前顶部可见页（0 基——submit_visible 实时推算；缩略图
+    /// 侧栏高亮联动读数源）。首帧前 0。
+    top_page: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +529,7 @@ impl PdfPagesView {
             search_focus: cx.focus_handle(),
             search_rx: None,
             search_polling: false,
+            top_page: 0,
         }
     }
 
@@ -565,6 +569,7 @@ impl PdfPagesView {
             search_focus,
             search_rx: None,
             search_polling: false,
+            top_page: 0,
         }
     }
 
@@ -587,6 +592,28 @@ impl PdfPagesView {
         }
         let idx = page.min(self.page_count - 1);
         self.scroll.scroll_to_item(idx, gpui::ScrollStrategy::Top);
+    }
+
+    /// #420：源字节（缩略图侧栏共享同源字节快照——零拷贝零重复内存；
+    /// 侧栏自有低 dpi 工人据此重开引擎）。
+    pub fn bytes(&self) -> Arc<Vec<u8>> {
+        self.bytes.clone()
+    }
+
+    /// #420：总页数（侧栏行数与跳页钳制同源）。
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    /// #420：首页纵横比（高/宽，含旋转归一——侧栏槽高基准同源）。
+    pub fn page_aspect(&self) -> f32 {
+        self.aspect
+    }
+
+    /// #420：当前顶部可见页（0 基——submit_visible 实时推算；无 pdfium
+    /// 环境首帧前恒 0）。侧栏高亮联动的读数面。
+    pub fn top_visible_page(&self) -> usize {
+        self.top_page as usize
     }
 
     // ------------------------------------------------------------------
@@ -733,9 +760,16 @@ impl PdfPagesView {
         // #421：光栅宽单点口径（缩放模式解析——FitWidth 与 v1 同值）。
         let fit_w = self.raster_width(vw, vh);
         let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
-        // 滚动偏移（内容坐标——base_handle.offset）。
-        let offset_y = f32::from(self.scroll.0.borrow().base_handle.offset().y).max(0.);
+        // 滚动偏移（内容坐标）。gpui 滚动句柄为**负向约定**（下滚 =
+        // 负 y——uniform_list 自身以 `-offset` 推可见行，见其
+        // `first_visible_element_ix` 实现）；取负归正为内容坐标。
+        // （#420 修正：原 `.max(0.)` 把负向 offset 全部钳成 0——
+        // 滚动后 `first` 观测窗恒首页、top_page 读数恒 0。）
+        let offset_y = (-f32::from(self.scroll.0.borrow().base_handle.offset().y)).max(0.);
         let first = (((offset_y / slot_h) as i64).saturating_sub(1)).max(0) as u32;
+        // #420：顶部可见页实时记录（精确槽对齐读数——独立于渲染
+        // `first` 的 -1 观测余量：scroll_to_page(N, Top) 后读数 = N）。
+        self.top_page = ((offset_y / slot_h) as u32).min(self.page_count.saturating_sub(1) as u32);
         let visible_rows = (((vh / slot_h).ceil() as i64) + 2).max(1) as u32;
         let last = (first + visible_rows).min(self.page_count as u32);
         let mut submitted = false;
@@ -1975,7 +2009,8 @@ fn index_document(bytes: Arc<Vec<u8>>, page_count: u32, tx: Sender<SearchIndexMs
 /// 光栅产物 → gpui 图像（BGRA 直通——`RenderedPage::bgra` 与
 /// `RenderImage` 同为 BGRA 字节序，无通道交换；canvas_view 的 RGBA
 /// 面才需要换 R↔B）。尺寸乘积不一致（防御）→ None 走 failed 面。
-fn rendered_page_to_image(page: &RenderedPage) -> Option<gpui::RenderImage> {
+/// 光栅页 → gpui 位图（#420 起缩略图侧栏同源复用——pub(crate)）。
+pub(crate) fn rendered_page_to_image(page: &RenderedPage) -> Option<gpui::RenderImage> {
     let expected = (page.width_px as usize) * (page.height_px as usize) * 4;
     if page.bgra.len() != expected || page.width_px == 0 || page.height_px == 0 {
         return None;
