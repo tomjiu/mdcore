@@ -136,6 +136,21 @@ pub struct FieldInfo {
     pub editable: bool,
 }
 
+/// #630：TOC 原位整组替换报告（[`DocxEditor::replace_toc_group`] 返回
+/// ——手术审计面：组段数变化 + 锚注册清单 + 复用计数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocReplaceReport {
+    /// 被移除的旧 TOC 域组段数（begin..=end 含端）。
+    pub paragraphs_removed: usize,
+    /// 新发射产物段数（域头 + 目录项×N + 域尾；空计划 = 占位单段）。
+    pub paragraphs_inserted: usize,
+    /// 本次补注册的锚名清单（新项——在标题段插入 bookmarkStart/End
+    /// 的名字；存续复用名不入此清单）。
+    pub bookmarks_registered: Vec<String>,
+    /// 复用既有锚的条目数（不重复注册）。
+    pub names_reused: usize,
+}
+
 /// 脚注条目（[`DocxEditor::footnotes`] 返回——id + 内容 + 引用位置）。
 ///
 /// 分隔符条目（`w:type=separator`/`continuationSeparator`——惯例
@@ -558,6 +573,397 @@ impl DocxEditor {
             || self.pending_comments.iter().any(|p| p.is_some())
     }
 
+    // #630 TOC 原位整组替换（加性扩展——段落组级手术 + 坐标重建）
+    // -----------------------------------------------------------------------
+
+    /// **#630：TOC 域组原位整组替换**——把首个 TOC 域的 begin..end
+    /// 段落区间整组替换为重算计划的引擎形发射产物（三段式跨段域 +
+    /// 目录项段），并为其 PAGEREF 目标补注册缺失锚。
+    ///
+    /// 与 [`Self::recompute_toc`] 的关系：重算产计划（读面）→ 本方法
+    /// 消费计划落刀（写面）。典型链路：
+    ///
+    /// ```ignore
+    /// let plan = ed.recompute_toc(None)?;
+    /// let report = ed.replace_toc_group(&plan, None)?;
+    /// std::fs::write("a.docx", ed.save_to_vec()?)?;
+    /// ```
+    ///
+    /// ## 语义（#630 验收对应）
+    ///
+    /// - **原位**：只动 TOC 域组区间 + 新项锚注册点——`document.xml`
+    ///   其余区域与其他部件（媒体/样式/页眉脚/编号/设置）字节零触碰
+    ///   （`save_to_vec` 重打包透传原条目）；
+    /// - **锚保真**：计划复用名（存续标题——[`Self::recompute_toc`]
+    ///   已配对旧锚）不重复注册；新名在标题段补注册
+    ///   `bookmarkStart/End`（id 取文档 max+1 递增）；
+    /// - **计划-文档一致性（fail-closed）**：新名锚注册按**当前文本**
+    ///   定位标题段（非表格/非 sdt——与读面标题可见域一致）；定位
+    ///   不到（计划过期/篡改/空文本歧义）→ typed 拒 + 编辑器状态
+    ///   零变化（脏态保持——已应用的 pending 编辑原样保留）；
+    /// - **坐标重建**：替换后段落序变化——全文重扫 + pending/域编辑
+    ///   按旧坐标重映射（组前不变/组后平移），逐段文本恒等校验不过
+    ///   即回滚拒（不静默错改）；
+    /// - **冲突拒面**：组内域有待落账域编辑（旧目录显示值编辑与本
+    ///   替换互斥）/ 域跨越组边界（畸形）→ typed 拒。
+    ///
+    /// 拒面（typed `DocxError::InvalidInput`，fail-closed）：无 TOC
+    /// 域（插入位选择是产品面决策，非本方法职责）/ 计划长度不一致
+    /// （V13 同判据）/ 锚定位失败（逐项列名）/ 坐标重建校验失败。
+    /// 计划的域校验（V8/V8'/V14/V1-V6）经发射面
+    /// [`crate::docx::DocxWriter::toc_entries_recomputed`] 的 save
+    /// 漏斗复用单点。
+    pub fn replace_toc_group(
+        &mut self,
+        plan: &crate::docx_toc::TocRecompute,
+        heading_range: Option<(u8, u8)>,
+    ) -> Result<TocReplaceReport, DocxError> {
+        // ── 前置校验（全部在不可变借用下完成——任一失败即返回，
+        //    编辑器零变化） ──────────────────────────────────────
+        // V13 同判据：计划三数组等长（发射按下标取值）。
+        if plan.names.len() != plan.entries.len() || plan.cached_pages.len() != plan.entries.len() {
+            return Err(DocxError::InvalidInput(format!(
+                "V13: TocRecompute 计划长度不一致（entries={} names={} cached_pages={}——须经 DocxEditor::recompute_toc 产出）",
+                plan.entries.len(),
+                plan.names.len(),
+                plan.cached_pages.len()
+            )));
+        }
+        // 无 TOC 域：无替换目标（插入位选择 = 产品面决策）。
+        let Some(toc_field_idx) = self
+            .fields_idx
+            .iter()
+            .position(|f| f.kind == FieldKind::Toc)
+        else {
+            return Err(DocxError::InvalidInput(
+                "无 TOC 域——原位替换需要既有目录域组（新插入位属产品面决策）".into(),
+            ));
+        };
+        let begin = self.fields_idx[toc_field_idx].begin_para;
+        let end = self.fields_idx[toc_field_idx].end_para;
+        if end < begin || end >= self.paragraphs.len() {
+            return Err(DocxError::InvalidInput(format!(
+                "TOC 域组区间畸形（begin={begin} end={end}——重开文档或报 Lead）"
+            )));
+        }
+        // 冲突拒：组内/跨组边界的待落账域编辑（旧目录显示值编辑与
+        // 整组替换互斥——替换会丢弃该域，语义不确定）。同时拒任何
+        // 跨组边界的域（非全内/非全外的畸形跨越——手术会截断它）。
+        for (pos, f) in self.fields_idx.iter().enumerate() {
+            let fully_inside = f.begin_para >= begin && f.end_para <= end;
+            let fully_outside = f.end_para < begin || f.begin_para > end;
+            if !fully_inside && !fully_outside {
+                return Err(DocxError::InvalidInput(format!(
+                    "域 {}（段 {}..{}）跨越 TOC 组边界（{}..{}）——畸形形态 fail-closed 拒",
+                    pos, f.begin_para, f.end_para, begin, end
+                )));
+            }
+            if fully_inside && self.field_edits[pos].is_some() {
+                return Err(DocxError::InvalidInput(format!(
+                    "域编辑冲突：域 {}（段 {}..{}）有待落账编辑，与 TOC 组（{}..{}）替换互斥——先 save 或撤销该域编辑",
+                    pos, f.begin_para, f.end_para, begin, end
+                )));
+            }
+        }
+        // 组内段落不可有文本 pending（field_code 段拒改——防御断言）。
+        if (begin..=end).any(|i| self.pending[i].is_some()) {
+            return Err(DocxError::InvalidInput(
+                "不变量破坏：TOC 组内段落存在文本待编辑（field_code 段应拒改）".into(),
+            ));
+        }
+
+        // ── 锚注册配对（当前坐标）：计划名是否已有同文本锚 ──────────
+        // 复用名：引擎 TOC 书签在**非组**段且当前文本 == 条目文本
+        //（与 recompute 配对同键）。新名：定位标题段（首个未消费的
+        // 同文本非表格/非 sdt 段——与读面标题可见域一致）。
+        let group_range = begin..=end;
+        let mut anchored_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for b in &self.bookmarks {
+            if group_range.contains(&b.para) {
+                continue; // 组内书签随组消亡（TOC 自有域——旧锚清理见下）
+            }
+            if crate::docx_toc::is_engine_toc_bookmark(&b.name) {
+                anchored_names.insert(b.name.as_str());
+            }
+        }
+        // 文本多重集定位（文档序先现先配——与 recompute 同纪律）。
+        let mut consumed: Vec<bool> = vec![false; self.paragraphs.len()];
+        for i in group_range.clone() {
+            consumed[i] = true; // 组内段不做候选（含旧目录项段）
+        }
+        // 复用名先消费其锚所在段（防同名重复注册）。
+        for b in &self.bookmarks {
+            if group_range.contains(&b.para) {
+                continue;
+            }
+            if anchored_names.contains(b.name.as_str()) && !consumed[b.para] {
+                consumed[b.para] = true;
+            }
+        }
+        struct Registration {
+            entry_idx: usize,
+            para: usize,
+        }
+        let mut registrations: Vec<Registration> = Vec::new();
+        let mut reused_count = 0usize;
+        for (k, e) in plan.entries.iter().enumerate() {
+            let name = plan.names[k].as_str();
+            if anchored_names.contains(name) {
+                reused_count += 1;
+                continue; // 存续标题——锚已在位，不重复注册
+            }
+            // 新名：定位标题段。空文本歧义面 fail-closed。
+            if e.text.is_empty() {
+                return Err(DocxError::InvalidInput(format!(
+                    "锚注册失败：条目 {k} 文本为空（空标题锚定位歧义——fail-closed 拒）"
+                )));
+            }
+            let para = (0..self.paragraphs.len()).find(|&i| {
+                !consumed[i]
+                    && !self.paragraphs[i].in_table
+                    && !self.paragraphs[i].in_sdt
+                    && self.paragraph_text(i) == e.text
+            });
+            let Some(para) = para else {
+                return Err(DocxError::InvalidInput(format!(
+                    "锚注册失败：条目 {k}（{name:?} → 文本 {:?}）在文档中定位不到标题段——计划可能过期或来自其他文档（fail-closed 拒，编辑器未改动）",
+                    e.text
+                )));
+            };
+            consumed[para] = true;
+            registrations.push(Registration { entry_idx: k, para });
+        }
+
+        // ── 发射产物（单真源：DocxWriter 发射面） ────────────────────
+        // 空计划同退化（占位五连域段单段）。发射面 save 漏斗复用计划的
+        // 全部域校验（V8/V8'/V14/V1-V6/V13——sticky 首错零产物拒）。
+        let fragment = Self::emit_toc_fragment(plan, heading_range)?;
+        let fragment_para_count = count_paragraphs(&fragment);
+
+        // ── 手术（全部在克隆上拼装，校验全过后才提交） ────────────────
+        let group_start = self.paragraphs[begin].span.0;
+        let group_end = self.paragraphs[end].span.1;
+        if group_end <= group_start || group_end > self.doc_xml.len() {
+            return Err(DocxError::InvalidInput(format!(
+                "TOC 域组 span 畸形（{group_start}..{group_end}）"
+            )));
+        }
+        // 锚注册插入点：段内 pPr 之后（无 pPr = 开标签之后）。
+        // 不降序处理（后面统一按坐标降序套用）。
+        let mut inserts: Vec<(usize, String)> = Vec::new();
+        let first_id = self
+            .bookmarks
+            .iter()
+            .filter_map(|b| b.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for (seq, r) in registrations.iter().enumerate() {
+            let next_id = first_id + seq as u64;
+            let name = &plan.names[r.entry_idx];
+            let span = self.paragraphs[r.para].span;
+            let seg = &self.doc_xml[span.0..span.1];
+            if seg.trim_end().ends_with("/>") {
+                return Err(DocxError::InvalidInput(format!(
+                    "锚注册失败：目标段 {} 为自闭合空段（不可能是标题段）——计划与文档不一致",
+                    r.para
+                )));
+            }
+            let insert_at = match seg.find("</w:pPr>") {
+                Some(rel) => span.0 + rel + "</w:pPr>".len(),
+                None => {
+                    // 开标签之后（首 '>' ——段落开标签必无属性内 '>'）。
+                    let rel = seg.find('>').ok_or_else(|| {
+                        DocxError::InvalidInput(format!("段落 {} 开标签畸形", r.para))
+                    })?;
+                    span.0 + rel + 1
+                }
+            };
+            inserts.push((
+                insert_at,
+                format!(
+                    "<w:bookmarkStart w:id=\"{next_id}\" w:name=\"{}\"/><w:bookmarkEnd w:id=\"{next_id}\"/>",
+                    escape_attr(name)
+                ),
+            ));
+        }
+
+        // 组替换 + 锚插入合并为坐标升序手术表（同坐标不重叠——
+        // 锚插入点必在组外段内，组区间独占）。
+        let mut ops: Vec<(usize, usize, String)> = vec![(group_start, group_end, fragment)];
+        for (at, xml) in inserts {
+            ops.push((at, at, xml));
+        }
+        ops.sort_by_key(|(start, _, _)| *start); // 升序——游标单调前进
+        let mut new_xml = String::with_capacity(
+            self.doc_xml.len() + ops.iter().map(|(_, _, s)| s.len()).sum::<usize>(),
+        );
+        let mut cursor = 0usize;
+        for (start, end, xml) in &ops {
+            new_xml.push_str(&self.doc_xml[cursor..*start]);
+            new_xml.push_str(xml);
+            cursor = *end;
+        }
+        new_xml.push_str(&self.doc_xml[cursor..]);
+
+        // ── 全文重扫 + 坐标重映射校验（不过即弃——编辑器未动） ────────
+        let (new_paragraphs, new_tables, new_fields, new_anchors, new_bookmarks) =
+            match scan_paragraphs(&new_xml) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(DocxError::Container(io::ReadError::InvalidPart {
+                        part: "word/document.xml".to_string(),
+                        detail: format!("替换后重扫失败（回滚拒——编辑器未改动）：{e}"),
+                    }))
+                }
+            };
+        let old_count = end - begin + 1;
+        let expected_len = self.paragraphs.len() - old_count + fragment_para_count;
+        if new_paragraphs.len() != expected_len {
+            return Err(DocxError::InvalidInput(format!(
+                "坐标重建校验失败：段数 {} ≠ 期望 {}（回滚拒——编辑器未改动）",
+                new_paragraphs.len(),
+                expected_len
+            )));
+        }
+        // 逐段文本恒等（组外旧段 ↔ 重映射新段）——错位即拒。
+        let remap = |i: usize| {
+            if i < begin {
+                i
+            } else {
+                i + fragment_para_count - old_count
+            }
+        };
+        for (i, old_p) in self.paragraphs.iter().enumerate() {
+            if group_range.contains(&i) {
+                continue;
+            }
+            let new_p = &new_paragraphs[remap(i)];
+            if new_p.text != old_p.text
+                || new_p.in_table != old_p.in_table
+                || new_p.in_textbox != old_p.in_textbox
+                || new_p.in_sdt != old_p.in_sdt
+            {
+                return Err(DocxError::InvalidInput(format!(
+                    "坐标重建校验失败：段 {i} 重映射后文本/旗标漂移（回滚拒——编辑器未改动）"
+                )));
+            }
+        }
+        // pending 重映射（组内无 pending 已断言——纯平移）。
+        let mut new_pending = vec![None; new_paragraphs.len()];
+        for (i, p) in self.pending.iter().enumerate() {
+            if group_range.contains(&i) {
+                continue;
+            }
+            new_pending[remap(i)] = p.clone();
+        }
+        // 域编辑重映射：存活域（组外）按文档序保持相对序配对——新组
+        // 内域（PAGEREF/HYPERLINK 等发射产物自带）跳过不配对。
+        let surviving_old: Vec<usize> = (0..self.fields_idx.len())
+            .filter(|&i| {
+                let f = &self.fields_idx[i];
+                !(f.begin_para >= begin && f.end_para <= end)
+            })
+            .collect();
+        let new_group_range = begin..begin + fragment_para_count;
+        let mut new_field_edits = vec![None; new_fields.len()];
+        let mut survivors = surviving_old.iter();
+        for (np, nf) in new_fields.iter().enumerate() {
+            if new_group_range.contains(&nf.begin_para) {
+                continue; // 新组内域（发射产物自带——不与旧域配对）
+            }
+            let Some(&old_pos) = survivors.next() else {
+                return Err(DocxError::InvalidInput(format!(
+                    "坐标重建校验失败：组外新域多于存活旧域（{} > {}——回滚拒）",
+                    new_fields.len(),
+                    surviving_old.len()
+                )));
+            };
+            let of = &self.fields_idx[old_pos];
+            if nf.begin_para != remap(of.begin_para) || nf.kind != of.kind || nf.instr != of.instr {
+                return Err(DocxError::InvalidInput(format!(
+                    "坐标重建校验失败：存活域 {old_pos} 重映射后类型/指令/段号漂移（回滚拒）"
+                )));
+            }
+            new_field_edits[np] = self.field_edits[old_pos].clone();
+        }
+        if survivors.next().is_some() {
+            return Err(DocxError::InvalidInput(
+                "坐标重建校验失败：存活旧域多于组外新域（回滚拒）".into(),
+            ));
+        }
+
+        // ── 提交（全部校验已过） ──────────────────────────────────────
+        let report = TocReplaceReport {
+            paragraphs_removed: old_count,
+            paragraphs_inserted: fragment_para_count,
+            bookmarks_registered: registrations
+                .iter()
+                .map(|r| plan.names[r.entry_idx].clone())
+                .collect(),
+            names_reused: reused_count,
+        };
+        self.doc_xml = new_xml;
+        self.paragraphs = new_paragraphs;
+        self.pending = new_pending;
+        self.tables = new_tables;
+        self.fields_idx = new_fields;
+        self.field_edits = new_field_edits;
+        self.bookmarks = new_bookmarks;
+        self.note_anchors = new_anchors;
+        Ok(report)
+    }
+
+    /// #630：TOC 发射产物提取（单真源——复用 [`crate::docx::
+    /// DocxWriter::toc_entries_recomputed`] 的发射面与 save 漏斗域校验）。
+    ///
+    /// 产物 = 只含 TOC 组的 scratch 文档的 body 段落区（剥尾 sectPr）
+    /// ——引擎形三段式域 + 目录项段，字节面与重建发射路径完全同源
+    ///（不造第二套发射真源）。
+    fn emit_toc_fragment(
+        plan: &crate::docx_toc::TocRecompute,
+        heading_range: Option<(u8, u8)>,
+    ) -> Result<String, DocxError> {
+        let mut w = crate::docx::DocxWriter::new();
+        w.toc_entries_recomputed(plan, heading_range);
+        let bytes = w.save_to_vec()?; // 域校验失败（V8/V14/V1-V6/…）在此拒
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut za = zip::ZipArchive::new(cursor).map_err(|e| {
+            DocxError::Container(io::ReadError::ContainerCorrupt(format!(
+                "TOC 发射产物解包失败：{e}"
+            )))
+        })?;
+        let mut xml = String::new();
+        use std::io::Read as _;
+        za.by_name("word/document.xml")
+            .map_err(|_| {
+                DocxError::Container(io::ReadError::InvalidPart {
+                    part: "word/document.xml".to_string(),
+                    detail: "TOC 发射产物缺 document.xml".to_string(),
+                })
+            })?
+            .read_to_string(&mut xml)
+            .map_err(|e| {
+                DocxError::Container(io::ReadError::InvalidPart {
+                    part: "word/document.xml".to_string(),
+                    detail: format!("读失败：{e}"),
+                })
+            })?;
+        // body 段落区：剥 <w:body> 壳与尾 <w:sectPr>（docx-rs 恒置尾）。
+        let body_open = xml
+            .find("<w:body>")
+            .ok_or_else(|| DocxError::Parse("TOC 发射产物缺 w:body".into()))?;
+        let body_close = xml
+            .rfind("</w:body>")
+            .ok_or_else(|| DocxError::Parse("TOC 发射产物缺 /w:body".into()))?;
+        let mut frag = xml[body_open + "<w:body>".len()..body_close].to_string();
+        if let Some(sp) = frag.rfind("<w:sectPr") {
+            // 尾部 sectPr 区（至串尾）剥除。
+            frag.truncate(sp);
+        }
+        Ok(frag)
+    }
+
     /// #617/#627：旧目录项提取（私有——编辑面原文坐标）。
     ///
     /// 定位：`fields()` 首个 [`FieldKind::Toc`] 域的 **begin..end 实际
@@ -841,6 +1247,40 @@ impl DocxEditor {
 // scan_vml_textbox_regions 同款：起点前向修 '<'，终点前向修 '>'；
 // 闭标签起点由终点回扫（闭标签与前一事件尾之间只有空白）。
 // ---------------------------------------------------------------------------
+
+/// #630：XML 片段段数计数（`<w:p>`/`<w:p …>`/`<w:p/>`——`<w:pPr`
+/// 等同前缀更长元素不计：后随字符必须是 `>`、空格或 `/`）。
+fn count_paragraphs(xml: &str) -> usize {
+    let b = xml.as_bytes();
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while let Some(rel) = xml[i..].find("<w:p") {
+        let at = i + rel;
+        let after = b.get(at + 4).copied().unwrap_or(b'>');
+        if matches!(after, b'>' | b' ' | b'/') {
+            n += 1;
+        }
+        i = at + 4;
+    }
+    n
+}
+
+/// #630：属性位实体转义（bookmarkStart `w:name` 属性值——V4 域约束
+/// 下名字是纯 `[A-Za-z0-9_]`，此函数为纵深防御位：`&`/`<`/`>`/`"`
+/// 四字符最小合法集）。
+fn escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 fn fwd_to_lt(bytes: &[u8], from: usize) -> usize {
     let mut i = from.min(bytes.len());
@@ -1354,11 +1794,14 @@ type ScanTuple = (
 );
 
 /// #627：书签扫描落账（原文坐标系——open 后不变；`w:bookmarkStart`
-/// 的 name 属性 + 所在段落号）。TOC 重算的书签保真配对数据源：存续
-/// 标题复用旧锚名（避免内容寻址重命名导致旧引用悬空）。
+/// 的 name/id 属性 + 所在段落号）。TOC 重算的书签保真配对与 #630
+/// 原位替换的锚注册（id 发号避撞）数据源。
 #[derive(Debug, Clone)]
 struct BookmarkScan {
     name: String,
+    /// `w:id` 属性（数字形态；缺席/非数字畸形 = None——#630 锚注册
+    /// 发新 id 时取 max+1，畸形 id 不参与发号面）。
+    id: Option<u64>,
     /// 所在段落号（文档序扁平坐标系——与 `paragraphs()` 同源；
     /// 段落外孤立书签不落账）。段内多书签按文档序全部保留。
     para: usize,
@@ -1501,7 +1944,12 @@ fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
                         if let (Some(&p), Some(name)) = (para_stack.last(), attr_named(&e, "name"))
                         {
                             if !name.is_empty() {
-                                bookmarks.push(BookmarkScan { name, para: p });
+                                bookmarks.push(BookmarkScan {
+                                    name,
+                                    id: attr_named(&e, "id")
+                                        .and_then(|v| v.trim().parse::<u64>().ok()),
+                                    para: p,
+                                });
                             }
                         }
                     }
@@ -1664,7 +2112,12 @@ fn scan_paragraphs(xml: &str) -> Result<ScanTuple, DocxError> {
                         if let (Some(&p), Some(name)) = (para_stack.last(), attr_named(&e, "name"))
                         {
                             if !name.is_empty() {
-                                bookmarks.push(BookmarkScan { name, para: p });
+                                bookmarks.push(BookmarkScan {
+                                    name,
+                                    id: attr_named(&e, "id")
+                                        .and_then(|v| v.trim().parse::<u64>().ok()),
+                                    para: p,
+                                });
                             }
                         }
                     }
