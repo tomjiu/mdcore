@@ -95,8 +95,7 @@ pub fn tab_label(path: &Path, all: &[&Path], workspace: Option<&Path>) -> String
 /// - 保留：max_w(220) 长名限宽、脏标 ●（Accent，zed 习惯放 start_slot
 ///   图标位）、同名消歧文案、点击切换。
 ///
-/// 未迁移（诚实登记）：关闭钮（现状即无，Ctrl+W 关闭——end_slot +
-/// IconButton 增强待后续批次，避免单批行为面扩张）。
+/// 每个标签的关闭钮经 Shell 的指定标签确认路径，未保存时不直接丢弃。
 pub fn tab_bar(
     tabs: &[TabItem],
     active: usize,
@@ -143,6 +142,22 @@ pub fn tab_bar(
             .when(*dirty, |tab| {
                 tab.start_slot(div().text_color(dirty_dot_color).child("●"))
             })
+            .end_slot(
+                div()
+                    .id(SharedString::from(format!("tab-close-{idx}")))
+                    .debug_selector(move || format!("tab-close-{idx}"))
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.request_close_tab(idx, window, cx);
+                    }))
+                    .child(ui::Icon::new(ui::IconName::Close).size(ui::IconSize::XSmall)),
+            )
             .child(
                 // 长名限宽（Tab 无宽度 API——限在 label 面并中段截断
                 // `…`，VS Code 同款；溢出横滚由 TabBar 承担）。

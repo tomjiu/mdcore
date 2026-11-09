@@ -1624,22 +1624,22 @@ impl ShellApp {
     /// 取消）；干净标签直接关。#386：pdf 批注脏（页视图未落盘）计入
     /// 脏判定（`tab_is_modified` 同源）。
     pub fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.is_empty() {
+        self.request_close_tab(self.active, window, cx);
+    }
+
+    pub fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
             return;
         }
         // F4：脏标签 → 确认框拦截（#389 阶段 2 xlsx 会话脏 + #386
         // pdf 批注脏——tab_is_modified 已统一收口）。
-        if self.tab_is_modified(self.active, cx).unwrap_or(false) {
-            let name = self.tabs[self.active]
-                .editor
-                .read(cx)
-                .display_name()
-                .to_string();
+        if self.tab_is_modified(index, cx).unwrap_or(false) {
+            let name = self.tabs[index].editor.read(cx).display_name().to_string();
             eprintln!("confirm: 关闭未保存标签（{name}）");
             self.confirm = Some(ConfirmState {
                 message: format!("{name} 有未保存的修改"),
                 detail: "关闭前保存？".to_string(),
-                action: ConfirmAction::CloseTab { idx: self.active },
+                action: ConfirmAction::CloseTab { idx: index },
                 selected: 0,
                 buttons: CONFIRM_BUTTONS.to_vec(),
             });
@@ -1648,7 +1648,7 @@ impl ShellApp {
             cx.notify();
             return;
         }
-        self.close_tab_at(self.active, window, cx);
+        self.close_tab_at(index, window, cx);
     }
 
     /// F3/F4：关闭指定标签（无确认——确认面在 [`Self::close_active_tab`]）。
