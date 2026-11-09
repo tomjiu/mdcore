@@ -64,14 +64,19 @@ const THUMB_WATCHDOG: Duration = Duration::from_secs(20);
 /// 回执轮询周期（pdf_pages POLL_INTERVAL 同款 16ms——待办清空退出）。
 const THUMB_POLL_MS: Duration = Duration::from_millis(16);
 
+/// 跳页回调签名（0 基页号；壳接主视图 scroll_to_page）。
+pub type PageJumpFn = Arc<dyn Fn(usize, &mut Window, &mut App)>;
+/// 当前页读数回调签名（壳接主视图 top_visible_page）。
+pub type CurrentPageFn = Arc<dyn Fn(&App) -> usize>;
+
 /// #420 联动钩子（壳注入——本模块零 shell/主视图依赖；测试同面注入）。
 pub struct PdfThumbsHooks {
     /// 点击缩略行（0 基页号）→ 跳页（壳接
     /// [`crate::pdf_pages::PdfPagesView::scroll_to_page`]）。
-    pub jump_to_page: Arc<dyn Fn(usize, &mut Window, &mut App)>,
+    pub jump_to_page: PageJumpFn,
     /// 当前顶部可见页读数（壳接
     /// [`crate::pdf_pages::PdfPagesView::top_visible_page`]）。
-    pub current_page: Arc<dyn Fn(&App) -> usize>,
+    pub current_page: CurrentPageFn,
 }
 
 /// 缩略图侧栏实体（左栏——点击跳页 + 高亮跟随）。
@@ -104,7 +109,7 @@ impl PdfThumbnailsView {
     /// 构造：主线程一次性 open 读页数/纵横比（与主视图几何预读同源
     /// 口径——aspect 入参为主视图同源值，字节自证优先），随即把引擎
     /// 交给看门狗工人在渲染线程重建（字节快照 Arc 共享）。
-    pub fn new(bytes: Arc<Vec<u8>>, aspect: f32, hooks: PdfThumbsHooks, cx: &mut App) -> Self {
+    pub fn new(bytes: Arc<Vec<u8>>, aspect: f32, hooks: PdfThumbsHooks, _cx: &mut App) -> Self {
         let (page_count, aspect) = match PdfiumEngine::open((*bytes).clone()) {
             Ok(engine) => {
                 let count = engine.page_count() as usize;
@@ -468,6 +473,9 @@ mod tests {
     struct ThumbsHost {
         thumbs: Entity<PdfThumbnailsView>,
         pages: Entity<PdfPagesView>,
+        // 测试端点击记录：jump 钩子闭包 push，宿主持一份防提前释放；
+        // 断言经宿主窗口外句柄读（click 测试）——本字段非直读面。
+        #[allow(dead_code)]
         clicked: Rc<RefCell<Vec<usize>>>,
     }
 
@@ -489,15 +497,15 @@ mod tests {
 
     /// 主题初始化序列镜像 main.rs（Label/panel 渲染依赖）+ 双实体真实
     /// hooks 接线 + 整树宿主窗口（鼠标命中需要整树 + 命中盒）。
-    fn host_window(
-        cx: &mut gpui::TestAppContext,
-        doc: &str,
-    ) -> Option<(
+    type Host = (
         Entity<PdfThumbnailsView>,
         Entity<PdfPagesView>,
         gpui::WindowHandle<ThumbsHost>,
         Rc<RefCell<Vec<usize>>>,
-    )> {
+    );
+
+    fn host_window(cx: &mut gpui::TestAppContext, doc: &str) -> Option<Host> {
+        #![allow(clippy::arc_with_non_send_sync)] // 钩子闭包捕获非 Send 实体引用——钩子只在主线程 App 上下文调用，不跨线程
         cx.update(|app| {
             theme::init(theme::LoadThemes::JustBase, app);
             theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
@@ -586,7 +594,7 @@ mod tests {
         x: f32,
         y: f32,
     ) {
-        let any: gpui::AnyWindowHandle = window.clone().into();
+        let any: gpui::AnyWindowHandle = (*window).into();
         let down = PlatformInput::MouseDown(MouseDownEvent {
             button: MouseButton::Left,
             position: point(px(x), px(y)),
@@ -610,7 +618,7 @@ mod tests {
     /// 重绘一帧（shell.rs b11 redraw 同构——update_window 口径，不
     /// 双租宿主实体；命中盒随最新状态重注册）。
     fn redraw(window: &gpui::WindowHandle<ThumbsHost>, cx: &mut gpui::TestAppContext) {
-        let any: gpui::AnyWindowHandle = window.clone().into();
+        let any: gpui::AnyWindowHandle = (*window).into();
         cx.update_window(any, |_, window, cx| {
             window.draw(cx).clear(cx);
         })
@@ -623,7 +631,7 @@ mod tests {
     fn eager_small_doc_and_lazy_big_doc(cx: &mut gpui::TestAppContext) {
         // ① 小文档：首批全量（smoke.pdf——页数 ≤60）。
         let host = host_window(cx, "smoke.pdf");
-        let (thumbs, pages, window, _clicked) = match host {
+        let (thumbs, _pages, window, _clicked) = match host {
             None => return, // SKIP 门已打横幅
             Some(h) => h,
         };
@@ -640,11 +648,11 @@ mod tests {
                 "小文档第 {i} 页首批全量就绪"
             );
         }
-        drop(window);
+        let _ = window; // 窗口存活至断言后（显式声明非有意丢弃）
 
         // ② 大文档（100 页）：>60 → 懒加载——只染可见窗。
         let host = host_window(cx, "thumbs_100p.pdf");
-        let (thumbs, pages, window, _clicked) = match host {
+        let (thumbs, _pages, window, _clicked) = match host {
             None => return,
             Some(h) => h,
         };
@@ -678,7 +686,7 @@ mod tests {
             cx.read(|app| thumbs.read(app).thumb_ready(far)),
             "滚入可见窗的页自愈就绪"
         );
-        drop(window);
+        let _ = window; // 窗口存活至断言后（显式声明非有意丢弃）
     }
 
     /// 验收 2+3：点击缩略行 → 真实跳页（主视图读回 top_page）；
@@ -711,12 +719,12 @@ mod tests {
         redraw(&window, cx);
         click_at(&window, cx, SIDEBAR_W / 2., 60.);
         assert_eq!(
-            cx.read(|app| clicked.borrow().len()),
+            cx.read(|_| clicked.borrow().len()),
             1,
             "点击恰好触发一次跳页"
         );
         assert_eq!(
-            cx.read(|app| *clicked.borrow().first().unwrap()),
+            cx.read(|_| *clicked.borrow().first().unwrap()),
             target,
             "点击第 9 行 → 跳第 9 页（0 基）"
         );
@@ -752,6 +760,6 @@ mod tests {
             next,
             "主视图滚到 20 → 侧栏高亮 Nearest 跟随"
         );
-        drop(window);
+        let _ = window; // 窗口存活至断言后（显式声明非有意丢弃）
     }
 }
