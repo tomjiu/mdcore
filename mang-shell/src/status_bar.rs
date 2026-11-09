@@ -189,8 +189,8 @@ pub fn status_bar(
                             .rounded_sm()
                             .hover(move |el| el.bg(hover))
                             .on_click(cx.listener(
-                                |this, _ev: &ClickEvent, _window: &mut Window, cx| {
-                                    this.toggle_pdf_view_mode(cx);
+                                |this, _ev: &ClickEvent, window: &mut Window, cx| {
+                                    this.toggle_pdf_view_mode(window, cx);
                                 },
                             ))
                             .child(
@@ -210,8 +210,8 @@ pub fn status_bar(
                             .rounded_sm()
                             .hover(move |el| el.bg(hover))
                             .on_click(cx.listener(
-                                |this, _ev: &ClickEvent, _window: &mut Window, cx| {
-                                    this.toggle_xlsx_view_mode(cx);
+                                |this, _ev: &ClickEvent, window: &mut Window, cx| {
+                                    this.toggle_xlsx_view_mode(window, cx);
                                 },
                             ))
                             .child(
