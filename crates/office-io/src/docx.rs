@@ -6977,16 +6977,7 @@ impl DocxWriter {
         // tab stop 位 = 文本宽（页宽 - 左右边距 - 装订线；几何未设置
         // = 引擎基线 A4 11906 + Word 2019 边距 1701/1701——g2_t4 钉定
         // 的字节面缺省）。
-        let text_width = match &self.page_geometry {
-            Some(g) => {
-                let w = g.width as i64
-                    - g.margin_left.max(0) as i64
-                    - g.margin_right.max(0) as i64
-                    - g.gutter.max(0) as i64;
-                w.max(0) as usize
-            }
-            None => 11906 - 1701 - 1701,
-        };
+        let text_width = self.toc_text_width();
         // 域头段（#309③：begin 不置 dirty——打开即显缓存目录项，
         // Word/LO 零弹窗；F9 重算精确页码）。
         let mut toc = docx_rs::InstrToC::new();
@@ -7019,40 +7010,198 @@ impl DocxWriter {
                 n += 1;
             }
             let name = names.last().unwrap().clone();
-            let mut p = docx_rs::Paragraph::new().indent(
-                Some((e.level as i32 - 1) * 240),
-                None,
-                None,
-                None,
-            );
-            p = p.add_tab(
-                docx_rs::Tab::new()
-                    .val(docx_rs::TabValueType::Right)
-                    .leader(docx_rs::TabLeaderType::Dot)
-                    .pos(text_width),
-            );
-            let hl = docx_rs::Hyperlink::new(name.as_str(), docx_rs::HyperlinkType::Anchor)
-                .add_run(docx_rs::Run::new().add_text(e.text.as_str()))
-                .add_run(docx_rs::Run::new().add_tab())
+            self.emit_toc_entry_paragraph(&e.text, e.level, &name, "1", text_width);
+        }
+        // 域尾段（end——独立空段，引擎 TableOfContentsItem 同形）。
+        let tail = docx_rs::Paragraph::new()
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false));
+        self.docx = std::mem::take(&mut self.docx).add_paragraph(tail);
+        self.paragraphs += 1;
+        self.runs += 1;
+        names
+    }
+
+    /// #617：目录项 tab stop 位 = 文本宽（页宽 - 左右边距 - 装订线；
+    /// 几何未设置 = 引擎基线 A4 11906 + Word 2019 边距 1701/1701——
+    /// g2_t4 钉定的字节面缺省）。[`Self::toc_entries`] /
+    /// [`Self::toc_entries_recomputed`] 共享单点。
+    fn toc_text_width(&self) -> usize {
+        match &self.page_geometry {
+            Some(g) => {
+                let w = g.width as i64
+                    - g.margin_left.max(0) as i64
+                    - g.margin_right.max(0) as i64
+                    - g.gutter.max(0) as i64;
+                w.max(0) as usize
+            }
+            None => 11906 - 1701 - 1701,
+        }
+    }
+
+    /// #617：目录项段发射单点（[`Self::toc_entries`] /
+    /// [`Self::toc_entries_recomputed`] 共享——自 `toc_entries` 原位
+    /// 提取，字节面零漂移：缩进 (level-1)×240 + 右对齐点线 tab stop +
+    /// `hyperlink(w:anchor=name)`{ 文本 + tab + PAGEREF 五连（缓存值
+    /// = `cached_page`——静态面恒 "1"，重算面按 [`TocRecompute`] 逐项）}。
+    /// 计数：+1 段 +7 run（hyperlink 内 run 计入文档 run 面）。
+    fn emit_toc_entry_paragraph(
+        &mut self,
+        text: &str,
+        level: u8,
+        name: &str,
+        cached_page: &str,
+        text_width: usize,
+    ) {
+        let mut p =
+            docx_rs::Paragraph::new().indent(Some((level as i32 - 1) * 240), None, None, None);
+        p = p.add_tab(
+            docx_rs::Tab::new()
+                .val(docx_rs::TabValueType::Right)
+                .leader(docx_rs::TabLeaderType::Dot)
+                .pos(text_width),
+        );
+        let hl = docx_rs::Hyperlink::new(name, docx_rs::HyperlinkType::Anchor)
+            .add_run(docx_rs::Run::new().add_text(text))
+            .add_run(docx_rs::Run::new().add_tab())
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Begin, false))
+            .add_run(
+                docx_rs::Run::new().add_instr_text(docx_rs::InstrText::PAGEREF(
+                    docx_rs::InstrPAGEREF::new(name).hyperlink(),
+                )),
+            )
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Separate, false))
+            .add_run(docx_rs::Run::new().add_text(cached_page))
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false));
+        p = p.add_hyperlink(hl);
+        self.docx = std::mem::take(&mut self.docx).add_paragraph(p);
+        self.paragraphs += 1;
+        self.runs += 7;
+    }
+
+    /// **#617：TOC 重算发射**（[`crate::docx_toc`] 重算产物的写面消费
+    /// ——与 [`Self::toc_entries`] 同构三段式跨段域，三处差异）：
+    ///
+    /// - **书签名**：取 [`TocRecompute::names`]（内容寻址稳定名
+    ///   `toc_h<hex>`——重算后同标题同名，跳转配对不漂移；静态面的
+    ///   `toc_N` 计数器名域零碰撞）。**生成侧不注册**纪律与
+    ///   [`Self::toc_entries`] 同——注册/定义发生在调用方
+    ///   `heading_bookmarked` 携同名注册时。
+    /// - **PAGEREF 缓存值**：按 [`TocRecompute::cached_pages`] 逐项——
+    ///   `Some(缓存)` 保留旧缓存；`None`（待重算标记——新标题/无旧
+    ///   TOC）落 `"—"` **显式未知，不产假页码**（静态面恒 `"1"` 是
+    ///   占位假页；重算面从数据上拒绝）。真页码面属 #309 排版路线
+    ///   M1-M4（明确排除）。
+    /// - **begin 不置 dirty**：#309③ 打开即显缓存语义维持（零漂移）。
+    ///
+    /// 校验（save 漏斗粘性，V8/V8'/V1-V6 同纪律——首错落账零产物拒）：
+    /// `heading_range` 1-9 且 lo ≤ hi；entry 层级 1-9；names 与
+    /// entries/cached_pages 等长且逐名过 [`validate_bookmark_name`]
+    /// 域校验（V1-V6——计划是公开输入，域校验兜底）+ 计划内重名拒。
+    ///
+    /// **entries 空 = 旧形态退化**：与 [`Self::toc_entries`] 同（占位
+    /// 提示五连域段，静态面既有行为零漂移）。
+    ///
+    /// **接线契约**（产品面接线另拆——本面只做引擎增量）：与静态面
+    /// 同序——**先本方法（引用侧发射，返回 names）→ 再在对应标题处
+    /// `heading_bookmarked(level, text, &names[i])` 注册定义侧**（发射
+    /// 侧不注册；V6 重名拒绝在定义侧单点生效——先注册后发射会被
+    /// 本方法的 V6 面诚实拒，与静态面 `toc_entries` 先生成后注册的
+    /// 既有纪律同构）。names 与 entries 位置配对。
+    pub fn toc_entries_recomputed(
+        &mut self,
+        plan: &crate::docx_toc::TocRecompute,
+        heading_range: Option<(u8, u8)>,
+    ) -> Vec<String> {
+        let entries = &plan.entries;
+        // V8 域校验（heading_range——与 toc_entries 同判据单点落账）。
+        if let Some((lo, hi)) = heading_range {
+            if self.validation_error.is_none()
+                && (lo == 0 || hi == 0 || lo > 9 || hi > 9 || lo > hi)
+            {
+                self.validation_error = Some(format!(
+                    "V8: TOC 标题层级域违规（{lo}-{hi}——须 1-9 且 lo ≤ hi）"
+                ));
+            }
+        }
+        // V8'（entry level 域——heading 同域 1-9）。
+        if self.validation_error.is_none() {
+            if let Some(bad) = entries.iter().find(|e| !(1..=9).contains(&e.level)) {
+                self.validation_error =
+                    Some(format!("V8: TOC 目录项层级越界（{}——须 1-9）", bad.level));
+            }
+        }
+        // #617 计划一致性：names / cached_pages 与 entries 等长。
+        // **长度不一致 = 早退**（发射循环按下标取值——不一致时无安全
+        // 发射面，与 V8 的继续-落账不同；save 漏斗零产物拒不变）。
+        if plan.names.len() != entries.len() || plan.cached_pages.len() != entries.len() {
+            if self.validation_error.is_none() {
+                self.validation_error = Some(format!(
+                    "V13: TocRecompute 计划长度不一致（entries={} names={} cached_pages={}——须经 DocxEditor::recompute_toc 产出）",
+                    entries.len(),
+                    plan.names.len(),
+                    plan.cached_pages.len()
+                ));
+            }
+            return plan.names.clone();
+        }
+        // #617 名域校验（V1-V6 逐名——计划为公开输入，域校验兜底；
+        // 与用户已注册书签的 V6 撞名在此粘性拒）+ 计划内重名拒。
+        if self.validation_error.is_none() {
+            let mut seen = std::collections::HashSet::new();
+            for name in &plan.names {
+                if let Err(e) = validate_bookmark_name(name, &self.bookmark_names) {
+                    self.validation_error = Some(e.to_string());
+                    break;
+                }
+                if !seen.insert(name.clone()) {
+                    self.validation_error =
+                        Some(format!("V13: TocRecompute 计划内书签重名（{name:?}）"));
+                    break;
+                }
+            }
+        }
+        // 空退化：占位五连域段（静态面既有行为零漂移——begin 不置
+        // dirty 同「打开即显缓存」语义）。
+        if entries.is_empty() {
+            let mut toc = docx_rs::InstrToC::new();
+            if let Some((lo, hi)) = heading_range {
+                toc = toc.heading_styles_range(lo as usize, hi as usize);
+            }
+            let p = docx_rs::Paragraph::new()
                 .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Begin, false))
-                .add_run(
-                    docx_rs::Run::new().add_instr_text(docx_rs::InstrText::PAGEREF(
-                        docx_rs::InstrPAGEREF::new(name.as_str()).hyperlink(),
-                    )),
-                )
+                .add_run(docx_rs::Run::new().add_instr_text(docx_rs::InstrText::TOC(toc)))
                 .add_run(
                     docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Separate, false),
                 )
-                .add_run(docx_rs::Run::new().add_text("1"))
+                .add_run(docx_rs::Run::new().add_text("（目录域——打开后全选再按 F9 更新生成）"))
                 .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false));
-            p = p.add_hyperlink(hl);
             self.docx = std::mem::take(&mut self.docx).add_paragraph(p);
             self.paragraphs += 1;
-            // 文本 + tab + PAGEREF 五连 = 7 run（hyperlink 内 run 计
-            // 入文档 run 面——与 link run 同纪律）。
-            self.runs += 7;
+            self.runs += 5;
+            return Vec::new();
         }
-        // 域尾段（end——独立空段，引擎 TableOfContentsItem 同形）。
+        let text_width = self.toc_text_width();
+        // 域头段（#309③：begin 不置 dirty——打开即显缓存目录项，
+        // Word/LO 零弹窗；F9 重算精确页码）。
+        let mut toc = docx_rs::InstrToC::new();
+        if let Some((lo, hi)) = heading_range {
+            toc = toc.heading_styles_range(lo as usize, hi as usize);
+        }
+        let head = docx_rs::Paragraph::new()
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Begin, false))
+            .add_run(docx_rs::Run::new().add_instr_text(docx_rs::InstrText::TOC(toc)))
+            .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::Separate, false));
+        self.docx = std::mem::take(&mut self.docx).add_paragraph(head);
+        self.paragraphs += 1;
+        self.runs += 3;
+        // 目录项段 × N——稳定名 + 逐项缓存值（None → "—" 显式未知，
+        // 不产假页码）。
+        let names = plan.names.clone();
+        for (i, e) in entries.iter().enumerate() {
+            let cached = plan.cached_pages[i].as_deref().unwrap_or("—");
+            self.emit_toc_entry_paragraph(&e.text, e.level, &names[i], cached, text_width);
+        }
+        // 域尾段（end——独立空段，与 toc_entries 同形）。
         let tail = docx_rs::Paragraph::new()
             .add_run(docx_rs::Run::new().add_field_char(docx_rs::FieldCharType::End, false));
         self.docx = std::mem::take(&mut self.docx).add_paragraph(tail);

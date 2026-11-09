@@ -437,6 +437,120 @@ impl DocxEditor {
             .collect()
     }
 
+    // #617 TOC 自动重算（加性扩展——读面派生 + 稳定名 + 缓存语义）
+    // -----------------------------------------------------------------------
+
+    /// **#617：TOC 重算**——从当前文档标题树重新派生目录项集，差分旧
+    /// 目录项，产出内容寻址稳定书签名与 PAGEREF 缓存语义。
+    ///
+    /// 数据流（两模型各取所长，**不做段落序跨模型连接**——sdt 盲区
+    /// 下两侧段落序发散，见 [`ParagraphRef::in_sdt`] 登记）：
+    ///
+    /// - **标题树**：`read_docx_from_bytes`（读面单一真源
+    ///   `ParagraphData::heading_level`——含样式表解析链）；表内标题
+    ///   为读面已登记盲区（cell 段扁平化）。
+    /// - **旧目录项**：本编辑面原文坐标（`fields()` 定位 TOC 域 begin
+    ///   段 → `paragraphs()`/`paragraph_text()` 提取目录项段——**含
+    ///   sdt 包裹形态与 PAGEREF 缓存值**，不受读模型对 sdt 容器的
+    ///   结构性丢弃影响）。
+    /// - **配对**：按文本多重集（增/删/缓存保留），无段落序耦合。
+    ///
+    /// 返回 [`TocRecompute`]——写面经
+    /// [`crate::docx::DocxWriter::toc_entries_recomputed`] 消费（同构
+    /// 三段式发射 + 稳定名 + 逐项缓存值）。产品接线（触发命令/
+    /// mang-shell/web 入口）不在本面。
+    ///
+    /// 拒面（typed `DocxError::InvalidInput`，fail-closed）：
+    /// `heading_range` 越域（V8 同判据——1-9 且 lo ≤ hi）。读模型
+    /// 解析失败透传（容器门语义不变）。
+    pub fn recompute_toc(
+        &self,
+        heading_range: Option<(u8, u8)>,
+    ) -> Result<crate::docx_toc::TocRecompute, DocxError> {
+        // V8 域前置拒（读面一次性判——与写面粘性落账不同面）。
+        if let Some((lo, hi)) = heading_range {
+            if lo == 0 || hi == 0 || lo > 9 || hi > 9 || lo > hi {
+                return Err(DocxError::InvalidInput(format!(
+                    "V8: TOC 标题层级域违规（{lo}-{hi}——须 1-9 且 lo ≤ hi）"
+                )));
+            }
+        }
+        // 标题树（读模型——bytes 为 open 时的原始字节，容器门内）。
+        let doc = crate::docx::read_docx_from_bytes(&self.bytes)?;
+        let entries = crate::docx_toc::heading_entries(&doc, heading_range);
+        // 旧目录项提取（编辑面原文坐标）。
+        let old = self.extract_old_toc_entries();
+        let old_toc_present = old.is_some();
+        let old_entries = old.unwrap_or_default();
+        // 稳定名（内容寻址——同标题跨重算同名）。
+        let mut used = std::collections::HashSet::new();
+        let names = entries
+            .iter()
+            .map(|e| crate::docx_toc::stable_bookmark_name(e.level, &e.text, &mut used))
+            .collect();
+        // 缓存配对 + 差分（按文本多重集）。**无基线语义**：无旧 TOC
+        // = 初次生成而非增量编辑——差分全空（「added」指相对既有
+        // 目录的新增，无基线则无差分面）。
+        let (cached_pages, diff) = if old_toc_present {
+            crate::docx_toc::diff_and_cache(&entries, &old_entries)
+        } else {
+            (
+                vec![None; entries.len()],
+                crate::docx_toc::TocDiff::default(),
+            )
+        };
+        Ok(crate::docx_toc::TocRecompute {
+            entries,
+            names,
+            cached_pages,
+            old_toc_present,
+            diff,
+        })
+    }
+
+    /// #617：旧目录项提取（私有——编辑面原文坐标）。
+    ///
+    /// 定位：`fields()` 首个 [`FieldKind::Toc`] 域的 begin 段；从该段
+    /// 起解析「`文本\t缓存页`」形态的目录项段（rsplit `\t`——标题文本
+    /// 自带 `\t` 时缓存值取末段，中段归文本）。终止条件（三态）：
+    /// 域头自身含目录项（Word 真机形态 begin/separate 与首项同段）→
+    /// 从头段起解析；空文本域段（域尾 end）或非域段（TOC 结束后的
+    /// 正文）→ 止。**无 TOC 域 → None**（`old_toc_present = false`，
+    /// 全量待重算）。
+    fn extract_old_toc_entries(&self) -> Option<Vec<(String, String)>> {
+        let toc_field = self
+            .fields()
+            .into_iter()
+            .find(|f| f.kind == FieldKind::Toc)?;
+        let begin = toc_field.para;
+        let mut out: Vec<(String, String)> = Vec::new();
+        // 域头段自身可能承载首目录项（begin+separate+首项同段——
+        // Word 真机形态；引擎发射形态为独立头段，文本为空自然跳过）。
+        if let Some((entry, cached)) =
+            crate::docx_toc::parse_old_toc_entry(self.paragraph_text(begin))
+        {
+            out.push((entry.to_string(), cached.to_string()));
+        }
+        // 后续段：域段且含 `\t` = 目录项；空文本域段（域尾）/非域段 → 止。
+        let mut i = begin + 1;
+        while i < self.paragraphs.len() {
+            let pref = &self.paragraphs[i];
+            if !pref.field_code {
+                break;
+            }
+            let text = self.paragraph_text(i);
+            if text.is_empty() {
+                break;
+            }
+            match crate::docx_toc::parse_old_toc_entry(text) {
+                Some((entry, cached)) => out.push((entry.to_string(), cached.to_string())),
+                None => break,
+            }
+            i += 1;
+        }
+        Some(out)
+    }
+
     // #141 批注脚注（加性扩展——部件级编辑面）
     // -----------------------------------------------------------------------
 
