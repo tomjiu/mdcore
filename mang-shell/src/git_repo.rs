@@ -101,7 +101,9 @@ fn repo_base(root: &Path) -> Option<RepoBase> {
     if !top.status.success() {
         return None;
     }
-    let top = String::from_utf8_lossy(&top.stdout).trim().to_string();
+    let top = String::from_utf8_lossy(&top.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
     if top.is_empty() {
         return None;
     }
@@ -115,7 +117,7 @@ fn repo_base(root: &Path) -> Option<RepoBase> {
     // POSIX 化（Windows 反斜杠变体对齐 porcelain 的正斜杠形态）。
     // 先 trim 空白（stdout 尾换行）再裁斜杠——顺序反了会把换行留在段内。
     let prefix = String::from_utf8_lossy(&prefix.stdout)
-        .trim()
+        .trim_end_matches(['\r', '\n'])
         .replace('\\', "/")
         .trim_matches('/')
         .to_string();
@@ -684,6 +686,58 @@ mod tests {
         assert!(
             !is_git_repo(&tmp) || is_git_repo(&tmp),
             "探测不崩溃（tmp 是否在仓库内因环境而异）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod whitespace_path_regression {
+    use super::*;
+    #[test]
+    fn leading_space_workspace_keeps_its_real_git_prefix() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("pr610-space-{}", std::process::id()));
+        let workspace = root.join(" leading");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("tracked.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(&file, "after\n").unwrap();
+        let changes = git_status(&workspace).unwrap();
+        println!("actual change list for leading-space workspace: {changes:?}");
+        assert_eq!(
+            changes.len(),
+            1,
+            "valid workspace prefix must retain its leading space"
+        );
+        assert_eq!(changes[0].path, "tracked.txt");
+        assert!(
+            git_diff(&workspace, &changes[0].path)
+                .unwrap()
+                .contains("+after")
         );
     }
 }
