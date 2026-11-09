@@ -242,9 +242,7 @@ pub fn git_diff(root: &Path, path: &str) -> Option<String> {
         return None;
     }
     let records = porcelain_z_records(&status.stdout);
-    let Some((change, original)) = records
-        .iter()
-        .find(|(change, _)| change.path == repo_path)
+    let Some((change, original)) = records.iter().find(|(change, _)| change.path == repo_path)
     else {
         // 干净的已跟踪文件保持空 diff；缺文件或被忽略路径不产伪 diff。
         let tracked = git_in_top(&base.top)
@@ -428,10 +426,7 @@ mod tests {
     }
 
     fn temp_repo(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mdc-598-unit-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("mdc-598-unit-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         sh(&dir, &["init", "-q"]);
@@ -557,10 +552,7 @@ mod tests {
         );
         assert_eq!(changes[0].path, "a.txt");
         let diff = git_diff(&nested, "a.txt").expect("diff 应有结果");
-        assert!(
-            diff.contains("+巢改"),
-            "读的是 nested/a.txt（工作区文件）"
-        );
+        assert!(diff.contains("+巢改"), "读的是 nested/a.txt（工作区文件）");
         assert!(!diff.contains("+邻改"), "不串读前缀邻居 nestedx/a.txt");
         assert!(!diff.contains("+顶层"), "不串读顶层 a.txt");
     }
@@ -573,8 +565,7 @@ mod tests {
         }
         // 子目录 root + 无 HEAD 新仓（SHA256）：空树 base 必须取自同一
         // 仓库（hash-object 在实际仓库根执行）。
-        let dir = std::env::temp_dir()
-            .join(format!("mdc-598-unit-sha256-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mdc-598-unit-sha256-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         sh(&dir, &["init", "-q", "--object-format=sha256"]);
@@ -587,8 +578,7 @@ mod tests {
         let changes = git_status(&nested).expect("无 HEAD 仓 status 应成功");
         let change = changes.iter().find(|c| c.path == "初始.txt").unwrap();
         assert_eq!(change.code, "A");
-        let diff =
-            git_diff(&nested, "初始.txt").expect("无 HEAD 初始变更不吞（vs 空树）");
+        let diff = git_diff(&nested, "初始.txt").expect("无 HEAD 初始变更不吞（vs 空树）");
         assert!(diff.contains("+初始内容"), "SHA256 空树 base 正确");
     }
 
@@ -600,7 +590,11 @@ mod tests {
         }
         let dir = temp_repo("rename");
         std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("nested/旧 名.txt"), "一\n二\n三\n四\n五\n六\n七\n八\n").unwrap();
+        std::fs::write(
+            dir.join("nested/旧 名.txt"),
+            "一\n二\n三\n四\n五\n六\n七\n八\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("nested/恢复.txt"), "原\n").unwrap();
         sh(&dir, &["add", "--all"]);
         sh(&dir, &["commit", "-q", "-m", "init"]);
@@ -626,7 +620,11 @@ mod tests {
         assert!(dirty.contains("+改"), "改动先非空（恢复对照）");
         sh(&dir, &["checkout", "--", "nested/恢复.txt"]);
         let clean = git_diff(&nested, "恢复.txt").expect("恢复后应有结果");
-        assert!(clean.is_empty(), "恢复 clean → 空 diff（实测 {} 字节）", clean.len());
+        assert!(
+            clean.is_empty(),
+            "恢复 clean → 空 diff（实测 {} 字节）",
+            clean.len()
+        );
         let changes = git_status(&nested).expect("恢复后 status");
         assert!(changes.is_empty(), "恢复后工作区干净；实测 {changes:?}");
     }

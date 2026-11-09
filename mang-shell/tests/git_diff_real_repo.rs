@@ -623,7 +623,11 @@ fn subdir_special_names_rename_and_no_head_sha256() {
     std::fs::write(dir.join("nested/带 空格 名.txt"), "中文\n").unwrap();
     std::fs::write(dir.join("nested/r[1].txt"), "literal\n").unwrap();
     std::fs::write(dir.join("nested/r1.txt"), "sibling\n").unwrap();
-    std::fs::write(dir.join("nested/旧 名.txt"), "一\n二\n三\n四\n五\n六\n七\n八\n").unwrap();
+    std::fs::write(
+        dir.join("nested/旧 名.txt"),
+        "一\n二\n三\n四\n五\n六\n七\n八\n",
+    )
+    .unwrap();
     sh(&dir, &["add", "--all"]);
     sh(&dir, &["commit", "-q", "-m", "init"]);
     std::fs::write(dir.join("nested/带 空格 名.txt"), "中文\n追加\n").unwrap();
@@ -654,10 +658,7 @@ fn subdir_special_names_rename_and_no_head_sha256() {
         git_diff(&nested, "r1.txt").unwrap().contains("+changed"),
         "兄弟文件差异正常"
     );
-    let untracked = changes
-        .iter()
-        .find(|c| c.code == "??")
-        .expect("未跟踪在列");
+    let untracked = changes.iter().find(|c| c.code == "??").expect("未跟踪在列");
     assert_eq!(untracked.path, "新 未跟踪 [1].txt", "特殊名字面保留");
     let diff = git_diff(&nested, "新 未跟踪 [1].txt").expect("未跟踪 diff");
     assert!(
@@ -684,7 +685,10 @@ fn subdir_special_names_rename_and_no_head_sha256() {
         .expect("staged 以工作区相对列出");
     assert_eq!(staged.code, "A");
     let diff = git_diff(&nested, "初始.txt").expect("无 HEAD staged 不吞");
-    assert!(diff.contains("+初始内容"), "SHA256 空树 base 正确（vs 空树）");
+    assert!(
+        diff.contains("+初始内容"),
+        "SHA256 空树 base 正确（vs 空树）"
+    );
     let diff = git_diff(&nested, "未跟踪.txt").expect("无 HEAD untracked diff");
     assert!(diff.contains("+无头新增"), "无 HEAD 未跟踪新增可见");
 }
