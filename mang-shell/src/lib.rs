@@ -114,6 +114,15 @@ pub mod pdf_pages;
 #[path = "pdf_thumbs.rs"]
 pub mod pdf_thumbs;
 
+/// #634：PDFium 页面正确显示专项验收（真实文件对照——15 文件 ×
+/// 25 探针页，poppler 独立引擎参照 + pypdf 几何对照 + 视图链/健壮性
+/// 三面）。测试专用模块（`#[cfg(test)]`——不进产线编译面与 bin 树）；
+/// 语料与参照清单在 tests/fixtures/display_corpus/，口径镜像
+/// scripts/display_corpus/build_corpus.py。
+#[cfg(test)]
+#[path = "pdf_display_verify.rs"]
+mod pdf_display_verify;
+
 /// #389 阶段 1：XLSX 网格视图（真网格渲染骨架——列头/行号槽固定 +
 /// 双向虚拟化 + 单元格点选；数据面/几何纯函数零 GPUI 依赖可测，
 /// GPUI 层编译面验证 + 真机登记——pdf_pages 同纪律）。
