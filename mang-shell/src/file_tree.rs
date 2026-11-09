@@ -333,12 +333,10 @@ impl FileTree {
     /// Nearest（复用 move_cursor 同策略——可视行不动，离屏行就近带回）。
     /// 无光标时零副作用（None 不被凭空点亮）。
     fn mutate_rows_keep_cursor(&mut self, mutate: impl FnOnce(&mut TreeState)) {
-        let selected_path = self
-            .selected
-            .and_then(|ix| {
-                let rows = self.state.visible_rows();
-                rows.get(ix).map(|row| row.path.clone())
-            });
+        let selected_path = self.selected.and_then(|ix| {
+            let rows = self.state.visible_rows();
+            rows.get(ix).map(|row| row.path.clone())
+        });
         mutate(&mut self.state);
         self.selected = selected_path.and_then(|path| {
             let rows = self.state.visible_rows();
@@ -959,10 +957,7 @@ mod keyboard_tests {
     // -------------------------------------------------------------------
 
     /// 光标行当前路径（断言辅助——经 selected 序号读真实行）。
-    fn selected_path(
-        tree: &Entity<FileTree>,
-        visual: &gpui::VisualTestContext,
-    ) -> Option<PathBuf> {
+    fn selected_path(tree: &Entity<FileTree>, visual: &gpui::VisualTestContext) -> Option<PathBuf> {
         tree.read_with(visual, |t, _| {
             let rows = t.state.visible_rows();
             t.selected
@@ -1162,7 +1157,11 @@ mod keyboard_tests {
         tree.update(&mut visual, |t, _| t.selected = None);
         std::fs::write(root.join("f99.md"), "f").unwrap();
         tree.update(&mut visual, |t, _| t.reload(&root));
-        assert_eq!(selected_path(&tree, &visual), None, "None 光标 reload 后仍 None");
+        assert_eq!(
+            selected_path(&tree, &visual),
+            None,
+            "None 光标 reload 后仍 None"
+        );
         visual.dispatch_action(menu::Confirm);
         assert_eq!(opened.lock().unwrap().len(), 1, "无光标 Enter 零副作用");
         let _ = std::fs::remove_dir_all(&root);
