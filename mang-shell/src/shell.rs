@@ -4493,16 +4493,20 @@ mod pdf_annot_save_tests {
 // 纯标签，点击零效果；pdf/xlsx 两钮按活动文档形态互斥在场，先中者
 // 必为当前形态的切换钮）。
 //
-// 文案断言边界（如实登记）：钮标签是 `pdf_view_mode` /
-// `xlsx_grid_view_mode` 的 1:1 纯函数（status_bar.rs 渲染期组串，
-// 两文案等宽不位移）——本层断言状态翻转（= 文案翻转的判据源），
-// 像素级文本呈现归 #554 真机走查，不冒充。
+// #585 残余①（文案）：钮文案 = 状态的 1:1 纯函数
+// （`status_info::pdf_toggle_label` / `xlsx_toggle_label`——渲染消费
+// 同一函数）。三面闭环：映射穷尽单测（status_info，CI 可见）+
+// 接线源码锚点（ui_wiring_faces face 5，CI 可见）+ 本模块真实点击
+// 翻转后断言纯函数输出随翻（运行时联动）。像素级文本呈现归 #554。
 //
-// 条件占位断言边界：md 态「双钮零渲染」与 toggle 守卫
-// （`active_is_pdf`/`active_is_xlsx`）共享同一谓词（doc_kind 判据，
-// 源码级同源）——本层运行时证据为「全扫零翻转」（用户可见行为：
-// 点了没反应）；「渲染了但被守卫拦」与「未渲染」在该层不可区分，
-// 属已知边界（如需像素级占位断言归 #554 截图回归）。
+// #585 残余②（零占位）：结构性证据 = ui_wiring_faces face 5 锚点
+//（钮构造整体位于 `.when(is_pdf/is_xlsx)` 臂内且全文件无臂外构造点
+// ——GPUI `when(false, f)` 不应用 f，元素/命中盒/占位不存在）；运行
+// 时证据 = 本模块 md 态全扫零翻转（用户可见行为）。像素级截图归 #554。
+//
+// #585 残余③（PDFium 真跑）：开档成功即打印「PDFIUM 真跑（非
+// SKIP）」横幅——CI/本地输出可辨真跑与跳过；无库环境保持 SKIP 横幅
+// 不伪装通过（AGENTS 13.1）。
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod statusbar_view_toggle_tests {
@@ -4660,10 +4664,23 @@ mod statusbar_view_toggle_tests {
         assert!(pdf0, "pdf 态默认 true（未开 pdf 标签不受扰）");
 
         // 扫描命中（Some = 右区存在交互钮且点击真实翻转了状态）。
+        // #585 残余①：文案联动前置（网格态 → 钮显示「去文本」）。
+        assert_eq!(
+            crate::status_info::xlsx_toggle_label(xlsx0),
+            "切换到文本视图"
+        );
+
         let (hit_x, (pdf1, xlsx1)) =
             sweep_statusbar_right(&shell, &window, cx).expect("xlsx 标签活跃：右区应命中切换钮");
         assert!(!xlsx1, "第一击：网格 → 文本（true → false）");
         assert!(pdf1 == pdf0, "xlsx 钮点击不串扰 pdf 态");
+        // #585 残余①：真实点击翻转 ⇒ 钮文案随纯函数翻转（渲染消费
+        // 同一 `xlsx_toggle_label`——状态与文案闭环）。
+        assert_eq!(
+            crate::status_info::xlsx_toggle_label(xlsx1),
+            "切换到网格视图",
+            "翻转后钮文案应翻转为「切换到网格视图」"
+        );
 
         // 同点回切（文案两态等宽——按钮不位移；仍重绘保命中盒新鲜）。
         let status_y = statusbar_y(&window, cx);
@@ -4759,13 +4776,29 @@ mod statusbar_view_toggle_tests {
             panic!("pdf 标签开档失败（夹具/真缺陷，非环境缺件）：{notice:?}");
         }
 
+        // #585 残余③：PDFium 真跑的显式日志证据（bin/lib/libpdfium.so
+        // 在位——开档成功 = 引擎已绑定，本测试全量执行非 SKIP）。
+        eprintln!(
+            "\n══════ PDFIUM 真跑（非 SKIP）══════\n               pdf 标签开档成功 = libpdfium 引擎已绑定（定位序 \
+             MDC_PDFIUM_LIB → bin/lib 取件位 → 系统）。\n               下方翻转/回切为真实引擎态下的完整点击链。\n═══════════════════════════\n"
+        );
         let (pdf0, xlsx0) = view_modes(&shell, cx);
         assert!(pdf0, "pdf 态初始 = 页面视图（ShellApp 默认 true）");
+        // ① 文案联动前置：钮上文案 = 状态的纯函数映射（渲染消费同一
+        // 函数——翻转前为「去文本」）。
+        assert_eq!(crate::status_info::pdf_toggle_label(pdf0), "切换到文本视图");
 
         let (hit_x, (pdf1, xlsx1)) =
             sweep_statusbar_right(&shell, &window, cx).expect("pdf 标签活跃：右区应命中切换钮");
         assert!(!pdf1, "第一击：页面 → 文本（true → false）");
         assert!(xlsx1 == xlsx0, "pdf 钮点击不串扰 xlsx 态");
+        // #585 残余①：真实点击翻转状态 ⇒ 钮文案随纯函数翻转（渲染
+        // 消费同一 `pdf_toggle_label`——状态与文案在同一事实源上闭环）。
+        assert_eq!(
+            crate::status_info::pdf_toggle_label(pdf1),
+            "切换到页面视图",
+            "翻转后钮文案应翻转为「切换到页面视图」"
+        );
 
         let status_y = statusbar_y(&window, cx);
         redraw(&window, cx);

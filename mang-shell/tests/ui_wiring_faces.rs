@@ -312,6 +312,86 @@ fn face5_status_bar_binds_data_sources() {
     );
 }
 
+/// #585 残余①+②：视图切换钮的**文案接线**与**条件占位结构**。
+///
+/// ① 文案链：两枚切换钮（`pdf-view-toggle` / `xlsx-view-toggle`）的
+/// `Label::new` 消费 `status_info::pdf_toggle_label` /
+/// `xlsx_toggle_label` 纯函数（状态 → 文案的单一事实源——映射在
+/// status_info 单测穷尽锁死，此处锁「渲染真的消费它」）。
+///
+/// ② 零占位结构：钮构造（id + Label）必须**整体位于**
+/// `.when(is_pdf, …)` / `.when(is_xlsx, …)` 条件臂内——GPUI 的
+/// `when(false, f)` 不应用 f（文档语义），故非该形态标签时按钮
+/// 元素/命中盒/占位**不存在**（不止「点击无效」——节点本身不在
+/// 树内；md 态运行时全扫零翻转见 shell.rs 批 11 测试）。
+#[test]
+fn face5_view_toggle_buttons_wire_labels_and_occupy_conditionally() {
+    let sb = src("status_bar.rs");
+
+    // ① 文案接线：钮标签 = status_info 纯函数（非内联字面量）。
+    for (call, btn, what) in [
+        (
+            "status_info::pdf_toggle_label(pdf_view_mode)",
+            "pdf-view-toggle",
+            "pdf 切换钮文案（#585 ①）",
+        ),
+        (
+            "status_info::xlsx_toggle_label(xlsx_grid_view_mode)",
+            "xlsx-view-toggle",
+            "xlsx 切换钮文案（#585 ①）",
+        ),
+    ] {
+        assert!(
+            sb.contains(call),
+            "【面 5：状态栏 → 数据源】{btn} 文案断链——{what}（`{call}`）未被消费"
+        );
+    }
+
+    // ② 条件占位：按钮 id 只允许出现在对应 when 臂内（结构性零占位）。
+    // when 臂块提取：`.when(is_pdf, |el| { … }` 起的配对大括号。
+    for (guard, btn) in [
+        ("is_pdf", "pdf-view-toggle"),
+        ("is_xlsx", "xlsx-view-toggle"),
+    ] {
+        let arm = when_arm(&sb, guard);
+        assert!(
+            arm.contains(&format!("\"{btn}\"")),
+            "【面 5：状态栏 → 数据源】{btn} 构造不在 `.when({guard}, …)` 臂内——             条件占位被破坏（非{guard}标签时按钮仍渲染/占位）"
+        );
+        // 全文件唯一性：id 出现次数 = when 臂内出现次数（臂外零构造点）。
+        let total = sb.matches(&format!("\"{btn}\"")).count();
+        let in_arm = arm.matches(&format!("\"{btn}\"")).count();
+        assert_eq!(
+            total, in_arm,
+            "【面 5：状态栏 → 数据源】{btn} 在 `.when({guard})` 臂外另有构造点——             存在绕过条件占位的渲染路径"
+        );
+    }
+}
+
+/// 提取 `.when(<guard>, |el| { … }` 的配对大括号块（首个匹配——
+/// status_bar.rs 中每守卫仅一臂）。
+fn when_arm(file: &str, guard: &str) -> String {
+    let needle = format!(".when({guard}, |el| ");
+    let start = file
+        .find(&needle)
+        .unwrap_or_else(|| panic!("`.when({guard}, |el| …)` 条件臂缺失——条件占位结构被拆除"));
+    let body_start = file[start..].find('{').expect("when 臂后无块体") + start;
+    let mut depth = 0usize;
+    for (i, b) in file[body_start..].bytes().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return file[body_start..body_start + i + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("when 臂块未闭合：{guard}");
+}
+
 // ---------------------------------------------------------------------------
 // 面 6：设置项 → 生效
 // ---------------------------------------------------------------------------

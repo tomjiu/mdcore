@@ -144,20 +144,14 @@ pub fn status_bar(
     let locked_notice = editor.and_then(|ed| ed.read(cx).locked_notice().cloned());
     // #289-④：pdf 标签 → 页面/文本视图切换钮（右侧信息区，git 分支
     // 前——文档形态面）。非 pdf 态不占位。
+    // #585 残余①：文案经 status_info 纯函数（状态 → 文案的单一事实源
+    // ——穷尽两态映射在 status_info 单测锁，此处零内联字面量）。
     let is_pdf = editor.is_some_and(|ed| ed.read(cx).doc_kind() == "pdf");
-    let pdf_toggle_label = if pdf_view_mode {
-        "切换到文本视图"
-    } else {
-        "切换到页面视图"
-    };
+    let pdf_toggle_label = status_info::pdf_toggle_label(pdf_view_mode);
     // #389 阶段 1：xlsx 标签 → 网格/文本视图切换钮（pdf 先例同构——
-    // 非 xlsx 态不占位）。
+    // 非 xlsx 态不占位；#585 残余①同源收口）。
     let is_xlsx = editor.is_some_and(|ed| ed.read(cx).doc_kind() == "xlsx");
-    let xlsx_toggle_label = if xlsx_grid_view_mode {
-        "切换到文本视图"
-    } else {
-        "切换到网格视图"
-    };
+    let xlsx_toggle_label = status_info::xlsx_toggle_label(xlsx_grid_view_mode);
     let hover = colors.element_hover;
 
     h_flex()

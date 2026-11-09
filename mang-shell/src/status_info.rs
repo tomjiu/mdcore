@@ -361,9 +361,73 @@ pub fn git_branch_at_cached(git_root: &std::path::Path) -> Option<String> {
     branch
 }
 
+// ── #585 残余①：视图切换钮文案（状态的 1:1 纯函数）─────────────────
+//
+// 文案是 `pdf_view_mode` / `xlsx_grid_view_mode` 布尔态的确定性映射，
+// 渲染面（status_bar.rs 两枚切换钮）消费同一函数——单一事实源：
+// 状态翻转 ⇒ 钮文案翻转（「点了之后钮上写什么」的数据链在此锁死，
+// 像素级文本呈现归 #554 真机走查）。
+
+/// pdf 视图切换钮文案：页面视图态显示「切换到文本视图」，文本态显示
+/// 「切换到页面视图」（钮描述的是**点击后去哪**，不是当前态——
+/// status_bar.rs `pdf-view-toggle` 消费）。
+pub fn pdf_toggle_label(page_view: bool) -> &'static str {
+    if page_view {
+        "切换到文本视图"
+    } else {
+        "切换到页面视图"
+    }
+}
+
+/// xlsx 视图切换钮文案：网格态显示「切换到文本视图」，文本态显示
+/// 「切换到网格视图」（语义同 [`pdf_toggle_label`]——status_bar.rs
+/// `xlsx-view-toggle` 消费）。
+pub fn xlsx_toggle_label(grid_view: bool) -> &'static str {
+    if grid_view {
+        "切换到文本视图"
+    } else {
+        "切换到网格视图"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #585 残余①：视图切换钮文案映射（穷尽两态）────────────
+
+    #[test]
+    fn pdf_toggle_label_maps_both_states() {
+        // 页面视图态 → 钮显示「点击后去文本」；文本态 → 「去页面」。
+        // 钮文案描述目标态而非当前态——Excel「切换到普通视图」同语义。
+        assert_eq!(pdf_toggle_label(true), "切换到文本视图");
+        assert_eq!(pdf_toggle_label(false), "切换到页面视图");
+    }
+
+    #[test]
+    fn xlsx_toggle_label_maps_both_states() {
+        assert_eq!(xlsx_toggle_label(true), "切换到文本视图");
+        assert_eq!(xlsx_toggle_label(false), "切换到网格视图");
+    }
+
+    #[test]
+    fn toggle_labels_flip_with_state() {
+        // 状态翻转 ⇒ 文案翻转（#585 ①的判据核心：真实点击翻转状态后，
+        // 钮上文案必随纯函数翻转——渲染消费同一函数，见 ui_wiring_faces
+        // face 5 源码锚点）。
+        for state in [true, false] {
+            assert_ne!(
+                pdf_toggle_label(state),
+                pdf_toggle_label(!state),
+                "pdf 钮文案必须随状态翻转"
+            );
+            assert_ne!(
+                xlsx_toggle_label(state),
+                xlsx_toggle_label(!state),
+                "xlsx 钮文案必须随状态翻转"
+            );
+        }
+    }
 
     // ── 换行符 ───────────────────────────────────────────────
 
