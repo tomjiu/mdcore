@@ -46,12 +46,15 @@
 //!    - 内容变化为主标签（Modified）；
 //!    - 位置变化可由 old_index/new_index 观察（如实不折叠）。
 //!
-//! **同 ID 改 BlockKind（#599 契约）**：谱系入口的 ID pass 仅配
+//! **同 ID 改 BlockKind（#599/#626 契约）**：谱系入口的 ID pass 仅配
 //! 同 kind 的同 ID 对——kind 变更（如段落→标题）**显式拆分**为
 //! Removed（旧型携旧侧 ID）+ Added（新型携新侧 ID，同一 ID 值——
 //! 身份仍可观察），不输出双侧异型的 Modified（[`BlockDiff::block_kind`]
-//! 双侧同型契约不得默默破坏）。文本 pass 同样要求同 kind，拆分
-//! 结果与内容面自然一致。
+//! 双侧同型契约不得默默破坏）。拆分两端**退出后续全部配对面**
+//! （#626：精确/相似 pass 不得偷配——旧端从签名与相似候选池排除、
+//! 新端置占位；否则同文/近文块会把拆分端偷配成 Unchanged/Modified，
+//! 丢失应保留的 Removed/Added 事件）。文本 pass 同样要求同 kind，
+//! 拆分结果与内容面自然一致。
 //!
 //! ## L2：行内 diff（零新依赖的 clean-room Myers）
 //!
@@ -247,6 +250,11 @@ fn align_impl(old: &[FlatBlock], new: &[FlatBlock], id_pass: bool) -> Vec<BlockD
     // 配对表：old_idx → new_idx（ID/精确/相似三 pass 填充）。
     let mut pair_old_new: Vec<Option<usize>> = vec![None; old.len()];
     let mut paired_new = vec![false; new.len()];
+    // #626：同 ID 异 kind 的强制拆分端——旧端强制 Removed（从精确/
+    // 相似候选池排除，不得被后续 pass 偷配）；新端经 `paired_new` 标
+    // 占即天然排除（组装段自然输出 Added）。全 false 时（默认入口）
+    // 对各 pass 判定零影响——`id_pass=false` 语义零漂移。
+    let mut forced_removed_old = vec![false; old.len()];
     // 同文配对表（ID 同文对 + 精确文本对——共用全局 LIS）。
     let mut exact: Vec<(usize, usize)> = Vec::new();
 
@@ -255,6 +263,14 @@ fn align_impl(old: &[FlatBlock], new: &[FlatBlock], id_pass: bool) -> Vec<BlockD
     //     同文 ID 对入 exact（与精确文本对共用 LIS）；异文 ID 对
     //     仅占位（Modified——组装段判定）。新侧 ID 首现胜（同谱系
     //     ID 唯一是树不变量，防御位不取尽）。
+    //
+    //     同 ID 异 kind（#626）：两端**双占排除**——旧端记
+    //     `forced_removed_old`（pass 1 签名跳过 + pass 2 候选排除），
+    //     新端置 `paired_new`（pass 1 队列弹出即弃 + pass 2 未配对
+    //     表排除）。不排除则同文/近文的后续块会把这两端偷配成
+    //     Unchanged/Modified，丢失拆分契约要求的 Removed/Added 事件
+    //     （PR #614 审核三反例）。组装段两端各按未配对自然输出
+    //     Removed（旧型携旧 ID）/ Added（新型携同 ID）。
     if id_pass {
         use std::collections::HashMap;
         let mut id_map: HashMap<u64, usize> = HashMap::with_capacity(new.len());
@@ -265,8 +281,14 @@ fn align_impl(old: &[FlatBlock], new: &[FlatBlock], id_pass: bool) -> Vec<BlockD
             let Some(&j) = id_map.get(&b.id.0) else {
                 continue;
             };
-            if paired_new[j] || old[i].kind != new[j].kind {
-                continue; // 已占（防御）/ 改 kind（显式拆分——不配）
+            if old[i].kind != new[j].kind {
+                // 改 kind：显式拆分——两端退出后续全部配对面。
+                forced_removed_old[i] = true;
+                paired_new[j] = true;
+                continue;
+            }
+            if paired_new[j] {
+                continue; // 已占（防御）
             }
             pair_old_new[i] = Some(j);
             paired_new[j] = true;
@@ -293,8 +315,8 @@ fn align_impl(old: &[FlatBlock], new: &[FlatBlock], id_pass: bool) -> Vec<BlockD
             .push_back(j);
     }
     for (i, b) in old.iter().enumerate() {
-        if pair_old_new[i].is_some() {
-            continue; // ID pass 已占
+        if pair_old_new[i].is_some() || forced_removed_old[i] {
+            continue; // ID pass 已占 / #626 强制拆分端（不可偷配）
         }
         if let Some(queue) = sig_map.get_mut(&(b.kind as u8, b.text.as_str())) {
             while let Some(j) = queue.pop_front() {
@@ -310,9 +332,10 @@ fn align_impl(old: &[FlatBlock], new: &[FlatBlock], id_pass: bool) -> Vec<BlockD
     }
 
     // --- pass 2：相似度匹配（同 kind 未配对，位置窗口 + 阈值，按
-    // 相似度降序贪心取不冲突对）。
+    // 相似度降序贪心取不冲突对）。#626：强制拆分旧端不入候选池
+    // （新端经 paired_new 已排除）——相似文本不得偷配拆分端。
     let unmatched_old: Vec<usize> = (0..old.len())
-        .filter(|&i| pair_old_new[i].is_none())
+        .filter(|&i| pair_old_new[i].is_none() && !forced_removed_old[i])
         .collect();
     let unmatched_new: Vec<usize> = (0..new.len()).filter(|&j| !paired_new[j]).collect();
     let mut candidates: Vec<(f64, usize, usize)> = Vec::new();

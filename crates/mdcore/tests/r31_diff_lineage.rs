@@ -1,7 +1,7 @@
 //! r31（#599）—— diff 同谱系 ID 匹配验收：重写块身份保持 + 精确 pass
 //! 防覆盖。
 //!
-//! 验收对照（issue #599 四条）：
+//! 验收对照（issue #599 四条 + #626 审核返工三条）：
 //! 1. 真同谱系（capture/restore 与 save→open meta 两条路径）：大幅
 //!    重写块仍 Modified 且 old_id==new_id → `lineage_rewrite_*`
 //! 2. 关键负例：同 ID 异文 + 重复文本，精确 pass 不覆盖配对、不复用
@@ -12,6 +12,11 @@
 //!    移动/删除/前插分类与身份正确 → `default_entries_zero_drift`
 //!    / `lineage_move_delete_insert_ids`
 //! 5. 同谱系 10k 性能门 → `perf_10k_lineage_under_1s`
+//! 6. #626 审核返工——同 ID 异 kind 的两端不得被精确/相似 pass
+//!    偷配：旧端偷配（`kind_change_old_side_not_stolen_by_exact`）/
+//!    新端偷配（`kind_change_new_side_not_stolen_by_exact`）/
+//!    相似 pass 偷配（`kind_change_not_stolen_by_similar_pass`），
+//!    双方向（段落→标题 与 标题→段落）都锁。
 //!
 //! 谱系纪律：`diff_documents_lineage` 是显式入口——调用方声明两侧
 //! 同谱系（capture/restore、save→open meta v2 等 ID 同源路径）。两份
@@ -401,4 +406,201 @@ fn perf_10k_lineage_under_1s() {
         d.len()
     );
     println!("10k 谱系 diff：{elapsed:?}（{mods} Modified）");
+}
+
+// ------------------------------------------------- #626 审核返工（验收 6）
+//
+// 审核反例（PR #614 评论 6733138074）：pass 0 发现同 ID 异 kind 后仅
+// 「不配」，两端未从后续 pass 排除——精确/相似 pass 会把这两端「偷
+// 配」成 Unchanged/Modified，丢失应保留的 Removed/Added 事件。以下
+// 三测各锁一种偷配形态，段落→标题 与 标题→段落 双方向都验。
+
+/// #626 反例 1：**旧端被精确 pass 偷配**。
+/// 段落(id1) 改 kind 为标题（同 ID 同文），另前插/追加一个同文本的
+/// 新段落（新发号 id2）——旧段落(id1) 不得与新段落(id2) 精确配成
+/// Unchanged：拆分契约要求 Removed(旧型) + Added(新型) + Added(新段)。
+#[test]
+fn kind_change_old_side_not_stolen_by_exact() {
+    // 方向 A：段落 → 标题。
+    let old = Core::from_markdown("共享文本。\n");
+    let ids = old.tree.preorder_block_ids();
+    assert_eq!(ids.len(), 1, "结构前提：单块");
+    let id1 = ids[0];
+
+    let mut new = lineage_restore(&old);
+    new.set_block_type(new.revision(), vec![0], BlockKind::Heading)
+        .expect("set_block_type");
+    // 追加同文本新段落（新发号 id2——与旧段落签名完全相同）。
+    new.insert_block(
+        new.revision(),
+        vec![],
+        1,
+        BlockKind::Paragraph,
+        Default::default(),
+        "共享文本。".into(),
+    )
+    .expect("insert");
+    let d = diff_documents_lineage(&old, &new);
+
+    assert_eq!(
+        kinds(&d),
+        vec![
+            DiffKind::Removed, // 旧段落（id1，Paragraph）
+            DiffKind::Added,   // 新标题（id1，Heading——kind 变更端）
+            DiffKind::Added,   // 新段落（id2，全新块）
+        ],
+        "旧端不得被精确 pass 偷配（方向 A：段落→标题）"
+    );
+    let r = &d[0];
+    assert_eq!(r.block_kind, BlockKind::Paragraph, "Removed 取旧侧类型");
+    assert_eq!(r.old_id, Some(id1), "Removed 携旧侧 ID");
+    assert_eq!(r.text_old.as_deref(), Some("共享文本。"));
+    let a = &d[1];
+    assert_eq!(a.block_kind, BlockKind::Heading, "Added 取新侧类型");
+    assert_eq!(a.new_id, Some(id1), "Added 携同 ID（身份可观察）");
+    let a2 = &d[2];
+    assert_eq!(a2.block_kind, BlockKind::Paragraph, "追加段是 Paragraph");
+    let id2 = a2.new_id.expect("追加段携新侧 ID");
+    assert_ne!(id2, id1, "追加段是全新 ID（非旧端偷配的旧 ID）");
+
+    // 方向 B：标题 → 段落（反向同锁）。
+    let old_b = Core::from_markdown("# 共享文本。\n");
+    let ids_b = old_b.tree.preorder_block_ids();
+    assert_eq!(ids_b.len(), 1, "结构前提：单块（方向 B）");
+    let id1_b = ids_b[0];
+
+    let mut new_b = lineage_restore(&old_b);
+    new_b
+        .set_block_type(new_b.revision(), vec![0], BlockKind::Paragraph)
+        .expect("set_block_type");
+    new_b
+        .insert_block(
+            new_b.revision(),
+            vec![],
+            1,
+            BlockKind::Heading,
+            Default::default(),
+            "共享文本。".into(),
+        )
+        .expect("insert");
+    let db = diff_documents_lineage(&old_b, &new_b);
+
+    assert_eq!(
+        kinds(&db),
+        vec![
+            DiffKind::Removed, // 旧标题（id1，Heading）
+            DiffKind::Added,   // 新段落（id1，Paragraph——kind 变更端）
+            DiffKind::Added,   // 新标题（全新块）
+        ],
+        "旧端不得被精确 pass 偷配（方向 B：标题→段落）"
+    );
+    assert_eq!(db[0].block_kind, BlockKind::Heading, "Removed 取旧侧类型");
+    assert_eq!(db[0].old_id, Some(id1_b));
+    assert_eq!(db[1].block_kind, BlockKind::Paragraph, "Added 取新侧类型");
+    assert_eq!(db[1].new_id, Some(id1_b), "Added 携同 ID");
+}
+
+/// #626 反例 2：**新端被精确 pass 偷配**。
+/// 旧 [段落(id1) + 标题(id2)] → 新 [标题(id1)]（标题被删、段落改 kind）：
+/// 新标题(id1) 是 kind 变更端（强制 Added），不得被旧标题(id2) 的
+/// 精确签名偷配成 Unchanged——旧标题(id2) 应保留 Removed。
+#[test]
+fn kind_change_new_side_not_stolen_by_exact() {
+    let old = Core::from_markdown("共享文本。\n\n# 共享文本。\n");
+    let ids = old.tree.preorder_block_ids();
+    assert_eq!(ids.len(), 2, "结构前提：段落 + 标题");
+    let (id1, id2) = (ids[0], ids[1]);
+
+    let mut new = lineage_restore(&old);
+    // 删旧标题（顶层 index 1）。
+    new.delete_block(new.revision(), vec![1]).expect("delete");
+    // 段落（顶层 index 0）改 kind 为标题——同 ID 同文。
+    new.set_block_type(new.revision(), vec![0], BlockKind::Heading)
+        .expect("set_block_type");
+    let d = diff_documents_lineage(&old, &new);
+
+    assert_eq!(
+        kinds(&d),
+        vec![
+            DiffKind::Removed, // 旧段落（id1，Paragraph）
+            DiffKind::Removed, // 旧标题（id2，Heading——真删除）
+            DiffKind::Added,   // 新标题（id1，Heading——kind 变更端）
+        ],
+        "新端不得被旧标题精确偷配成 Unchanged"
+    );
+    assert_eq!(d[0].block_kind, BlockKind::Paragraph);
+    assert_eq!(d[0].old_id, Some(id1), "Removed₁ 携旧段落 ID");
+    assert_eq!(d[1].block_kind, BlockKind::Heading);
+    assert_eq!(d[1].old_id, Some(id2), "Removed₂ 携旧标题 ID（真删除）");
+    assert_eq!(d[2].block_kind, BlockKind::Heading);
+    assert_eq!(
+        d[2].new_id,
+        Some(id1),
+        "Added 携 kind 变更端同 ID（非旧标题 ID）"
+    );
+    // 不允许任何双侧异型条目（Unchanged/Modified/Moved 零）。
+    assert!(
+        !d.iter().any(|x| matches!(
+            x.kind,
+            DiffKind::Unchanged | DiffKind::Modified | DiffKind::Moved
+        )),
+        "kind 变更 + 删除场景不得输出任何配对条目：{:?}",
+        kinds(&d)
+    );
+}
+
+/// #626 反例 3：**相似 pass 偷配**。
+/// 段落(id1, "alpha") 改 kind 为标题 + 追加相似文本新段落(id2, "alphax")：
+/// 旧段落(id1) 不得与新段落(id2) 经 pass 2 相似配成 Modified——拆分
+/// 契约保持 Removed(旧型) + Added(新型) + Added(新段)。
+#[test]
+fn kind_change_not_stolen_by_similar_pass() {
+    let old = Core::from_markdown("alpha\n");
+    let ids = old.tree.preorder_block_ids();
+    assert_eq!(ids.len(), 1, "结构前提：单块");
+    let id1 = ids[0];
+
+    let mut new = lineage_restore(&old);
+    new.set_block_type(new.revision(), vec![0], BlockKind::Heading)
+        .expect("set_block_type");
+    // 追加相似文本新段落（"alpha" vs "alphax"：相似度 1-1/6≈0.83 ≥
+    // 阈值 0.5——pass 2 候选在场）。
+    new.insert_block(
+        new.revision(),
+        vec![],
+        1,
+        BlockKind::Paragraph,
+        Default::default(),
+        "alphax".into(),
+    )
+    .expect("insert");
+    let d = diff_documents_lineage(&old, &new);
+
+    assert_eq!(
+        kinds(&d),
+        vec![
+            DiffKind::Removed, // 旧段落（id1，Paragraph，"alpha"）
+            DiffKind::Added,   // 新标题（id1，Heading，"alpha"）
+            DiffKind::Added,   // 新段落（id2，Paragraph，"alphax"）
+        ],
+        "旧端不得被相似 pass 偷配成 Modified"
+    );
+    assert_eq!(d[0].block_kind, BlockKind::Paragraph);
+    assert_eq!(d[0].old_id, Some(id1), "Removed 携旧侧 ID");
+    assert_eq!(d[0].text_old.as_deref(), Some("alpha"));
+    assert_eq!(d[1].block_kind, BlockKind::Heading);
+    assert_eq!(d[1].new_id, Some(id1), "Added 携 kind 变更端同 ID");
+    assert_eq!(d[1].text_new.as_deref(), Some("alpha"));
+    assert_eq!(d[2].block_kind, BlockKind::Paragraph);
+    assert_eq!(d[2].text_new.as_deref(), Some("alphax"));
+    // 追加段是全新 ID。
+    let id2 = d[2].new_id.expect("追加段携新侧 ID");
+    assert_ne!(id2, id1);
+    // 相似面断言（防测试退化为非相似输入）：文本对确实过阈值。
+    assert!(
+        !d.iter()
+            .any(|x| x.kind == DiffKind::Modified || x.kind == DiffKind::Unchanged),
+        "相似候选在场时也不得产生任何配对条目：{:?}",
+        kinds(&d)
+    );
 }
