@@ -616,6 +616,37 @@ impl PdfPagesView {
         self.top_page as usize
     }
 
+    /// #634 测试读数（`#[cfg(test)]` 不入产线）：可见页位图就绪——与
+    /// [`Self::render_page_slot`] 同键径（光栅宽随缩放档、几何高随引擎
+    /// 实测），键在缓存即「可上屏」。
+    #[cfg(test)]
+    pub fn page_ready_for_test(&self, page: usize) -> bool {
+        let (vw, vh) = self.viewport_size;
+        let fit_w = self.raster_width(vw, vh);
+        self.render_key(&(page as u32, fit_w))
+            .is_some_and(|k| self.cache.contains(&k))
+    }
+
+    /// #634 测试读数：当前光栅宽（缩放档位断言）。
+    #[cfg(test)]
+    pub fn raster_width_for_test(&self) -> u32 {
+        let (vw, vh) = self.viewport_size;
+        self.raster_width(vw, vh)
+    }
+
+    /// #634 测试读数：缓存（已用字节, 条目数）——预算受限不变量断言
+    /// （LRU 逐出语义的单元面在 crates/pdf cache 单测）。
+    #[cfg(test)]
+    pub fn cache_stats_for_test(&self) -> (usize, usize) {
+        (self.cache.bytes(), self.cache.len())
+    }
+
+    /// #634 测试读数：引擎面错误（坏文件视图态断言——面板明示面同源）。
+    #[cfg(test)]
+    pub fn error_for_test(&self) -> Option<String> {
+        self.error.clone()
+    }
+
     // ------------------------------------------------------------------
     // #421：缩放域（状态面——交互面在 render/键分派两处接入）
     // ------------------------------------------------------------------
@@ -695,8 +726,16 @@ impl PdfPagesView {
         let ratio = new_w / old_w;
         let state = self.scroll.0.borrow();
         let offset = state.base_handle.offset();
-        let y = f32::from(offset.y).max(0.) * ratio;
-        state.base_handle.set_offset(gpui::point(px(0.), px(y)));
+        // #634 修正：gpui 滚动句柄为**负向约定**（下滚 = 负 y——与
+        // submit_visible 的 #420 修正同源，见 uniform_list
+        // `first_visible_element_ix` 的 `-offset` 实现）。原
+        // `f32::from(offset.y).max(0.)` 把负向 offset 全部钳成 0 →
+        // 缩放换档后视口**恒跳回首页**（#421 验收 4「缩放后不跳页」
+        // 被破——#421 交付时该面无 e2e 覆盖，#634 视图链核验抓红）。
+        // 取负归正为内容坐标，回写时还原负向（1296 行 px(-clamped)
+        // 同款先例）。
+        let y = (-f32::from(offset.y)).max(0.) * ratio;
+        state.base_handle.set_offset(gpui::point(px(0.), px(-y)));
     }
 
     /// #421：预设行是否为当前态（Custom 档比倍率近似——0.5% 内视为

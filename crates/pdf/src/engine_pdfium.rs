@@ -284,9 +284,22 @@ impl DocumentEngine for PdfiumEngine {
             PdfPageRenderRotation::Degrees180 => Rotation::Deg180,
             PdfPageRenderRotation::Degrees270 => Rotation::Deg270,
         };
+        // #634 修正：width_pt/height_pt = **渲染显示域**尺寸（真 CropBox
+        // 优先，缺省/恒等回落 MediaBox）——与 rasterize 的取宽口径
+        // （pdfium `FPDF_GetPageWidthF/HeightF` = CropBox 优先）一致。
+        // 原 MediaBox 口径在裁剪页与渲染位图纵横比脱钩：pdf_pages 显示
+        // 槽高 / 搜索高亮坐标 / 打印 DPI 换算全按错误纵横比走（语义锁
+        // 「渲染与命中测试的唯一取宽出口」在裁剪页被破——#634 真实文件
+        // 语料 cropbox_offset/inset 抓红：pypdf 独立解析 451×698pt vs
+        // 引擎旧报 595.28×841.89pt）。media_box/crop_box 原点数据不变
+        // （transform 层两盒几何自持，不受本口径影响）。
+        let (width_pt, height_pt) = match crop {
+            Some(c) => (c.x1 - c.x0, c.y1 - c.y0),
+            None => (media.width().value, media.height().value),
+        };
         Ok(PageGeometry {
-            width_pt: media.width().value,
-            height_pt: media.height().value,
+            width_pt,
+            height_pt,
             rotation,
             media_box: PageBox {
                 x0: ml,
