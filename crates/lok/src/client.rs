@@ -1,0 +1,692 @@
+//! 宿主侧客户端：worker 进程生命周期 + 请求/超时/事件消费 + 脏位语义。
+//!
+//! ## 隔离保证（issue 第 1/4 条）
+//!
+//! - 宿主进程**永不加载 LOK 内核**（见 [`crate::runtime`]「隔离铁律」）；
+//!   所有内核调用都发生在 worker 进程，由本客户端代理。
+//! - 超时：每个请求带截止时间；超时 → **杀 worker**（挂死的内核不可信，
+//!   不等待、不重试同进程）→ 脏位保留 → 宿主可重开会话。
+//! - worker 异常退出：读线程 EOF → 所有挂起请求立刻失败（`E_WORKER_DIED`，
+//!   附 stderr 尾部），宿主继续可用。
+//! - 脏位：输入/UNO 变更成功置位；**只有 save_as 成功才清位**；超时 /
+//!   worker 死亡 / 保存失败一律保留（issue 明文）。
+
+use crate::protocol::{self, codes};
+use crate::runtime::{LokRuntime, LOK_HOME_ENV, LOK_LIB_ENV};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// 宿主侧错误（含线上错误帧的错误码 + 本地超时/死亡错误）。
+#[derive(Debug, Clone)]
+pub enum LokError {
+    /// 线上错误帧（code 见 [`crate::protocol::codes`]）。
+    Lok { code: String, message: String },
+    /// 请求超时（worker 已被看门狗杀掉）。
+    Timeout { op: String, waited_ms: u128 },
+    /// worker 异常退出（附 stderr 尾部与退出信息）。
+    WorkerDied {
+        detail: String,
+        stderr_tail: Vec<String>,
+    },
+    /// 协议/IO 层错误。
+    Protocol(String),
+}
+
+impl std::fmt::Display for LokError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LokError::Lok { code, message } => write!(f, "[{code}] {message}"),
+            LokError::Timeout { op, waited_ms } => {
+                write!(
+                    f,
+                    "[{}] op={op} 超时（{waited_ms}ms，worker 已被看门狗终止）",
+                    codes::TIMEOUT
+                )
+            }
+            LokError::WorkerDied {
+                detail,
+                stderr_tail,
+            } => {
+                write!(f, "[{}] {detail}", codes::WORKER_DIED)?;
+                if !stderr_tail.is_empty() {
+                    write!(f, "\nstderr 尾部：\n  {}", stderr_tail.join("\n  "))?;
+                }
+                Ok(())
+            }
+            LokError::Protocol(m) => write!(f, "[E_PROTOCOL] {m}"),
+        }
+    }
+}
+
+impl std::error::Error for LokError {}
+
+impl LokError {
+    /// 线上错误码。
+    pub fn code(&self) -> &str {
+        match self {
+            LokError::Lok { code, .. } => code,
+            LokError::Timeout { .. } => codes::TIMEOUT,
+            LokError::WorkerDied { .. } => codes::WORKER_DIED,
+            LokError::Protocol(_) => "E_PROTOCOL",
+        }
+    }
+}
+
+/// worker 事件（回调 + 生命周期）。
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// LOK 回调（type 值见 [`crate::abi::callbacks`]，payload 原文）。
+    Callback {
+        type_id: i32,
+        name: String,
+        payload: String,
+        truncated: bool,
+    },
+    /// 生命周期（hello / ready / boot-failed / bye）。
+    Life { kind: String, detail: Value },
+}
+
+/// 默认每操作超时（LO 首启慢：hook_2 一次性数秒属正常）。
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// worker 客户端。
+pub struct WorkerClient {
+    child: std::sync::Mutex<Child>,
+    child_pid: u32,
+    stdin: std::sync::Mutex<Option<ChildStdin>>,
+    next_id: AtomicU64,
+    pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    // events Sender 保活：读线程持克隆，本字段防止「唯一接收端被取走前
+    // 通道被拆」（take_events 一次性取走接收端；此后由接收端持有连接）
+    _events_keepalive: Sender<Event>,
+    event_rx: Mutex<Option<Receiver<Event>>>,
+    dead: Arc<AtomicBool>,
+    death_detail: Arc<Mutex<String>>,
+    stderr_tail: crate::worker::StderrTail,
+    session_dir: PathBuf,
+}
+
+impl WorkerClient {
+    /// spawn worker。
+    ///
+    /// `worker_bin`：worker 可执行文件（None = 与本进程同目录的
+    /// `mdc-lok-worker`，或测试经 `CARGO_BIN_EXE_mdc-lok-worker` 注入）。
+    /// `fake`：协议自测模式（echo/hang/die；无 LOK）。
+    pub fn spawn(
+        runtime: Option<&LokRuntime>,
+        session_root: &Path,
+        worker_bin: Option<&Path>,
+        fake: Option<&str>,
+    ) -> Result<WorkerClient, LokError> {
+        let exe = worker_bin
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("mdc-lok-worker")))
+            })
+            .ok_or_else(|| LokError::Protocol("无法定位 mdc-lok-worker 可执行文件".into()))?;
+        if !exe.is_file() {
+            return Err(LokError::Protocol(format!(
+                "worker 可执行文件不存在：{exe:?}（部署时应与本进程同目录）"
+            )));
+        }
+        if fake.is_none() && runtime.is_none() {
+            return Err(LokError::Protocol(
+                "真实 worker 需要 runtime（fake 模式才可不传）".into(),
+            ));
+        }
+
+        std::fs::create_dir_all(session_root)
+            .map_err(|e| LokError::Protocol(format!("建会话目录失败：{e}")))?;
+        // 干净会话目录（残留 profile 可能带锁语义混乱；SAL_NOLOCK_PROFILE=1
+        // 下无锁，但清空最稳）
+        if let Ok(entries) = std::fs::read_dir(session_root) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    let _ = std::fs::remove_dir_all(e.path());
+                } else {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--session-dir").arg(session_root);
+        if let Some(mode) = fake {
+            cmd.arg("--fake").arg(mode);
+        }
+        if let Some(rt) = runtime {
+            cmd.arg("--kernel-lib").arg(&rt.kernel_lib);
+            cmd.arg("--program-dir").arg(&rt.program_dir);
+            cmd.arg("--kernel-sha256").arg(&rt.kernel_sha256);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // 环境卫生（worker 启动时也会自设；双侧幂等）
+        cmd.env("SAL_NOLOCK_PROFILE", "1");
+        cmd.env("SAL_DISABLE_OPENCL", "1");
+        if cfg!(windows) {
+            cmd.env("SAL_SKIA", "raster");
+        } else {
+            cmd.env("SAL_DISABLESKIA", "1");
+        }
+        // 发现序环境透传（worker 内 bind 需要同序发现）
+        for k in [LOK_HOME_ENV, LOK_LIB_ENV] {
+            if let Some(v) = std::env::var_os(k) {
+                cmd.env(k, v);
+            }
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| LokError::Protocol(format!("spawn worker 失败（{exe:?}）：{e}")))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let pending: Arc<Mutex<HashMap<u64, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
+        let dead = Arc::new(AtomicBool::new(false));
+        let death_detail = Arc::new(Mutex::new(String::new()));
+
+        // 读线程：应答路由 + 事件转发 + EOF 死亡扩散
+        std::thread::Builder::new()
+            .name("lok-reader".into())
+            .spawn({
+                let pending = pending.clone();
+                let dead = dead.clone();
+                let death_detail = death_detail.clone();
+                let ev_tx_reader = ev_tx.clone();
+                move || reader_loop(stdout, pending, ev_tx_reader, dead, death_detail)
+            })
+            .map_err(|e| LokError::Protocol(format!("spawn reader 线程失败：{e}")))?;
+
+        // stderr 线程：尾部环形保留（诊断；绝不吞掉）
+        let stderr_tail = crate::worker::StderrTail::new(200);
+        let tail_buf = stderr_tail.lines.clone();
+        std::thread::Builder::new()
+            .name("lok-stderr".into())
+            .spawn(move || {
+                let mut r = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(mut q) = tail_buf.lock() {
+                                if q.len() >= 200 {
+                                    q.pop_front();
+                                }
+                                q.push_back(line.trim_end().to_string());
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| LokError::Protocol(format!("spawn stderr 线程失败：{e}")))?;
+
+        Ok(WorkerClient {
+            child_pid: child.id(),
+            child: std::sync::Mutex::new(child),
+            stdin: std::sync::Mutex::new(stdin),
+            next_id: AtomicU64::new(1),
+            pending,
+            _events_keepalive: ev_tx,
+            event_rx: Mutex::new(Some(ev_rx)),
+            dead,
+            death_detail,
+            stderr_tail,
+            session_dir: session_root.to_path_buf(),
+        })
+    }
+
+    /// 子进程 PID（诊断/被杀步骤记录用）。
+    pub fn session_pid(&self) -> u32 {
+        self.child_pid
+    }
+
+    /// 会话目录（tile side file 落在这里）。
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    /// worker 是否已死。
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
+    /// 死亡细节（诊断）。
+    pub fn death_detail(&self) -> String {
+        self.death_detail
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    /// stderr 尾部（最近的在后）。
+    pub fn stderr_tail(&self, n: usize) -> Vec<String> {
+        self.stderr_tail.tail(n)
+    }
+
+    /// 取事件接收端（一次性；多订阅者自建 channel 转发）。
+    pub fn take_events(&self) -> Option<Receiver<Event>> {
+        self.event_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// 非阻塞取一条事件。
+    pub fn try_recv_event(&self) -> Option<Event> {
+        self.event_rx
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|rx| rx.try_recv().ok()))
+    }
+
+    /// 带超时取一条事件（回调断言用）。
+    pub fn recv_event_timeout(&self, dur: Duration) -> Option<Event> {
+        self.event_rx
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|rx| rx.recv_timeout(dur).ok()))
+    }
+
+    /// 发请求（默认超时 [`DEFAULT_TIMEOUT`]）。
+    pub fn request(&self, op: &str, args: Value) -> Result<Value, LokError> {
+        self.request_with_timeout(op, args, DEFAULT_TIMEOUT)
+    }
+
+    /// 发请求（带截止超时；超时 → 杀 worker → `Timeout`）。
+    pub fn request_with_timeout(
+        &self,
+        op: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, LokError> {
+        if self.is_dead() {
+            return Err(LokError::WorkerDied {
+                detail: format!(
+                    "worker 已死：{}（本请求 {} 未发出；脏位语义不受影响）",
+                    self.death_detail(),
+                    op
+                ),
+                stderr_tail: self.stderr_tail(10),
+            });
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
+        if let Ok(mut p) = self.pending.lock() {
+            p.insert(id, tx);
+        }
+        let mut v = json!({"id": id, "op": op});
+        if let (Some(obj), Some(extra)) = (v.as_object_mut(), args.as_object()) {
+            for (k, val) in extra {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+        // 请求帧长上限（写侧拒发）
+        let line = serde_json::to_vec(&v)
+            .map_err(|e| LokError::Protocol(format!("请求序列化失败：{e}")))?;
+        if line.len() > crate::MAX_FRAME_BYTES {
+            if let Ok(mut p) = self.pending.lock() {
+                p.remove(&id);
+            }
+            return Err(LokError::Lok {
+                code: codes::OVERSIZE.to_string(),
+                message: format!(
+                    "请求帧 {} 字节超上限 {}（op={op}）",
+                    line.len(),
+                    crate::MAX_FRAME_BYTES
+                ),
+            });
+        }
+        {
+            let guard = self
+                .stdin
+                .lock()
+                .map_err(|e| LokError::Protocol(format!("stdin 锁失败（worker 已死？）：{e}")))?;
+            let mut w = guard
+                .as_ref()
+                .ok_or_else(|| LokError::Protocol("stdin 已关闭".into()))?;
+            if let Err(e) = w
+                .write_all(&line)
+                .and_then(|_| w.write_all(b"\n"))
+                .and_then(|_| w.flush())
+            {
+                if let Ok(mut p) = self.pending.lock() {
+                    p.remove(&id);
+                }
+                return Err(LokError::WorkerDied {
+                    detail: format!("写 worker stdin 失败（op={op}）：{e}"),
+                    stderr_tail: self.stderr_tail(10),
+                });
+            }
+        }
+        let started = Instant::now();
+        match rx.recv_timeout(timeout) {
+            Ok(answer) => {
+                if answer.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    Ok(answer)
+                } else {
+                    let e = answer.get("error").cloned().unwrap_or(json!({}));
+                    Err(LokError::Lok {
+                        code: e
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .unwrap_or("E_INTERNAL")
+                            .to_string(),
+                        message: e
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("worker 应答缺错误信息")
+                            .to_string(),
+                    })
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // 看门狗：挂死内核不可信 → 杀；脏位语义在 DocHandle 层保留
+                self.kill();
+                Err(LokError::Timeout {
+                    op: op.to_string(),
+                    waited_ms: started.elapsed().as_millis(),
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(LokError::WorkerDied {
+                detail: format!("worker 死亡扩散到达（op={op}）：{}", self.death_detail()),
+                stderr_tail: self.stderr_tail(10),
+            }),
+        }
+    }
+
+    /// 硬杀 worker（超时看门狗 / 宿主主动放弃）。
+    pub fn kill(&self) {
+        if !self.dead.swap(true, Ordering::SeqCst) {
+            if let Ok(mut child) = self.child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Ok(mut d) = self.death_detail.lock() {
+                if d.is_empty() {
+                    *d = "宿主看门狗终止（超时/放弃）".into();
+                }
+            }
+        }
+        if let Ok(mut s) = self.stdin.lock() {
+            *s = None;
+        }
+        self.fail_all_pending();
+    }
+
+    /// 关机（先友好 shutdown 请求，1s 后兜底杀）。
+    pub fn shutdown(&self) {
+        if self.is_dead() {
+            return;
+        }
+        let _ = self.request_with_timeout("shutdown", json!({}), Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(300));
+        if !self.is_dead() {
+            self.kill();
+        }
+    }
+
+    fn fail_all_pending(&self) {
+        if let Ok(mut p) = self.pending.lock() {
+            let map: HashMap<u64, Sender<Value>> = std::mem::take(&mut *p);
+            for (_, tx) in map {
+                // 值不会到达：挂起方经 Disconnected 得到 WorkerDied
+                drop(tx);
+            }
+        }
+    }
+}
+
+impl Drop for WorkerClient {
+    fn drop(&mut self) {
+        if !self.is_dead() {
+            self.kill();
+        }
+    }
+}
+
+/// 读线程主体。
+fn reader_loop<R: Read>(
+    stdout: R,
+    pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    events: Sender<Event>,
+    dead: Arc<AtomicBool>,
+    death_detail: Arc<Mutex<String>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let frame = match protocol::read_frame(&mut reader) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                mark_dead(
+                    &dead,
+                    &death_detail,
+                    "worker stdout 干净 EOF（正常退出或被杀）",
+                );
+                break;
+            }
+            Err(e) => {
+                mark_dead(&dead, &death_detail, &format!("worker stdout 帧超限：{e}"));
+                break;
+            }
+        };
+        let v: Value = match serde_json::from_slice(&frame) {
+            Ok(v) => v,
+            Err(_) => continue, // 坏行跳过（应答缺失由超时兜底）
+        };
+        if let Some(ev) = v.get("ev").and_then(Value::as_str) {
+            if ev == "cb" {
+                let e = Event::Callback {
+                    type_id: v.get("type").and_then(Value::as_i64).unwrap_or(-1) as i32,
+                    name: v
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_string(),
+                    payload: v
+                        .get("payload")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    truncated: v
+                        .get("payload_truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                };
+                let _ = events.send(e);
+            } else {
+                let e = Event::Life {
+                    kind: ev.to_string(),
+                    detail: v.get("detail").cloned().unwrap_or(json!({})),
+                };
+                let _ = events.send(e);
+            }
+            continue;
+        }
+        if let Some(id) = v.get("id").and_then(Value::as_u64) {
+            if let Ok(mut p) = pending.lock() {
+                if let Some(tx) = p.remove(&id) {
+                    let _ = tx.send(v);
+                }
+            }
+        }
+    }
+    // EOF：清空所有挂起（发送端 drop → 调用方得 WorkerDied）
+    if let Ok(mut p) = pending.lock() {
+        let map: HashMap<u64, Sender<Value>> = std::mem::take(&mut *p);
+        for (_, tx) in map {
+            drop(tx);
+        }
+    }
+}
+
+fn mark_dead(dead: &AtomicBool, detail: &Mutex<String>, why: &str) {
+    dead.store(true, Ordering::SeqCst);
+    if let Ok(mut d) = detail.lock() {
+        if d.is_empty() {
+            *d = why.to_string();
+        }
+    }
+}
+
+/// 打开的文档句柄（脏位宿主侧语义）。
+pub struct DocHandle<'a> {
+    client: &'a WorkerClient,
+    dirty: std::cell::Cell<bool>,
+}
+
+impl<'a> DocHandle<'a> {
+    /// load + 建句柄（单文档 worker：成功后本 worker 上不能再 load）。
+    pub fn load(
+        client: &'a WorkerClient,
+        url: &str,
+        options: Option<&str>,
+    ) -> Result<DocHandle<'a>, LokError> {
+        let mut a = json!({"url": url});
+        if let Some(o) = options {
+            a["options"] = json!(o);
+        }
+        client.request("load", a)?;
+        Ok(DocHandle::new(client))
+    }
+
+    fn new(client: &'a WorkerClient) -> DocHandle<'a> {
+        DocHandle {
+            client,
+            dirty: std::cell::Cell::new(false),
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.set(true);
+    }
+
+    /// 任意请求的脏位包装：成功回调收到 result 后置位（编辑类 op）。
+    fn edit_request(&self, op: &str, args: Value) -> Result<Value, LokError> {
+        let r = self.client.request(op, args)?;
+        self.mark_dirty();
+        Ok(r)
+    }
+
+    pub fn ping(&self) -> Result<Value, LokError> {
+        self.client.request("ping", json!({}))
+    }
+
+    pub fn version(&self) -> Result<String, LokError> {
+        let v = self.client.request("version", json!({}))?;
+        Ok(v.get("version_info")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    pub fn init_rendering(&self, args: Option<&str>) -> Result<Value, LokError> {
+        let mut a = json!({});
+        if let Some(s) = args {
+            a["args"] = json!(s);
+        }
+        self.client.request("init_rendering", a)
+    }
+
+    pub fn size(&self) -> Result<(i64, i64), LokError> {
+        let v = self.client.request("size", json!({}))?;
+        Ok((
+            v.get("width_twips").and_then(Value::as_i64).unwrap_or(0),
+            v.get("height_twips").and_then(Value::as_i64).unwrap_or(0),
+        ))
+    }
+
+    /// paintTile（返回 side file 路径与统计）。
+    pub fn paint(
+        &self,
+        canvas_w: usize,
+        canvas_h: usize,
+        tile_x: i32,
+        tile_y: i32,
+        tile_w: i32,
+        tile_h: i32,
+    ) -> Result<Value, LokError> {
+        self.client.request(
+            "paint",
+            json!({
+                "canvas_w": canvas_w, "canvas_h": canvas_h,
+                "tile_x": tile_x, "tile_y": tile_y,
+                "tile_w": tile_w, "tile_h": tile_h,
+            }),
+        )
+    }
+
+    /// 输入文本（逐字符 KEYINPUT+KEYUP；选区被替换——标准编辑语义）。
+    /// 成功即置脏位。
+    pub fn type_text(&self, text: &str) -> Result<(), LokError> {
+        for ch in text.chars() {
+            self.edit_request("post_key", json!({"char": ch as i32, "key_code": 0}))?;
+        }
+        Ok(())
+    }
+
+    /// postUnoCommand（args = JSON 字符串）。编辑类命令成功置脏位
+    /// （查询类命令由调用方用 [`Self::uno_query`]）。
+    pub fn uno(&self, command: &str, args: Option<&str>, notify: bool) -> Result<Value, LokError> {
+        let mut a = json!({"command": command, "notify": notify});
+        if let Some(s) = args {
+            a["args"] = json!(s);
+        }
+        self.edit_request("uno", a)
+    }
+
+    /// 非变更类 UNO（SelectAll / ExecuteSearch 查找等；不置脏位）。
+    pub fn uno_query(&self, command: &str, args: Option<&str>) -> Result<Value, LokError> {
+        let mut a = json!({"command": command, "notify": false});
+        if let Some(s) = args {
+            a["args"] = json!(s);
+        }
+        self.client.request("uno", a)
+    }
+
+    /// getTextSelection。
+    pub fn text_selection(&self, mime: &str) -> Result<(String, String), LokError> {
+        let v = self
+            .client
+            .request("text_selection", json!({"mime": mime}))?;
+        Ok((
+            v.get("mime")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            v.get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ))
+    }
+
+    /// saveAs：**成功才清脏位**（issue 明文：超时/异常/失败不清）。
+    pub fn save_as(&self, url: &str, format: &str) -> Result<Value, LokError> {
+        let r = self
+            .client
+            .request("save_as", json!({"url": url, "format": format}));
+        if r.is_ok() {
+            self.dirty.set(false);
+        } // Err 路径脏位保留
+        r
+    }
+
+    pub fn close(&self) -> Result<Value, LokError> {
+        self.client.request("close", json!({}))
+    }
+}

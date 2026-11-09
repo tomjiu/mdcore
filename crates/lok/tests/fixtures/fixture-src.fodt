@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+<office:body>
+<office:text>
+<text:p text:style-name="Standard">锚点正文句甲：这是 LOK 冒烟夹具的第一段中文正文，用于搜索定位与键盘替换编辑。</text:p>
+<text:p text:style-name="Standard">相邻段落乙：本段与锚点段相邻，保存重开后必须原样保留，用于校验相邻内容不丢。</text:p>
+<text:p text:style-name="Standard">图片段落：<draw:frame draw:name="probe" svg:width="2cm" svg:height="2cm" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAANElEQVR42mP4jwTkNPbB0Qk5OTgiRpxhGBtEiWZk8eFsECWaUQJ7GBs0mo5G09FoOqKLQQAI3Giv+qCwHgAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame></text:p>
+<text:p text:style-name="Standard">表格前置段落：下表用于校验单元格键盘编辑。</text:p>
+<table:table table:name="probetable">
+<table:table-column/><table:table-column/>
+<table:table-row><table:table-cell><text:p>表头一</text:p></table:table-cell><table:table-cell><text:p>表头二</text:p></table:table-cell></table:table-row>
+<table:table-row><table:table-cell><text:p>表格单元格丙</text:p></table:table-cell><table:table-cell><text:p>表格单元格丁</text:p></table:table-cell></table:table-row>
+</table:table>
+<text:p text:style-name="Standard">末尾段落戊：文档结尾哨兵文本。</text:p>
+</office:text>
+</office:body>
+</office:document>
