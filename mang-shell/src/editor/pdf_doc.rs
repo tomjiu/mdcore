@@ -617,6 +617,7 @@ impl PdfPayload {
                 // 层叠加，不是文本层改写；ocr.is_some() 是「已识别」判据）。
                 scanned: self.props.scanned,
             },
+            security_findings: self.security_findings.clone(),
             ocr: Some(outcome),
         }
     }
