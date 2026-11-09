@@ -544,3 +544,41 @@ fn export_omits_absent_sides() {
     assert!(v["edges"][0].get("fromSide").is_none(), "无 side 不导键");
     assert!(v["edges"][0].get("toSide").is_none(), "无 side 不导键");
 }
+
+/// C3（round-40 §3.3 遗留用例，#406 残余收口）：导出为规范形——
+/// 纯导入→导出的产物再往返，二次导出**逐字节恒等**（props 保留 +
+/// typed 同步双保险的机械锁定；比 `roundtrip_objects_survive` 的
+/// 对象级幂等更强——钉到字节面）。
+#[test]
+fn export_canonical_bytes_reexport_identical() {
+    let first = import_json_canvas(SPEC_SAMPLE).unwrap();
+    let e1 = export_json_canvas(&first);
+    let second = import_json_canvas(&e1).unwrap();
+    let e2 = export_json_canvas(&second);
+    assert_eq!(e1, e2, "二次导出须逐字节恒等（规范形固定点）");
+}
+
+/// #406 残余登记面锁定：产品边 caption（一等字段 + 渲染消费，#447
+/// 交付面）在 JSON Canvas 导出即丢——规范边仅 label。本测试把
+/// 「登记的损失」锁成机械事实：升级路径（label 空时 caption→label /
+/// `jc:caption` 专键往返）属 #406 裁决位——实施时须同步更新本测试
+/// 与模块文档映射表（不许可静默漂移，也不可顺手造伪值）。
+#[test]
+fn edge_caption_export_loss_registered() {
+    let mut objs = import_json_canvas(SPEC_SAMPLE).unwrap();
+    let e1 = objs.iter_mut().find(|o| o.id == "e1").unwrap();
+    e1.caption = Some("审批通过".into());
+    let exported = export_json_canvas(&objs);
+    // 损失面现状：caption 文本不出现在导出产物。
+    assert!(
+        !exported.contains("审批通过"),
+        "caption 导出即丢（模块文档登记的损失面）"
+    );
+    // label 语义不被污染（既不顶替 label 也不造伪键）。
+    let v: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(v["edges"][0]["label"], "包含", "label 原语义保持");
+    // 再导入：caption 为 None（丢失可观察——不造伪值）。
+    let back = import_json_canvas(&exported).unwrap();
+    let e1_back = back.iter().find(|o| o.id == "e1").unwrap();
+    assert_eq!(e1_back.caption, None, "再导入 caption 丢失（无伪值）");
+}
