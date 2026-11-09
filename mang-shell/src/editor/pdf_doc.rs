@@ -1450,6 +1450,7 @@ fn with_ocr_rebuilds_line_model() {
         }],
         outline: vec![],
         security_notices: vec![],
+        security_findings: vec![],
     };
     let scanned = convert(&raw);
     assert!(scanned.props.scanned, "前置：扫描件判定");
@@ -1546,6 +1547,7 @@ fn with_ocr_preserves_security_notices() {
         }],
         outline: vec![],
         security_notices: vec!["【安全】检测到 JavaScript 嵌入（S2 只读告警）。".into()],
+        security_findings: vec![],
     };
     let scanned = convert(&raw);
     assert!(scanned.text.contains("JavaScript"), "前置：安全提示在位");
