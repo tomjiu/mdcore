@@ -165,6 +165,14 @@ jobs:
         shell: bash
         run: python test-artifacts/pdf-corpus/fetch_corpus.py
 
+      # #634：mdc-pdf 引擎面新增显示对照硬门（pdfr_display_matrix 六
+      # 测试面）：parity_vs_poppler 现场对照 pdftoppm——需要 poppler
+      # 工具链；MDC_634_REQUIRE_PARITY=1 时缺席即 FAIL（防静默 SKIP
+      # 假绿——与本地门同款语义）。
+      - name: Install poppler (pdftoppm for #634 parity gate)
+        shell: pwsh
+        run: choco install -y poppler
+
       - name: Test mdc-pdf (lopdf + pdfium 双引擎面——#210 真实环境验证)
         # #210/#222：pdfium 测试面 CI 化——此前本步骤只开 engine-lopdf
         # （注释自认「pdfium 面需要动态库，CI 上没有」= engine-pdfium
@@ -175,6 +183,7 @@ jobs:
         # 旁、走候选 0 绑定）。
         env:
           MDC_PDFIUM_LIB: ${{ github.workspace }}/bin/lib/pdfium.dll
+          MDC_634_REQUIRE_PARITY: "1"
         run: cargo test -p mdc-pdf --features engine-lopdf,engine-pdfium
 
       - name: Test mdc-formula (xlsx formula engine)
@@ -225,6 +234,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #634：test-shell 面此前不装 pdfium——mang-shell --lib 的 PDFium
+      # 真跑测试（engine_pdfium 接线的页面视图/缩略图/查找/批注面）
+      # 在 CI 全走「库缺席」SKIP 路径，声称覆盖实则零执行。与
+      # test-engine 同款取件（同 SHA256 铆定）+ MDC_PDFIUM_LIB 注入。
+      - name: Cache pdfium (shell job)
+        id: pdfium-cache-shell
+        uses: actions/cache@v4
+        with:
+          path: bin/lib/pdfium.dll
+          key: pdfium-win-x64-chromium-8086-v1
+
+      - name: Fetch pdfium (win-x64, pinned chromium/8086)
+        if: steps.pdfium-cache-shell.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p bin/lib
+          curl -fL "https://github.com/mmqz/mdcore/releases/download/ci-deps-v1/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
+          echo "1fd8af952832dbb0eb16d9249f68fe09e5f5ebf7c3dd9f6066ea2720cc28487d  /tmp/pdfium-win-x64.tgz" | sha256sum -c -
+          rm -rf /tmp/pdfium-x && mkdir -p /tmp/pdfium-x
+          tar -xzf /tmp/pdfium-win-x64.tgz -C /tmp/pdfium-x
+          cp /tmp/pdfium-x/bin/pdfium.dll bin/lib/pdfium.dll
+          test -f bin/lib/pdfium.dll && echo "pdfium.dll in place ($(stat -c%s bin/lib/pdfium.dll) bytes)"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -247,11 +279,19 @@ jobs:
 
       - name: cargo test --lib (编辑器逻辑 + docx/pdf/xlsx 映射)
         working-directory: mang-shell
+        # #634：库注入——PDFium 面测试（页面视图/缩略图/查找/批注/
+        # pdf_display_verify 显示验证模块）从 SKIP 转真跑。
+        env:
+          MDC_PDFIUM_LIB: ${{ github.workspace }}/bin/lib/pdfium.dll
         # perf 门槛测试在 4 核 runner 上会抖动——单线程跑（本地单跑 0.12s 稳定）。
         run: cargo test --lib -- --test-threads=1
 
       - name: cargo test (集成测试：docx 往返/端到端/语料)
         working-directory: mang-shell
+        # #634：库注入同 --lib 面（#386 的 e2e 开面环境门从 SKIP 横幅
+        # 转真跑路径）。
+        env:
+          MDC_PDFIUM_LIB: ${{ github.workspace }}/bin/lib/pdfium.dll
         # 跳过两个「重/环境敏感」的语料测试：
         #   · real_rust_corpus_full_sweep —— 扫描全仓 .rs（11 分钟），CI 太慢
         #   · real_rust_file_string_and_comment_are_ignored —— CI 环境失败待查

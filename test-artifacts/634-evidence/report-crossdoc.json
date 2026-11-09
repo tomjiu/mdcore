@@ -1,0 +1,236 @@
+{
+  "face": "cross_document_render_and_aspect",
+  "head": {
+    "mdc_pdfium_lib_env": "/home/z/my-project/cb634/bin/lib/libpdfium.so",
+    "pdfium_lib": {
+      "path": "/home/z/my-project/cb634/target/debug/deps/libpdfium.so",
+      "provenance": "chromium/8086（CI ci-deps-v1 同轨铆定）",
+      "role": "exe 同目录（产品部署位）",
+      "sha256": "e995a89f11d48605a79a0e44f101ca3a621e5c3ef9ee311a1405e03b44dc5b19"
+    },
+    "poppler": null
+  },
+  "rows": [
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "chinese_embedded.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "chinese_embedded.pdf",
+      "page": 2
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "chinese_missing_font.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "chinese_missing_font.pdf",
+      "page": 2
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "scanned_gray.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "vector_graphics.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "transparency_blend.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.4,
+      "bitmap": [
+        120,
+        93
+      ],
+      "display_size_pt": [
+        640.0,
+        494.0
+      ],
+      "file": "cropped_mediabox.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.18,
+      "bitmap": [
+        120,
+        85
+      ],
+      "display_size_pt": [
+        841.8898,
+        595.2756
+      ],
+      "file": "rotation_matrix.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "rotation_matrix.pdf",
+      "page": 2
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "landscape_mixed.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.18,
+      "bitmap": [
+        120,
+        85
+      ],
+      "display_size_pt": [
+        841.8898,
+        595.2756
+      ],
+      "file": "landscape_mixed.pdf",
+      "page": 2
+    },
+    {
+      "aspect_delta_pct": 0.0,
+      "bitmap": [
+        120,
+        120
+      ],
+      "display_size_pt": [
+        600.0,
+        600.0
+      ],
+      "file": "landscape_mixed.pdf",
+      "page": 3
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "multipage_120.pdf",
+      "page": 1
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "multipage_120.pdf",
+      "page": 60
+    },
+    {
+      "aspect_delta_pct": 0.17,
+      "bitmap": [
+        120,
+        170
+      ],
+      "display_size_pt": [
+        595.2756,
+        841.8898
+      ],
+      "file": "multipage_120.pdf",
+      "page": 120
+    },
+    {
+      "aspect_delta_pct": 0.0,
+      "bitmap": [
+        120,
+        2160
+      ],
+      "display_size_pt": [
+        40.0,
+        720.0
+      ],
+      "file": "tiny_note.pdf",
+      "page": 1
+    }
+  ]
+}
