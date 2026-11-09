@@ -6,6 +6,9 @@
 //! 在 issue #588 评论在案：clean tracked 误报新增 / 恢复 clean 复发 /
 //! 无 HEAD 双场景吞初始变更 / 空格+Unicode clean 误报。
 //!
+//! #598 追加：子目录工作区基准统一验收（仓根/一级/两级三档 status →
+//! diff 链路、相似名不串读 + 范围收窄、特殊名/rename/无 HEAD+SHA256）。
+//!
 //! 环境门（AGENTS 诚实边界）：git 缺失环境跳过全场景（横幅明示，不
 //! 伪装通过）——CI windows-latest 与开发机恒有 git。
 
@@ -486,4 +489,202 @@ fn no_index_execution_failure_returns_none() {
         None,
         "execution failure must not appear as empty success"
     );
+}
+
+// ------------------------------------------------------------------
+// #598 —— 子目录工作区：仓库根执行 + 仓库根相对 path 基准统一
+//（验收四条的生产 API 面：git_status → git_diff 链路在三档深度、
+//  相似名/特殊名/rename、无 HEAD+SHA256 下都返回真实内容不空 diff）
+// ------------------------------------------------------------------
+
+/// 建仓 + 嵌套目录种子文件提交（#598 子目录场景共用底座）。
+fn nested_repo(tag: &str) -> PathBuf {
+    let dir = repo(tag);
+    std::fs::create_dir_all(dir.join("nested/deep")).unwrap();
+    std::fs::write(dir.join("nested/tracked.txt"), "基线\n").unwrap();
+    std::fs::write(dir.join("nested/deep/deep.txt"), "深基线\n").unwrap();
+    sh(&dir, &["add", "--all"]);
+    sh(&dir, &["commit", "-q", "-m", "init"]);
+    dir
+}
+
+/// 验收 1：仓根 / 一级 / 两级子目录三档工作区，status → diff
+/// 链路返回同一批已修改文件的真实内容（不空 diff）。
+#[test]
+fn subdir_workspace_three_depths_roundtrip() {
+    if !git_present() {
+        eprintln!("SKIP（#598 环境门）：无 git");
+        return;
+    }
+    let dir = nested_repo("598-depths");
+    std::fs::write(dir.join("nested/tracked.txt"), "基线\n改动\n").unwrap();
+    std::fs::write(dir.join("nested/deep/deep.txt"), "深基线\n深改\n").unwrap();
+
+    // 仓根口径：仓库根相对 path。
+    let changes = mang_shell::git_repo::git_status(&dir).unwrap();
+    let tracked = changes
+        .iter()
+        .find(|c| c.path == "nested/tracked.txt")
+        .expect("仓根口径列出 nested/tracked.txt");
+    assert_eq!(tracked.code, "M");
+    let diff = git_diff(&dir, "nested/tracked.txt").expect("仓根 diff");
+    assert!(diff.contains("+改动"), "仓根口径真实 hunk（实测 {diff:?}）");
+
+    // 一级子目录：path 收窄为工作区相对。
+    let nested = dir.join("nested");
+    let changes = mang_shell::git_repo::git_status(&nested).unwrap();
+    assert_eq!(
+        changes.len(),
+        2,
+        "一级工作区含本范围内的两处改动；实测 {changes:?}"
+    );
+    changes
+        .iter()
+        .find(|c| c.path == "tracked.txt")
+        .expect("工作区相对 path（不带 nested/ 前缀）");
+    let diff = git_diff(&nested, "tracked.txt").expect("一级子目录 diff（非空）");
+    assert!(
+        diff.contains("+改动") && !diff.is_empty(),
+        "一级子目录链路：真实 hunk（#598 缺陷面——基线 0 字节）"
+    );
+    changes
+        .iter()
+        .find(|c| c.path == "deep/deep.txt")
+        .expect("下级文件以工作区相对列出");
+
+    // 两级子目录：deep 作为工作区。
+    let deep_ws = dir.join("nested/deep");
+    let changes = mang_shell::git_repo::git_status(&deep_ws).unwrap();
+    assert_eq!(changes.len(), 1, "两级工作区只含自己范围内改动");
+    assert_eq!(changes[0].path, "deep.txt");
+    let diff = git_diff(&deep_ws, "deep.txt").expect("两级子目录 diff");
+    assert!(diff.contains("+深改"), "两级子目录链路返回真实 hunk");
+    // 范围外不存在文件：deep 工作区里 tracked.txt 解析为
+    // nested/deep/tracked.txt → 不在库 → 诊断性 None（不产伪 diff）。
+    assert_eq!(
+        git_diff(&deep_ws, "tracked.txt"),
+        None,
+        "范围外不存在文件：诊断性 None（不伪 diff 不伪 clean）"
+    );
+}
+
+/// 验收 2：相似名不串读 + 工作区范围收窄（范围外改动在仓根口径仍在）。
+#[test]
+fn subdir_scope_narrows_and_similar_names_do_not_cross_read() {
+    if !git_present() {
+        eprintln!("SKIP（#598 环境门）：无 git");
+        return;
+    }
+    let dir = repo("598-similar");
+    std::fs::write(dir.join("a.txt"), "顶层\n").unwrap();
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::create_dir_all(dir.join("nestedx")).unwrap();
+    std::fs::write(dir.join("nested/a.txt"), "巢\n").unwrap();
+    std::fs::write(dir.join("nestedx/a.txt"), "巢邻\n").unwrap();
+    sh(&dir, &["add", "--all"]);
+    sh(&dir, &["commit", "-q", "-m", "init"]);
+    std::fs::write(dir.join("nested/a.txt"), "巢\n巢改\n").unwrap();
+    std::fs::write(dir.join("nestedx/a.txt"), "巢邻\n邻改\n").unwrap();
+
+    let nested = dir.join("nested");
+    let changes = mang_shell::git_repo::git_status(&nested).unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "前缀整段精确（nestedx 不误切）；顶层与 nestedx 改动范围外丢弃"
+    );
+    assert_eq!(changes[0].path, "a.txt");
+    let diff = git_diff(&nested, "a.txt").expect("相似名 diff");
+    assert!(diff.contains("+巢改"), "读工作区文件 nested/a.txt");
+    assert!(!diff.contains("+邻改"), "不串读前缀邻居 nestedx/a.txt");
+    assert!(!diff.contains("顶层"), "不串读顶层 a.txt");
+
+    // 反证：范围收窄不是丢失——仓根口径仍列出并 diff 范围外改动。
+    let all = mang_shell::git_repo::git_status(&dir).unwrap();
+    assert!(
+        all.iter().any(|c| c.path == "nestedx/a.txt"),
+        "仓根口径完整（收窄只发生在子目录工作区）"
+    );
+    let neighbor = git_diff(&dir, "nestedx/a.txt").expect("仓根口径 nestedx diff");
+    assert!(neighbor.contains("+邻改"));
+}
+
+/// 验收 2/3：子目录下的空格/Unicode/[1] 特殊名、rename 组合、
+/// 未跟踪新增、无 HEAD SHA256 新仓。
+#[test]
+fn subdir_special_names_rename_and_no_head_sha256() {
+    if !git_present() {
+        eprintln!("SKIP（#598 环境门）：无 git");
+        return;
+    }
+    // —— 特殊名 + rename（HEAD 仓）——
+    let dir = repo("598-special");
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("nested/带 空格 名.txt"), "中文\n").unwrap();
+    std::fs::write(dir.join("nested/r[1].txt"), "literal\n").unwrap();
+    std::fs::write(dir.join("nested/r1.txt"), "sibling\n").unwrap();
+    std::fs::write(dir.join("nested/旧 名.txt"), "一\n二\n三\n四\n五\n六\n七\n八\n").unwrap();
+    sh(&dir, &["add", "--all"]);
+    sh(&dir, &["commit", "-q", "-m", "init"]);
+    std::fs::write(dir.join("nested/带 空格 名.txt"), "中文\n追加\n").unwrap();
+    std::fs::write(dir.join("nested/r1.txt"), "sibling\nchanged\n").unwrap();
+    std::fs::write(dir.join("nested/新 未跟踪 [1].txt"), "全新\n").unwrap();
+    sh(&dir, &["mv", "--", "nested/旧 名.txt", "nested/新 名.txt"]);
+
+    let nested = dir.join("nested");
+    let changes = mang_shell::git_repo::git_status(&nested).unwrap();
+    let renamed = changes
+        .iter()
+        .find(|c| c.code.contains('R'))
+        .expect("rename 在列");
+    assert_eq!(renamed.path, "新 名.txt", "rename 目标为工作区相对路径");
+    let diff = git_diff(&nested, "新 名.txt").expect("rename diff");
+    assert!(
+        diff.contains("rename from") && diff.contains("rename to"),
+        "rename from/to 组合保持（源以仓库根相对参与上下文）"
+    );
+    let diff = git_diff(&nested, "带 空格 名.txt").expect("Unicode 修改 diff");
+    assert!(diff.contains("+追加"), "空格+Unicode 修改差异正确");
+    let diff = git_diff(&nested, "r[1].txt").expect("literal 名 clean 有结果");
+    assert!(
+        diff.is_empty(),
+        "未改动的字面 r[1].txt 不串读 r1.txt 的改动（实测 {diff}）"
+    );
+    assert!(
+        git_diff(&nested, "r1.txt").unwrap().contains("+changed"),
+        "兄弟文件差异正常"
+    );
+    let untracked = changes
+        .iter()
+        .find(|c| c.code == "??")
+        .expect("未跟踪在列");
+    assert_eq!(untracked.path, "新 未跟踪 [1].txt", "特殊名字面保留");
+    let diff = git_diff(&nested, "新 未跟踪 [1].txt").expect("未跟踪 diff");
+    assert!(
+        diff.contains("+全新") && diff.contains("new file mode"),
+        "未跟踪特殊名 → 新增全文"
+    );
+
+    // —— 无 HEAD SHA256 新仓（子目录工作区）——
+    let dir = std::env::temp_dir().join(format!("mdc-598-sha256-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    sh(&dir, &["init", "-q", "--object-format=sha256"]);
+    sh(&dir, &["config", "user.email", "probe@local"]);
+    sh(&dir, &["config", "user.name", "probe"]);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("nested/初始.txt"), "初始内容\n").unwrap();
+    std::fs::write(dir.join("nested/未跟踪.txt"), "无头新增\n").unwrap();
+    sh(&dir, &["add", "--", "nested/初始.txt"]);
+    let nested = dir.join("nested");
+    let changes = mang_shell::git_repo::git_status(&nested).unwrap();
+    let staged = changes
+        .iter()
+        .find(|c| c.path == "初始.txt")
+        .expect("staged 以工作区相对列出");
+    assert_eq!(staged.code, "A");
+    let diff = git_diff(&nested, "初始.txt").expect("无 HEAD staged 不吞");
+    assert!(diff.contains("+初始内容"), "SHA256 空树 base 正确（vs 空树）");
+    let diff = git_diff(&nested, "未跟踪.txt").expect("无 HEAD untracked diff");
+    assert!(diff.contains("+无头新增"), "无 HEAD 未跟踪新增可见");
 }
