@@ -110,6 +110,9 @@ mod pdf_annotate;
 // lib.rs 侧 `pub mod pdf_export_docx;` 双根声明，bin 侧缺声明会 E0433）。
 mod pdf_export_docx;
 mod pdf_pages;
+// #420：PDF 页面缩略图侧栏（bin 根声明——shell.rs 壳接线消费；与
+// lib.rs 双根同文件复用，缺此声明 bin 面 E0432）。
+mod pdf_thumbs;
 // #389 阶段 1：XLSX 网格视图（真网格渲染骨架——office-io 读面 →
 // 网格模型 + 双向虚拟化 + 单元格点选）。
 mod right_dock;
