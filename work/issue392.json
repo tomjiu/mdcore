@@ -1,0 +1,78 @@
+{
+  "url": "https://api.github.com/repos/mmqz/mdcore/issues/392",
+  "repository_url": "https://api.github.com/repos/mmqz/mdcore",
+  "labels_url": "https://api.github.com/repos/mmqz/mdcore/issues/392/labels{/name}",
+  "comments_url": "https://api.github.com/repos/mmqz/mdcore/issues/392/comments",
+  "events_url": "https://api.github.com/repos/mmqz/mdcore/issues/392/events",
+  "html_url": "https://github.com/mmqz/mdcore/issues/392",
+  "id": 6256780176,
+  "node_id": "I_kwDOVDNLe88AAAABdO7jkA",
+  "number": 392,
+  "title": "【常驻·不限人数】全仓增量审计（30 commit）+ 综合审计（200 commit）——产品闭环核查",
+  "user": {
+    "login": "mmqz",
+    "id": 260861911,
+    "node_id": "U_kgDOD4xv1w",
+    "avatar_url": "https://avatars.githubusercontent.com/u/260861911?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/mmqz",
+    "html_url": "https://github.com/mmqz",
+    "followers_url": "https://api.github.com/users/mmqz/followers",
+    "following_url": "https://api.github.com/users/mmqz/following{/other_user}",
+    "gists_url": "https://api.github.com/users/mmqz/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/mmqz/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/mmqz/subscriptions",
+    "organizations_url": "https://api.github.com/users/mmqz/orgs",
+    "repos_url": "https://api.github.com/users/mmqz/repos",
+    "events_url": "https://api.github.com/users/mmqz/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/mmqz/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "labels": [
+
+  ],
+  "state": "open",
+  "locked": false,
+  "assignees": [
+
+  ],
+  "milestone": null,
+  "comments": 0,
+  "created_at": "2026-11-07T08:07:10Z",
+  "updated_at": "2026-11-07T08:15:56Z",
+  "closed_at": null,
+  "assignee": null,
+  "author_association": "OWNER",
+  "active_lock_reason": null,
+  "sub_issues_summary": {
+    "total": 0,
+    "completed": 0,
+    "percent_completed": 0
+  },
+  "issue_dependencies_summary": {
+    "blocked_by": 0,
+    "total_blocked_by": 0,
+    "blocking": 0,
+    "total_blocking": 0
+  },
+  "body": "# 【常驻任务 · 不限接取人数】全仓增量审计（30 commit）+ 综合审计（200 commit）\n\n> **本 issue 长期开放，可多人同时接取。** 每次审计贴独立报告，互不覆盖。\n\n---\n\n# 审计节奏（硬性）\n\n```\n增量审计：main 前进 >= 30 个 commit 未审计  -> 必须做一次（1-2 小时）\n综合审计：main 前进 >= 200 个 commit 未审计 -> 必须做一次（约 1 天）\n```\n\n## 当前基线（每次审计后必须更新）\n\n| 仓 | 上次审计点 | 当前 main | 已累积 | 分支 |\n|---|---|---|---|---|\n| mdcore | `70ab769` | `70ab769` | 0 | 32 个（已合并 0） |\n| ai-bid | `a53fa27` | `a53fa27` | 0 | 58 个（已合并 0） |\n\n```bash\ngit fetch origin main\ngit rev-list --count 70ab769..origin/main    # mdcore\ngit rev-list --count a53fa27..origin/main    # ai-bid\n```\n\n**2026-11-07 首次清理**：mdcore 72→32（删 40）、ai-bid 90→58（删 32）。\n\n---\n\n# 🔴 增量审计必做（每次 30 commit 都要做）\n\n## 固定项 1：分支清理\n\n**分类规则（Lead 2026-11-07 裁定）：**\n\n```\n① 已合并进 main          -> 直接删（零风险）\n② 完全落后（无独有 commit）-> 进一步分析后删（看有无未合 PR）\n③ 有独有 commit 且无 PR   -> 僵尸分支，报告 Lead\n④ 有独有 commit 且有 open PR -> 活跃，不动\n```\n\n```bash\ngit fetch --prune origin\n\n# ① 已合并（可删）\ngit branch -r --merged origin/main | grep -v \"HEAD\\|origin/main$\"\n\n# ② 完全落后（无独有 commit，但要先确认无 open PR）\nfor b in $(git branch -r | grep -v HEAD | sed \"s|origin/||\"); do\n  ahead=$(git rev-list --count origin/main..origin/$b)\n  if [ \"$ahead\" = \"0\" ]; then echo \"落后: $b\"; fi\ndone\n\n# ③ 有独有 commit：查是否有 open PR\n#    有 PR -> 活跃；无 PR -> 僵尸，报告\ngh pr list --state open --json number,headRefName\n```\n\n**删除命令：**\n\n```bash\ngit push origin --delete <branch>\n```\n\n## 固定项 2：issue 有效性\n\n```bash\n# ① 已完成的 issue 是否已关\ngh api \"repos/mmqz/<repo>/issues?state=closed&per_page=30\" \\\n  --jq '.[] | select(.pull_request==null) | \"#\\(.number) \\(.title)'\"\n# 逐个核实：真的完成了吗？有没有 #283 那种「只修了一半就关」？\n\n# ② 重复 issue\n#   按关键词聚类，看有没有两个 issue 说的是同一件事\n\n# ③ issue 描述是否还准确\n#   引用的文件还在吗？行号还准吗？\ngh issue view <N> | grep -oE \"[a-zA-Z/_-]+\\.rs\" | while read f; do\n  test -f \"$f\" || echo \"失效引用: $f in #<N>\"\ndone\n\n# ④ 认领是否僵尸（AGENTS 0.0.6）\n#   认领 >12h 无分支/PR/评论 -> 释放\n```\n\n## 固定项 3：文档一致性\n\n```bash\n# ① 数字漂移\ncd bidcore && cargo run -q -p bid-mcp --bin tool-surface -- --check\n#   -> 工具面数字自动核对\n\n# ② 声称-实现倒挂（抽样 5 处）\ngit grep -n \"增量\\|签名仍有效\\|保持\\|不丢\\|完整\\|原子\" -- \"*/src/*.rs\" | head -5\n#   逐个核实注释说的和代码做的一致吗\n\n# ③ 路径漂移\ngit grep -ohE \"\\x60[a-zA-Z0-9_/-]+\\.(rs|md|toml|py)\\x60\" -- \"*.md\" | sort -u | head -20\n#   逐个 test -f\n```\n\n## 固定项 4：仓库卫生\n\n```bash\n# ① 构建产物泄漏\ngit ls-files | grep -E \"^(target|node_modules|dist|build)/\" \n\n# ② 大文件\ngit ls-files | xargs -I{} ls -la {} 2>/dev/null | sort -k5 -rn | head -10\n\n# ③ 临时文件\ngit ls-files | grep -E \"\\.(log|tmp|bak|swp)$|_ctx/\"\n\n# ④ .gitignore 完整性\n#   新增的产物目录有没有加进去\nls -d */ | while read d; do\n  git check-ignore -q \"$d\" || echo \"未忽略目录: $d\"\ndone\n```\n\n## 固定项 5：孤儿 crate（有引擎没接线）\n\n```bash\nfor c in crates/*/; do\n  name=$(basename \"$c\")\n  if ! git grep -q \"mdc-$name\" -- \"*/Cargo.toml\"; then\n    echo \"孤儿: $name\";\n  fi\ndone\n```\n\n**已知孤儿：`crates/overlay`（#387）。**\n\n---\n\n# 🟠 增量审计选做（有发现就查）\n\n## 选做 1：死断言抽样\n\n```bash\ngit grep -n \"assert!(true)\\|assert_eq!(x, x)\\|unwrap()\" -- \"*/tests/*.rs\" | head -10\n```\n\n## 选做 2：产品路径上的 unwrap\n\n```bash\ngit grep -n \"unwrap()\\|expect(\" -- \"*/src/*.rs\" | grep -v \"test\" | head -20\n```\n\n## 选做 3：依赖重复 / 未使用\n\n```bash\ncargo tree --duplicates 2>&1 | head -20\ncargo clippy --workspace --all-targets 2>&1 | grep -E \"dead_code|never used\" | head -20\n```\n\n---\n\n# 🔵 综合审计额外项（200 commit 才做）\n\n## 综合 1：全仓测试\n\n```bash\ncargo test --workspace --all-targets -- --nocapture 2>&1 | tee /tmp/fulltest.log\ncd mang-shell && cargo test --tests 2>&1 | tee /tmp/mangshell-test.log\n```\n\n**注意：单次 50-110 分钟属正常。**\n\n## 综合 2：产品闭环矩阵（最重要）\n\n**逐个格式走用户路径，标出断在哪一步：**\n\n| 格式 | 打开 | 看到 | 能改 | 能存 | 重开还在 | 断在哪 |\n|---|---|---|---|---|---|---|\n| Markdown | | | | | | |\n| DOCX | | | | | | |\n| XLSX | | | | | | |\n| PDF（读） | | | | | | |\n| PDF（批注） | | | | | | |\n| 画布 | | | | | | |\n| DOCX→PDF | | | | | | |\n| PDF→DOCX | | | | | | |\n\n**每格填 ✅ / ❌ / ⚠️ + 证据（文件:行 或 测试名）。**\n\n## 综合 3：测试有效性（变异抽样）\n\n```\n挑 3 处关键逻辑，手工改一行，看测试该红吗：\n  ① 改一个边界条件（< 改成 <=）\n  ② 改一个返回值（true 改成 false）\n  ③ 删一个校验（if 语句整块删）\n\n三处都该红。有一处不红 = 测试无效。\n```\n\n**参考 FG-10 的做法：三变异全 KILLED 才证明约束存在。**\n\n## 综合 4：性能回归\n\n```bash\n# 大文件加载\n#   100MB docx / 1000 页 pdf 打开耗时\n# 关键路径计时\ngit grep -n \"Instant::now\" -- \"*/src/*.rs\" | head\n```\n\n## 综合 5：平台覆盖\n\n```bash\n# 三平台是否都能构建（看 CI）\ngh run list --limit 10\n# 打包产物体积\nls -la packaging/ 2>/dev/null\n```\n\n## 综合 6：安全面\n\n```bash\n# 路径穿越\ngit grep -n \"PathBuf::from.*user\\|join(.*input\" -- \"*/src/*.rs\" | head\n# 反序列化炸弹（超大 zip/xml）\ngit grep -n \"decompress\\|inflate\" -- \"*/src/*.rs\" | head\n```\n\n## 综合 7：能力矩阵更新\n\n```bash\ngh issue view 161   # 工作地图，每次综合审计后必须更新能力矩阵\n```\n\n## 综合 8：假绿登记册复核\n\n```bash\n# 逐条检查 audit/false-green-register.md 里的 FG-01~18 是否真的修了\n```\n\n---\n\n# 已知缺口（审计时先查这些）\n\n| # | 问题 | issue | 状态 |\n|---|---|---|---|\n| 1 | PDF 批注不落盘 | #386 | 待接 P0 |\n| 2 | overlay 层孤岛 | #387 | 待接 P0 |\n| 3 | XLSX 桌面只读 | #389 | 待接 P1 |\n| 4 | GPUI 手写 UI | #385 | 待接 P0 |\n| 5 | Word 排版层空缺 | #309 | 1.0 借 LO |\n| 6 | PDF→DOCX 未实现 | #307 | 待裁定 |\n| 7 | PDF 消费倒挂 | #302 | 待接 P0 |\n| 8 | forms 毁签名 | #303 | 待接 P0 |\n\n---\n\n# 报告模板\n\n```markdown\n## <增量|综合>审计报告 <日期>（<上次点>..<当前点>，N commits）\n\n### 1. 分支清理\n| 类型 | 数量 | 处理 |\n|---|---|---|\n| 已合并 | N | 已删 |\n| 完全落后 | N | 已删/待分析 |\n| 僵尸（有 commit 无 PR） | N | 报告 Lead |\n\n### 2. 发现的缺口\n| # | 类型 | 位置 | 问题 | 建议 |\n|---|---|---|---|---|\n\n### 3. 已开的 issue\n- #NNN <标题>\n\n### 4. 无需行动\n- <检查过没问题的>\n\n### 5. 基线更新\n上次审计点 -> 本次审计点\n```\n\n---\n\n# 纪律\n\n```\n1. 本 issue 不限接取人数——多人可同时审不同模块\n2. 每次审计贴独立报告（标题带日期，互不覆盖）\n3. 发现的缺口必须开新 issue（不要只写在报告里）\n4. 审计完更新顶部「基线」表格\n5. 只审计不改代码（保持独立性；发现问题开 issue）\n6. 报告要贴证据（文件:行 / 命令输出），不要泛泛而谈\n7. 删分支前必须确认：已合并 OR (无独有 commit AND 无 open PR)\n```\n\n# 参考\n\n```\naudit/false-green-register.md   假绿登记册 FG-01~18\naudit/README.md                 审计归档\n#161  工作地图（能力矩阵）\n#272  任务池\nAGENTS.md 0.0.10  引擎能力 ≠ 产品可用\n```",
+  "closed_by": null,
+  "reactions": {
+    "url": "https://api.github.com/repos/mmqz/mdcore/issues/392/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "timeline_url": "https://api.github.com/repos/mmqz/mdcore/issues/392/timeline",
+  "performed_via_github_app": null,
+  "state_reason": null,
+  "pinned_comment": null
+}

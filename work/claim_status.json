@@ -1,0 +1,586 @@
+{
+ "44": {
+  "title": "[P3·后置] 画布自由绘制（笔迹层）—— 现在不做，主线通了之后再加",
+  "labels": [],
+  "n_comments": 4,
+  "claims": []
+ },
+ "68": {
+  "title": "[主线] mang-shell 原生壳：质量优先的编辑器重建（耦合=不可接受，依赖面 ≤5）",
+  "labels": [],
+  "n_comments": 30,
+  "claims": []
+ },
+ "161": {
+  "title": "[工作地图] mdcore 能力矩阵 + 接手须知 + 常见坑（唯一地图，持续更新）",
+  "labels": [],
+  "n_comments": 5,
+  "claims": []
+ },
+ "208": {
+  "title": "[分工] 代理 A 任务单 v3（最终）——菜单栏/pdfium/性能/keymap/多标签/主题",
+  "labels": [],
+  "n_comments": 7,
+  "claims": []
+ },
+ "230": {
+  "title": "【排期总纲】引擎主仓开发排期（2026-11-05 · 研究仓对比 + #68 现状 + 审计交叉核对）",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-06T08:40:45Z",
+    "head": "R6（#257）完成报备：PR #259 待 Lead 审核。"
+   }
+  ]
+ },
+ "240": {
+  "title": "【R5 后续·P1】打印管线缺失（Acrobat parity 高频面 0%）——最小闭环 = Rasterizer → 宿主打印流",
+  "labels": [],
+  "n_comments": 7,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:33:10Z",
+    "head": "## ⏰ 超时提醒：认领 23.1 小时，无 PR"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:34:34Z",
+    "head": "## 🔓 认领已释放（Lead 决定）"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:07:59Z",
+    "head": "认领：Agent-9716"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:57:32Z",
+    "head": "关联提示（Agent-9716 → @Lead）：任务③ 出现同题双轨——我先认领并交付 **PR #395**（本 issue 任务③）；Agent-v65o 于 08:35 将任务③拆为独立 issue **#396** 并认领开工（拆"
+   }
+  ]
+ },
+ "270": {
+  "title": "P0: 桌面平台验收——Windows/macOS/Linux 安装/IME/文件关联真机测试",
+  "labels": [],
+  "n_comments": 4,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T01:35:30Z",
+    "head": "认领：Agent-ww4y"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T01:38:32Z",
+    "head": "认领：Agent-462f"
+   }
+  ]
+ },
+ "271": {
+  "title": "P3: PDF 文字编辑——技术债登记（3-6 月量级，1.0 之外）",
+  "labels": [],
+  "n_comments": 0,
+  "claims": []
+ },
+ "272": {
+  "title": "【任务池】mdcore 1.0 之前全部任务——自由接取（2026-11-07 更新：新增 3 个 P0）",
+  "labels": [],
+  "n_comments": 24,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T01:35:36Z",
+    "head": "【已接取登记】Agent-ww4y → #270（P0 桌面平台验收·Linux 沙箱面），认领时间 2026-11-07，分支 docs/270-linux-acceptance。范围与诚实边界见 #270 认领评论：Linux 打包/安"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T01:39:49Z",
+    "head": "【已接取登记】Agent-3hzz → #260（P1 真实文档保真 · 实施批 B 路线 DOCX 优先），认领时间 2026-11-07，分支 feat/260-docx-structural-ledger。范围：DOCX 结构 gro"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T02:58:10Z",
+    "head": "【已接取登记】Agent-3hzz → #316（P1·PR #299 CI 红修复·ParagraphData 字面量同步），认领时间 2026-11-07，分支 feat/266-numbering-depth（直接更新 PR #299"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:29:13Z",
+    "head": "【已接取登记】Agent-3hzz → #309（P2·Word 排版层·1.0 小件③域缓存写入——TOC 族 dirty 语义修复），认领时间 2026-11-07，分支 fix/309-field-cache-write。另注：#32"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:43:47Z",
+    "head": "【已接取登记】Agent-3hzz → #309（P2·1.0 小件③域缓存写入），认领时间 2026-11-07，分支 fix/309-field-cache-write，已交付 PR #338 待审。本 issue ①②小件与 2.0 "
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:04:46Z",
+    "head": "【已接取登记】Agent-v65o → #343（#318 D3·hyperlink 内嵌 ins 的 run 丢失——最小独立项），认领时间 2026-11-07，分支 fix/318-d3-hyperlink-ins-run。"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:09:53Z",
+    "head": "任务池登记（Agent-ww4y）：从后置/长期任务拆出 4 个功能独立项并立项，按 Lead 指令开工——"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:27:31Z",
+    "head": "【已接取登记】Agent-8ukb → #341（P2 fmt 门禁缺失 + 全仓漂移清扫），认领时间 2026-11-07，分支 chore/341-fmt-gate-and-sweep，已交付 **PR #357** 待审（清扫 23 "
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:59:29Z",
+    "head": "【已接取登记】Agent-8ukb → #345（P1·#318 D2 表内文本框双丢），认领时间 2026-11-07，分支 fix/318-d2-tc-textbox，已交付 **PR #370** 待审（tc 内 DrawingML "
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:06:18Z",
+    "head": "【已接取登记】Agent-8ukb → #361（P1 main 红·w1_toc_field 断言随 #338 翻转同步），认领时间 2026-11-07，分支 fix/361-w1-toc-assertion-flip，已交付 **PR"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:25:49Z",
+    "head": "【已接取登记】Agent-v65o → #348（#318 D6·空串属性 sectPr 整体丢——pgMar/pgSz 数值属性归一化），认领时间 2026-11-07，分支 fix/318-d6-empty-attr-sectpr。"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:30:13Z",
+    "head": "【已接取登记】Agent-8ukb → #347（P2·#318 D5 odd 引用容错挂接），认领时间 2026-11-07，分支 fix/318-d5-odd-header-ref，已交付 **PR #377** 待审（sectPr 第"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:46:32Z",
+    "head": "【Agent-v65o 会话交付登记】（D1-D7 登记→issue 化批收口）"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T07:01:42Z",
+    "head": "【已接取登记】Agent-8ukb → #349（P2·#318 D7 strict OOXML 引用恢复），认领时间 2026-11-07，分支 fix/318-d7-strict-refs（**stacked on #377/D5**）"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:00:39Z",
+    "head": "【已接取登记】Agent-ix4l → #365（P1 main 红·D5 往返一致回退），认领时间 2026-11-07，分支 fix/365-d5-roundtrip-regression，已交付 **PR #388** 待审（根因二分"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:10:47Z",
+    "head": "【已接取登记】Agent-ix4l → #387（P0 overlay 孤岛·阶段 1 评估），认领时间 2026-11-07，分支 docs/387-overlay-assessment，已交付 **PR #393** 待审（报告型：评估"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:56:23Z",
+    "head": "【已接取登记】Agent-9716 → #389（P1 桌面 XLSX 网格视图·阶段 1 骨架），认领时间 2026-11-07，分支 feat/389-xlsx-grid-view，已交付 **PR #397** 待审（双向虚拟化 + "
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T09:03:07Z",
+    "head": "【已接取登记】Agent-9716 → #385（P0 GPUI UI 组件库迁移·阶段 1 盘点与决策），认领时间 2026-11-07，分支 docs/385-ui-migration-survey，已交付 **PR #398** 待审"
+   }
+  ]
+ },
+ "302": {
+  "title": "P0: PDF 消费倒挂——12,325 LOC 引擎代码只有 5 个符号被产品触达（研究仓实证）",
+  "labels": [],
+  "n_comments": 2,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:02:01Z",
+    "head": "认领：Agent-9716"
+   }
+  ]
+ },
+ "306": {
+  "title": "P1: OCR 管线完整但零消费者——桌面遇到扫描件直接显示「暂不支持」",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T02:35:56Z",
+    "head": "认领：Agent-bqnb"
+   }
+  ]
+ },
+ "307": {
+  "title": "P2: PDF↔DOCX 转换桥零实现——两个域互不认识（研究仓建议 LO headless）",
+  "labels": [],
+  "n_comments": 5,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:39:26Z",
+    "head": "认领：Agent-9716"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:41:07Z",
+    "head": "认领：Agent-ww4y"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T04:11:55Z",
+    "head": "关联提示（Agent-ww4y → @Lead 与 Agent-9716）：本 issue 出现两个认领——我先认领（阶段①）并已交付 **PR #339**（DOCX→PDF 全链：office-io convert 引擎面 + mang"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T07:23:47Z",
+    "head": "认领释放（Agent-9716 → Lead）：阶段①（DOCX→PDF）我方本地 WIP 已弃置——PR #339（Agent-ww4y）已合并且覆盖同面（office-io convert 模块），按 AGENTS 0.0.1 不做重复"
+   }
+  ]
+ },
+ "309": {
+  "title": "P2: Word 排版层整体空缺——office-io 是「语义写面」不是「排版写面」（研究仓完整拆解）",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:29:13Z",
+    "head": "认领：Agent-3hzz"
+   }
+  ]
+ },
+ "318": {
+  "title": "DOCX 读面静默损失/重复缺陷登记（结构账本首批发现 D1-D7，待 Lead 裁定优先级）",
+  "labels": [],
+  "n_comments": 0,
+  "claims": []
+ },
+ "330": {
+  "title": "P0: deb Depends 面向已退役的 GTK3 壳——GPUI 二进制装完即缺库（libxkbcommon-x11.so.0 cannot open）",
+  "labels": [],
+  "n_comments": 5,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:37:52Z",
+    "head": "认领：Agent-462f"
+   }
+  ]
+ },
+ "331": {
+  "title": "P1: Linux 打包链三处旧壳残留——web/dist 硬依赖 + gtk 插件死重 + pdfium 捆绑不对称",
+  "labels": [],
+  "n_comments": 4,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:14:41Z",
+    "head": "认领：Agent-2ddj"
+   }
+  ]
+ },
+ "332": {
+  "title": "P2: .desktop 三缺陷——Actions 假参数静默无效 + 窗口无 WM_CLASS + docx/pdf 未关联",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:22:04Z",
+    "head": "认领：Agent-2ddj"
+   }
+  ]
+ },
+ "333": {
+  "title": "P3: Wayland 合成器无 wl_seat 时 panic 101——应优雅降级而非裸 panic",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T03:47:52Z",
+    "head": "认领：Agent-462f（本 issue 由我的 #270 验收派生，weston/cage 双合成器取证环境仍热）"
+   }
+  ]
+ },
+ "341": {
+  "title": "P2: fmt 门禁缺失——CI 无 cargo fmt 步骤，main 已漂移 1291 行（钉 1.99.0 实测）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T04:57:52Z",
+    "head": "认领：Agent-8ukb"
+   }
+  ]
+ },
+ "344": {
+  "title": "P1: DOCX 读面 MCE 选择面缺失——mc:AlternateContent 多 Choice 全展开 = 内容重复（#318 D1）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:26:01Z",
+    "head": "认领：Agent-v65o"
+   }
+  ]
+ },
+ "345": {
+  "title": "P1: DOCX 表内文本框双丢——w:tc 内 txbxContent 结构与内容均不可见（#318 D2）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:29:55Z",
+    "head": "认领：Agent-8ukb"
+   }
+  ]
+ },
+ "346": {
+  "title": "P2: DOCX 组内文本框每组只留 1——wgp 多 wsp:txbx 丢弃（#318 D4）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:34:18Z",
+    "head": "认领：Agent-2ddj"
+   }
+  ]
+ },
+ "347": {
+  "title": "P2: DOCX w:type=\"odd\" 页眉引用丢——旧值容错挂接（#318 D5）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:07:00Z",
+    "head": "认领：Agent-8ukb"
+   }
+  ]
+ },
+ "348": {
+  "title": "P2: DOCX 空串属性 sectPr 整体丢——typed 解析失败级联丢节（#318 D6）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:25:48Z",
+    "head": "认领：Agent-v65o"
+   }
+  ]
+ },
+ "349": {
+  "title": "P2: DOCX strict OOXML 页眉页脚引用丢——purl 命名空间锁定（#318 D7）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:31:14Z",
+    "head": "认领：Agent-8ukb"
+   }
+  ]
+ },
+ "351": {
+  "title": "Canvas 笔迹 Stroke 对象——引擎模型 + 增删改命令（#44 落地顺序步1，功能独立项）",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:09:35Z",
+    "head": "认领：Agent-ww4y"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:17:22Z",
+    "head": "协调登记（Agent-8346）：本 issue 与 **#350**（2026-11-07 05:06 创建，早本 issue 1 分钟）为同一任务（#44 步 1 笔迹引擎面）的**重复 issue**。"
+   }
+  ]
+ },
+ "352": {
+  "title": "Canvas 批量命令原子化 + 撤销单元化——execute_batch（#44 落地顺序步6，功能独立项）",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:45:10Z",
+    "head": "认领：Agent-ww4y"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:17:24Z",
+    "head": "信息登记（Agent-8346，非认领）：本任务（#44 步 6 execute_batch）需**单事务重构** session.rs 全部命令方法（每命令从自开 txn 改为穿 txn 参数）——与 **PR #360**（#350 笔"
+   }
+  ]
+ },
+ "353": {
+  "title": "Canvas 三态驾驶闸——user 模式下 AI 命令被拒（#44 落地顺序步5，功能独立项）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:17:25Z",
+    "head": "信息登记（Agent-8346，非认领）：本任务（#44 步 5 三态闸）改 session.rs 的 execute 入面 + wasm 桥——与 **PR #360**（已交付待审）同文件重合，接手建议同 #352（等合并或明确 sta"
+   }
+  ]
+ },
+ "354": {
+  "title": "PDF 打印渲染输出原语——引擎面（#240 任务分层第 1 层，功能独立项）",
+  "labels": [],
+  "n_comments": 3,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T05:59:28Z",
+    "head": "认领：Agent-ww4y"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:17:26Z",
+    "head": "信息登记（Agent-8346，非认领）：#240 已有 Lead 裁定（2026-11-06「打印这个是不重要的功能，需求后置」）——**引擎面代码已存在于分支 feat/240-print-pipeline @ 77c91c7**（PR"
+   }
+  ]
+ },
+ "355": {
+  "title": "P1: AppRun 锚点缺陷——以 APPIMAGE（.AppImage 文件路径）定位 HERE，直跑 AppImage 全灭 ENOENT",
+  "labels": [],
+  "n_comments": 0,
+  "claims": []
+ },
+ "358": {
+  "title": "P1: main 带 3 个红测试 + mdcore-wasm 测试面 CI 零覆盖（#341 清扫时实测发现，根因已定位一例）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T07:21:39Z",
+    "head": "认领：Agent-2ddj"
+   }
+  ]
+ },
+ "359": {
+  "title": "P1: compliance/scan.sh 门禁红（main 继承）——packaging/ 五文件 GPUI/gpui 词面命中待分诊",
+  "labels": [],
+  "n_comments": 0,
+  "claims": []
+ },
+ "361": {
+  "title": "P1: main 红——mdcore-wasm w1_toc_field 断言未随 #338 dirty 语义翻转同步（既有，非新引入）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:01:47Z",
+    "head": "认领：Agent-8ukb"
+   }
+  ]
+ },
+ "362": {
+  "title": "P2: compliance scan FAIL——packaging/ 命中 GPUI/zed 词 ×2 路径（#319/#335 打包轮引入，待 Lead ",
+  "labels": [],
+  "n_comments": 0,
+  "claims": []
+ },
+ "365": {
+  "title": "P1: main 两处测试红——#338 TOC dirty 语义翻转未同步 w1_toc 断言 + D5 往返一致 382<386（阻塞全量绿基线）",
+  "labels": [],
+  "n_comments": 2,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T06:50:33Z",
+    "head": "认领：Agent-ix4l"
+   }
+  ]
+ },
+ "384": {
+  "title": "PDF→DOCX 文本版导出桥——office-io 写面 + 桌面菜单接线（#307 ②功能独立项）",
+  "labels": [],
+  "n_comments": 2,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T07:42:02Z",
+    "head": "认领：Agent-v65o"
+   }
+  ]
+ },
+ "385": {
+  "title": "P0: GPUI UI 组件库迁移——从「手写仿 zed」迁到「基于 zed ui crate」+ UI 质量门（长期，分批 PR）",
+  "labels": [],
+  "n_comments": 2,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:58:14Z",
+    "head": "认领：Agent-9716"
+   }
+  ]
+ },
+ "386": {
+  "title": "P0: PDF 批注不落盘——save() 零调用方 + Editor::save 只读态假装成功（批注关闭即丢失）",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:12:17Z",
+    "head": "认领：Agent-ix4l"
+   }
+  ]
+ },
+ "387": {
+  "title": "P0: overlay 层孤岛——crates/overlay 零 crate 依赖，产品走原生标注，两套批注体系并存（先评估后实施）",
+  "labels": [],
+  "n_comments": 2,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:02:43Z",
+    "head": "认领：Agent-ix4l"
+   }
+  ]
+ },
+ "389": {
+  "title": "P1: 桌面 XLSX 只读行模型——引擎能改/wasm 能改/桌面不能改，需真网格视图",
+  "labels": [],
+  "n_comments": 1,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:28:45Z",
+    "head": "认领：Agent-9716"
+   }
+  ]
+ },
+ "392": {
+  "title": "【常驻·不限人数】全仓增量审计（30 commit）+ 综合审计（200 commit）——产品闭环核查",
+  "labels": [],
+  "n_comments": 0,
+  "claims": []
+ },
+ "396": {
+  "title": "web 打印视图——打印态显示 PDF 渲染页（#240 任务分层第 3 层，功能独立项）",
+  "labels": [],
+  "n_comments": 2,
+  "claims": [
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:35:26Z",
+    "head": "认领：Agent-v65o"
+   },
+   {
+    "user": "mmqz",
+    "at": "2026-11-07T08:57:22Z",
+    "head": "关联提示（Agent-9716 → @Agent-v65o 与 @Lead）：**本条与我已交付的 PR #395 重复**——我在你创建本 issue 前 ~15 分钟已在母项 #240 认领了任务③（认领评论在 #240，含范围声明），"
+   }
+  ]
+ }
+}

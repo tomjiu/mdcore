@@ -1,0 +1,113 @@
+{
+ "audit/recheck-t0": {
+  "files": 1,
+  "residual": 105,
+  "pr": "无PR",
+  "verdict": "◆ 残差105行(真独有) → 报Lead",
+  "touched": [
+   "audit/recheck/engine-recheck-T0.md"
+  ]
+ },
+ "docs/agents-claim-timeout": {
+  "files": 1,
+  "residual": 284,
+  "pr": 363,
+  "verdict": "◆ 残差284行(真独有) → 报Lead",
+  "touched": [
+   "AGENTS.md"
+  ]
+ },
+ "docs/agents-decompose": {
+  "files": 1,
+  "residual": 241,
+  "pr": 366,
+  "verdict": "◆ 残差241行(真独有) → 报Lead",
+  "touched": [
+   "AGENTS.md"
+  ]
+ },
+ "feat/240-print-pipeline": {
+  "files": 18,
+  "residual": 1998,
+  "pr": 256,
+  "verdict": "◆ 残差1998行(真独有) → 报Lead",
+  "touched": [
+   "crates/pdf/src/engine_pdfium.rs",
+   "crates/pdf/src/lib.rs",
+   "crates/pdf/src/print.rs",
+   "crates/pdf/src/render.rs",
+   "crates/pdf/tests/pdfm_acrobat_parity.rs",
+   "docs/pdf-acrobat-parity.md"
+  ]
+ },
+ "feat/304-page-transform": {
+  "files": 10,
+  "residual": 1913,
+  "pr": 315,
+  "verdict": "◆ 残差1913行(真独有) → 报Lead",
+  "touched": [
+   "crates/pdf/fixtures/gen_rotated_crop_fixture.py",
+   "crates/pdf/fixtures/rotated_crop.pdf",
+   "crates/pdf/fixtures/verify_transform_crosscheck.py",
+   "crates/pdf/src/engine.rs",
+   "crates/pdf/src/engine_pdfium.rs",
+   "crates/pdf/src/lib.rs"
+  ]
+ },
+ "feat/308-digest-verification": {
+  "files": 7,
+  "residual": 1126,
+  "pr": 312,
+  "verdict": "◆ 残差1126行(真独有) → 报Lead",
+  "touched": [
+   "Cargo.lock",
+   "crates/pdf/Cargo.toml",
+   "crates/pdf/src/signature.rs",
+   "crates/pdf/tests/pdfi_signature.rs",
+   "gates.md",
+   "gates/308.md"
+  ]
+ },
+ "feat/351-canvas-stroke": {
+  "files": 7,
+  "residual": 2102,
+  "pr": 364,
+  "verdict": "◆ 残差2102行(真独有) → 报Lead",
+  "touched": [
+   "crates/canvas/src/lib.rs",
+   "crates/canvas/src/render.rs",
+   "crates/canvas/src/session.rs",
+   "crates/canvas/tests/render.rs",
+   "crates/canvas/tests/stroke.rs",
+   "crates/mdcore-wasm/src/canvas.rs"
+  ]
+ },
+ "fix/309-field-cache-write": {
+  "files": 2,
+  "residual": 576,
+  "pr": 338,
+  "verdict": "◆ 残差576行(真独有) → 报Lead",
+  "touched": [
+   "crates/office-io/src/docx.rs",
+   "crates/office-io/tests/docx_paragraph_layout.rs"
+  ]
+ },
+ "fix/330-depends-gpui": {
+  "files": 1,
+  "residual": 45,
+  "pr": 337,
+  "verdict": "◆ 残差45行(真独有) → 报Lead",
+  "touched": [
+   "packaging/deb/control.tpl"
+  ]
+ },
+ "fix/main-pagegeometry-sync": {
+  "files": 1,
+  "residual": 17,
+  "pr": 325,
+  "verdict": "△ 残差17行(≈版本演进) → 报Lead备删",
+  "touched": [
+   "crates/pdf/tests/pdfo_render_cache_rev.rs"
+  ]
+ }
+}

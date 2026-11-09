@@ -1,0 +1,720 @@
+{
+ "generated": "2026-11-09T14:11:12+00:00",
+ "cb_branches_before": {
+  "audit/recheck-t0": "b4efc6e579ffd4fc300bbba3cd61382e75e1b099",
+  "backup/feat/633-lok-worker": "fcf057ce4d2b9420bdca3255d67af3ff1b8d6fa0",
+  "backup/github-main-a3dc14b": "a3dc14b7e9151324d1d208331326b2942effe0c1",
+  "backup/history-graft": "3d5cb1089fe9102718790449fd6e3cebd9d15deb",
+  "backup/stash-385-wip": "4d2995dea958da4078de91989f40f292b1b90256",
+  "chore/406-canvas-caption-loss-face": "7dd92e932a309583ac57a85c1ad8f2c29f026536",
+  "docs/460-enum-variant-match-check": "eba963165e7034332479889bbad5c1bed95e7c00",
+  "docs/agents-branch-naming": "3f9deb1040a5f46f4eb5c47beaa95a90c078d911",
+  "docs/agents-claim-timeout": "f0b60391de0018b0ea527456c6c7bd88e8da7d04",
+  "docs/agents-conflict-markers": "db95fb173cc0f54602c800352e1b3317d4b91837",
+  "docs/agents-decompose": "8a86c0de1b9a8ea5416c0f4141f26a38166865bf",
+  "docs/agents-product-loop": "1aadd977dbce7b6c1f3c97ca8f52de19afe84920",
+  "feat/240-print-pipeline": "77c91c7beff8730b37d8922c6fbb606b8b858900",
+  "feat/304-page-transform": "0824e15f8a64a2264ebd88c28016c096399c584a",
+  "feat/306-ocr-wiring": "4c492ab6fcffae32a5e809a474485733f4a87318",
+  "feat/308-digest-verification": "8b8194ca4c8a47cf3c09a0818820b1bd4ca28dd2",
+  "feat/351-canvas-stroke": "7c0363a528873609b7c1e94e9ef868b92137d4dd",
+  "feat/352-canvas-batch": "112c3389e6c6ef59e159608fe2880d2881ac9a8f",
+  "feat/385-b1-context-menu": "7e89941a685f85f726fdfc4f69084821c5fa3c98",
+  "feat/385-b3b-palette-redo": "dd1774d989487615e5f57a7a329da0709c5420a2",
+  "feat/385-b3c-goto-popover": "6c81cb02bb24517f34a96514fd19af9f0a29739a",
+  "feat/385-b4-menu-bar": "58a40c8525b103c573e40ccf8872d1c2bc5f7ff8",
+  "feat/385-ui-migration-batch3b": "616155612b5360932e0041acb42e982f5c6f787e",
+  "feat/406-edge-route": "6652bfe68baa4dcd1cb459ff66a2be0eafbefec4",
+  "feat/420-pdf-thumbs-sidebar": "cb295a11df5f4dbffdd2816caa87b6df6a1fd605",
+  "feat/421-pdf-zoom": "f77b49b2701a0f4cf8b991e1450eb7e34e0d2d2f",
+  "feat/485-docx-footnote-import": "5c56087b98bf5a5adfbaa81285dde204db8d501c",
+  "feat/496-xlsx-freeze-panes": "b52721b49a65b627d734ccbf90f534631ea80e89",
+  "feat/517-scan-note-2d-key": "6adccb0bfb7838542cdb72a38d0fb9b1e0b1693b",
+  "feat/570-web-ci-gate": "8e99d0accef7f5d0d2821ef499d8d0d5508acf75",
+  "feat/600-diff-l3-marks": "6d03b354db53ec31a1bd2ecca4de98bb0fecbf98",
+  "fix/318-d5-odd-header-ref": "04e1388811a5f5529ed7fa036878efaf5cca2276",
+  "fix/330-depends-gpui": "d9c73a6c3759246e0b95426ae617e2fe5d58e06e",
+  "fix/365-d5-roundtrip-regression": "1db054bf04b129c9c117bb3b5263d3b584fe232e",
+  "fix/386-pdf-annotate-save": "70947027ea28da31a273b80d60890bde8456b637",
+  "fix/386-rebase": "6423733a2ae8eab84abe20c0f6e5c07363e1c39c",
+  "fix/523-clippy-approx-constant": "32381a5246f5161fa2d289d5edb207d5b3e7133f",
+  "fix/548-ci-concurrency": "a517191e64f563c8634e224a43c59037e63942e8",
+  "fix/625-pdfraw-literal": "57038f110a8ec302e6f45a647feb10129bb4f507",
+  "fix/634-pdfium-display-verify": "b523a964db5ecb9198854a21f673a33f1f9da6b9",
+  "fix/docx-save-history-629-20261109": "6f75231322dacb49e6b3e50740c936d67252b744",
+  "fix/issue-463": "096bdf101d2657c252a26100ac7f8e425a83ff1f",
+  "fix/issue-472": "2a79d05e0f12606cc098bda295d80fa1fc77e049",
+  "fix/issue-502": "07515435f42fcb9a583afa8abd821740021eb83b",
+  "fix/main-pagegeometry-sync": "4f0a4ce657e00f71f89dc0814a4d6b90bd9512e4",
+  "main": "83d63d8e373700cd2cfb3aaf717b73bb1aed75fd",
+  "serial-verify/400-d-chain-stack": "d271d511bba9cb7b1982c716f7a1dc9677a98103"
+ },
+ "plan": [
+  {
+   "clone": "work",
+   "sha": "671ba01ec50cad4018ed85c9d455fb648cd734b8",
+   "target": "refs/heads/docs/agents-0609-mother-scan",
+   "refspec": "671ba01ec50cad4018ed85c9d455fb648cd734b8:refs/heads/docs/agents-0609-mother-scan",
+   "action": "push_new",
+   "final_target": "refs/heads/docs/agents-0609-mother-scan",
+   "src": "refs/remotes/origin/docs/agents-0609-mother-scan"
+  },
+  {
+   "clone": "work",
+   "sha": "fbbf1056be180044d326cf8fb46c010743381ca7",
+   "target": "refs/heads/feat/352-canvas-batch",
+   "refspec": "fbbf1056be180044d326cf8fb46c010743381ca7:refs/heads/feat/352-canvas-batch",
+   "action": "push_update",
+   "alt": "backup/gh-feat/352-canvas-batch-fbbf1056",
+   "final_target": "refs/heads/backup/gh-feat/352-canvas-batch-fbbf1056",
+   "src": "refs/remotes/origin/feat/352-canvas-batch"
+  },
+  {
+   "clone": "work",
+   "sha": "51668c9753e8f800ae82023793da2cfcef7a42b8",
+   "target": "refs/heads/feat/384-pdf-docx-text",
+   "refspec": "51668c9753e8f800ae82023793da2cfcef7a42b8:refs/heads/feat/384-pdf-docx-text",
+   "action": "push_new",
+   "final_target": "refs/heads/feat/384-pdf-docx-text",
+   "src": "refs/remotes/origin/feat/384-pdf-docx-text"
+  },
+  {
+   "clone": "work",
+   "sha": "dda60badc12bb29a09cf5258eccb2a877022bb8d",
+   "target": "refs/heads/fix/318-d1-mce-selection",
+   "refspec": "dda60badc12bb29a09cf5258eccb2a877022bb8d:refs/heads/fix/318-d1-mce-selection",
+   "action": "push_new",
+   "final_target": "refs/heads/fix/318-d1-mce-selection",
+   "src": "refs/remotes/origin/fix/318-d1-mce-selection"
+  },
+  {
+   "clone": "work",
+   "sha": "e452eaa3b1796c5eb61853cdadc9f802b754f3f8",
+   "target": "refs/heads/fix/318-d5-odd-header-ref",
+   "refspec": "e452eaa3b1796c5eb61853cdadc9f802b754f3f8:refs/heads/fix/318-d5-odd-header-ref",
+   "action": "push_update",
+   "alt": "backup/gh-fix/318-d5-odd-header-ref-e452eaa3",
+   "final_target": "refs/heads/backup/gh-fix/318-d5-odd-header-ref-e452eaa3",
+   "src": "refs/remotes/origin/fix/318-d5-odd-header-ref"
+  },
+  {
+   "clone": "work",
+   "sha": "aadc5bbc77e53a698f096036eb8e47f0d9ca0a16",
+   "target": "refs/heads/fix/318-d6-empty-attr-sectpr",
+   "refspec": "aadc5bbc77e53a698f096036eb8e47f0d9ca0a16:refs/heads/fix/318-d6-empty-attr-sectpr",
+   "action": "push_new",
+   "final_target": "refs/heads/fix/318-d6-empty-attr-sectpr",
+   "src": "refs/remotes/origin/fix/318-d6-empty-attr-sectpr"
+  },
+  {
+   "clone": "work",
+   "sha": "09e58d783496ec07bf7d6f5b6328a05de6329786",
+   "target": "refs/heads/fix/318-d7-strict-refs",
+   "refspec": "09e58d783496ec07bf7d6f5b6328a05de6329786:refs/heads/fix/318-d7-strict-refs",
+   "action": "push_new",
+   "final_target": "refs/heads/fix/318-d7-strict-refs",
+   "src": "refs/remotes/origin/fix/318-d7-strict-refs"
+  },
+  {
+   "clone": "work",
+   "sha": "0bb09dcb77650b983328962bf35c02294809bee3",
+   "target": "refs/tags/checkpoint/2026-10-19-pre-batch1",
+   "refspec": "refs/tags/checkpoint/2026-10-19-pre-batch1:refs/tags/checkpoint/2026-10-19-pre-batch1",
+   "action": "tag",
+   "final_target": "refs/tags/checkpoint/2026-10-19-pre-batch1",
+   "src": "refs/tags/checkpoint/2026-10-19-pre-batch1"
+  },
+  {
+   "clone": "sec",
+   "sha": "ce5279cf8578bd90ac340bd934f5eb59e6b82314",
+   "target": "refs/heads/feat/385-b5a-panels-list",
+   "refspec": "ce5279cf8578bd90ac340bd934f5eb59e6b82314:refs/heads/feat/385-b5a-panels-list",
+   "action": "push_new",
+   "final_target": "refs/heads/feat/385-b5a-panels-list",
+   "src": "refs/heads/feat/385-b5a-panels-list"
+  },
+  {
+   "clone": "repo",
+   "sha": "d1a149d4d583597c5ac1405eb7ec3d13fab6d37f",
+   "target": "refs/heads/feat/385-ui-migration-batch1",
+   "refspec": "d1a149d4d583597c5ac1405eb7ec3d13fab6d37f:refs/heads/feat/385-ui-migration-batch1",
+   "action": "push_new",
+   "final_target": "refs/heads/feat/385-ui-migration-batch1",
+   "src": "refs/remotes/origin/feat/385-ui-migration-batch1"
+  },
+  {
+   "clone": "repo",
+   "sha": "9b7afe8afc19c4d55fe1017a9ed503df218d252d",
+   "target": "refs/heads/feat/420-pdf-thumbs-sidebar",
+   "refspec": "9b7afe8afc19c4d55fe1017a9ed503df218d252d:refs/heads/feat/420-pdf-thumbs-sidebar",
+   "action": "push_update",
+   "alt": "backup/gh-feat/420-pdf-thumbs-sidebar-9b7afe8a",
+   "final_target": "refs/heads/backup/gh-feat/420-pdf-thumbs-sidebar-9b7afe8a",
+   "src": "refs/remotes/origin/feat/420-pdf-thumbs-sidebar"
+  },
+  {
+   "clone": "repo",
+   "sha": "c11e78168bb3d992954340e9c757253852e10bc8",
+   "target": "refs/heads/fix/309-field-cache-write",
+   "refspec": "c11e78168bb3d992954340e9c757253852e10bc8:refs/heads/fix/309-field-cache-write",
+   "action": "push_new",
+   "final_target": "refs/heads/fix/309-field-cache-write",
+   "src": "refs/remotes/origin/fix/309-field-cache-write"
+  }
+ ],
+ "wip": [
+  {
+   "clone": "work",
+   "sha": "671179cef5c96d472ecd53404dd5efdddcbade17",
+   "target": "refs/heads/backup/wip-671179ce",
+   "refspec": "671179cef5c96d472ecd53404dd5efdddcbade17:refs/heads/backup/wip-671179ce",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-671179ce",
+   "src": "dangling: fix(#346): DOCX 组内文本框全保留——第二趟补发被丢成员（#318 D4）\n"
+  },
+  {
+   "clone": "work",
+   "sha": "6eb3f3778f118eba2b60440c8edad1d06a42ccf0",
+   "target": "refs/heads/backup/wip-6eb3f377",
+   "refspec": "6eb3f3778f118eba2b60440c8edad1d06a42ccf0:refs/heads/backup/wip-6eb3f377",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-6eb3f377",
+   "src": "dangling: feat(#384): PDF→DOCX 文本版导出桥——office-io 写面 + 桌面菜单接线（#307 ②功能独"
+  },
+  {
+   "clone": "work",
+   "sha": "de57a25a45f22b828b4744011690aec125d6ddd2",
+   "target": "refs/heads/backup/wip-de57a25a",
+   "refspec": "de57a25a45f22b828b4744011690aec125d6ddd2:refs/heads/backup/wip-de57a25a",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-de57a25a",
+   "src": "dangling: docs(AGENTS): 0.0.11 项目状态用 GitHub 原生机制查，废弃任务池文档\n"
+  },
+  {
+   "clone": "repo",
+   "sha": "19207c69a5e32fa94957d2fab35892c83612053e",
+   "target": "refs/heads/backup/wip-19207c69",
+   "refspec": "19207c69a5e32fa94957d2fab35892c83612053e:refs/heads/backup/wip-19207c69",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-19207c69",
+   "src": "dangling: On chore/341-fmt-gate-and-sweep: fmt-sweep-wip\n"
+  },
+  {
+   "clone": "repo",
+   "sha": "64857a16636123a20e5c808e8e4aca16f6bbfdc6",
+   "target": "refs/heads/backup/wip-64857a16",
+   "refspec": "64857a16636123a20e5c808e8e4aca16f6bbfdc6:refs/heads/backup/wip-64857a16",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-64857a16",
+   "src": "dangling: index on chore/341-fmt-gate-and-sweep: 575df6c feat(#266): 多"
+  },
+  {
+   "clone": "repo",
+   "sha": "6a623d2843cd13452b8875f79bcbf044bda989b3",
+   "target": "refs/heads/backup/wip-6a623d28",
+   "refspec": "6a623d2843cd13452b8875f79bcbf044bda989b3:refs/heads/backup/wip-6a623d28",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-6a623d28",
+   "src": "dangling: index on chore/341-fmt-gate-and-sweep: 575df6c feat(#266): 多"
+  },
+  {
+   "clone": "repo",
+   "sha": "728a73c310c10ccbeb141c7139b9c0ce91468c93",
+   "target": "refs/heads/backup/wip-728a73c3",
+   "refspec": "728a73c310c10ccbeb141c7139b9c0ce91468c93:refs/heads/backup/wip-728a73c3",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-728a73c3",
+   "src": "dangling: index on fix/318-d2-tc-textbox: 575df6c feat(#266): 多级列表自动编号"
+  },
+  {
+   "clone": "repo",
+   "sha": "7ca28f1d4ae9e618c5d10b9eebb81ece5b85719b",
+   "target": "refs/heads/backup/wip-7ca28f1d",
+   "refspec": "7ca28f1d4ae9e618c5d10b9eebb81ece5b85719b:refs/heads/backup/wip-7ca28f1d",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-7ca28f1d",
+   "src": "dangling: index on chore/341-fmt-gate-and-sweep: 575df6c feat(#266): 多"
+  },
+  {
+   "clone": "repo",
+   "sha": "92f14c1fd082bb359b8123c2db27e91591007292",
+   "target": "refs/heads/backup/wip-92f14c1f",
+   "refspec": "92f14c1fd082bb359b8123c2db27e91591007292:refs/heads/backup/wip-92f14c1f",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-92f14c1f",
+   "src": "dangling: On chore/341-fmt-gate-and-sweep: verify-clean\n"
+  },
+  {
+   "clone": "repo",
+   "sha": "9480100d362ab8d5e33653db6fd74181c876a5a6",
+   "target": "refs/heads/backup/wip-9480100d",
+   "refspec": "9480100d362ab8d5e33653db6fd74181c876a5a6:refs/heads/backup/wip-9480100d",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-9480100d",
+   "src": "dangling: index on chore/341-fmt-gate-and-sweep: 575df6c feat(#266): 多"
+  },
+  {
+   "clone": "repo",
+   "sha": "a8369904662932d629c9c0d1e02b90e782c9a795",
+   "target": "refs/heads/backup/wip-a8369904",
+   "refspec": "a8369904662932d629c9c0d1e02b90e782c9a795:refs/heads/backup/wip-a8369904",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-a8369904",
+   "src": "dangling: On chore/341-fmt-gate-and-sweep: scan-check\n"
+  },
+  {
+   "clone": "repo",
+   "sha": "af90a240e54016bc222372b6bf325664d87008ab",
+   "target": "refs/heads/backup/wip-af90a240",
+   "refspec": "af90a240e54016bc222372b6bf325664d87008ab:refs/heads/backup/wip-af90a240",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-af90a240",
+   "src": "dangling: On fix/318-d2-tc-textbox: clippy-base\n"
+  },
+  {
+   "clone": "repo",
+   "sha": "dc51aed92df09baeb5cf131de779fbcc99c2c4cb",
+   "target": "refs/heads/backup/wip-dc51aed9",
+   "refspec": "dc51aed92df09baeb5cf131de779fbcc99c2c4cb:refs/heads/backup/wip-dc51aed9",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-dc51aed9",
+   "src": "dangling: index on feat/485-docx-footnote-import: 5c56087 chore(#485):"
+  },
+  {
+   "clone": "repo",
+   "sha": "e4abff6a4332d047ad6973d5a5d6b3caece6b14d",
+   "target": "refs/heads/backup/wip-e4abff6a",
+   "refspec": "e4abff6a4332d047ad6973d5a5d6b3caece6b14d:refs/heads/backup/wip-e4abff6a",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-e4abff6a",
+   "src": "dangling: On chore/341-fmt-gate-and-sweep: verify-clean3\n"
+  },
+  {
+   "clone": "repo",
+   "sha": "e9e9a7176579a6015d34cc05d3cdbad9b3cf0a16",
+   "target": "refs/heads/backup/wip-e9e9a717",
+   "refspec": "e9e9a7176579a6015d34cc05d3cdbad9b3cf0a16:refs/heads/backup/wip-e9e9a717",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-e9e9a717",
+   "src": "dangling: index on chore/341-fmt-gate-and-sweep: 575df6c feat(#266): 多"
+  },
+  {
+   "clone": "repo",
+   "sha": "fab61f09d72eafcee76514ba31914e010daf3a60",
+   "target": "refs/heads/backup/wip-fab61f09",
+   "refspec": "fab61f09d72eafcee76514ba31914e010daf3a60:refs/heads/backup/wip-fab61f09",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-fab61f09",
+   "src": "dangling: fix(#345): D2 表内文本框补提取——tc 内 DrawingML 文本框第二趟 + 账本 txbx_in_t"
+  },
+  {
+   "clone": "repo",
+   "sha": "fb13be0851782e469ed721d49fc8f422c3927d91",
+   "target": "refs/heads/backup/wip-fb13be08",
+   "refspec": "fb13be0851782e469ed721d49fc8f422c3927d91:refs/heads/backup/wip-fb13be08",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-fb13be08",
+   "src": "dangling: WIP on feat/485-docx-footnote-import: 5c56087 chore(#485): C"
+  },
+  {
+   "clone": "repo",
+   "sha": "fea9a2d6b14f16a84dd353d7c90d07f831c5fb87",
+   "target": "refs/heads/backup/wip-fea9a2d6",
+   "refspec": "fea9a2d6b14f16a84dd353d7c90d07f831c5fb87:refs/heads/backup/wip-fea9a2d6",
+   "action": "wip",
+   "final_target": "refs/heads/backup/wip-fea9a2d6",
+   "src": "dangling: On chore/341-fmt-gate-and-sweep: verify-clean2\n"
+  }
+ ],
+ "docs": [
+  [
+   "refs/heads/chore/416-draft-sweep",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/docs/agents-issue-dedup",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/fix/408-stamp-signature-gate",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/fix/428-fold-current-walkup",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/audit/recheck-t0",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/ci/358-wasm-test-coverage",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/385-ui-migration-survey",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/387-overlay-assessment",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-claim-timeout",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-conflict-markers",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-decompose",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-github-native",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-product-loop",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/240-print-pipeline",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/302-annotate-kinds",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/304-page-transform",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/308-digest-verification",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/351-canvas-stroke",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/389-xlsx-grid-view",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/240-web-print-pdf",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/318-d4-group-textbox",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/330-depends-gpui",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/359-compliance-scan-packaging",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/365-d5-roundtrip-regression",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/main-pagegeometry-sync",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/main",
+   "GitHub main 历史已并入 cb/main"
+  ],
+  [
+   "refs/heads/feat/385-b1-context-menu",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/heads/feat/385-b5c-git-panel-list",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/main",
+   "GitHub main 历史已并入 cb/main"
+  ],
+  [
+   "refs/heads/chore/341-fmt-gate-and-sweep",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/feat/419-json-canvas",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/feat/421-pdf-pages-zoom",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/feat/485-docx-footnote-import",
+   "内容已并入 CB 历史（CB 分支 5c56087b 占名），跳过指针"
+  ],
+  [
+   "refs/heads/fix/318-d2-tc-textbox",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/fix/361-w1-toc-assertion-flip",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/fix/issue-469",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/heads/fix/issue-480",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/ci/struct-field-guard",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/270-desktop-acceptance-linux",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/270-linux-acceptance",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/460-enum-variant-match-check",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-branch-naming",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-ci-stuck",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-pr-base-check",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-prework-check",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/docs/agents-struct-field",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/257-multisection-docx",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/260-docx-structural-ledger",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/261-latex-math",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/264-pdf-corpus",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/265-xlsx-corpus-gaps",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/266-numbering-depth",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/267-style-inheritance",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/268-docx-columns",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/283-xlsx-editor-wiring",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/302-pdf-annotate-wiring",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/307-docx-to-pdf",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/352-canvas-batch",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/385-b5b-file-tree-list",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/385-ui-migration-batch3b",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/389-xlsx-edit-wiring",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/406-edge-route",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/421-pdf-zoom",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/feat/493-encrypt-permissions",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/feat/496-xlsx-freeze-panes",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/262-corpus-gate-empty-run",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/275-rpc-sandbox-escape",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/276-sanitize-wiring",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/277-stamp-encrypted-gate",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/278-md-depth-guard",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/279-worker-generation-cap",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/280-wasm-bridge-double-tax",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/281-statusbar-io-cache",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/282-web-sdk-boundary",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/289-ui-overhaul",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/304-page-transform",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/308-signature-digest",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/309b-para-align-spacing",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/318-d5-odd-header-ref",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/319-packaging-mangshell",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/320-pdfium-bundle",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/321-desktop-action-cli",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/333-wayland-seat-preflight",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/358-ci-skip-removal",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/386-pdf-annotate-save",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-353",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-463",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-466",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-472",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-499",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-502",
+   "CB 已有同名同 SHA 分支"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-505",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-507",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/fix/issue-509",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/hotfix/pagegeometry-fields",
+   "内容已并入 cb/main 历史，跳过指针"
+  ],
+  [
+   "refs/remotes/origin/main",
+   "GitHub main 历史已并入 cb/main"
+  ],
+  [
+   "refs/remotes/origin/serial-verify/400-d-chain-stack",
+   "CB 已有同名同 SHA 分支"
+  ]
+ ],
+ "missed": []
+}

@@ -1,0 +1,62 @@
+{
+ "audit/recheck-t0": [
+  0,
+  1,
+  "无PR",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "docs/agents-claim-timeout": [
+  0,
+  1,
+  "#363 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "docs/agents-decompose": [
+  0,
+  1,
+  "#366 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "feat/240-print-pipeline": [
+  0,
+  1,
+  "#256 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "feat/304-page-transform": [
+  0,
+  1,
+  "#315 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "feat/308-digest-verification": [
+  0,
+  2,
+  "#312 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "feat/351-canvas-stroke": [
+  0,
+  1,
+  "#364 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "fix/309-field-cache-write": [
+  1,
+  0,
+  "#338 MERGED",
+  "★ 内容已全在main → 可删"
+ ],
+ "fix/330-depends-gpui": [
+  0,
+  1,
+  "#337 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ],
+ "fix/main-pagegeometry-sync": [
+  0,
+  1,
+  "#325 closed-unmerged",
+  "◆ 有真独有内容 → 报Lead"
+ ]
+}
