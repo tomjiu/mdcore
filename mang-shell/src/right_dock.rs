@@ -49,7 +49,7 @@ pub fn right_dock_strip(right_open: bool, cx: &mut Context<ShellApp>) -> impl In
             "dock-toggle-right",
             icon,
             right_open,
-            "属性 / 来源",
+            "文档大纲",
             colors.element_hover,
             colors.element_selected,
             cx.listener(|this, _, _, cx| this.toggle_right(cx)),

@@ -1479,6 +1479,7 @@ impl Render for PdfPagesView {
         }
         let entity = cx.entity().downgrade();
         let viewport_cell = self.viewport.clone();
+        let viewport_entity = entity.clone();
         let zoom_entity = entity.clone();
         let page_count = self.page_count;
         // #421：缩放百分比（首帧视口未记录时用下限兜底——与 v1 适宽
@@ -1507,6 +1508,8 @@ impl Render for PdfPagesView {
             },
         )
         .track_scroll(&self.scroll)
+        .debug_selector(|| "pdf-pages-list".into())
+        .w_full()
         .h_full();
         // #302④：批注路径错误横幅（最近一次——不静默丢，用户可重试）。
         let error_banner = annotate_error.map(|message| {
@@ -1727,20 +1730,26 @@ impl Render for PdfPagesView {
             // 共享，零实体更新零重入；不注册命中区，不挡列表滚轮）+
             // #421 Ctrl+滚轮 capture 期拦截（缩放——止冒泡防列表滚动）。
             .child(
-                div()
-                    .id("pdf-viewport-probe")
-                    .absolute()
-                    .size_full()
-                    .child(gpui::canvas(
+                div().id("pdf-viewport-probe").absolute().size_full().child(
+                    gpui::canvas(
                         move |bounds, _window, _cx| bounds,
                         move |bounds: gpui::Bounds<gpui::Pixels>,
                               _t,
                               window: &mut Window,
                               _cx: &mut App| {
-                            viewport_cell.set(Some((
-                                f32::from(bounds.size.width),
-                                f32::from(bounds.size.height),
-                            )));
+                            let measured =
+                                (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                            if measured.0 > 0.
+                                && measured.1 > 0.
+                                && viewport_cell.get() != Some(measured)
+                            {
+                                viewport_cell.set(Some(measured));
+                                // Paint cannot update its borrowed view. A changed
+                                // viewport needs one next frame to start the worker.
+                                window.on_next_frame(move |_, cx| {
+                                    let _ = viewport_entity.update(cx, |_, cx| cx.notify());
+                                });
+                            }
                             // #421：Ctrl+滚轮缩放——capture 期窗口级拦截
                             //（annotate_overlay paint 注册先例同款；capture
                             // 先于 bubble = 先于 uniform_list 滚动消费，
@@ -1779,7 +1788,9 @@ impl Render for PdfPagesView {
                                 },
                             );
                         },
-                    )),
+                    )
+                    .size_full(),
+                ),
             )
             .into_any_element()
     }
@@ -1992,6 +2003,7 @@ fn annotate_overlay(
     let page = idx as u32;
     div()
         .id(gpui::SharedString::from(format!("pdf-annot-overlay-{idx}")))
+        .debug_selector(move || format!("pdf-visible-page-{idx}"))
         .relative()
         .flex_none()
         .child(slot)
@@ -2235,6 +2247,112 @@ mod tests {
     fn smoke_pdf_bytes() -> Vec<u8> {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.pdf");
         std::fs::read(&p).unwrap_or_else(|e| panic!("夹具不可读（{}）：{e}", p.display()))
+    }
+
+    /// No fonts or text layer: a visible filled rectangle must still render.
+    fn bitmap_only_pdf_bytes() -> Vec<u8> {
+        let content = "q 1 0 0 rg 20 30 70 50 re f Q\n";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 240] /Resources << >> /Contents 4 0 R >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+        ];
+        let mut pdf = "%PDF-1.4\n".to_string();
+        let mut offsets = vec![0];
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str("xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        ));
+        pdf.into_bytes()
+    }
+
+    struct BitmapHost(gpui::Entity<PdfPagesView>);
+
+    impl gpui::Render for BitmapHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// The first painted viewport must schedule its own follow-up frame. No
+    /// mouse/key/resize event is injected to accidentally start the worker.
+    #[gpui::test]
+    fn first_painted_viewport_starts_bitmap_render_without_input(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bitmap_only_pdf_bytes(), cx)));
+        if let Some(err) = view.read_with(cx, |v, _| v.error.clone()) {
+            if std::env::var_os("MDC_PDFIUM_LIB").is_none() && err.contains("pdfium") {
+                eprintln!("SKIP: first-frame bitmap rendering requires a PDFium library: {err}");
+                return;
+            }
+            panic!("bitmap-only PDF must open with configured PDFium: {err}");
+        }
+        let window = cx.open_window(gpui::size(px(600.), px(480.)), {
+            let view = view.clone();
+            move |_, _| BitmapHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            view.read_with(&visual, |v, _| v
+                .viewport
+                .get()
+                .is_some_and(|(w, h)| w > 0. && h > 0.)),
+            "real layout/paint must measure a nonempty PDF viewport"
+        );
+        let scheduled = visual.update(|window, app| window.simulate_next_frame(app));
+        assert!(
+            scheduled > 0,
+            "first painted viewport must request a follow-up frame; waiting for user input leaves PDF unrendered"
+        );
+        visual.update(|window, app| window.draw(app).clear(app));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(&visual, |v, _| {
+                let width = v.raster_width(v.viewport_size.0, v.viewport_size.1);
+                v.render_key(&(0, width))
+                    .is_some_and(|key| v.cache.contains(&key))
+            }) {
+                visual.update(|window, app| window.draw(app).clear(app));
+                let list = visual
+                    .debug_bounds("pdf-pages-list")
+                    .expect("page list is in the real rendered tree");
+                assert!(
+                    list.size.width > px(200.),
+                    "rendered list must have visible width, not only a cache entry"
+                );
+                let page = visual
+                    .debug_bounds("pdf-visible-page-0")
+                    .expect("first rendered page reaches the layout tree");
+                assert!(
+                    page.size.width > px(100.) && page.size.height > px(100.),
+                    "cached PDF image must occupy a visible page slot"
+                );
+                assert_eq!(
+                    visual.update(|window, app| window.simulate_next_frame(app)),
+                    0,
+                    "unchanged viewport must not create a permanent animation loop"
+                );
+                return;
+            }
+        }
+        panic!("first visible bitmap did not reach the real worker/cache within 10s");
     }
 
     /// 合成按键（main.rs 烟雾派发同构）。

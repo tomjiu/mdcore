@@ -3,11 +3,11 @@ name: windows-installer
 # #228 R4·P0（打包链修复）：Windows CI 产 NSIS installer artifact。
 # 覆盖面：版本注入链（build-installer.py 内置断言：占位符零残留 +
 #   APPVERSION==版本单源 + 产物名含版本）/ NSIS 编译 / pdfium 载荷 /
-#   artifact 上传。**不装包**——安装行为面（注册表/快捷方式/.md 关联/
-#   自检弹窗）= BUILD-VERIFY §3 的 Lead Windows 实机复核清单。
-# 内测口径：debug 构建（restore 复用 test-shell 的 mang-shell 缓存面，
-# 分钟数可控——windows-test.yml 的「云端也扛不住」教训不重蹈）；
-# 正式出包 = BUILD-VERIFY §3 的 --release 命令（Lead 实机）。
+#   artifact 上传。最终 NSIS 解包后离开 checkout 真启动（隐藏 shader
+#   源码、真实窗口响应、MD/PDF 打开、正常退出）；注册表/快捷方式/.md
+#   关联仍由 BUILD-VERIFY §3 的 Lead Windows 实机复核。
+# 发行口径：release（GPUI Windows 构建时嵌入 shader bytes）；debug
+# 依赖编译机 HLSL 绝对路径，不能作为可分发安装包。
 
 # #548 方案 B：打包是发布面——PR 阶段不再跑 nsis（每个 PR push 少 1 个
 # run，单 run 50-110 分钟）；main 合并后仍跑一次兜底 + 手动 dispatch 保留。
@@ -34,14 +34,15 @@ jobs:
   installer:
     name: windows / nsis installer
     runs-on: windows-latest
-    timeout-minutes: 90
+    # 首次 release 缓存未命中需编译完整 GPUI；后续只增量构建。
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo + mang-shell target
+      - name: Cache cargo + mang-shell release target
         uses: actions/cache@v4
         with:
           path: |
@@ -49,20 +50,38 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            mang-shell/target/
-          key: ${{ runner.os }}-installer-${{ hashFiles('mang-shell/Cargo.lock', 'third_party/zed/**/Cargo.toml') }}
-          # restore 链：installer 自身缓存 → test-shell 的缓存（debug
-          # 构建增量复用——首跑之外的分钟数主要花在链接 + NSIS）。
+            mang-shell/target/release/
+          key: ${{ runner.os }}-installer-release-v2-${{ hashFiles('rust-toolchain.toml', 'mang-shell/Cargo.lock', 'third_party/zed/**/Cargo.toml') }}
+          # 与 debug test-shell 分离：发行目标必须关闭 debug_assertions。
           restore-keys: |
-            ${{ runner.os }}-installer-
-            ${{ runner.os }}-shell-
+            ${{ runner.os }}-installer-release-v2-
 
-      - name: Build mang-shell (debug——CI 内测口径)
-        working-directory: mang-shell
-        run: cargo build --locked
+      - name: Locate Windows SDK shader compiler
+        shell: pwsh
+        run: |
+          $fxcTool = Get-Command fxc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($fxcTool) {
+            $fxcPath = $fxcTool.Source
+          } else {
+            $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $sdkVersions = Get-ChildItem -LiteralPath $sdkBin -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending
+            $fxcPath = $sdkVersions | ForEach-Object { Join-Path $_.FullName 'x64\fxc.exe' } |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          }
+          if (-not $fxcPath) { throw 'Windows SDK fxc.exe is required for embedded release shaders' }
+          "GPUI_FXC_PATH=$fxcPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install NSIS
         run: choco install nsis -y --no-progress
+
+      - name: Test packaging staging and relocated startup gate
+        run: python packaging/tests/test_windows_portable.py
+
+      - name: Build mang-shell (release with embedded shaders)
+        working-directory: mang-shell
+        run: cargo build --release --locked --bin mang-shell
 
       - name: Cache pdfium
         # 与 windows-test.yml 的 Cache pdfium 同款（key 相同 → 两 job 共享缓存）。
@@ -90,8 +109,15 @@ jobs:
         shell: bash
         run: |
           python packaging/nsis/build-installer.py \
-            --exe mang-shell/target/debug/mang-shell.exe \
+            --exe mang-shell/target/release/mang-shell.exe \
             --pdfium bin/lib/pdfium.dll
+
+      - name: Start finished installer payload without build source
+        shell: pwsh
+        run: |
+          $installerFile = Get-ChildItem -LiteralPath build/nsis -Filter 'mdcore-setup-*.exe' | Select-Object -First 1
+          if (-not $installerFile) { throw 'Installer artifact is missing' }
+          python packaging/nsis/portable-smoke.py --installer $installerFile.FullName --expected-payload build/nsis/payload --checkout-root $env:GITHUB_WORKSPACE --expected-version (python packaging/version.py) --output build/nsis/portable-smoke
 
       - name: Report
         if: always()
@@ -103,12 +129,21 @@ jobs:
           echo '|---|---|' >> $GITHUB_STEP_SUMMARY
           echo '| 版本注入（单源 mdcore::VERSION） | build-installer.py 断言内置 |' >> $GITHUB_STEP_SUMMARY
           echo "| 产物名 | $(ls build/nsis/mdcore-setup-*.exe 2>/dev/null || echo 未产出) |" >> $GITHUB_STEP_SUMMARY
-          echo '| 构建口径 | debug（CI 内测；正式出包 = BUILD-VERIFY §3 release 命令） |' >> $GITHUB_STEP_SUMMARY
+          echo '| 构建口径 | release（构建时嵌入 shader bytes） |' >> $GITHUB_STEP_SUMMARY
+          echo '| 脱离源码启动 | portable-smoke/report.json：实际窗口响应、MD/PDF 打开、exit 0 |' >> $GITHUB_STEP_SUMMARY
           echo '| 安装行为面 | 不在 CI（Lead Windows 实机复核清单） |' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-installer-debug
+          name: windows-installer-release
           path: build/nsis/mdcore-setup-*.exe
           if-no-files-found: error
+
+      - name: Upload portable startup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-portable-smoke
+          path: build/nsis/portable-smoke/
+          if-no-files-found: warn

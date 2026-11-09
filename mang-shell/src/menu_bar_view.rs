@@ -50,6 +50,7 @@ pub fn menu_titles(
     let selected_bg = colors.element_selected;
     h_flex()
         .id("menu-bar-titles")
+        .debug_selector(|| "menu-bar-titles".into())
         .h_full()
         .flex_none()
         .items_center()

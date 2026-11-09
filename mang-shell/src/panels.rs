@@ -100,6 +100,7 @@ pub fn left_panel(
         .unwrap_or(false);
     v_flex()
         .id("left-panel")
+        .debug_selector(|| "left-panel".into())
         .w(width)
         .flex_none()
         .h_full()
@@ -146,12 +147,46 @@ pub fn left_panel(
 
 /// 右栏：属性 / 来源（md 态：文件名/字数联动；docx 态：引擎实测
 /// 属性面——批 3；pdf 态：页/字符/书签/扫描件——批 4）。
-pub fn right_panel(editor: Option<&Entity<Editor>>, width: Pixels, cx: &App) -> impl IntoElement {
+pub fn right_panel(
+    outline: Option<&Entity<crate::outline_panel::OutlinePanel>>,
+    width: Pixels,
+    cx: &App,
+) -> impl IntoElement {
+    let colors = cx.theme().colors().clone();
+    let has_outline = outline.is_some_and(|panel| !panel.read(cx).is_empty());
+    v_flex()
+        .id("right-panel")
+        .debug_selector(|| "right-panel".into())
+        .w(width)
+        .flex_none()
+        .h_full()
+        .min_h_0()
+        .min_w_0()
+        .bg(colors.panel_background)
+        .p(PANEL_PADDING)
+        .when(has_outline, |el| {
+            el.when_some(outline, |el, panel| el.child(panel.clone()))
+        })
+        .when(!has_outline, |el| {
+            el.child(Label::new("文档大纲").size(LabelSize::Small))
+                .child(
+                    Label::new("当前文档没有大纲")
+                        .size(LabelSize::Small)
+                        .color(ui::Color::Muted),
+                )
+        })
+}
+
+pub fn document_information(
+    editor: Option<&Entity<Editor>>,
+    width: Pixels,
+    cx: &App,
+) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
     // #167：编辑器状态行按**真实态**呈现（is_read_only），不再无条件写
     // 「只读」——可编辑 docx（#115 链路）标「可编辑」，降级只读标原因
     // （docx_notice 行）。pdf/xlsx/canvas 无编辑引擎，只读是设计事实。
-    let (name, chars, modified, mode, engine) = match editor {
+    let (name, chars, modified, _mode, _engine) = match editor {
         Some(ed) => {
             let ed = ed.read(cx);
             (
@@ -285,7 +320,7 @@ pub fn right_panel(editor: Option<&Entity<Editor>>, width: Pixels, cx: &App) -> 
         None => vec![],
     };
     v_flex()
-        .id("right-panel")
+        .id("document-information-rows")
         .w(width)
         .flex_none()
         .h_full()
@@ -295,7 +330,7 @@ pub fn right_panel(editor: Option<&Entity<Editor>>, width: Pixels, cx: &App) -> 
         .gap_2()
         .overflow_y_scroll()
         .child(
-            Label::new("属性 / 来源")
+            Label::new("文档信息")
                 .size(LabelSize::Small)
                 .color(ui::Color::Muted)
                 .mb(HEADER_MARGIN),
@@ -303,8 +338,6 @@ pub fn right_panel(editor: Option<&Entity<Editor>>, width: Pixels, cx: &App) -> 
         .child(property_row("文件", &name))
         .child(property_row("字数", &chars))
         .child(property_row("状态", &modified))
-        .child(property_row("引擎", &engine))
-        .child(property_row("编辑器", &mode))
         .children(docx_rows.iter().map(|(k, v)| {
             let k = k.clone();
             let v = v.clone();
@@ -324,11 +357,6 @@ pub fn right_panel(editor: Option<&Entity<Editor>>, width: Pixels, cx: &App) -> 
         .when_some(docx_notice, |el, notice| {
             el.child(property_row_owned("降级说明".into(), notice))
         })
-        .child(
-            Label::new("块级锚定 / 边注 / 证据来源随 #68 阶段 4 接线")
-                .size(LabelSize::XSmall)
-                .color(ui::Color::Hidden),
-        )
 }
 
 /// 属性键值行（_owned 变体——docx 行动态 String 键；视觉与
