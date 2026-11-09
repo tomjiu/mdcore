@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/mdcore", "crates/mdcore-wasm", "crates/formula", "crates/pdf-wasm", "crates/shell", "crates/shell-native", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf"]
-default-members = ["crates/mdcore", "crates/shell", "crates/shell-native", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf"]
+members = ["crates/mdcore", "crates/mdcore-wasm", "crates/formula", "crates/pdf-wasm", "crates/shell", "crates/shell-native", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf", "crates/lok"]
+default-members = ["crates/mdcore", "crates/shell", "crates/shell-native", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf", "crates/lok"]
 
 # R24-c 版本单源：全部 crate 经 version.workspace 继承此值（禁止
 # crate 内独立声明版本——r24_packaging.rs 跨 crate 一致性锁背书）。
@@ -46,3 +46,11 @@ serde_json = "1.0.151"
 # PDF-b 增补：crates/pdf（mdc-pdf）= 第二 Document Model 骨架（页/大纲/
 # 标注 + Command 边界 + 安全策略 + 协议草案；与 mdcore 零 path 依赖，
 # 零引擎依赖——pdfium/lopdf 自 PDF-c/d 引入）。
+#
+# #633 增补（2026-11-09）：crates/lok（mdc-lok）= LibreOfficeKit 隔离
+# worker 原型——LOK 内核动态加载（dlopen/dlsym libreofficekit_hook_2，
+# 宿主进程永不加载内核）+ 单文档 worker 进程（JSON-lines stdio：请求ID/
+# 帧长上限/超时看门狗/错误码化）+ 会话独立 user profile（多会话不互锁）
+# + 真实运行时 smoke（paintTile 非空像素/键盘+UNO 编辑/saveAs/重开校验）。
+# 三方依赖仅 serde_json（本表单源）；对 mdcore 零 path 依赖（三域纪律：
+# LOK = Office 域外部运行时，不引入第二套文档模型）。spec = issue #633。
