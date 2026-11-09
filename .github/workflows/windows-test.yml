@@ -1,0 +1,261 @@
+name: windows-test
+
+# 目标：让云端跑测试，本地只做人的决策。
+# 由来：本地 6 核机器跑 7 个代理的 GPUI 编译（每个 310 分钟）会互相拖死，
+# 而云端 runner 有 cargo 缓存，36 秒就能 check 完。
+#
+# 范围纪律：
+#   - 只跑「引擎层」crate 的测试（mdcore / office-io / pdf / formula / canvas）
+#   - 不跑 mang-shell（GPUI 397 crate，编译 310 分钟，云端也扛不住）
+#   - 不跑需要外部工具的测试（poppler / tesseract / LibreOffice —— 用环境门 SKIP）
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # #548：types 显式化（默认即 opened/synchronize/reopened——写出来
+    # 防后人误加放大面）。
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# #548：队列深度防线——同 workflow + 同 ref 只保留最新 run
+#（详见 windows-check.yml 同款注释）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+  # 测试二进制不带调试符号：体积小、链接快
+  CARGO_PROFILE_TEST_DEBUG: none
+
+jobs:
+  test-engine:
+    name: windows / engine tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 二进制夹具（*.pdf / *.docx）必须是 LF 原样，
+          # 否则 xref 偏移漂移 → pdf 测试全红（详见 issue #89 的 CRLF 坑）
+          lfs: false
+
+      - name: Verify binary fixtures are not line-ending converted
+        shell: bash
+        run: |
+          # CRLF 污染守卫：small.pdf 应为 1099 字节
+          f=crates/pdf/fixtures/small.pdf
+          if [ -f "$f" ]; then
+            sz=$(stat -c%s "$f" 2>/dev/null || wc -c < "$f")
+            echo "small.pdf = $sz bytes"
+            if [ "$sz" != "1099" ]; then
+              echo "::error::夹具被行尾转换污染（$sz != 1099）。检查 .gitattributes 与 worktree 检出。"
+              exit 1
+            fi
+          fi
+
+      # 结构体加字段守卫（#317）——2026-11-07 单日三次同类事故：
+      #   Anchor/#285②、ParagraphData/#266、PageGeometry/#304
+      #   共同根因：给结构体加字段后没检查所有字面量构造点。
+      # `#[serde(default)]` 只让反序列化兼容，Rust 字面量仍是全字段必需。
+      # 本步骤是**报告模式**（不判红）——先让风险面可见；
+      # 存量清零后再改 -Strict 变硬门禁。
+      - name: Struct field guard (加字段风险面报告)
+        shell: pwsh
+        run: |
+          ./scripts/struct-field-guard.ps1 -Repo $PWD
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-test-
+            ${{ runner.os }}-cargo-
+
+      # 引擎层 crate：纯 Rust，无外部工具依赖
+      - name: Test mdcore (core engine)
+        run: cargo test -p mdcore
+
+      # #358（2026-11-07）：mdcore-wasm 测试面 CI 化——此前本 job 的
+      # cargo test 清单漏 mdcore-wasm（windows-check.yml 仅 wasm32 编译
+      # check），122 条 lib 测试 + 8 个集成测试面在 CI 零执行 →
+      # AGENTS.md 13.4「CI 全绿 ≠ 稳定」实证：#338 断言翻转后 wasm 侧
+      # 漏改（w1_toc_field）在 main 静默红（本地 cargo test --workspace
+      # 才暴露，#358 红①）；hc_docx4j 六维门回归同理（红②）。
+      # native target 跑全目标（lib + 集成——红②恰在集成面，只跑 lib
+      # 会再漏）；wasm32 面维持 windows-check.yml 的编译 check 不变。
+      # 两个红①/红②修复均已合并（PR #372 · PR #388）——对应显式
+      # --skip 已移除（#358 收口增量：skip 不移除 = 覆盖缺口复现，
+      # dd748e1 注释的合并后义务）。w1_toc 断言与 hc_docx4j 六维门
+      # 回归进入 CI 常跑面（语料在库 git 跟踪，纯 Rust 零外部工具）。
+      - name: Test mdcore-wasm (wasm bridge - lib + integration)
+        run: cargo test -p mdcore-wasm
+
+      - name: Fetch xlsx-structural-corpus (#265 结构面语料 28 件, Apache-2.0)
+        # #265 语料门 CI 化：语料二进制不入库（.gitignore），CI 在
+        # Test mdc-office-io 前取件——结构面锁（隐藏行/外部链接/
+        # numFmt/xf 继承四类下限 + 零 panic + 形态实值断言）在云端
+        # 真跑而非 skip。幂等；依赖 curl（无 poppler/pdfinfo 面）。
+        shell: bash
+        run: python test-artifacts/xlsx-structural-corpus/fetch_corpus.py
+
+      - name: Test mdc-office-io (docx/xlsx/pptx)
+        run: cargo test -p mdc-office-io
+
+      - name: Cache pdfium
+        # 缓存 pdfium 二进制（3.87 MB）——避免每次 CI 重复下载：
+        # 2026-11-08 实测 GitHub release CDN 返回 504 导致 engine tests 恒红，
+        # 命中缓存后不再依赖外部下载（本步骤仅在缓存未命中时执行）。
+        id: pdfium-cache
+        uses: actions/cache@v4
+        with:
+          path: bin/lib/pdfium.dll
+          key: pdfium-win-x64-chromium-8086-v1
+
+      - name: Fetch pdfium (win-x64, pinned chromium/8086)
+        if: steps.pdfium-cache.outputs.cache-hit != 'true'
+        # #210 真实环境验证（#222 Lead 指派）：下载到定位序取件位（仓根 bin/lib）。
+        # 2026-11-08 改从本仓 release ci-deps-v1 取件——上游
+        # bblanchon/pdfium-binaries CDN 持续 504（GitHub 状态页显示正常但
+        # 实际下载失败），导致 engine tests/installer 恒红。
+        # SHA256 与上游一致（non-V8，安全策略 §JS 面不变）。
+        # 版本 pin + SHA256 与分析仓 fetch-pdfium.sh 同轨
+        # （chromium/8086 = pdfium-render pdfium_7881 绑定面的兼容二进制）；
+        # 升级 = 两处同步改 + 全 pdf 测试面复验。
+        shell: bash
+        run: |
+          mkdir -p bin/lib
+          curl -fL "https://github.com/mmqz/mdcore/releases/download/ci-deps-v1/pdfium-win-x64.tgz" -o /tmp/pdfium-win-x64.tgz
+          echo "1fd8af952832dbb0eb16d9249f68fe09e5f5ebf7c3dd9f6066ea2720cc28487d  /tmp/pdfium-win-x64.tgz" | sha256sum -c -
+          # win 包顶层结构 = bin/pdfium.dll（linux 包是 lib/libpdfium.so——
+          # 两平台包内布局不同）：解压到临时目录后显式放置到定位序
+          # 取件位（仓根 bin/lib/pdfium.dll）。
+          rm -rf /tmp/pdfium-x && mkdir -p /tmp/pdfium-x
+          tar -xzf /tmp/pdfium-win-x64.tgz -C /tmp/pdfium-x
+          cp /tmp/pdfium-x/bin/pdfium.dll bin/lib/pdfium.dll
+          test -f bin/lib/pdfium.dll && echo "pdfium.dll in place ($(stat -c%s bin/lib/pdfium.dll) bytes)"
+
+      - name: Fetch pdf-organize realworld corpus (多页真实件 8 件, Apache-2.0)
+        # #262/#273（Lead 评审 2026-11-06 方案 A）：语料二进制不入库，
+        # CI 在 Test mdc-pdf 前取件——语料门（pdff_organize.rs）从
+        # 「未取件 skip」转「在场全量」路径，sweep（≥5 件全操作）与
+        # 10× 往返抽样在云端真跑。manual300 压测件不随 CI（31MB），
+        # 大件测试按在场性自跳过。幂等；单源漂移 [MISS] 时取件不足
+        # 5 件退出码 1（sweep 下限对齐）。
+        shell: bash
+        run: python test-artifacts/pdf-organize-corpus/fetch_corpus.py
+
+      - name: Fetch pdf-corpus (#264 真实语料 78 件, Apache-2.0)
+        # #264 语料门 CI 化：语料二进制不入库（.gitignore），CI 在
+        # Test mdc-pdf 前取件——行为分布锁（ok/denied/engine_err 基线
+        # + 每类下限 + 零 panic）在云端真跑而非 skip。幂等；pdfinfo
+        # 缺席记 pages=null 不阻断；取件 <70 件退出码 1（上游漂移
+        # 快速失败，信息直指 [MISS] 源）。
+        shell: bash
+        run: python test-artifacts/pdf-corpus/fetch_corpus.py
+
+      - name: Test mdc-pdf (lopdf + pdfium 双引擎面——#210 真实环境验证)
+        # #210/#222：pdfium 测试面 CI 化——此前本步骤只开 engine-lopdf
+        # （注释自认「pdfium 面需要动态库，CI 上没有」= engine-pdfium
+        # 零覆盖，INSTALL.md 指引与装载逻辑从未被真实 Windows 验证）。
+        # 库经 MDC_PDFIUM_LIB（定位序第 1 优先）显式提供；
+        # 「exe 同目录」部署位（INSTALL.md 方式 B）由 tests/pdfk_deploy.rs
+        # 在本步骤内进程级验证（该测试自行清 env、复制库到测试二进制
+        # 旁、走候选 0 绑定）。
+        env:
+          MDC_PDFIUM_LIB: ${{ github.workspace }}/bin/lib/pdfium.dll
+        run: cargo test -p mdc-pdf --features engine-lopdf,engine-pdfium
+
+      - name: Test mdc-formula (xlsx formula engine)
+        run: cargo test -p mdc-formula
+
+      # #239 主线 P0：跨文档索引/标注/投影层。三步分层——契约层
+      # （零引擎依赖，cargo tree 断言在测试内）→ PDF 适配 lopdf 面
+      # （plan_with_geometry + execute + read_annotations 读回，纯
+      # Rust 可跑）→ PDF 适配 pdfium e2e（真实字符几何生产路径，
+      # 复用上一步已就位的 pdfium.dll）。
+      - name: Test mdc-overlay (overlay contract layer)
+        run: cargo test -p mdc-overlay
+
+      - name: Test mdc-overlay-pdf (lopdf face - plan/execute/readback)
+        run: cargo test -p mdc-overlay-pdf --features engine-lopdf
+
+      - name: Test mdc-overlay-pdf (pdfium e2e - real char geometry)
+        env:
+          MDC_PDFIUM_LIB: ${{ github.workspace }}/bin/lib/pdfium.dll
+        run: cargo test -p mdc-overlay-pdf --features engine-lopdf,engine-pdfium
+
+      - name: Test mdc-canvas (rendering)
+        # golden_svg_matches_fixture 是字节级黄金例比较，但夹具里含
+        # 三角函数结果（旋转矩形的 sqrt(2) 分量，如 145.4437/31.1127）——
+        # Windows 与 Linux 的浮点格式化末位有差异，字节比较必然失败。
+        # 黄金例的目的是【同平台防回归】，跨平台应改容差比较（待后续任务）。
+        run: cargo test -p mdc-canvas -- --skip golden_svg_matches_fixture
+
+      - name: Test mdc-evidence
+        run: cargo test -p mdc-evidence
+
+      - name: Test mdc-collab
+        run: cargo test -p mdc-collab
+
+      - name: Test mdc-workbench
+        run: cargo test -p mdc-workbench
+
+  # mang-shell 是【独立 workspace】（依赖 third_party/zed 的 gpui 32 crate /
+  # 157K LOC），主仓的 cargo test 覆盖不到。这里单独建 job。
+  #
+  # 用 windows-latest 而不是 ubuntu：
+  #   · GPUI Windows 走 D3D11，不需要 GTK/alsa/xkbcommon 一堆系统库
+  #   · 本地开发验证就是 Windows，环境一致
+  test-shell:
+    name: windows / mang-shell (GPUI 编辑器)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target (mang-shell 独立 workspace)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            mang-shell/target/
+          key: ${{ runner.os }}-shell-${{ hashFiles('mang-shell/Cargo.lock', 'third_party/zed/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-shell-
+
+      - name: cargo check (mang-shell 全目标)
+        working-directory: mang-shell
+        run: cargo check --all-targets
+
+      - name: cargo test --lib (编辑器逻辑 + docx/pdf/xlsx 映射)
+        working-directory: mang-shell
+        # perf 门槛测试在 4 核 runner 上会抖动——单线程跑（本地单跑 0.12s 稳定）。
+        run: cargo test --lib -- --test-threads=1
+
+      - name: cargo test (集成测试：docx 往返/端到端/语料)
+        working-directory: mang-shell
+        # 跳过两个「重/环境敏感」的语料测试：
+        #   · real_rust_corpus_full_sweep —— 扫描全仓 .rs（11 分钟），CI 太慢
+        #   · real_rust_file_string_and_comment_are_ignored —— CI 环境失败待查
+        #     （本地过、CI 挂；已排除行尾因素，疑高版本 rustc 的 highlight 行为差异）
+        # 只跳过「扫全仓 .rs」的重测试（11 分钟，CI 太慢）。
+        # real_rust_file_string_and_comment_are_ignored 已在 #157 修好（Doc::new 围栏态），不再跳过。
+        run: cargo test --tests -- --test-threads=1 --skip real_rust_corpus_full_sweep

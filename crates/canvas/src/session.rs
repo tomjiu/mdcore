@@ -1,0 +1,2566 @@
+//! Canvas 会话：领域模型 + 命令接口 + CRDT 载体（根 Map "canvas"）。
+//!
+//! 不变量集与 mdc-collab 同源同构（见两 crate Cargo.toml 注释）：
+//! skip_gc 无条件 / 捕获窗 0 / client_id 53 位域 / 入向全限额 +
+//! panic 隔离 / 双撤销栈 origin 分栈 + capture_transaction 拒
+//! None-origin（远端应用不入本地栈）/ 撤销栈软上限粗粒度策略。
+
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use mdc_evidence::Fingerprinter as _;
+use yrs::sync::time::Clock;
+use yrs::undo::Options as UndoOptions;
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::{
+    Any, ClientID, Doc, In, Map, MapPrelim, Number, Options as DocOptions, Origin, Out, ReadTxn,
+    StateVector, Transact, UndoManager, Update,
+};
+
+use crate::events::{CanvasChangeSource, CanvasEvent, EventHub, TouchedCollector, UpdateCollector};
+
+/// 载体根名。
+const ROOT: &str = "canvas";
+/// 载体字段名（私有常量——载体形状是本 crate 私事）。
+const F_KIND: &str = "kind";
+const F_X: &str = "x";
+const F_Y: &str = "y";
+const F_W: &str = "w";
+const F_H: &str = "h";
+const F_FROM: &str = "from";
+const F_TO: &str = "to";
+/// #406：边锚侧字段（Top/Right/Bottom/Left 线名）。
+const F_FROM_SIDE: &str = "from_side";
+const F_TO_SIDE: &str = "to_side";
+/// #406：边标题字段。
+const F_CAPTION: &str = "caption";
+const F_MEMBERS: &str = "members";
+const F_PROPS: &str = "props";
+/// 笔迹专有四键（#350——非 Stroke 对象不写不读）。
+const F_POINTS: &str = "points";
+const F_COLOR: &str = "color";
+const F_SWIDTH: &str = "swidth";
+const F_TOOL: &str = "tool";
+/// #402：z 序键（fractional index 字符串——字典序即 z 序；缺省
+/// `zorder::DEFAULT_KEY`，存量对象读侧兼容）。
+const F_ZINDEX: &str = "zindex";
+/// #405：标签集（嵌套 Map：tag → true——集字段的 CRDT 自然形状，
+/// 并发加不同 tag 联合合并；对比 members 整值替换的丢失面）。
+const F_TAGS: &str = "tags";
+/// #404：frame 命名（命名区——搜索/导出/演示支点）。
+const F_NAME: &str = "name";
+/// #404：父 frame 引用（树结构——reparent 不换 ID；指向 Frame kind）。
+const F_PARENT: &str = "parent";
+
+/// 画布对象种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectKind {
+    Node,
+    Edge,
+    Group,
+    /// 笔迹（#44 第 1 步）：原始采样点列 + 笔色/线宽/工具——存点不存
+    /// outline（换平滑算法/改粗细不迁移数据；outline 体积 = 点列 5-10 倍）。
+    Stroke,
+    /// #404：命名区（frame）——文档结构的空间对应物（section 类比）。
+    /// 容器语义：成员经 parent 属性挂接（对比 Group 的 members 数组）；
+    /// 渲染面恒在内容层之下（背景框 + 标题，见 render 容器分层）。
+    Frame,
+}
+
+impl ObjectKind {
+    fn wire(self) -> &'static str {
+        match self {
+            ObjectKind::Node => "node",
+            ObjectKind::Edge => "edge",
+            ObjectKind::Group => "group",
+            ObjectKind::Stroke => "stroke",
+            ObjectKind::Frame => "frame",
+        }
+    }
+
+    fn from_wire(s: &str) -> Option<ObjectKind> {
+        match s {
+            "node" => Some(ObjectKind::Node),
+            "edge" => Some(ObjectKind::Edge),
+            "group" => Some(ObjectKind::Group),
+            "stroke" => Some(ObjectKind::Stroke),
+            "frame" => Some(ObjectKind::Frame),
+            _ => None,
+        }
+    }
+}
+
+/// 笔迹工具（渲染语义差：Pen = 不透明圆头线；Highlighter = 半透明
+/// 平头宽线——半透明是**渲染态**，模型颜色恒存不透明值）。
+///
+/// 橡皮擦**不建模为笔种**（#44 引 canvas-a §3：两段式橡皮擦 =
+/// pointer-up 才提交的**软删交互**，引擎面 = 既有 [`CanvasCommand::RemoveObject`]；
+/// 建模为笔种会产生「画出来的删除」语义矛盾）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeTool {
+    Pen,
+    Highlighter,
+}
+
+impl StrokeTool {
+    fn wire(self) -> &'static str {
+        match self {
+            StrokeTool::Pen => "pen",
+            StrokeTool::Highlighter => "highlighter",
+        }
+    }
+
+    fn from_wire(s: &str) -> Option<StrokeTool> {
+        match s {
+            "pen" => Some(StrokeTool::Pen),
+            "highlighter" => Some(StrokeTool::Highlighter),
+            _ => None,
+        }
+    }
+}
+
+/// 画布对象读模型（快照式视图）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanvasObject {
+    pub id: String,
+    pub kind: ObjectKind,
+    /// Node/Group 几何（左上角 + 尺寸；Edge 恒 0）。
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// Edge 端点（节点 ID；非 Edge = None）。
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// #406：边锚侧（渲染锚点 = 指定边中点；缺省 None = 中心——
+    /// 既有行为。双侧同时指定时渲染为直角折线路由）。
+    pub from_side: Option<Side>,
+    pub to_side: Option<Side>,
+    /// #406：边标题（渲染在路径中点；关系语义的可见载体）。
+    pub caption: Option<String>,
+    /// Group 成员（对象 ID 集；非 Group = 空）。
+    pub members: Vec<String>,
+    /// 笔迹采样点（(x, y) 原始序列；非 Stroke = 空）——**不存
+    /// outline**（#44 裁决：平滑/加粗由消费侧重算，数据免迁移）。
+    pub points: Vec<(f64, f64)>,
+    /// 笔迹颜色（#RGB/#RRGGBB；非 Stroke = None）。
+    pub color: Option<String>,
+    /// 笔迹线宽（域单位；非 Stroke = None）。
+    pub width: Option<f64>,
+    /// 笔迹工具（非 Stroke = None）。
+    pub tool: Option<StrokeTool>,
+    /// #402：z 序键（fractional index——字典序即 z 序；渲染按
+    /// `(z_index, id)` 排序，ID 决胜吸收并发同键）。新建对象置顶
+    /// （generate(max, None)）；存量对象缺省 [`zorder::DEFAULT_KEY`]。
+    /// Group 对象的 z 不影响成员渲染（成员各自成图元），字段统一
+    /// 仅为模型一致性。
+    pub z_index: String,
+    /// #405：跨区分类标签（props 之外的一等公民——AI 检索/过滤面）。
+    /// 集语义：读侧排序去重（确定性读模型）；不塞 props 的理由：
+    /// props 是 string→string 自由字典，无法索引、无法区分业务 tag
+    /// 与样式属性（研究仓 canvas/mdcore-mapping.md §6 裁决）。
+    pub tags: Vec<String>,
+    /// #404：对象命名（frame 命名区——搜索/导出/演示支点）。开放面：
+    /// 引擎不禁止其他 kind 携带；渲染面仅 Frame 消费（标题）。
+    pub name: Option<String>,
+    /// #404：父 frame 引用（树结构——reparent 不换 ID）。写入侧校验：
+    /// 指向存在的 Frame kind 对象且无环；并发删除可留悬空引用（读模型
+    /// 如实暴露，消费侧按顶层处理——同 Edge 悬空端点纪律）。
+    pub parent: Option<String>,
+    /// 开放属性（label/color/…；字符串值面）。
+    pub props: BTreeMap<String, String>,
+}
+
+impl Default for CanvasObject {
+    /// 缺省 = 零几何 Node（AGENTS.md 0.0.5 方案 A：字面量构造点用
+    /// `..Default::default()` 跟住未来新增字段——kind 专属字段的缺省
+    /// 形状 = 非 Stroke/非 Edge 的空/None，读模型语义安全）。
+    fn default() -> Self {
+        CanvasObject {
+            id: String::new(),
+            kind: ObjectKind::Node,
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            from: None,
+            to: None,
+            from_side: None,
+            to_side: None,
+            caption: None,
+            members: vec![],
+            points: vec![],
+            color: None,
+            width: None,
+            tool: None,
+            z_index: crate::zorder::DEFAULT_KEY.to_string(),
+            tags: vec![],
+            name: None,
+            parent: None,
+            props: BTreeMap::new(),
+        }
+    }
+}
+
+/// 画布域错误（公开面零 yrs 类型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanvasError {
+    Limit {
+        size: usize,
+        limit: usize,
+    },
+    Decode(String),
+    Panic(String),
+    InvalidInput(String),
+    ObjectNotFound {
+        object_id: String,
+    },
+    DuplicateId {
+        object_id: String,
+    },
+    /// 边端点不存在（创建时校验——并发端点删除留下的悬空边在
+    /// 读模型暴露 from/to，消费侧可检测）。
+    EndpointNotFound {
+        object_id: String,
+    },
+    /// 成员不存在（分组时校验）。
+    MemberNotFound {
+        object_id: String,
+    },
+    /// 几何非有限值（NaN/±inf 拒收——敌意输入面）。
+    NonFiniteGeometry {
+        field: &'static str,
+    },
+    KindMismatch {
+        object_id: String,
+        op: &'static str,
+    },
+    /// #353：三态驾驶闸拒绝（含当前模式与被拒 actor；wasm 码
+    /// `cv_mode_denied`）。两类触发面同一变体：① `User` 模式下 Ai 的
+    /// 一切写入面；② Ai 的非法模式转移（仅 Ai 态可让出——自我提权被拒）。
+    ModeDenied {
+        mode: DriveMode,
+        actor: Actor,
+    },
+}
+
+impl std::fmt::Display for CanvasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CanvasError::Limit { size, limit } => {
+                write!(f, "input {size}B exceeds limit {limit}B")
+            }
+            CanvasError::Decode(m) => write!(f, "wire decode failed: {m}"),
+            CanvasError::Panic(m) => write!(f, "engine panic isolated: {m}"),
+            CanvasError::InvalidInput(m) => write!(f, "invalid input: {m}"),
+            CanvasError::ObjectNotFound { object_id } => {
+                write!(f, "canvas object not found: {object_id}")
+            }
+            CanvasError::DuplicateId { object_id } => {
+                write!(f, "duplicate object id: {object_id}")
+            }
+            CanvasError::EndpointNotFound { object_id } => {
+                write!(f, "edge endpoint not found: {object_id}")
+            }
+            CanvasError::MemberNotFound { object_id } => {
+                write!(f, "group member not found: {object_id}")
+            }
+            CanvasError::NonFiniteGeometry { field } => {
+                write!(f, "geometry field {field} is not finite (NaN/inf rejected)")
+            }
+            CanvasError::KindMismatch { object_id, op } => {
+                write!(f, "object {object_id} kind does not support {op}")
+            }
+            CanvasError::ModeDenied { mode, actor } => {
+                let who = match actor {
+                    Actor::Human => "human",
+                    Actor::Ai => "ai",
+                };
+                write!(
+                    f,
+                    "drive mode `{mode}` denied `{who}` operation (mode gate #353)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CanvasError {}
+
+/// 编辑来源（与 mdc-collab::Actor 同构——分栈 + origin 溯源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Actor {
+    Human,
+    Ai,
+}
+
+impl Actor {
+    fn wire(self) -> Origin {
+        match self {
+            Actor::Human => Origin::from("mdc:human"),
+            Actor::Ai => Origin::from("mdc:ai"),
+        }
+    }
+}
+
+/// #353：三态驾驶闸（kokoa 协议①——AI 能不能改画布的授权面，与
+/// `Actor`（谁在改）正交）。
+///
+/// - `User`：AI 的一切写入面（execute/execute_batch/undo/redo/切模式）
+///   被拒 [`CanvasError::ModeDenied`]——安全默认（宿主显式开启锁定后）。
+/// - `Collaborative`：双方都能改——**会话缺省**（零破坏：现网 AI 路径
+///   消费者/既有测试/wasm 调用方不回归；Lead 裁定点 1，PR 显著标注）。
+/// - `Ai`：AI 绘制中，人可随时夺回（Human 永不被闸拒）。
+///
+/// 模式是**会话本地策略，不入 CRDT**（issue 第 4 点：两端策略由宿主
+/// 各自决定，不产生同步语义）——切换零 CRDT 字节/零事件/零撤销入栈
+/// （Lead 裁定点 2：不做切换事件，读面轮询 [`Self::drive_mode`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DriveMode {
+    User,
+    Collaborative,
+    Ai,
+}
+
+impl DriveMode {
+    /// wire 名（wasm/JSON 面）。
+    pub fn wire(self) -> &'static str {
+        match self {
+            DriveMode::User => "user",
+            DriveMode::Collaborative => "collaborative",
+            DriveMode::Ai => "ai",
+        }
+    }
+
+    /// wire 反解（wasm 命令面）。
+    pub fn from_wire(s: &str) -> Option<DriveMode> {
+        match s {
+            "user" => Some(DriveMode::User),
+            "collaborative" => Some(DriveMode::Collaborative),
+            "ai" => Some(DriveMode::Ai),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DriveMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire())
+    }
+}
+
+/// #402：z 序重排操作（四向——Figma/Excalidraw/tldraw 标准集）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderOp {
+    /// 置顶（绝对——越过所有其他对象）。
+    BringToFront,
+    /// 置底（绝对）。
+    SendToBack,
+    /// 上移一层（相对；已在顶层则无变化）。
+    BringForward,
+    /// 下移一层（相对；已在底层则无变化）。
+    SendBackward,
+}
+
+impl ReorderOp {
+    /// 线格式（wasm 桥 / JSON 命令面）。
+    pub fn wire(self) -> &'static str {
+        match self {
+            ReorderOp::BringToFront => "front",
+            ReorderOp::SendToBack => "back",
+            ReorderOp::BringForward => "forward",
+            ReorderOp::SendBackward => "backward",
+        }
+    }
+
+    /// 线格式反解（未知串 → None——敌意面缺省拒）。
+    pub fn from_wire(s: &str) -> Option<ReorderOp> {
+        match s {
+            "front" => Some(ReorderOp::BringToFront),
+            "back" => Some(ReorderOp::SendToBack),
+            "forward" => Some(ReorderOp::BringForward),
+            "backward" => Some(ReorderOp::SendBackward),
+            _ => None,
+        }
+    }
+}
+
+/// 会话选项（与 mdc-collab::SessionOptions 同构纪律：不含 skip_gc、
+/// 不含捕获窗）。
+#[derive(Clone)]
+pub struct SessionOptions {
+    pub client_id: u64,
+    pub input_byte_limit: usize,
+    /// 撤销栈软上限（粗粒度 clear_all 策略——同 mdc-collab）。
+    pub undo_stack_limit: Option<usize>,
+    /// 时钟注入面（p5-t5 wasm 前置）：撤销栈时间戳源。`None` = 系统
+    /// 时钟（native 默认——既有行为零变化）；`Some(f)` = 宿主注入
+    /// （wasm32 无 std 时间系统——`SystemTime::now()` = trap；注入
+    /// 确定性时钟，与 mdcore-wasm `set_clock_ms`/mdc-pdf
+    /// `PortableInstant` 同纪律）。
+    pub clock_ms: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SessionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 闭包面非 Debug——以占位标记呈现（Debug derive 与 dyn Fn 冲突）。
+        f.debug_struct("SessionOptions")
+            .field("client_id", &self.client_id)
+            .field("input_byte_limit", &self.input_byte_limit)
+            .field("undo_stack_limit", &self.undo_stack_limit)
+            .field("clock_ms", &self.clock_ms.as_ref().map(|_| "<clock>"))
+            .finish()
+    }
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        SessionOptions {
+            client_id: 7_200_001,
+            input_byte_limit: 52 * 1024 * 1024,
+            undo_stack_limit: None,
+            clock_ms: None,
+        }
+    }
+}
+
+/// 画布命令全集（人类/AI 共用——受控集，无任意路径/脚本面）。
+#[derive(Debug, Clone)]
+pub enum CanvasCommand {
+    AddNode {
+        id: Option<String>,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        props: BTreeMap<String, String>,
+    },
+    /// 位置更新（键级 LWW——高频拖拽的自然语义）。
+    MoveNode {
+        id: String,
+        x: f64,
+        y: f64,
+    },
+    ResizeNode {
+        id: String,
+        w: f64,
+        h: f64,
+    },
+    AddEdge {
+        id: Option<String>,
+        from: String,
+        to: String,
+        props: BTreeMap<String, String>,
+    },
+    /// 属性终态替换（与文档域 SetAttrs 同语义）。
+    SetProps {
+        id: String,
+        props: BTreeMap<String, String>,
+    },
+    RemoveObject {
+        id: String,
+    },
+    GroupObjects {
+        group_id: Option<String>,
+        members: Vec<String>,
+    },
+    /// 解组（删除分组对象——成员对象不动）。
+    Ungroup {
+        group_id: String,
+    },
+    /// 加一笔笔迹（#350——#44 第 1 步）：原始采样点 ≥ 2，不存 outline。
+    AddStroke {
+        id: Option<String>,
+        points: Vec<(f64, f64)>,
+        /// #RGB/#RRGGBB（不透明值——Highlighter 半透明是渲染态）。
+        color: String,
+        width: f64,
+        tool: StrokeTool,
+    },
+    /// 笔迹样式终态替换（#44 第 3 步选择器的引擎前置；不动点列——
+    /// 平滑 outline 由消费侧重算，改粗细零数据迁移）。
+    SetStrokeStyle {
+        id: String,
+        color: String,
+        width: f64,
+        tool: StrokeTool,
+    },
+    /// #406：边路由/标题终态替换（锚侧 ×2 + caption——循 SetStrokeStyle
+    /// 先例；None = 清除该面，双侧 None + None caption = 回中心直线）。
+    SetEdgeRoute {
+        id: String,
+        from_side: Option<Side>,
+        to_side: Option<Side>,
+        caption: Option<String>,
+    },
+    /// #402：z 序重排（fractional index 改写——单对象原子属性，
+    /// O(1) 无写放大）。
+    Reorder {
+        id: String,
+        op: ReorderOp,
+    },
+    /// #405：加分类标签（幂等——已有该 tag = 零写入零事件，同
+    /// reorder 幂等纪律）。
+    AddTag {
+        id: String,
+        tag: String,
+    },
+    /// #405：移除分类标签（幂等——无该 tag = 零写入零事件）。
+    RemoveTag {
+        id: String,
+        tag: String,
+    },
+    /// #404：创建命名区（frame）——几何 + 名称 + 可选父 frame。
+    CreateFrame {
+        id: Option<String>,
+        name: String,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        parent: Option<String>,
+    },
+    /// #404：重命名 frame。
+    RenameFrame {
+        id: String,
+        name: String,
+    },
+    /// #404：reparent（parent = None 提为顶层；写入侧无环 + 目标必须是
+    /// Frame——ID 恒不变，reparent 不换 ID 是本命令的存在理由）。
+    SetParent {
+        id: String,
+        parent: Option<String>,
+    },
+    /// #353：三态驾驶闸切换（Human 任意态可切；Ai 仅能从 Ai 态让出
+    /// ——自我提权被拒）。模式不入 CRDT：成功也零字节/零事件/零入栈。
+    /// **不可进 execute_batch**（批语义只覆盖载体变更，会话本地策略在
+    /// 沙箱内静默丢失 = 谎报——入口拒）。
+    SetDriveMode {
+        mode: DriveMode,
+    },
+}
+
+/// #406：边锚侧（连接到节点的哪条边——JSON Canvas fromSide/toSide
+/// 规范级）。渲染锚点 = 该边中点；缺省 None = 中心（既有行为，
+/// 向后兼容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl Side {
+    /// 线名（JSON Canvas fromSide/toSide 取值）。
+    pub fn wire(self) -> &'static str {
+        match self {
+            Side::Top => "top",
+            Side::Right => "right",
+            Side::Bottom => "bottom",
+            Side::Left => "left",
+        }
+    }
+
+    /// 线名 → Side（未知值 = None；`from_wire` 命名别名，与 ObjectKind 同名口径）。
+    pub fn from_wire(s: &str) -> Option<Side> {
+        Self::parse(s)
+    }
+
+    /// 线名 → Side（未知值 = None）。
+    pub fn parse(s: &str) -> Option<Side> {
+        match s {
+            "top" => Some(Side::Top),
+            "right" => Some(Side::Right),
+            "bottom" => Some(Side::Bottom),
+            "left" => Some(Side::Left),
+            _ => None,
+        }
+    }
+}
+
+/// 命令回执。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandReceipt {
+    pub outcome: CommandOutcome,
+    pub undo_depth: usize,
+    pub undo_cleared: bool,
+}
+
+/// 批量回执（#352/#44 步6）：逐命令 outcome + 批级撤销面（整批 = 单
+/// 事务 = 一个撤销单元——一次 undo 全撤）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchReceipt {
+    /// 逐命令回执（含批内自动分配的对象 ID——消费方据此接线）。
+    pub outcomes: Vec<CommandOutcome>,
+    /// 批级撤销深度（应用后）。
+    pub undo_depth: usize,
+    pub undo_cleared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    NodeAdded {
+        id: String,
+    },
+    NodeMoved {
+        id: String,
+    },
+    NodeResized {
+        id: String,
+    },
+    EdgeAdded {
+        id: String,
+    },
+    PropsSet {
+        id: String,
+    },
+    ObjectRemoved {
+        id: String,
+    },
+    Grouped {
+        group_id: String,
+    },
+    Ungrouped {
+        group_id: String,
+    },
+    StrokeAdded {
+        id: String,
+    },
+    /// #402：z 序已重排（新键已写入；幂等无变化也回此回执）。
+    Reordered {
+        id: String,
+    },
+    StrokeStyled {
+        id: String,
+    },
+    /// #406：边路由/标题已设（终态替换）。
+    EdgeRouted {
+        id: String,
+    },
+    /// #405：标签已加（幂等无变化也回此回执）。
+    TagAdded {
+        id: String,
+    },
+    /// #405：标签已移除（幂等无变化也回此回执）。
+    TagRemoved {
+        id: String,
+    },
+    /// #404：frame 已建。
+    FrameCreated {
+        id: String,
+    },
+    /// #404：frame 已重命名。
+    FrameRenamed {
+        id: String,
+    },
+    /// #404：parent 已设（含提顶层）。
+    ParentSet {
+        id: String,
+    },
+    /// #353：驾驶模式已切（幂等同模式也回此回执——零载体字节）。
+    DriveModeSet {
+        mode: DriveMode,
+    },
+}
+
+/// Canvas 会话。
+pub struct CanvasSession {
+    doc: Doc,
+    undo_human: UndoManager,
+    undo_ai: UndoManager,
+    options: SessionOptions,
+    next_seq: u64,
+    undo_cleared_last: bool,
+    /// #353：驾驶模式（会话本地策略，不入 CRDT——两端策略由宿主各自
+    /// 决定，不产生同步语义）。缺省 Collaborative（零破坏裁定点）。
+    drive_mode: DriveMode,
+    /// 事件订阅面（集成项③——见 events 模块）。
+    pub(crate) hub: EventHub,
+    /// 事务字节收集器。
+    pub(crate) collector: UpdateCollector,
+    /// 受触对象收集器（根 Map 深观察）。
+    pub(crate) touched: TouchedCollector,
+}
+
+impl CanvasSession {
+    /// 构造面唯一入口（不变量集见模块文档）。
+    pub fn open(options: SessionOptions) -> Result<CanvasSession, CanvasError> {
+        if options.client_id == 0 || options.client_id & (u64::MAX << 53) != 0 {
+            return Err(CanvasError::InvalidInput(format!(
+                "client_id {} 超出 (0, 2^53) 域（yjs 兼容）",
+                options.client_id
+            )));
+        }
+        let mut opts = DocOptions::with_client_id(ClientID::new(options.client_id));
+        opts.skip_gc = true; // B1.1 无条件
+        let doc = Doc::with_options(opts);
+        let root = doc.get_or_insert_map(ROOT);
+        let _ = root.len(&doc.transact());
+
+        let mut undo_human = Self::new_undo_manager(Actor::Human, &options.clock_ms);
+        let mut undo_ai = Self::new_undo_manager(Actor::Ai, &options.clock_ms);
+        undo_human.expand_scope(&doc, &doc.get_or_insert_map(ROOT));
+        undo_ai.expand_scope(&doc, &doc.get_or_insert_map(ROOT));
+
+        // 事件面接线（集成项③）：doc 级 update 观察者 + 根 Map 深观察。
+        let collector = UpdateCollector::default();
+        collector.attach(&doc);
+        let touched = TouchedCollector::default();
+        touched.attach(&root);
+
+        Ok(CanvasSession {
+            doc,
+            undo_human,
+            undo_ai,
+            options,
+            next_seq: 0,
+            undo_cleared_last: false,
+            drive_mode: DriveMode::Collaborative,
+            hub: EventHub::default(),
+            collector,
+            touched,
+        })
+    }
+
+    fn new_undo_manager(
+        origin: Actor,
+        clock_ms: &Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
+    ) -> UndoManager {
+        // 与 mdc-collab 同构：每 origin 一栈 + 窗 0 + capture_transaction
+        // 拒 None-origin（远端应用不入本地栈）。
+        let mut tracked = HashSet::new();
+        tracked.insert(origin.wire());
+        /// 宿主闭包 → yrs Clock 适配器（注入面）。
+        struct HostClock<F: Fn() -> u64 + Send + Sync>(F);
+        impl<F: Fn() -> u64 + Send + Sync> Clock for HostClock<F> {
+            fn now(&self) -> u64 {
+                (self.0)()
+            }
+        }
+        /// 系统时钟（native 默认——wasm32 不可达：SessionOptions 时钟
+        /// 注入是 wasm 构造前置）。
+        struct SystemClock;
+        impl Clock for SystemClock {
+            fn now(&self) -> u64 {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            }
+        }
+        let timestamp: std::sync::Arc<dyn Clock> = match clock_ms {
+            Some(f) => {
+                let f = f.clone();
+                std::sync::Arc::new(HostClock(move || f()))
+            }
+            None => std::sync::Arc::new(SystemClock),
+        };
+        UndoManager::with_options(UndoOptions {
+            capture_timeout_millis: 0,
+            tracked_origins: tracked,
+            capture_transaction: Some(std::sync::Arc::new(|txn| txn.origin().is_some())),
+            timestamp,
+            init_undo_stack: vec![],
+            init_redo_stack: vec![],
+        })
+    }
+
+    /// 故障恢复：权威快照重建（撤销栈不随快照走）。
+    pub fn restore(options: SessionOptions, snapshot: &[u8]) -> Result<CanvasSession, CanvasError> {
+        let s = CanvasSession::open(options)?;
+        s.apply_update(snapshot)?;
+        Ok(s)
+    }
+
+    pub fn options(&self) -> &SessionOptions {
+        &self.options
+    }
+
+    fn check_inbound(&self, size: usize) -> Result<(), CanvasError> {
+        if size > self.options.input_byte_limit {
+            return Err(CanvasError::Limit {
+                size,
+                limit: self.options.input_byte_limit,
+            });
+        }
+        Ok(())
+    }
+
+    fn next_id(&mut self) -> String {
+        // 撞号跳过环：同 client 域既有 id（对端复活/重放携带的同段号
+        // 对象——同槽 reload 后计数器归零的经典撞号面）逐段跳过。分配
+        // 是稀有路径（用户命令级），O(1) map 键查找零成本；无既有对象
+        // 时恰一次循环 = 与原实现同代价。
+        loop {
+            self.next_seq += 1;
+            let id = format!("{}-{}", self.options.client_id, self.next_seq);
+            let occupied = {
+                let root = self.root();
+                let txn = self.doc.transact();
+                root.get(&txn, id.as_str()).is_some()
+            };
+            if !occupied {
+                return id;
+            }
+        }
+    }
+
+    fn root(&self) -> yrs::MapRef {
+        self.doc.get_or_insert_map(ROOT)
+    }
+
+    // ── 撤销面 ─────────────────────────────────────────────────────
+
+    /// #353：驾驶闸（读面轮询——会话本地策略，无事件面）。
+    pub fn drive_mode(&self) -> DriveMode {
+        self.drive_mode
+    }
+
+    /// #353：写入面闸——`User` 模式下 Ai 的一切写入面被拒（拒绝路径
+    /// 零 CRDT 字节/零事件/零撤销入栈：入口早退，收集器未 begin）。
+    /// Human 永不被拒（安全默认：人可随时夺回）。
+    fn gate_actor(&self, actor: Actor) -> Result<(), CanvasError> {
+        if matches!(actor, Actor::Ai) && matches!(self.drive_mode, DriveMode::User) {
+            return Err(CanvasError::ModeDenied {
+                mode: self.drive_mode,
+                actor,
+            });
+        }
+        Ok(())
+    }
+
+    /// #353：模式切换（会话方法——与 `set_drive_mode` 命令同语义）。
+    /// Human 可切任意态；Ai 仅能从 Ai 态让出（→ User/Collaborative/
+    /// 幂等 Ai；任何自我提权被拒）。零 CRDT 字节/零事件/零入栈。
+    pub fn set_drive_mode(&mut self, actor: Actor, mode: DriveMode) -> Result<(), CanvasError> {
+        self.gate_actor(actor)?;
+        let transition_ok = match actor {
+            Actor::Human => true,
+            Actor::Ai => matches!(self.drive_mode, DriveMode::Ai),
+        };
+        if !transition_ok {
+            return Err(CanvasError::ModeDenied {
+                mode: self.drive_mode,
+                actor,
+            });
+        }
+        self.drive_mode = mode;
+        Ok(())
+    }
+
+    /// 撤销（按 origin 分栈）。#353：`User` 模式下 Ai 借撤销面改状态
+    /// 同样被拒（`ModeDenied`）；`Ok(false)` = 栈空。
+    pub fn undo(&mut self, actor: Actor) -> Result<bool, CanvasError> {
+        self.gate_actor(actor)?;
+        self.collector.begin();
+        self.touched.begin();
+        let r = match actor {
+            Actor::Human => self.undo_human.undo_blocking(),
+            Actor::Ai => self.undo_ai.undo_blocking(),
+        };
+        let updates = self.collector.drain();
+        let touched = self.touched.drain();
+        self.enforce_undo_limit(actor);
+        if r && !updates.is_empty() {
+            self.hub.dispatch(&CanvasEvent {
+                source: CanvasChangeSource::Undo { actor },
+                updates,
+                touched,
+            });
+        }
+        Ok(r)
+    }
+
+    /// 重做（#353 同拒语义）。
+    pub fn redo(&mut self, actor: Actor) -> Result<bool, CanvasError> {
+        self.gate_actor(actor)?;
+        self.collector.begin();
+        self.touched.begin();
+        let r = match actor {
+            Actor::Human => self.undo_human.redo_blocking(),
+            Actor::Ai => self.undo_ai.redo_blocking(),
+        };
+        let updates = self.collector.drain();
+        let touched = self.touched.drain();
+        if r && !updates.is_empty() {
+            self.hub.dispatch(&CanvasEvent {
+                source: CanvasChangeSource::Redo { actor },
+                updates,
+                touched,
+            });
+        }
+        Ok(r)
+    }
+
+    // ── 事件面（集成项③）────────────────────────────────
+
+    /// 订阅变更事件（Drop 句柄即退订；派发纪律见 events 模块）。
+    pub fn subscribe(
+        &mut self,
+        f: impl FnMut(&CanvasEvent) + Send + 'static,
+    ) -> crate::events::Subscription {
+        self.hub.subscribe(f)
+    }
+
+    pub fn undo_depth(&self, actor: Actor) -> usize {
+        match actor {
+            Actor::Human => self.undo_human.undo_stack().len(),
+            Actor::Ai => self.undo_ai.undo_stack().len(),
+        }
+    }
+
+    pub fn redo_depth(&self, actor: Actor) -> usize {
+        match actor {
+            Actor::Human => self.undo_human.redo_stack().len(),
+            Actor::Ai => self.undo_ai.redo_stack().len(),
+        }
+    }
+
+    fn enforce_undo_limit(&mut self, actor: Actor) {
+        self.undo_cleared_last = false;
+        if let Some(limit) = self.options.undo_stack_limit {
+            let over = match actor {
+                Actor::Human => self.undo_human.undo_stack().len() > limit,
+                Actor::Ai => self.undo_ai.undo_stack().len() > limit,
+            };
+            if over {
+                match actor {
+                    Actor::Human => self.undo_human.clear_all(),
+                    Actor::Ai => self.undo_ai.clear_all(),
+                }
+                self.undo_cleared_last = true;
+            }
+        }
+    }
+
+    fn take_undo_cleared(&mut self) -> bool {
+        let v = self.undo_cleared_last;
+        self.undo_cleared_last = false;
+        v
+    }
+
+    // ── 同步/快照/维护面（与 mdc-collab 同构）──────────────────────
+
+    pub fn state_vector(&self) -> Vec<u8> {
+        self.doc.transact().state_vector().encode_v1()
+    }
+
+    pub fn encode_diff(&self, remote_sv: &[u8]) -> Result<Vec<u8>, CanvasError> {
+        self.check_inbound(remote_sv.len())?;
+        let sv =
+            StateVector::decode_v1(remote_sv).map_err(|e| CanvasError::Decode(e.to_string()))?;
+        Ok(self.doc.transact().encode_diff_v1(&sv))
+    }
+
+    pub fn apply_update(&self, bytes: &[u8]) -> Result<(), CanvasError> {
+        self.check_inbound(bytes.len())?;
+        self.collector.begin();
+        self.touched.begin();
+        let doc = &self.doc;
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let update =
+                Update::decode_v1(bytes).map_err(|e| CanvasError::Decode(e.to_string()))?;
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update)
+                .map_err(|e| CanvasError::Decode(e.to_string()))?;
+            txn.commit();
+            Ok(())
+        }));
+        match r {
+            Ok(Ok(())) => {
+                let updates = self.collector.drain();
+                let touched = self.touched.drain();
+                if !updates.is_empty() {
+                    self.hub.dispatch(&CanvasEvent {
+                        source: CanvasChangeSource::Remote,
+                        updates,
+                        touched,
+                    });
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = self.collector.drain();
+                let _ = self.touched.drain();
+                Err(e)
+            }
+            Err(p) => {
+                let _ = self.collector.drain();
+                let _ = self.touched.drain();
+                Err(CanvasError::Panic(panic_message(&p)))
+            }
+        }
+    }
+
+    pub fn authoritative_snapshot(&self) -> Result<Vec<u8>, CanvasError> {
+        let doc = &self.doc;
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let snap = doc.transact_mut().snapshot();
+            let mut enc = EncoderV1::new();
+            doc.transact_mut()
+                .encode_state_from_snapshot(&snap, &mut enc)
+                .map_err(|e| CanvasError::InvalidInput(e.to_string()))?;
+            Ok(enc.to_vec())
+        }))
+        .unwrap_or_else(|p| Err(CanvasError::Panic(panic_message(&p))))
+    }
+
+    /// 受控压缩（清栈 + 显式 gc——同 mdc-collab 语义与代价）。
+    /// 维护窗事件恒发（updates 可能为空——逻辑读模型不变）。
+    pub fn maintenance_gc(&mut self) -> Result<(usize, usize), CanvasError> {
+        let before = self.full_update_len();
+        self.undo_human.clear_all();
+        self.undo_ai.clear_all();
+        self.collector.begin();
+        self.touched.begin();
+        let doc = &self.doc;
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut txn = doc.transact_mut();
+            txn.gc(None);
+            txn.commit();
+        }))
+        .map_err(|p| CanvasError::Panic(panic_message(&p)))?;
+        let updates = self.collector.drain();
+        let touched = self.touched.drain();
+        self.hub.dispatch(&CanvasEvent {
+            source: CanvasChangeSource::Maintenance,
+            updates,
+            touched,
+        });
+        Ok((before, self.full_update_len()))
+    }
+
+    pub fn full_update_len(&self) -> usize {
+        self.doc
+            .transact()
+            .encode_diff_v1(&StateVector::default())
+            .len()
+    }
+
+    // ── 读模型 ─────────────────────────────────────────────────────
+
+    /// 全量对象（确定性序：按 ID 排序——读模型稳定面）。
+    pub fn objects(&self) -> Vec<CanvasObject> {
+        let root = self.root();
+        let txn = self.doc.transact();
+        let mut ids: Vec<String> = root.keys(&txn).map(|k| k.to_string()).collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| read_object(&root, &txn, &id))
+            .collect()
+    }
+
+    /// #402：全量对象（z 序：`(z_index, id)` 决胜——渲染消费面）。
+    ///
+    /// 与 [`Self::objects`]（ID 序）并存：指纹/断言等稳定性敏感面用
+    /// ID 序；绘制顺序（遮挡关系）用本面。并发同键（两副本同邻位
+    /// 插入）由 ID 决胜吸收——合并后两副本全序一致。
+    pub fn objects_z_ordered(&self) -> Vec<CanvasObject> {
+        let mut out = self.objects();
+        out.sort_by(|a, b| (&a.z_index, &a.id).cmp(&(&b.z_index, &b.id)));
+        out
+    }
+
+    /// #405：按标签检索（读模型——ID 字典序，同 [`Self::objects`]
+    /// 确定性面；AI 检索/过滤消费面）。
+    pub fn list_by_tag(&self, tag: &str) -> Vec<CanvasObject> {
+        self.objects()
+            .into_iter()
+            .filter(|o| o.tags.iter().any(|t| t == tag))
+            .collect()
+    }
+
+    pub fn find_object(&self, id: &str) -> Option<CanvasObject> {
+        let root = self.root();
+        let txn = self.doc.transact();
+        read_object(&root, &txn, id)
+    }
+
+    /// 对象语义指纹（证据关联面）：语义字段确定性序列化 → FNV-1a 64。
+    pub fn object_fingerprint(&self, id: &str) -> Result<String, CanvasError> {
+        self.check_inbound(id.len())?;
+        let obj = self
+            .find_object(id)
+            .ok_or_else(|| CanvasError::ObjectNotFound {
+                object_id: id.to_string(),
+            })?;
+        Ok(fingerprint_object(&obj))
+    }
+
+    /// 全画布指纹（整体状态指纹——画布作为受证文档的 DocumentRef 面）。
+    pub fn canvas_fingerprint(&self) -> String {
+        let objs = self.objects();
+        let mut acc = String::new();
+        for o in &objs {
+            acc.push_str(&fingerprint_object(o));
+            acc.push('\n');
+        }
+        mdc_evidence::Fnv64.fingerprint(acc.as_bytes()).0
+    }
+
+    // ── 命令执行 ───────────────────────────────────────────────────
+
+    /// 受控命令执行（人类与 AI 同一入口）。成功且产出 CRDT 字节的命令
+    /// 恰派发一个 [`crate::events::CanvasChangeSource::Command`] 事件
+    /// （touched = 受触对象 ID 字典序去重）。
+    pub fn execute(
+        &mut self,
+        actor: Actor,
+        cmd: CanvasCommand,
+    ) -> Result<CommandReceipt, CanvasError> {
+        // #353：驾驶闸在收集器 begin 之前——拒绝路径零字节/零事件/零入栈。
+        self.gate_actor(actor)?;
+        self.collector.begin();
+        self.touched.begin();
+        let result = self.execute_inner(actor, cmd);
+        let updates = self.collector.drain();
+        let touched = self.touched.drain();
+        match result {
+            Ok(receipt) => {
+                if !updates.is_empty() {
+                    self.hub.dispatch(&CanvasEvent {
+                        source: CanvasChangeSource::Command { actor },
+                        updates,
+                        touched,
+                    });
+                }
+                Ok(receipt)
+            }
+            // 失败不产事件（错误经返回值显式传递）。
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 命令实施体（事件包裹的内层——`?` 早退不绕过收集器清理）。
+    fn execute_inner(
+        &mut self,
+        actor: Actor,
+        cmd: CanvasCommand,
+    ) -> Result<CommandReceipt, CanvasError> {
+        let outcome = match cmd {
+            CanvasCommand::AddNode {
+                id,
+                x,
+                y,
+                w,
+                h,
+                props,
+            } => {
+                let oid = self.add_node(actor, id, x, y, w, h, &props)?;
+                CommandOutcome::NodeAdded { id: oid }
+            }
+            CanvasCommand::MoveNode { id, x, y } => {
+                self.move_node(actor, &id, x, y)?;
+                CommandOutcome::NodeMoved { id }
+            }
+            CanvasCommand::ResizeNode { id, w, h } => {
+                self.resize_node(actor, &id, w, h)?;
+                CommandOutcome::NodeResized { id }
+            }
+            CanvasCommand::AddEdge {
+                id,
+                from,
+                to,
+                props,
+            } => {
+                let oid = self.add_edge(actor, id, &from, &to, &props)?;
+                CommandOutcome::EdgeAdded { id: oid }
+            }
+            CanvasCommand::SetProps { id, props } => {
+                self.set_props(actor, &id, &props)?;
+                CommandOutcome::PropsSet { id }
+            }
+            CanvasCommand::RemoveObject { id } => {
+                self.remove_object(actor, &id)?;
+                CommandOutcome::ObjectRemoved { id }
+            }
+            CanvasCommand::GroupObjects { group_id, members } => {
+                let gid = self.group_objects(actor, group_id, &members)?;
+                CommandOutcome::Grouped { group_id: gid }
+            }
+            CanvasCommand::Ungroup { group_id } => {
+                self.ungroup(actor, &group_id)?;
+                CommandOutcome::Ungrouped { group_id }
+            }
+            CanvasCommand::AddStroke {
+                id,
+                points,
+                color,
+                width,
+                tool,
+            } => {
+                let sid = self.add_stroke(actor, id, &points, &color, width, tool)?;
+                CommandOutcome::StrokeAdded { id: sid }
+            }
+            CanvasCommand::SetStrokeStyle {
+                id,
+                color,
+                width,
+                tool,
+            } => {
+                self.set_stroke_style(actor, &id, &color, width, tool)?;
+                CommandOutcome::StrokeStyled { id }
+            }
+            CanvasCommand::SetEdgeRoute {
+                id,
+                from_side,
+                to_side,
+                caption,
+            } => {
+                self.set_edge_route(actor, &id, from_side, to_side, caption)?;
+                CommandOutcome::EdgeRouted { id }
+            }
+            CanvasCommand::Reorder { id, op } => {
+                self.reorder_object(actor, &id, op)?;
+                CommandOutcome::Reordered { id }
+            }
+            CanvasCommand::AddTag { id, tag } => {
+                self.add_tag(actor, &id, &tag)?;
+                CommandOutcome::TagAdded { id }
+            }
+            CanvasCommand::RemoveTag { id, tag } => {
+                self.remove_tag(actor, &id, &tag)?;
+                CommandOutcome::TagRemoved { id }
+            }
+            CanvasCommand::CreateFrame {
+                id,
+                name,
+                x,
+                y,
+                w,
+                h,
+                parent,
+            } => {
+                let fid = self.create_frame(actor, id, &name, x, y, w, h, parent)?;
+                CommandOutcome::FrameCreated { id: fid }
+            }
+            CanvasCommand::RenameFrame { id, name } => {
+                self.rename_frame(actor, &id, &name)?;
+                CommandOutcome::FrameRenamed { id }
+            }
+            CanvasCommand::SetParent { id, parent } => {
+                self.set_parent(actor, &id, parent)?;
+                CommandOutcome::ParentSet { id }
+            }
+            // #353：模式切换命令（门已过 gate_actor；此处只裁转移
+            // 合法性——Human 任意态 / Ai 仅让出）。零载体字节：事件
+            // 面零派发（updates 空）、撤销栈零入栈。
+            CanvasCommand::SetDriveMode { mode } => {
+                self.set_drive_mode(actor, mode)?;
+                CommandOutcome::DriveModeSet { mode }
+            }
+        };
+        Ok(CommandReceipt {
+            outcome,
+            undo_depth: self.undo_depth(actor),
+            undo_cleared: self.take_undo_cleared(),
+        })
+    }
+
+    // ── 批量命令面（#352/#44 步6）─────────────────────────
+
+    /// 派生沙箱 client_id（确定性，与自身 client_id 错开命名空间——
+    /// 批内自动分配的对象 ID 落在 `{sandbox_client}-{seq}` 前缀下，
+    /// 天然不与本地计数器序列撞号）。越 (0, 2^53) 域时回落取模
+    /// （残余撞号由 `next_id` 的占用跳过环兜底）。
+    fn sandbox_client_id(&self) -> u64 {
+        const OFFSET: u64 = 4_000_000_000_000;
+        let id = self.options.client_id.wrapping_add(OFFSET);
+        if id == 0 || id & (u64::MAX << 53) != 0 {
+            OFFSET + self.options.client_id % 1_000_000_000_000
+        } else {
+            id
+        }
+    }
+
+    /// 批量命令原子执行（#352/#44 步6）：**整批全成或全不成；整批 =
+    /// 单事务 = 一个撤销单元**（一次 undo 全撤、一次 redo 全恢复）。
+    ///
+    /// 实现路线（yrs 0.28 无 Transaction rollback——`Drop for
+    /// TransactionMut` 无条件 `commit()`，单事务回滚不可行）：
+    /// **沙箱校验 + 差量转移**。
+    /// ① 沙箱 = 状态等价副本（独立 client_id 的 `CanvasSession`）；
+    ///    顺序执行全批——cmd N 可见 cmd N-1 的效果（依赖序列合法）；
+    ///    任一失败即返回错误，**真实 doc 零接触**（原子性；沙箱即弃）。
+    /// ② 全批通过 → `encode_diff(批前 SV)` 取批效果差量 → 真实 doc
+    ///    单事务 + actor origin 落地（撤销单元化 + 恰一个 Command 事件）。
+    /// 成本：O(state) 状态副本——批是命令级稀有路径（用户/AI 显式
+    /// 批操作），换零回滚依赖与零既有路径改动。
+    ///
+    /// 语义注：
+    /// · 批内自动分配 ID 落在沙箱命名空间（回执如实返回实际 ID）；
+    ///   后续单命令自动分配不受影响（`next_id` 占用跳过环兜底）。
+    /// · 差量字节数计入真实入向限额（批效果聚合计——单命令逐条计
+    ///   之外的批级门）。
+    /// · 失败路径零事件、零撤销入栈、读模型/指纹不变。
+    pub fn execute_batch(
+        &mut self,
+        actor: Actor,
+        cmds: Vec<CanvasCommand>,
+    ) -> Result<BatchReceipt, CanvasError> {
+        // #353：驾驶闸在沙箱副本之前——拒绝路径零状态拷贝/零字节/零事件。
+        self.gate_actor(actor)?;
+        if cmds.is_empty() {
+            return Err(CanvasError::InvalidInput(
+                "空批不可执行（无意义的撤销单元）".into(),
+            ));
+        }
+        // #353：会话本地策略不入 CRDT——在沙箱内“成功”也不会出现在差量里
+        // （真实会话模式不变 = 回执谎报）。批入口显式拒绝，零静默丢弃面。
+        if cmds
+            .iter()
+            .any(|c| matches!(c, CanvasCommand::SetDriveMode { .. }))
+        {
+            return Err(CanvasError::InvalidInput(
+                "set_drive_mode 不能进批：会话本地策略非载体变更（批语义只覆盖 CRDT 字节）".into(),
+            ));
+        }
+        // 批前基线：全量状态（沙箱种子）+ 真实 SV（差量基准）。
+        let full = self.doc.transact().encode_diff_v1(&StateVector::default());
+        let sv_real = self.state_vector();
+        // 沙箱限额放宽到能容纳状态副本（自身数据非敌意入向；批效果
+        // 聚合计走 ② 的真实入向门）。
+        let mut sandbox_opts = self.options.clone();
+        sandbox_opts.client_id = self.sandbox_client_id();
+        sandbox_opts.input_byte_limit = self.options.input_byte_limit.max(full.len());
+        let mut sandbox = CanvasSession::open(sandbox_opts)?;
+        sandbox.apply_update(&full)?;
+        // ① 沙箱顺序执行全批。
+        let mut outcomes = Vec::with_capacity(cmds.len());
+        for cmd in &cmds {
+            let receipt = sandbox.execute(actor, cmd.clone())?;
+            outcomes.push(receipt.outcome);
+        }
+        // ② 批效果差量 → 真实 doc 单事务落地。
+        let diff = sandbox.encode_diff(&sv_real)?;
+        self.check_inbound(diff.len())?;
+        self.collector.begin();
+        self.touched.begin();
+        let doc = &self.doc;
+        let applied = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let update =
+                Update::decode_v1(&diff).map_err(|e| CanvasError::Decode(e.to_string()))?;
+            let mut txn = doc.transact_mut_with(actor.wire());
+            txn.apply_update(update)
+                .map_err(|e| CanvasError::Decode(e.to_string()))?;
+            txn.commit();
+            Ok(())
+        }));
+        match applied {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = self.collector.drain();
+                let _ = self.touched.drain();
+                return Err(e);
+            }
+            Err(p) => {
+                let _ = self.collector.drain();
+                let _ = self.touched.drain();
+                return Err(CanvasError::Panic(panic_message(&p)));
+            }
+        }
+        let updates = self.collector.drain();
+        let touched = self.touched.drain();
+        if !updates.is_empty() {
+            self.hub.dispatch(&CanvasEvent {
+                source: CanvasChangeSource::Command { actor },
+                updates,
+                touched,
+            });
+        }
+        self.enforce_undo_limit(actor);
+        Ok(BatchReceipt {
+            outcomes,
+            undo_depth: self.undo_depth(actor),
+            undo_cleared: self.take_undo_cleared(),
+        })
+    }
+
+    fn check_finite(v: f64, field: &'static str) -> Result<f64, CanvasError> {
+        if v.is_finite() {
+            Ok(v)
+        } else {
+            Err(CanvasError::NonFiniteGeometry { field })
+        }
+    }
+
+    fn ensure_absent(&self, id: &str) -> Result<(), CanvasError> {
+        if self.find_object(id).is_some() {
+            return Err(CanvasError::DuplicateId {
+                object_id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn props_prelim(props: &BTreeMap<String, String>) -> MapPrelim {
+        props
+            .iter()
+            .map(|(k, v)| (k.as_str(), In::Any(Any::String(v.as_str().into()))))
+            .collect()
+    }
+
+    // ── z 序（#402）─────────────────────────────────────────────
+
+    /// 新建对象的置顶 z 键（max 之上生成——新形状在上层，行业惯例）。
+    ///
+    /// 现存 z 键含敌意非法值时生成失败 → 兜底 `DEFAULT_KEY`（宁缺毋错：
+    /// 新对象落缺省位，不 panic；重排命令面会拒绝非法键并报错）。
+    fn next_top_z(&self) -> String {
+        let max = self.objects().into_iter().map(|o| o.z_index).max();
+        match crate::zorder::generate_between(max.as_deref(), None) {
+            Ok(z) => z,
+            Err(_) => crate::zorder::DEFAULT_KEY.to_string(),
+        }
+    }
+
+    /// 对象裸 Map 引用（重排/属性写面的公共取位——无 kind 门禁）。
+    fn object_map(&self, id: &str) -> Result<yrs::MapRef, CanvasError> {
+        self.check_inbound(id.len())?;
+        let root = self.root();
+        let txn = self.doc.transact();
+        match root.get(&txn, id) {
+            Some(Out::YMap(m)) => Ok(m),
+            _ => Err(CanvasError::ObjectNotFound {
+                object_id: id.to_string(),
+            }),
+        }
+    }
+
+    /// #402：z 序重排——按当前全序计算新键并单事务写入。
+    ///
+    /// - BringToFront / SendToBack：绝对（越过所有其他对象）；
+    /// - BringForward / SendBackward：相对一步——跨过最近的**不同 z**
+    ///   邻层（同键并列对象视为同层，一步整层跨过）；
+    /// - 相对操作已在端点 → 幂等无变化（不产生空写 = 零 CRDT 字节
+    ///   = 零事件，与既有命令的事件语义一致）；
+    /// - 邻层 z 键非法（敌意面）→ `InvalidInput` 拒绝（fail-closed，
+    ///   不静默排错）。
+    fn reorder_object(&mut self, actor: Actor, id: &str, op: ReorderOp) -> Result<(), CanvasError> {
+        self.check_inbound(id.len())?;
+        // 全序快照 (z, id)——邻域计算面（排序在 objects_z_ordered 同口径）
+        let mut zs: Vec<(String, String)> = self
+            .objects()
+            .into_iter()
+            .map(|o| (o.z_index, o.id))
+            .collect();
+        zs.sort();
+        let Some(pos) = zs.iter().position(|(_, oid)| oid == id) else {
+            return Err(CanvasError::ObjectNotFound {
+                object_id: id.to_string(),
+            });
+        };
+        let cur_z = zs[pos].0.clone();
+        let map_err = |e: crate::zorder::ZOrderError| {
+            CanvasError::InvalidInput(format!("z 序键生成失败（{e}）——现存键面非法"))
+        };
+        let new_z = match op {
+            ReorderOp::BringToFront => {
+                let max_other = zs
+                    .iter()
+                    .filter(|(_, oid)| oid != id)
+                    .map(|(z, _)| z.clone())
+                    .max();
+                crate::zorder::generate_between(max_other.as_deref(), None).map_err(map_err)?
+            }
+            ReorderOp::SendToBack => {
+                let min_other = zs
+                    .iter()
+                    .filter(|(_, oid)| oid != id)
+                    .map(|(z, _)| z.clone())
+                    .min();
+                crate::zorder::generate_between(None, min_other.as_deref()).map_err(map_err)?
+            }
+            ReorderOp::BringForward => {
+                // 上邻 u = 第一个不同 z 的在上方对象；新键 ∈ (u, u 之上
+                // 第一层)——落在 u 的**上方**（跨过整层）。
+                let upper = zs[pos + 1..]
+                    .iter()
+                    .find(|(z, _)| z.as_str() > cur_z.as_str())
+                    .map(|(z, _)| z.clone());
+                match upper {
+                    None => cur_z.clone(), // 已在顶层：幂等
+                    Some(u) => {
+                        let above_u = zs[pos + 1..]
+                            .iter()
+                            .find(|(z, _)| z.as_str() > u.as_str())
+                            .map(|(z, _)| z.clone());
+                        crate::zorder::generate_between(Some(&u), above_u.as_deref())
+                            .map_err(map_err)?
+                    }
+                }
+            }
+            ReorderOp::SendBackward => {
+                // 下邻 l = 第一个不同 z 的在下方对象；新键 ∈ (l 之下
+                // 第一层, l)——落在 l 的**下方**（跨过整层）。
+                let lower = zs[..pos]
+                    .iter()
+                    .rev()
+                    .find(|(z, _)| z.as_str() < cur_z.as_str())
+                    .map(|(z, _)| z.clone());
+                match lower {
+                    None => cur_z.clone(), // 已在底层：幂等
+                    Some(l) => {
+                        let below_l = zs[..pos]
+                            .iter()
+                            .rev()
+                            .find(|(z, _)| z.as_str() < l.as_str())
+                            .map(|(z, _)| z.clone());
+                        crate::zorder::generate_between(below_l.as_deref(), Some(&l))
+                            .map_err(map_err)?
+                    }
+                }
+            }
+        };
+        if new_z == cur_z {
+            return Ok(()); // 幂等：零写入零事件
+        }
+        let m = self.object_map(id)?;
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            m.insert(&mut txn, F_ZINDEX, In::Any(Any::String(new_z.into())));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // 命令域字段直传——结构化入参组（id/几何/属性）属领域形状
+    fn add_node(
+        &mut self,
+        actor: Actor,
+        id: Option<String>,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        props: &BTreeMap<String, String>,
+    ) -> Result<String, CanvasError> {
+        #[allow(clippy::too_many_arguments)]
+        {}
+        let inbound = x.to_string().len() * 4
+            + props.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            + id.as_deref().map(|i| i.len()).unwrap_or(0)
+            + 128;
+        self.check_inbound(inbound)?;
+        Self::check_finite(x, "x")?;
+        Self::check_finite(y, "y")?;
+        Self::check_finite(w, "w")?;
+        Self::check_finite(h, "h")?;
+        if w < 0.0 || h < 0.0 {
+            return Err(CanvasError::InvalidInput("尺寸不可为负".into()));
+        }
+        let id = match id {
+            Some(given) => {
+                if given.is_empty() {
+                    return Err(CanvasError::InvalidInput("对象 ID 不可为空".into()));
+                }
+                self.ensure_absent(&given)?;
+                given
+            }
+            None => self.next_id(),
+        };
+        {
+            let z = self.next_top_z();
+            let mut obj: MapPrelim = Vec::<(&'static str, In)>::new().into_iter().collect();
+            obj.insert(
+                F_KIND.into(),
+                In::Any(Any::String(ObjectKind::Node.wire().into())),
+            );
+            obj.insert(F_X.into(), In::Any(Any::Number(Number::Float(x))));
+            obj.insert(F_Y.into(), In::Any(Any::Number(Number::Float(y))));
+            obj.insert(F_W.into(), In::Any(Any::Number(Number::Float(w))));
+            obj.insert(F_H.into(), In::Any(Any::Number(Number::Float(h))));
+            obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
+            obj.insert(F_PROPS.into(), In::Map(Self::props_prelim(props)));
+            // #405：预建空标签 Map（props 同款先例）——并发首笔
+            // add_tag 成为既有 Map 内的键级操作（联合合并），而非
+            // F_TAGS 键上的整值 Map 插入（键级 LWW 互相覆盖丢 tag）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
+            let root = self.root();
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.insert(&mut txn, id.clone(), In::Map(obj));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(id)
+    }
+
+    fn node_map(&self, id: &str, op: &'static str) -> Result<yrs::MapRef, CanvasError> {
+        self.check_inbound(id.len())?;
+        let root = self.root();
+        let txn = self.doc.transact();
+        match root.get(&txn, id) {
+            Some(Out::YMap(m)) => {
+                // kind 校验（Move/Resize 仅 Node 面）。
+                if let Some(Out::Any(Any::String(k))) = m.get(&txn, F_KIND) {
+                    if op == "geometry" && k.as_ref() != ObjectKind::Node.wire() {
+                        return Err(CanvasError::KindMismatch {
+                            object_id: id.to_string(),
+                            op,
+                        });
+                    }
+                }
+                Ok(m)
+            }
+            _ => Err(CanvasError::ObjectNotFound {
+                object_id: id.to_string(),
+            }),
+        }
+    }
+
+    fn move_node(&mut self, actor: Actor, id: &str, x: f64, y: f64) -> Result<(), CanvasError> {
+        Self::check_finite(x, "x")?;
+        Self::check_finite(y, "y")?;
+        let m = self.node_map(id, "geometry")?;
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            m.insert(&mut txn, F_X, In::Any(Any::Number(Number::Float(x))));
+            m.insert(&mut txn, F_Y, In::Any(Any::Number(Number::Float(y))));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    fn resize_node(&mut self, actor: Actor, id: &str, w: f64, h: f64) -> Result<(), CanvasError> {
+        Self::check_finite(w, "w")?;
+        Self::check_finite(h, "h")?;
+        if w < 0.0 || h < 0.0 {
+            return Err(CanvasError::InvalidInput("尺寸不可为负".into()));
+        }
+        let m = self.node_map(id, "geometry")?;
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            m.insert(&mut txn, F_W, In::Any(Any::Number(Number::Float(w))));
+            m.insert(&mut txn, F_H, In::Any(Any::Number(Number::Float(h))));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    fn add_edge(
+        &mut self,
+        actor: Actor,
+        id: Option<String>,
+        from: &str,
+        to: &str,
+        props: &BTreeMap<String, String>,
+    ) -> Result<String, CanvasError> {
+        let inbound = from.len()
+            + to.len()
+            + props.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            + id.as_deref().map(|i| i.len()).unwrap_or(0)
+            + 128;
+        self.check_inbound(inbound)?;
+        // 端点校验（创建时——并发删除的悬空面由读模型暴露）。
+        for ep in [from, to] {
+            match self.find_object(ep) {
+                Some(o) if o.kind == ObjectKind::Node => {}
+                Some(_) => {
+                    return Err(CanvasError::InvalidInput(format!("边端点 {ep:?} 不是节点")))
+                }
+                None => {
+                    return Err(CanvasError::EndpointNotFound {
+                        object_id: ep.to_string(),
+                    })
+                }
+            }
+        }
+        if from == to {
+            return Err(CanvasError::InvalidInput("自环边不支持".into()));
+        }
+        let id = match id {
+            Some(given) => {
+                if given.is_empty() {
+                    return Err(CanvasError::InvalidInput("对象 ID 不可为空".into()));
+                }
+                self.ensure_absent(&given)?;
+                given
+            }
+            None => self.next_id(),
+        };
+        {
+            let z = self.next_top_z();
+            let mut obj: MapPrelim = Vec::<(&'static str, In)>::new().into_iter().collect();
+            obj.insert(
+                F_KIND.into(),
+                In::Any(Any::String(ObjectKind::Edge.wire().into())),
+            );
+            obj.insert(F_FROM.into(), In::Any(Any::String(from.into())));
+            obj.insert(F_TO.into(), In::Any(Any::String(to.into())));
+            obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
+            obj.insert(F_PROPS.into(), In::Map(Self::props_prelim(props)));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
+            let root = self.root();
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.insert(&mut txn, id.clone(), In::Map(obj));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(id)
+    }
+
+    fn set_props(
+        &mut self,
+        actor: Actor,
+        id: &str,
+        props: &BTreeMap<String, String>,
+    ) -> Result<(), CanvasError> {
+        let inbound = id.len() + props.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        self.check_inbound(inbound)?;
+        let root = self.root();
+        // 存在校验 + 嵌套 map 获取。
+        {
+            let txn = self.doc.transact();
+            if !matches!(root.get(&txn, id), Some(Out::YMap(_))) {
+                return Err(CanvasError::ObjectNotFound {
+                    object_id: id.to_string(),
+                });
+            }
+        }
+        // 读事务作用域内取嵌套 map 引用（MapRef 独立句柄），出域后
+        // 再开写事务——yrs 读写事务同锁，遮蔽持有 = 死锁（p18 纪律）。
+        let m = {
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                Some(Out::YMap(m)) => m,
+                _ => unreachable!("上校验已过"),
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            // 终态替换：删 props 键 + 写新集（同事务原子）。
+            m.remove(&mut txn, F_PROPS);
+            m.insert(&mut txn, F_PROPS, In::Map(Self::props_prelim(props)));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    fn remove_object(&mut self, actor: Actor, id: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len())?;
+        let root = self.root();
+        // #404：frame 删除级联——直系子对象提顶层（同事务原子，撤销
+        // 单元恢复）。仅显式删除面清理；并发副本上的 frame 删除仍可留
+        // 悬空 parent（读模型如实暴露，消费侧按顶层处理——同 Edge
+        // 悬空端点纪律）。
+        let children: Vec<(String, yrs::MapRef)> = {
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                None => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+                Some(Out::YMap(m)) => {
+                    let is_frame = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Frame.wire()
+                    );
+                    if !is_frame {
+                        vec![]
+                    } else {
+                        root.keys(&txn)
+                            .filter_map(|k| {
+                                let km = match root.get(&txn, k) {
+                                    Some(Out::YMap(km)) => km,
+                                    _ => return None,
+                                };
+                                let is_child = matches!(
+                                    km.get(&txn, F_PARENT),
+                                    Some(Out::Any(Any::String(p))) if p.as_ref() == id
+                                );
+                                is_child.then(|| (k.to_string(), km))
+                            })
+                            .collect()
+                    }
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.remove(&mut txn, id);
+            for (_, cm) in &children {
+                cm.remove(&mut txn, F_PARENT);
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    fn group_objects(
+        &mut self,
+        actor: Actor,
+        group_id: Option<String>,
+        members: &[String],
+    ) -> Result<String, CanvasError> {
+        let inbound = group_id.as_deref().map(|i| i.len()).unwrap_or(0)
+            + members.iter().map(|m| m.len()).sum::<usize>()
+            + 128;
+        self.check_inbound(inbound)?;
+        if members.is_empty() {
+            return Err(CanvasError::InvalidInput("分组成员不可为空".into()));
+        }
+        for m in members {
+            if self.find_object(m).is_none() {
+                return Err(CanvasError::MemberNotFound {
+                    object_id: m.clone(),
+                });
+            }
+        }
+        let gid = match group_id {
+            Some(given) => {
+                if given.is_empty() {
+                    return Err(CanvasError::InvalidInput("对象 ID 不可为空".into()));
+                }
+                self.ensure_absent(&given)?;
+                given
+            }
+            None => self.next_id(),
+        };
+        {
+            let z = self.next_top_z();
+            let mut obj: MapPrelim = Vec::<(&'static str, In)>::new().into_iter().collect();
+            obj.insert(
+                F_KIND.into(),
+                In::Any(Any::String(ObjectKind::Group.wire().into())),
+            );
+            obj.insert(
+                F_MEMBERS.into(),
+                In::Any(Any::Array(
+                    members
+                        .iter()
+                        .map(|m| Any::String(m.as_str().into()))
+                        .collect::<Vec<Any>>()
+                        .into(),
+                )),
+            );
+            obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
+            obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
+            let root = self.root();
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.insert(&mut txn, gid.clone(), In::Map(obj));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(gid)
+    }
+
+    fn ungroup(&mut self, actor: Actor, group_id: &str) -> Result<(), CanvasError> {
+        self.check_inbound(group_id.len())?;
+        let obj = self
+            .find_object(group_id)
+            .ok_or_else(|| CanvasError::ObjectNotFound {
+                object_id: group_id.to_string(),
+            })?;
+        if obj.kind != ObjectKind::Group {
+            return Err(CanvasError::KindMismatch {
+                object_id: group_id.to_string(),
+                op: "ungroup",
+            });
+        }
+        self.remove_object(actor, group_id)
+    }
+
+    // ── 笔迹面（#350——#44 第 1 步）────────────────────────────
+
+    /// 颜色合法面：#RGB/#RRGGBB（严格——8 位 RGBA 带透明语义，归
+    /// Highlighter 渲染态，不入模型面）。
+    fn valid_stroke_color(s: &str) -> bool {
+        let Some(hex) = s.strip_prefix('#') else {
+            return false;
+        };
+        matches!(hex.len(), 3 | 6) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// 笔迹字段校验（Add/SetStrokeStyle 共用——错误面全走既有变体）。
+    fn check_stroke_style(color: &str, width: f64) -> Result<(), CanvasError> {
+        if !Self::valid_stroke_color(color) {
+            return Err(CanvasError::InvalidInput(format!(
+                "笔迹颜色 {color:?} 不合 #RGB/#RRGGBB"
+            )));
+        }
+        if !width.is_finite() {
+            return Err(CanvasError::NonFiniteGeometry { field: "width" });
+        }
+        if width <= 0.0 {
+            return Err(CanvasError::InvalidInput("笔迹线宽必须 > 0".into()));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // 命令域字段直传（同 add_node 纪律）
+    fn add_stroke(
+        &mut self,
+        actor: Actor,
+        id: Option<String>,
+        points: &[(f64, f64)],
+        color: &str,
+        width: f64,
+        tool: StrokeTool,
+    ) -> Result<String, CanvasError> {
+        // 入站估算：每点两坐标（f64 字面宽 ~24）+ 颜色/工具/框架开销。
+        let inbound = points.len() * 48
+            + color.len()
+            + tool.wire().len()
+            + 128
+            + id.as_deref().map(|i| i.len()).unwrap_or(0);
+        self.check_inbound(inbound)?;
+        if points.len() < 2 {
+            return Err(CanvasError::InvalidInput(
+                "笔迹至少需 2 个采样点（单击不成笔）".into(),
+            ));
+        }
+        for &(x, y) in points {
+            Self::check_finite(x, "x")?;
+            Self::check_finite(y, "y")?;
+            // 重复点无害（采样抖动）；零长笔仍合法——渲染面退化不 panic。
+        }
+        Self::check_stroke_style(color, width)?;
+        let id = match id {
+            Some(given) => {
+                if given.is_empty() {
+                    return Err(CanvasError::InvalidInput("对象 ID 不可为空".into()));
+                }
+                self.ensure_absent(&given)?;
+                given
+            }
+            None => self.next_id(),
+        };
+        {
+            // 扁平点列 [x0,y0,x1,y1,…]——单 Any::Array，CRDT 面最简
+            //（嵌套数组读回成本高，逐点对象无必要）。
+            let flat: Vec<Any> = points
+                .iter()
+                .flat_map(|(x, y)| {
+                    [
+                        Any::Number(Number::Float(*x)),
+                        Any::Number(Number::Float(*y)),
+                    ]
+                })
+                .collect();
+            let z = self.next_top_z();
+            let mut obj: MapPrelim = Vec::<(&'static str, In)>::new().into_iter().collect();
+            obj.insert(
+                F_KIND.into(),
+                In::Any(Any::String(ObjectKind::Stroke.wire().into())),
+            );
+            obj.insert(F_POINTS.into(), In::Any(Any::Array(flat.into())));
+            obj.insert(F_COLOR.into(), In::Any(Any::String(color.into())));
+            obj.insert(F_SWIDTH.into(), In::Any(Any::Number(Number::Float(width))));
+            obj.insert(F_TOOL.into(), In::Any(Any::String(tool.wire().into())));
+            obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
+            obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
+            let root = self.root();
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.insert(&mut txn, id.clone(), In::Map(obj));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(id)
+    }
+
+    // ── 标签面（#405）────────────────────────────────────────────
+
+    /// 标签合法性：非空（空串 = 无语义分类，拒收；敌意长度走
+    /// check_inbound 入站面）。
+    fn check_tag(tag: &str) -> Result<(), CanvasError> {
+        if tag.is_empty() {
+            return Err(CanvasError::InvalidInput("标签不可为空".into()));
+        }
+        Ok(())
+    }
+
+    /// #405：加标签（幂等——已有该 tag 零写入零事件，同 reorder 纪律）。
+    ///
+    /// 载体为嵌套 Map（tag → true）：并发加不同 tag → 键集联合合并
+    /// （两笔都活）；并发加同 tag → 键级幂等。对比 Any::Array 整值
+    /// 替换（后写覆盖前写——并发丢 tag，members 的 P2-2 已知丢失面）。
+    fn add_tag(&mut self, actor: Actor, id: &str, tag: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + tag.len() + 64)?;
+        Self::check_tag(tag)?;
+        let m = self.object_map(id)?;
+        // 读域：已有该 tag → 幂等短路（零 CRDT 字节 = 零事件）；
+        // 同时取嵌套 tags Map 句柄（yrs 读写事务同锁，遮蔽持有 =
+        // 死锁 p18 纪律——句柄在读域取，写在写域做）。
+        let tags_map = {
+            let txn = self.doc.transact();
+            match m.get(&txn, F_TAGS) {
+                Some(Out::YMap(t)) => {
+                    if t.get(&txn, tag).is_some() {
+                        return Ok(()); // 幂等：零写入零事件
+                    }
+                    Some(t)
+                }
+                _ => None,
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            match tags_map {
+                Some(t) => {
+                    t.insert(&mut txn, tag, In::Any(Any::Bool(true)));
+                }
+                None => {
+                    // 首写建 Map（单键 Prelim）。
+                    let prelim: MapPrelim =
+                        std::iter::once((tag, In::Any(Any::Bool(true)))).collect();
+                    m.insert(&mut txn, F_TAGS, In::Map(prelim));
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    /// #405：移除标签（幂等——无该 tag 零写入零事件）。
+    fn remove_tag(&mut self, actor: Actor, id: &str, tag: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + tag.len() + 64)?;
+        Self::check_tag(tag)?;
+        let m = self.object_map(id)?;
+        let tags_map = {
+            let txn = self.doc.transact();
+            match m.get(&txn, F_TAGS) {
+                Some(Out::YMap(t)) => {
+                    if t.get(&txn, tag).is_none() {
+                        return Ok(()); // 幂等：零写入零事件
+                    }
+                    Some(t)
+                }
+                // 无标签面 = 必无该 tag → 幂等。
+                _ => None,
+            }
+        };
+        let Some(t) = tags_map else {
+            return Ok(());
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            t.remove(&mut txn, tag);
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    // ── frame 面（#404——命名区 + parent 树）──────────────────────
+
+    /// frame 名称合法性：非空（命名区——空名 = 无语义区域，拒收）。
+    fn check_frame_name(name: &str) -> Result<(), CanvasError> {
+        if name.is_empty() {
+            return Err(CanvasError::InvalidInput("frame 名称不可为空".into()));
+        }
+        Ok(())
+    }
+
+    /// parent 目标校验 + 无环检测（CreateFrame/SetParent 共用）。
+    ///
+    /// - 目标存在且为 Frame kind（命名区是唯一容器语义面）；
+    /// - 不自指（id == parent 即自环）；
+    /// - 无环：从目标沿 parent 链上溯，途中出现 id 即成环（visited
+    ///   集防御敌意载体中的既有环——上溯遇已访问节点即止，不 panic）。
+    fn check_parent_target(&self, id: &str, parent: &str) -> Result<(), CanvasError> {
+        if parent == id {
+            return Err(CanvasError::InvalidInput(
+                "parent 不可自指（对象不能是自己的父 frame）".into(),
+            ));
+        }
+        let target = self
+            .find_object(parent)
+            .ok_or_else(|| CanvasError::ObjectNotFound {
+                object_id: parent.to_string(),
+            })?;
+        if target.kind != ObjectKind::Frame {
+            return Err(CanvasError::InvalidInput(format!(
+                "父对象 {parent:?} 不是 frame（parent 目标必须是 Frame kind）"
+            )));
+        }
+        // 无环：从目标上溯，出现 id = 环。
+        let mut cur = Some(parent.to_string());
+        let mut visited = std::collections::HashSet::new();
+        while let Some(p) = cur {
+            if p == id {
+                return Err(CanvasError::InvalidInput(format!(
+                    "环路 parent 被拒：{parent} 的祖先链包含 {id}"
+                )));
+            }
+            if !visited.insert(p.clone()) {
+                break; // 敌意载体既有环——上溯终止（不 panic，拒绝写入面不变）
+            }
+            cur = self.find_object(&p).and_then(|o| o.parent);
+        }
+        Ok(())
+    }
+
+    /// #404：创建命名区（几何 + 名称 + 可选父 frame）。
+    #[allow(clippy::too_many_arguments)] // 命令域字段直传（同 add_node 纪律）
+    fn create_frame(
+        &mut self,
+        actor: Actor,
+        id: Option<String>,
+        name: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        parent: Option<String>,
+    ) -> Result<String, CanvasError> {
+        let inbound = x.to_string().len() * 4
+            + name.len()
+            + parent.as_deref().map(|p| p.len()).unwrap_or(0)
+            + id.as_deref().map(|i| i.len()).unwrap_or(0)
+            + 128;
+        self.check_inbound(inbound)?;
+        Self::check_frame_name(name)?;
+        Self::check_finite(x, "x")?;
+        Self::check_finite(y, "y")?;
+        Self::check_finite(w, "w")?;
+        Self::check_finite(h, "h")?;
+        if w < 0.0 || h < 0.0 {
+            return Err(CanvasError::InvalidInput("尺寸不可为负".into()));
+        }
+        let id = match id {
+            Some(given) => {
+                if given.is_empty() {
+                    return Err(CanvasError::InvalidInput("对象 ID 不可为空".into()));
+                }
+                self.ensure_absent(&given)?;
+                given
+            }
+            None => self.next_id(),
+        };
+        // 父目标校验（新 frame 无子——环只能来自敌意载体的既有环，
+        // check_parent_target 的 visited 集防御）。
+        if let Some(p) = &parent {
+            self.check_parent_target(&id, p)?;
+        }
+        {
+            let z = self.next_top_z();
+            let mut obj: MapPrelim = Vec::<(&'static str, In)>::new().into_iter().collect();
+            obj.insert(
+                F_KIND.into(),
+                In::Any(Any::String(ObjectKind::Frame.wire().into())),
+            );
+            obj.insert(F_X.into(), In::Any(Any::Number(Number::Float(x))));
+            obj.insert(F_Y.into(), In::Any(Any::Number(Number::Float(y))));
+            obj.insert(F_W.into(), In::Any(Any::Number(Number::Float(w))));
+            obj.insert(F_H.into(), In::Any(Any::Number(Number::Float(h))));
+            obj.insert(F_NAME.into(), In::Any(Any::String(name.into())));
+            if let Some(p) = &parent {
+                obj.insert(F_PARENT.into(), In::Any(Any::String(p.clone().into())));
+            }
+            obj.insert(F_ZINDEX.into(), In::Any(Any::String(z.into())));
+            obj.insert(F_PROPS.into(), In::Map(MapPrelim::default()));
+            // #405：预建空标签 Map（同 add_node——并发联合合并前提）。
+            obj.insert(F_TAGS.into(), In::Map(MapPrelim::default()));
+            let root = self.root();
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            root.insert(&mut txn, id.clone(), In::Map(obj));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(id)
+    }
+
+    /// #404：重命名 frame（Frame kind 门禁——重命名是命名区语义）。
+    fn rename_frame(&mut self, actor: Actor, id: &str, name: &str) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + name.len() + 64)?;
+        Self::check_frame_name(name)?;
+        let m = {
+            let root = self.root();
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                Some(Out::YMap(m)) => {
+                    let is_frame = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Frame.wire()
+                    );
+                    if !is_frame {
+                        return Err(CanvasError::KindMismatch {
+                            object_id: id.to_string(),
+                            op: "rename_frame",
+                        });
+                    }
+                    m
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            m.insert(&mut txn, F_NAME, In::Any(Any::String(name.into())));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    /// #406：边路由/标题终态替换（锚侧 + caption；None = 删键清除——
+    /// 读模型不留旧值）。Edge kind 门禁（同 set_stroke_style 纪律：
+    /// 读域取引用，出域再写——yrs 读写同锁 p18）。
+    fn set_edge_route(
+        &mut self,
+        actor: Actor,
+        id: &str,
+        from_side: Option<Side>,
+        to_side: Option<Side>,
+        caption: Option<String>,
+    ) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + caption.as_deref().map(|c| c.len()).unwrap_or(0) + 64)?;
+        if let Some(c) = &caption {
+            if c.is_empty() {
+                return Err(CanvasError::InvalidInput(
+                    "边标题不可为空串（清除用 None）".into(),
+                ));
+            }
+        }
+        let m = {
+            let root = self.root();
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                Some(Out::YMap(m)) => {
+                    let is_edge = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Edge.wire()
+                    );
+                    if !is_edge {
+                        return Err(CanvasError::KindMismatch {
+                            object_id: id.to_string(),
+                            op: "set_edge_route",
+                        });
+                    }
+                    m
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            let side_in = |txn: &mut yrs::TransactionMut, key: &str, v: Option<Side>| match v {
+                Some(s) => {
+                    m.insert(txn, key, In::Any(Any::String(s.wire().into())));
+                }
+                None => {
+                    m.remove(txn, key);
+                }
+            };
+            side_in(&mut txn, F_FROM_SIDE, from_side);
+            side_in(&mut txn, F_TO_SIDE, to_side);
+            match &caption {
+                Some(c) => {
+                    m.insert(&mut txn, F_CAPTION, In::Any(Any::String(c.clone().into())));
+                }
+                None => {
+                    m.remove(&mut txn, F_CAPTION);
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    /// #404：reparent（ID 恒不变——树结构重挂；parent = None 提顶层）。
+    ///
+    /// 对象种类不限（节点/边/分组/笔迹/frame 皆可入 frame）；parent
+    /// 目标必须是 Frame kind 且无环（见 [`Self::check_parent_target`]）。
+    fn set_parent(
+        &mut self,
+        actor: Actor,
+        id: &str,
+        parent: Option<String>,
+    ) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + parent.as_deref().map(|p| p.len()).unwrap_or(0) + 64)?;
+        let m = self.object_map(id)?;
+        if let Some(p) = &parent {
+            self.check_parent_target(id, p)?;
+        }
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            match &parent {
+                Some(p) => {
+                    m.insert(&mut txn, F_PARENT, In::Any(Any::String(p.clone().into())));
+                }
+                None => {
+                    // 提顶层：显式删键（残留旧值会让读模型继续暴露父引用）。
+                    m.remove(&mut txn, F_PARENT);
+                }
+            }
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+
+    fn set_stroke_style(
+        &mut self,
+        actor: Actor,
+        id: &str,
+        color: &str,
+        width: f64,
+        tool: StrokeTool,
+    ) -> Result<(), CanvasError> {
+        self.check_inbound(id.len() + color.len() + 64)?;
+        Self::check_stroke_style(color, width)?;
+        // 存在 + 类型校验（同 node_map 纪律：读域取引用，出域再写——
+        // yrs 读写同锁，遮蔽持有 = 死锁 p18）。
+        let m = {
+            let root = self.root();
+            let txn = self.doc.transact();
+            match root.get(&txn, id) {
+                Some(Out::YMap(m)) => {
+                    let is_stroke = matches!(
+                        m.get(&txn, F_KIND),
+                        Some(Out::Any(Any::String(k))) if k.as_ref() == ObjectKind::Stroke.wire()
+                    );
+                    if !is_stroke {
+                        // 已知对象但非笔迹 → 类型不符；不存在 → 下枝 404。
+                        return Err(CanvasError::KindMismatch {
+                            object_id: id.to_string(),
+                            op: "set_stroke_style",
+                        });
+                    }
+                    m
+                }
+                _ => {
+                    return Err(CanvasError::ObjectNotFound {
+                        object_id: id.to_string(),
+                    })
+                }
+            }
+        };
+        {
+            let mut txn = self.doc.transact_mut_with(actor.wire());
+            m.insert(&mut txn, F_COLOR, In::Any(Any::String(color.into())));
+            m.insert(
+                &mut txn,
+                F_SWIDTH,
+                In::Any(Any::Number(Number::Float(width))),
+            );
+            m.insert(&mut txn, F_TOOL, In::Any(Any::String(tool.wire().into())));
+            txn.commit();
+        }
+        self.enforce_undo_limit(actor);
+        Ok(())
+    }
+}
+
+// ── 载体读取/指纹工具 ───────────────────────────────────────────
+
+fn read_object(root: &yrs::MapRef, txn: &yrs::Transaction, id: &str) -> Option<CanvasObject> {
+    let m = match root.get(txn, id) {
+        Some(Out::YMap(m)) => m,
+        _ => return None,
+    };
+    let kind = match m.get(txn, F_KIND) {
+        Some(Out::Any(Any::String(k))) => ObjectKind::from_wire(&k)?,
+        _ => return None,
+    };
+    let num = |key: &str| -> f64 {
+        match m.get(txn, key) {
+            Some(Out::Any(Any::Number(Number::Float(f)))) => f,
+            Some(Out::Any(Any::Number(Number::Int(i)))) => i as f64,
+            _ => 0.0,
+        }
+    };
+    let str_field = |key: &str| -> Option<String> {
+        match m.get(txn, key) {
+            Some(Out::Any(Any::String(s))) => Some(s.to_string()),
+            _ => None,
+        }
+    };
+    let members = match m.get(txn, F_MEMBERS) {
+        Some(Out::Any(Any::Array(arr))) => arr
+            .iter()
+            .filter_map(|a| match a {
+                Any::String(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    // 笔迹面（#350）：扁平点列 [x0,y0,x1,y1,…] → (x,y) 对；奇数长
+    // /非数值条目按敌意载体处理——截到最近的完整对（读模型不 panic）。
+    let points = match m.get(txn, F_POINTS) {
+        Some(Out::Any(Any::Array(arr))) => arr
+            .iter()
+            .filter_map(|a| match a {
+                Any::Number(Number::Float(f)) => Some(*f),
+                Any::Number(Number::Int(i)) => Some(*i as f64),
+                _ => None,
+            })
+            .collect::<Vec<f64>>()
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| (c[0], c[1]))
+            .collect(),
+        _ => vec![],
+    };
+    let (color, width, tool) = if kind == ObjectKind::Stroke {
+        (
+            str_field(F_COLOR),
+            match m.get(txn, F_SWIDTH) {
+                Some(Out::Any(Any::Number(Number::Float(f)))) => Some(f),
+                Some(Out::Any(Any::Number(Number::Int(i)))) => Some(i as f64),
+                _ => None,
+            },
+            str_field(F_TOOL).as_deref().and_then(StrokeTool::from_wire),
+        )
+    } else {
+        (None, None, None)
+    };
+    // #402：z 序键（缺省 DEFAULT_KEY——存量对象/敌意缺字段兼容；
+    // 不在此校验键型：排序面只做字典序比较，重排命令面才校验）。
+    let z_index = str_field(F_ZINDEX).unwrap_or_else(|| crate::zorder::DEFAULT_KEY.to_string());
+    // #405：标签集（嵌套 Map keys → 排序 Vec；缺省/敌意形状 = 空集）。
+    let mut tags = match m.get(txn, F_TAGS) {
+        Some(Out::YMap(t)) => t
+            .iter(txn)
+            .map(|(k, _)| k.to_string())
+            .collect::<Vec<String>>(),
+        _ => vec![],
+    };
+    tags.sort();
+    // #404：frame 命名 + 父引用（缺省/敌意形状 = None）。
+    let name = str_field(F_NAME);
+    let parent = str_field(F_PARENT);
+    let mut props = BTreeMap::new();
+    if let Some(Out::YMap(p)) = m.get(txn, F_PROPS) {
+        for (k, v) in p.iter(txn) {
+            if let Out::Any(Any::String(s)) = v {
+                props.insert(k.to_string(), s.to_string());
+            }
+        }
+    }
+    Some(CanvasObject {
+        id: id.to_string(),
+        kind,
+        x: num(F_X),
+        y: num(F_Y),
+        w: num(F_W),
+        h: num(F_H),
+        from: str_field(F_FROM),
+        to: str_field(F_TO),
+        from_side: str_field(F_FROM_SIDE).and_then(|s| Side::parse(&s)),
+        to_side: str_field(F_TO_SIDE).and_then(|s| Side::parse(&s)),
+        caption: str_field(F_CAPTION),
+        members,
+        points,
+        color,
+        width,
+        tool,
+        z_index,
+        tags,
+        name,
+        parent,
+        props,
+    })
+}
+
+/// 对象语义指纹：语义字段确定性序列化 → FNV-1a 64。
+pub fn fingerprint_object(o: &CanvasObject) -> String {
+    let mut acc = String::new();
+    acc.push_str(o.kind.wire());
+    acc.push('|');
+    acc.push_str(&o.id);
+    if o.kind != ObjectKind::Edge {
+        // 几何语义面（Node/Group；Edge 无几何）。
+        acc.push_str(&format!("|{:.4}|{:.4}|{:.4}|{:.4}", o.x, o.y, o.w, o.h));
+    }
+    if o.kind == ObjectKind::Edge {
+        acc.push_str(&format!(
+            "|{}->{}",
+            o.from.as_deref().unwrap_or(""),
+            o.to.as_deref().unwrap_or("")
+        ));
+        // #406：锚侧 + 标题入指纹（路由/标题变更 = 语义变更）。
+        acc.push_str(&format!(
+            "|fs={}",
+            o.from_side.map(|s| s.wire()).unwrap_or("")
+        ));
+        acc.push_str(&format!(
+            "|ts={}",
+            o.to_side.map(|s| s.wire()).unwrap_or("")
+        ));
+        acc.push_str(&format!("|cap={}", o.caption.as_deref().unwrap_or("")));
+    }
+    if o.kind == ObjectKind::Group {
+        let mut ms = o.members.clone();
+        ms.sort();
+        acc.push('|');
+        acc.push_str(&ms.join(","));
+    }
+    if o.kind == ObjectKind::Stroke {
+        // 笔迹语义面：全点列 + 样式三件（改笔色/改粗细/换工具 = 语义
+        // 变更 → 证据失效；点序不可交换——按存序指纹，非排序）。
+        acc.push('|');
+        for (x, y) in &o.points {
+            acc.push_str(&format!("|{:.4},{:.4}", x, y));
+        }
+        acc.push('|');
+        acc.push_str(o.color.as_deref().unwrap_or(""));
+        acc.push('|');
+        if let Some(w) = o.width {
+            acc.push_str(&format!("{:.4}", w));
+        }
+        acc.push('|');
+        acc.push_str(o.tool.map(|t| t.wire()).unwrap_or(""));
+    }
+    for (k, v) in &o.props {
+        acc.push_str(&format!("|p:{k}={v}"));
+    }
+    // #402：z 序键入指纹（重排 = 语义变更 → 证据失效——与「位置漂移
+    // 即语义变更」同粒度：遮挡关系是视觉语义面）。
+    acc.push_str(&format!("|z={}", o.z_index));
+    // #405：标签集入指纹（分类变更 = 语义变更 → 证据失效——与 props
+    // 同粒度；集语义排序后指纹，同集不同序同指纹）。
+    let mut ts = o.tags.clone();
+    ts.sort();
+    acc.push_str(&format!("|t={}", ts.join(",")));
+    // #404：命名 + 父引用入指纹（重命名/reparent = 语义变更 → 证据
+    // 失效——树位置与命名都是检索/导出语义面）。
+    if let Some(n) = &o.name {
+        acc.push_str(&format!("|n={n}"));
+    }
+    if let Some(p) = &o.parent {
+        acc.push_str(&format!("|pa={p}"));
+    }
+    mdc_evidence::Fnv64.fingerprint(acc.as_bytes()).0
+}
+
+fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}

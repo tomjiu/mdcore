@@ -1,0 +1,2335 @@
+// Phase 5 §八.5 — Canvas 表面视图（web 面）：SVG 保留模式显示 +
+// WasmCanvas（mdc-canvas headless 会话，mdcore-wasm 桥）模型面。
+//
+// 架构（显示分离、真相不分离——与 pdf_view 同纪律）：
+//
+//   显示面 = SVG 保留模式（bench.ts canvas_render 实测口径：1k 节点
+//   60Hz 全量重建可用——本面走更省的 touched 局部失效）。分层
+//   #cv-l-groups < #cv-l-edges < #cv-l-nodes；节点 = <g data-id
+//   transform=translate(x,y)><rect/><text/></g>，边 = <line>（端点 =
+//   节点左上 +60/+18——bench 口径，120×36 默认节点即中心），分组 =
+//   成员包围盒虚线框。本模块只画，不持有任何「真相」。
+//
+//   模型面 = WasmCanvas（mdc-canvas 会话——crates/canvas/session.rs）：
+//   八命令 execute / 双撤销栈 / objects_json 读模型 / 事件轮询
+//   take_events_json / encode_diff+apply_update 协同面 / 快照恢复。
+//   渲染缓存 = objects_json → 内存 Map（事件 touched 局部失效——
+//   rAF 轮询排空事件队列）。
+//
+//   交互面：pointerdown 应用级 O(n) 命中 → 拖动纯 DOM 预览
+//   （transform + 相连边/包围盒跟随——bench canvas_drag 口径，不逐帧
+//   入核）→ pointerup 提交一次 move_node（LWW 提交粒度——undo 栈
+//   以「一次拖拽」为一项）。选中态（.selected）+ Delete 删除 +
+//   双击行内编辑 label（set_props 终态替换——客户端读旧集合并合并）
+//   + 工具条（加节点/连线模式[点两个节点]/分组/解组/撤销/重做/
+//   AI 端添加/保存快照/恢复/清空）。
+//
+//   协同演示层（单机版先行 + 同页双实例直连）：主画布（human 端，
+//   client 7200001）+ 右侧「AI 端」只读镜像（client 7200002）。两
+//   WasmCanvas 实例经事件 updates（base64 → Uint8Array →
+//   apply_update）互相同步——协同语义真实验证：AI 端添加节点 →
+//   主端事件轮询发现 remote 更新 → 渲染；主端拖拽 → AI 端跟随。
+//   转发纪律：command/undo/redo 事件跨实例转发，remote/maintenance
+//   不回发（每条 update 恰渡每个方向一次——无回声环）。AI 端构造
+//   与「恢复」后的追赶走 encode_diff（晚加入者/故障恢复的经典
+//   state-vector 差分交换）。
+//
+//   wasm 桥缺位（pkg 未含 WasmCanvas——主代理并行实施中）：面板照常
+//   构建，工具条禁用，探针 __canvasState().wasm = false，全部模型
+//   面调用 typed bridge_absent 失败（照 evidence_panel 模式），e2e
+//   会话类用例 SKIP。
+//
+//   时钟纪律（wasm32 无 std 时钟）：会话构造 set_clock_ms(
+//   BigInt(Date.now()))；每次 execute/undo/redo 前 +1 推进（单调）。
+//
+//   所有 wasm 调用包裹：抛出的 JSON 串解析为 typed {ok:false, code,
+//   message}（cv_* 错误码族）——本模块任何路径不向顶层抛出。
+
+// ---------------------------------------------------------------------------
+// wasm 桥类型（pkg 局部类型桥——照 evidence_panel 模式；pkg 重建前以
+// 运行时鸭子检查探测，缺面 = typed bridge_absent）
+// ---------------------------------------------------------------------------
+
+type WasmModule = typeof import('../pkg/mdcore_wasm.js');
+import { wasmBoot } from './wasm_boot.js';
+import { mount_surface_guide } from './empty_state.js';
+import { t, type DictKey } from './i18n/index.js';
+// #426（#44 步 2）：perfect-freehand（MIT）——引擎存原始采样点不存
+// outline（#44 裁决），平滑/加粗消费侧重算：渲染与预览共用本库。
+import { getStroke } from 'perfect-freehand';
+
+/** WasmCanvas 方法面（wasm-bindgen web-target，方法名 snake_case）。 */
+interface WasmCanvasFace {
+  /** 会话时钟注入（宿主是唯一时间源）。 */
+  set_clock_ms(ms: bigint): void;
+  /** 八命令单一调度入口（flat snake_case cmdJson）→ 回执 JSON。 */
+  execute(actor: 'human' | 'ai', cmdJson: string): string;
+  /** 批量命令原子执行（#352——flat 命令对象数组 JSON）：整批全成
+   * 或全不成，整批 = 单一撤销单元；回执 {outcomes,undo_depth,
+   * undo_cleared}。 */
+  execute_batch(actor: 'human' | 'ai', cmdsJson: string): string;
+  undo(actor: 'human' | 'ai'): boolean;
+  redo(actor: 'human' | 'ai'): boolean;
+  undo_depth(actor: 'human' | 'ai'): number;
+  redo_depth(actor: 'human' | 'ai'): number;
+  /** 读模型快照（确定性 ID 字典序）。 */
+  objects_json(): string;
+  object_json(id: string): string | null;
+  /** 对象语义指纹（"fnv64:…"）——证据关联面。 */
+  object_fingerprint(id: string): string;
+  canvas_fingerprint(): string;
+  state_vector(): Uint8Array;
+  encode_diff(remoteSv: Uint8Array): Uint8Array;
+  /** 远端 update 应用（origin None——不入本地撤销栈）。失败抛 cv_*。 */
+  apply_update(bytes: Uint8Array): void;
+  authoritative_snapshot(): Uint8Array;
+  /** 事件轮询（排空式）：[{source,actor?,updates:[b64],touched}]。 */
+  take_events_json(): string;
+}
+
+type WasmCanvasCtor = new (
+  clientId: bigint,
+  undoLimit: number | null,
+) => WasmCanvasFace;
+
+/** 静态恢复面（快照重建——撤销栈不随快照走）。 */
+type WasmCanvasStatic = {
+  restore(clientId: bigint, undoLimit: number | null, snapshot: Uint8Array): WasmCanvasFace;
+};
+
+// ---------------------------------------------------------------------------
+// serde 镜像（crates/canvas JSON 形——构造集中于此，形态漂移单点修）
+// ---------------------------------------------------------------------------
+
+/** objects_json 条目（session.rs CanvasObject 投影）。 */
+interface CanvasObjectJ {
+  id: string;
+  kind: 'node' | 'edge' | 'group' | 'stroke';
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Edge 端点（非 Edge = null；端点被删 = 悬空暴露面）。 */
+  from: string | null;
+  to: string | null;
+  /** Group 成员（非 Group = []）。 */
+  members: string[];
+  /** 笔迹采样点（[[x,y],…]——非 Stroke = []；perfect-freehand 消费形状）。 */
+  points: [number, number][];
+  /** 笔迹颜色（#RGB/#RRGGBB；非 Stroke = null）。 */
+  color: string | null;
+  /** 笔迹线宽（非 Stroke = null）。 */
+  width: number | null;
+  /** 笔迹工具（非 Stroke = null）。 */
+  tool: 'pen' | 'highlighter' | null;
+  /** 开放属性（label/color/…；set_props 终态替换）。 */
+  props: Record<string, string>;
+}
+
+/** execute 回执（outcome 变体携带 id 或 group_id）。 */
+interface CommandReceiptJ {
+  outcome: string;
+  id?: string;
+  group_id?: string;
+  undo_depth: number;
+  undo_cleared: boolean;
+}
+
+/** take_events_json 条目（source ∈ command/undo/redo/remote/maintenance）。 */
+interface CanvasEventJ {
+  source: 'command' | 'undo' | 'redo' | 'remote' | 'maintenance';
+  actor?: 'human' | 'ai';
+  /** 逐事务 wire update（base64——可独立 apply_update 转发）。 */
+  updates: string[];
+  /** 受触对象 ID（字典序去重）。 */
+  touched: string[];
+}
+
+type CvFail = { ok: false; code: string; message: string };
+type CvExec = { ok: true; receipt: CommandReceiptJ } | CvFail;
+type CvId = { ok: true; id: string; outcome: string } | CvFail;
+
+/** execute_batch 回执（#354 消费面——只读 undo 深度与整批成败，
+ * outcomes 逐条细节不消费）。 */
+type CvBatchExec = { ok: true; receipt: BatchReceiptJ } | CvFail;
+interface BatchReceiptJ {
+  outcomes: CommandReceiptJ[];
+  undo_depth: number;
+  undo_cleared: boolean;
+}
+
+/** 探针事件日志条目（__canvasEvents 面——轮询透传的只读投影）。 */
+interface EventLogEntry {
+  seq: number;
+  side: 'main' | 'ai';
+  source: string;
+  actor: string | null;
+  updates: number;
+  touched: string[];
+}
+
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+/** 相机缩放钳制（#367——tldraw/Excalidraw 同量级）。 */
+const CAM_Z_MIN = 0.1;
+const CAM_Z_MAX = 8;
+/** 适配视图的包围盒外扩比例（#367）。 */
+const CAM_FIT_PAD = 0.05;
+/** 滚轮缩放步长（指数曲率：factor = exp(±delta×k)—— deltaY ±100 ≈ ×1.1）。 */
+const CAM_WHEEL_K = 0.001;
+/** 滚轮单事件最大 |deltaY| 钦定（触控板高分辨率事件量级大——防一次跳多级）。 */
+const CAM_WHEEL_MAX_DELTA = 200;
+/** AI 镜像 viewBox（等比缩放只读概览）。 */
+const AI_VIEW_W = 1200;
+const AI_VIEW_H = 800;
+/** 默认节点几何（bench 节点口径——边端点 +60/+18 即中心）。 */
+const NODE_W = 120;
+const NODE_H = 36;
+const EDGE_DX = 60;
+const EDGE_DY = 18;
+/** 分组包围盒外扩（px）。 */
+const GROUP_PAD = 12;
+/** #426 画笔默认（步 3 选择器的前置固定值——引擎域：#RRGGBB / width>0）。 */
+const BRUSH_COLOR = '#1f1f1f';
+const BRUSH_WIDTH = 4;
+/** 步 3 预设色板（8 色——前 6 色值与 PDF 墨迹面 #45 对齐：红/黄/绿/
+ * 蓝/紫 + 白板默认墨黑；灰/橙为白板增量。共享组件抽取留待第三消费方
+ * 出现时再议——本面独立定义，值级对齐即互通）。 */
+const BRUSH_PALETTE: readonly (readonly [string, DictKey])[] = [
+  ['#1f1f1f', 'cv.colorInk'],
+  ['#6e6e6e', 'cv.colorGray'],
+  ['#e03131', 'cv.colorRed'],
+  ['#f08c00', 'cv.colorOrange'],
+  ['#ffd400', 'cv.colorYellow'],
+  ['#30a46c', 'cv.colorGreen'],
+  ['#1a73e8', 'cv.colorBlue'],
+  ['#8e4ec6', 'cv.colorPurple'],
+];
+/** 步 3 粗细档位（#44 原文「细/中/粗/特粗」4 档；中档 = #426 固定值
+ * 4——默认态视觉零漂移）。 */
+const BRUSH_WIDTHS: readonly (readonly [number, DictKey])[] = [
+  [2, 'cv.brushThin'],
+  [4, 'cv.brushMedium'],
+  [8, 'cv.brushThick'],
+  [14, 'cv.brushXThick'],
+];
+/** 采样阈值（世界坐标——相邻点距低于此不入点列；微抖不入核，
+ * 与引擎「重复点无害」语义的输入侧配合）。 */
+const BRUSH_SAMPLE_DIST = 1.0;
+/** 笔迹渲染半透明（highlighter——引擎存不透明值，渲染态分离）。 */
+const STROKE_HL_OPACITY = 0.4;
+/** #454 橡皮擦命中半径（世界坐标——笔迹 width/2 之外的容差带；
+ * 采样点级测试：点到擦除段距离 < width/2 + 本值即命中）。 */
+const ERASER_RADIUS = 10;
+
+/** perfect-freehand 选项（工具分化：pen 速度变细，highlighter 恒宽）。 */
+function pfOptions(tool: 'pen' | 'highlighter', width: number): {
+  size: number; thinning: number; smoothing: number; streamline: number;
+} {
+  return {
+    size: width,
+    thinning: tool === 'pen' ? 0.5 : 0,
+    smoothing: 0.5,
+    streamline: 0.5,
+  };
+}
+
+/** 采样点列 → 平滑 outline 多边形 → SVG path d（perfect-freehand
+ * 官方口径：outline 是填充多边形，不是 stroke 折线）。空 outline
+ * → ''（SVG 空 d 不渲染——零长笔退化安全）。 */
+function strokePathD(points: readonly (readonly [number, number])[], tool: 'pen' | 'highlighter', width: number): string {
+  if (points.length === 0) return '';
+  const outline = getStroke(points as [number, number][], pfOptions(tool, width));
+  if (outline.length === 0) return '';
+  let d = `M ${outline[0][0].toFixed(2)} ${outline[0][1].toFixed(2)}`;
+  for (let i = 1; i < outline.length; i++) {
+    d += ` L ${outline[i][0].toFixed(2)} ${outline[i][1].toFixed(2)}`;
+  }
+  return `${d} Z`;
+}
+
+/** 点到线段距离平方（#454 橡皮擦命中——退化段 = 点距）。 */
+function segDistSq(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx - px;
+  const cy = ay + t * dy - py;
+  return cx * cx + cy * cy;
+}
+
+/** 撤销栈软上限（两实例同限——receipt undo_cleared 演示面）。 */
+const UNDO_LIMIT = 200;
+/** 双实例 client id（(0, 2^53) 域；restore 实例另起段避免 ID 撞车）。
+ * 跨页协同（§九.5 双端 web 化）：`?cc=<slot>` URL 参数把本页双实例
+ * 段位平移 slot×10——两页各持段位后互不撞车（cc=0 默认 = 既有
+ * 常量行为零变化；collab_channel 消费同一 slot 约定）。 */
+function clientSlot(): number {
+  const raw = new URLSearchParams(location.search).get('cc');
+  const n = raw === null ? 0 : Number.parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 999 ? n : 0;
+}
+const CC_SLOT = clientSlot();
+const MAIN_CLIENT_ID = 7_200_001 + CC_SLOT * 10;
+const AI_CLIENT_ID = 7_200_002 + CC_SLOT * 10;
+const RESTORE_CLIENT_BASE = 7_200_100 + CC_SLOT * 10;
+/** #451：AI 镜像恢复段（restore 双端重建——镜像会话的新 client id 段；
+ * 050 段为 web 面空白区，与 RESTORE_CLIENT_BASE 同为 slot×10 平移 +
+ * 每次恢复 +1，页生命周期内不复用——镜像新操作会经 pump 汇入 main
+ * 后随差量外泄到跨页对端，id 复用 = 时钟分叉）。 */
+const AI_RESTORE_CLIENT_BASE = 7_200_050 + CC_SLOT * 10;
+/** 事件日志容量（__canvasEvents 面）。 */
+const EVENT_LOG_CAP = 200;
+/** 泵收敛轮上限（一次变更的跨实例回声 ≤ 2 轮——防御性上限）。 */
+const PUMP_MAX_ROUNDS = 8;
+
+const BRIDGE_ABSENT: CvFail = {
+  ok: false,
+  code: 'bridge_absent',
+  message: 'WasmCanvas not present in pkg (pending wasm rebuild — mdc-canvas wasm module)',
+};
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+/** 抛出的 wasm JSON 串 → typed 失败（永不抛出）。 */
+function wasmFail(e: unknown): CvFail {
+  const raw = typeof e === 'string' ? e : (e as { message?: string })?.message ?? '';
+  try {
+    const parsed = JSON.parse(raw) as { code?: string; message?: string };
+    if (parsed && typeof parsed.code === 'string') {
+      return { ok: false, code: parsed.code, message: parsed.message ?? raw };
+    }
+  } catch {
+    // 非 JSON 错误面——原样携带
+  }
+  return { ok: false, code: 'unknown', message: raw || String(e) };
+}
+
+/** Uint8Array → base64（分块展开——无调用栈溢出；xlsx_grid 模式复用）。 */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let out = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    out += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(out);
+}
+
+/** base64 → 新 Uint8Array。 */
+export function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// window 探针面（测试/宿主）
+// ---------------------------------------------------------------------------
+
+declare global {
+  interface Window {
+    /** Canvas 面板启动旗标（DOM 就绪 + wasm 模块解析完成）。 */
+    __canvasReady: boolean;
+    __canvasState: () => {
+      objects: number;
+      nodes: number;
+      edges: number;
+      groups: number;
+      undoDepth: number;
+      redoDepth: number;
+      /** WasmCanvas ctor 在场（false = e2e SKIP 门）。 */
+      wasm: boolean;
+      /** #367 相机态 + 双计数器（camSeq 增而 renderSeq 恒定 = 卸载命题）。 */
+      camera: { x: number; y: number; z: number };
+      camSeq: number;
+      renderSeq: number;
+    };
+    /** #367 相机只读探针（独立于模型面——无 wasm 也可测）。 */
+    __canvasCamera: () =>
+      | { ok: true; x: number; y: number; z: number; camSeq: number; renderSeq: number }
+      | CvFail;
+    /** objects_json 解析透传（side 缺省 main；'ai' = AI 端实例）。 */
+    __canvasObjects: (side?: 'main' | 'ai') => CanvasObjectJ[];
+    /** 程序化加节点（测试/宿主面——默认几何 + label）。 */
+    __canvasAddNode: (x: number, y: number, label?: string) => CvId;
+    /** 程序化移动（测试面——与拖拽同一提交路径 move_node）。 */
+    __canvasMoveNode: (id: string, x: number, y: number) => CvExec;
+    /** execute 透传（actor 分栈语义保持）。 */
+    __canvasExecute: (actor: 'human' | 'ai', cmdJson: string) => CvExec;
+    __canvasUndo: () => boolean;
+    __canvasRedo: () => boolean;
+    /** 快照 → restore 临时实例 → objects 对比（往返等价面）。 */
+    __canvasSnapshotRoundtrip: () =>
+      | { ok: true; objects: CanvasObjectJ[] }
+      | ({ ok: false; objects: CanvasObjectJ[] } & CvFail);
+    /** 对象语义指纹（证据关联面——悬空/过期检测钩子）。 */
+    __canvasFingerprint: (id: string) => { ok: true; fp: string } | CvFail;
+    /** 双实例状态（converged = 两端 objects_json 相等判定）。 */
+    __canvasSyncState: () => { main: number; ai: number; converged: boolean; wasm: boolean };
+    /** AI 端实例执行 add_node（actor 'ai'）+ 泵同步。 */
+    __canvasAiAddNode: () => CvId;
+    /** 事件轮询日志（最近 limit 条，seq 升序）。 */
+    __canvasEvents: (limit?: number) => EventLogEntry[];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 会话盒（face + 单调时钟）
+// ---------------------------------------------------------------------------
+
+/** 一个 WasmCanvas 实例 + 其时钟状态（宿主是唯一时间源）。 */
+class SessionBox {
+  readonly face: WasmCanvasFace;
+  private clockMs: bigint;
+
+  constructor(face: WasmCanvasFace) {
+    this.face = face;
+    this.clockMs = BigInt(Date.now());
+    face.set_clock_ms(this.clockMs);
+  }
+
+  /** execute/undo/redo 前推进（+1 单调——撤销栈时间戳源）。 */
+  advance(): void {
+    this.clockMs += 1n;
+    this.face.set_clock_ms(this.clockMs);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CanvasViewUI
+// ---------------------------------------------------------------------------
+
+interface DragState {
+  id: string;
+  /** 拖起时节点原位（缓存值）。 */
+  baseX: number;
+  baseY: number;
+  /** 指针 → 节点左上偏移。 */
+  offX: number;
+  offY: number;
+  /** 最近预览位（提交目标）。 */
+  lastX: number;
+  lastY: number;
+  moved: boolean;
+}
+
+export class CanvasViewUI {
+  private readonly ctor: (WasmCanvasCtor & WasmCanvasStatic) | null;
+
+  // 双实例（wasm 缺位 = null——显示面照常，模型面 typed 拒）
+  private main: SessionBox | null = null;
+  private ai: SessionBox | null = null;
+  private restoreSeq = 0;
+
+  // 渲染缓存（主端 objects_json → Map；事件 touched 局部失效）
+  private readonly objects = new Map<string, CanvasObjectJ>();
+  /** id → SVG 元素（保留模式 DOM 池）。 */
+  private readonly els = new Map<string, SVGElement>();
+  private readonly selected = new Set<string>();
+
+  // DOM 句柄
+  private panel: HTMLElement | null = null;
+  private statusEl: HTMLElement | null = null;
+  /** #3 UI 批 E：空态引导卡片层（对象计数零 = 显示）。 */
+  private guideEl!: HTMLDivElement;
+  private scrollEl: HTMLDivElement | null = null;
+  private svg: SVGSVGElement | null = null;
+  private layerGroups: SVGGElement | null = null;
+  private layerEdges: SVGGElement | null = null;
+  private layerNodes: SVGGElement | null = null;
+  /** #426 笔迹层（墨迹居顶层——pen 在节点上方可视）。 */
+  private layerStrokes: SVGGElement | null = null;
+  private aiSvg: SVGSVGElement | null = null;
+  private editInput: HTMLInputElement | null = null;
+  private readonly buttons = new Map<string, HTMLButtonElement>();
+
+  // 交互态
+  private edgeMode = false;
+  private edgeSource: string | null = null;
+  private drag: DragState | null = null;
+  /** 行内编辑位关联对象（单编辑位）。 */
+  private editingId: string | null = null;
+
+  // #426 画笔态（步 2：固定色宽；步 3 选择器的前置）。
+  /** 画笔模式（互斥于连线模式——两模式共用「工具态」位；工具为
+   * eraser 时拖拽语义切换为擦除——#454）。 */
+  private brushMode = false;
+  /** 在笔采样（null = 非绘制中；预览 path 挂笔迹层，提交后由
+   * touched 渲染接管——预览元素即删。tool 落笔时捕获：笔迹身份
+   * 起笔即固定，#454 后工具位含 eraser 但在笔只能是笔工具）。 */
+  private brushLive: { pts: [number, number][]; el: SVGPathElement; tool: 'pen' | 'highlighter' } | null = null;
+  // 步 3 画笔样式（选择器同源驱动预览与载荷；默认 = #426 固定值，
+  // 存量视觉零漂移。引擎域校验：#RGB/#RRGGBB、width>0、finite——
+  // 选择器面只产合法值，无二次防御）。
+  private brushTool: 'pen' | 'highlighter' | 'eraser' = 'pen';
+  private brushColor: string = BRUSH_COLOR;
+  private brushWidth: number = BRUSH_WIDTH;
+  /** #454 在擦预览集（null = 非擦除中；命中笔迹挂 .cv-eraser-hit
+   * 预览类，松手才单事务批删——Excalidraw 两段式纪律：拖动零命令）。 */
+  private eraserLive: { hits: Set<string>; last: [number, number] } | null = null;
+
+  // 相机态（#367——视图层临时态，不入模型；同滚动位置语义）。
+  // 卸载命题：applyCamera = 恰一次 setAttribute，零 renderObject、
+  // 零对象 DOM 变更——camSeq/renderSeq 两计数器使其可观测可断言。
+  private cam = { x: 0, y: 0, z: 1 };
+  private cameraEl: SVGGElement | null = null;
+  private zoomLabel: HTMLElement | null = null;
+  /** 相机变更计数（每次 applyCamera 递增）。 */
+  private camSeq = 0;
+  /** 对象渲染计数（renderObject 入口递增——相机不动它）。 */
+  private renderSeq = 0;
+  /** 背景平移拖拽态（null = 非平移中）。 */
+  private pan: { lastX: number; lastY: number } | null = null;
+
+  // 事件日志（探针面）+ 快照
+  private readonly eventLog: EventLogEntry[] = [];
+  private eventSeq = 0;
+  private lastSnapshot: Uint8Array | null = null;
+
+  constructor(mod: WasmModule) {
+    // 鸭子检查：pkg 重建前 WasmCanvas 缺面（evidence_panel 模式）
+    const candidate = (mod as unknown as { WasmCanvas?: WasmCanvasCtor & WasmCanvasStatic })
+      .WasmCanvas;
+    this.ctor =
+      typeof candidate === 'function'
+        ? (candidate as WasmCanvasCtor & WasmCanvasStatic)
+        : null;
+
+    this.buildDom();
+    this.setupTabs();
+    this.installHandlers();
+    if (this.ctor) this.initSessions();
+    this.installProbes();
+    this.syncStatus();
+    // rAF 事件泵（双实例排空式轮询 + 转发 + 局部渲染；空转 = 两次空 FFI）
+    const loop = (): void => {
+      this.pump();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+
+  // -----------------------------------------------------------------------
+  // DOM 构建（index.html 只提供 #canvas-panel 壳 + tab 按钮）
+  // -----------------------------------------------------------------------
+
+  private buildDom(): void {
+    const panel = document.getElementById('canvas-panel');
+    if (!panel) return; // 无壳页（如 bench）——惰性
+    panel.replaceChildren();
+
+    const toolbar = document.createElement('div');
+    toolbar.id = 'canvas-toolbar';
+
+    const mkBtn = (id: string, label: string, title = ''): HTMLButtonElement => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'cv-btn';
+      b.id = id;
+      b.textContent = label;
+      if (title) b.title = title;
+      return b;
+    };
+    const addNodeBtn = mkBtn('canvas-add-node-btn', t('cv.addNode'), t('cv.addNodeTitle'));
+    const edgeModeBtn = mkBtn('canvas-edge-mode-btn', t('cv.edgeMode'), t('cv.edgeModeTitle'));
+    const brushBtn = mkBtn('canvas-brush-btn', t('cv.brush'), t('cv.brushTitle'));
+    const groupBtn = mkBtn('canvas-group-btn', t('cv.group'), t('cv.groupTitle'));
+    const ungroupBtn = mkBtn('canvas-ungroup-btn', t('cv.ungroup'), t('cv.ungroupTitle'));
+    const undoBtn = mkBtn('canvas-undo-btn', t('cv.undo'));
+    const redoBtn = mkBtn('canvas-redo-btn', t('cv.redo'));
+    const aiAddBtn = mkBtn('canvas-ai-add-btn', t('cv.aiAddNode'), t('cv.aiAddNodeTitle'));
+    const saveBtn = mkBtn('canvas-save-btn', t('cv.saveSnapshot'), t('cv.saveSnapshotTitle'));
+    const restoreBtn = mkBtn('canvas-restore-btn', t('cv.restore'), t('cv.restoreTitle'));
+    const clearBtn = mkBtn('canvas-clear-btn', t('cv.clear'), t('cv.clearTitle'));
+
+    // 步 3 画笔样式选择器（工具/颜色/粗细——与载荷同源：change 即改
+    // this.brush*，预览与提交直接消费；id 面 = canvas-brush-tool /
+    // -color / -width / -custom。pdf_view #45 同形态，色板值级对齐）。
+    const brushTool = document.createElement('select');
+    brushTool.id = 'canvas-brush-tool';
+    brushTool.className = 'cv-sel';
+    brushTool.title = t('cv.brushToolTitle');
+    for (const [value, key] of [
+      ['pen', 'cv.brushPen'],
+      ['highlighter', 'cv.brushHighlighter'],
+      // #454（#44 步 4）：橡皮擦态——画笔模式内拖拽语义切换为
+      // 两段式擦除（拖过变预览色，松手单事务批删）。
+      ['eraser', 'cv.brushEraser'],
+    ] as const) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = t(key);
+      if (value === this.brushTool) o.selected = true;
+      brushTool.appendChild(o);
+    }
+    brushTool.addEventListener('change', () => {
+      this.brushTool = brushTool.value as 'pen' | 'highlighter' | 'eraser';
+      // 模式内切工具：状态行跟随（擦除/绘制提示分叉）。
+      if (this.brushMode) this.showStatus(this.brushModeHint());
+    });
+
+    /** 自定义色（#44 原文「6-8 个预设色 + 自定义」——原生 color
+     * 输入；值域 #RRGGBB 与引擎校验口径天然一致）。 */
+    const brushCustom = document.createElement('input');
+    brushCustom.type = 'color';
+    brushCustom.id = 'canvas-brush-custom';
+    brushCustom.className = 'cv-color';
+    brushCustom.title = t('cv.brushCustomTitle');
+    brushCustom.value = this.brushColor;
+
+    const brushColor = document.createElement('select');
+    brushColor.id = 'canvas-brush-color';
+    brushColor.className = 'cv-sel';
+    brushColor.title = t('cv.brushColorTitle');
+    for (const [value, key] of BRUSH_PALETTE) {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = t(key);
+      if (value === this.brushColor) o.selected = true;
+      brushColor.appendChild(o);
+    }
+
+    // 双向单源同步：任一控件改态，另一控件跟随（在预设面板内的值才
+    // 联动 select 选中；面板外保持显示上次预设）——状态真源始终是
+    // this.brushColor。
+    brushCustom.addEventListener('input', () => {
+      this.brushColor = brushCustom.value;
+      if (BRUSH_PALETTE.some(([v]) => v === brushCustom.value)) {
+        brushColor.value = brushCustom.value;
+      }
+    });
+    brushColor.addEventListener('change', () => {
+      this.brushColor = brushColor.value;
+      brushCustom.value = this.brushColor;
+    });
+
+    const brushWidth = document.createElement('select');
+    brushWidth.id = 'canvas-brush-width';
+    brushWidth.className = 'cv-sel';
+    brushWidth.title = t('cv.brushWidthTitle');
+    for (const [w, key] of BRUSH_WIDTHS) {
+      const o = document.createElement('option');
+      o.value = String(w);
+      o.textContent = t(key);
+      if (w === this.brushWidth) o.selected = true;
+      brushWidth.appendChild(o);
+    }
+    brushWidth.addEventListener('change', () => {
+      this.brushWidth = Number(brushWidth.value);
+    });
+
+    // #367 相机按钮组：缩小 / 百分比指示 / 放大 / 适配 / 复位。
+    const zoomOutBtn = mkBtn('canvas-zoom-out-btn', t('cv.zoomOut'), t('cv.zoomOutTitle'));
+    const zoomInBtn = mkBtn('canvas-zoom-in-btn', t('cv.zoomIn'), t('cv.zoomInTitle'));
+    const fitBtn = mkBtn('canvas-fit-btn', t('cv.fitView'), t('cv.fitViewTitle'));
+    const camResetBtn = mkBtn('canvas-cam-reset-btn', t('cv.resetView'), t('cv.resetViewTitle'));
+    const zoomLabel = document.createElement('span');
+    zoomLabel.id = 'canvas-zoom';
+    zoomLabel.textContent = '100%';
+    this.zoomLabel = zoomLabel;
+
+    const status = document.createElement('span');
+    status.id = 'canvas-status';
+
+    toolbar.append(
+      addNodeBtn, edgeModeBtn, brushBtn, brushTool, brushColor, brushCustom, brushWidth,
+      groupBtn, ungroupBtn, undoBtn, redoBtn,
+      aiAddBtn, saveBtn, restoreBtn, clearBtn,
+      zoomOutBtn, zoomLabel, zoomInBtn, fitBtn, camResetBtn, status,
+    );
+
+    // 双面板布局：主画布（可编辑）+ AI 端只读镜像（协同演示）
+    const body = document.createElement('div');
+    body.id = 'canvas-body';
+
+    const scroll = document.createElement('div');
+    scroll.id = 'canvas-scroll';
+    scroll.tabIndex = 0;
+
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.id = 'canvas-svg';
+    // #367 相机模型：svg 填充容器（无固定尺寸——无限画布 viewport），
+    // 导航交给相机层（滚轮缩放/背景平移），滚动条退役。
+    svg.setAttribute('width', '100%');
+    svg.setAttribute('height', '100%');
+    // 相机层（#367——tldraw tl-html-layer 同构）：三层唯一包裹者，
+    // 相机移动 = 本元素恰一次 transform 写入，对象 DOM 零变更。
+    const camera = document.createElementNS(SVG_NS, 'g');
+    camera.id = 'cv-camera';
+    const lg = document.createElementNS(SVG_NS, 'g');
+    lg.id = 'cv-l-groups';
+    const le = document.createElementNS(SVG_NS, 'g');
+    le.id = 'cv-l-edges';
+    const ln = document.createElementNS(SVG_NS, 'g');
+    ln.id = 'cv-l-nodes';
+    // #426 笔迹层（墨迹居顶——分组 < 边 < 节点 < 笔迹）。
+    const ls = document.createElementNS(SVG_NS, 'g');
+    ls.id = 'cv-l-strokes';
+    camera.append(lg, le, ln, ls);
+    svg.append(camera);
+    scroll.appendChild(svg);
+    this.cameraEl = camera;
+    this.layerStrokes = ls;
+    // #3 UI 批 E：空态引导卡片（对象计数零 = 显示——svg 底盘仍在）。
+    this.guideEl = mount_surface_guide(scroll, 'canvas-guide', {
+      icon: 'M7.5 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z M13.5 13.5h7v7h-7z M4 21l7.5-7.5',
+      title: t('cv.guideTitle'),
+      hints: [
+        t('cv.guideHint1'),
+        t('cv.guideHint2'),
+      ],
+    });
+
+    const aiPanel = document.createElement('div');
+    aiPanel.id = 'canvas-ai-panel';
+    const aiHead = document.createElement('div');
+    aiHead.id = 'canvas-ai-head';
+    const aiTitle = document.createElement('span');
+    aiTitle.textContent = t('cv.aiTitle');
+    const aiAddBtn2 = mkBtn('canvas-ai-add-btn2', t('cv.aiAddNode'), t('cv.aiAddNodeTitle2'));
+    aiHead.append(aiTitle, aiAddBtn2);
+    const aiWrap = document.createElement('div');
+    aiWrap.id = 'canvas-ai-svg-wrap';
+    const aiSvg = document.createElementNS(SVG_NS, 'svg');
+    aiSvg.id = 'canvas-ai-svg';
+    aiSvg.setAttribute('viewBox', `0 0 ${AI_VIEW_W} ${AI_VIEW_H}`);
+    aiSvg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    aiWrap.appendChild(aiSvg);
+    aiPanel.append(aiHead, aiWrap);
+
+    body.append(scroll, aiPanel);
+    panel.append(toolbar, body);
+
+    this.panel = panel;
+    this.statusEl = status;
+    this.scrollEl = scroll;
+    this.svg = svg;
+    this.layerGroups = lg;
+    this.layerEdges = le;
+    this.layerNodes = ln;
+    this.aiSvg = aiSvg;
+    for (const b of [addNodeBtn, edgeModeBtn, brushBtn, groupBtn, ungroupBtn, undoBtn, redoBtn,
+      aiAddBtn, saveBtn, restoreBtn, clearBtn, aiAddBtn2]) {
+      this.buttons.set(b.id, b);
+      b.disabled = this.ctor === null; // wasm 缺位 = 显示面可用、动作面禁用
+    }
+    // #367 相机按钮：注册进 buttons 供 wireToolbar，但**不随 wasm 缺位
+    // 禁用**——相机是纯视图层，bridge_absent 配置下缩放/平移照常可用。
+    for (const b of [zoomOutBtn, zoomInBtn, fitBtn, camResetBtn]) {
+      this.buttons.set(b.id, b);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 视图 tab（doc/grid/pdf 既有逻辑不动——本模块只追加 canvas 面显隐）
+  // -----------------------------------------------------------------------
+
+  private setupTabs(): void {
+    const cvTab = document.getElementById('tab-canvas');
+    const docTab = document.getElementById('tab-doc');
+    const gridTab = document.getElementById('tab-grid');
+    const pdfTab = document.getElementById('tab-pdf');
+    const editor = document.getElementById('editor');
+    const gridPanel = document.getElementById('grid-panel');
+    const pdfPanel = document.getElementById('pdf-panel');
+    if (!cvTab || !docTab || !gridTab || !pdfTab || !editor || !gridPanel || !pdfPanel
+      || !this.panel) return;
+    const show = (): void => {
+      docTab.classList.remove('active');
+      gridTab.classList.remove('active');
+      pdfTab.classList.remove('active');
+      cvTab.classList.add('active');
+      editor.style.display = 'none';
+      gridPanel.style.display = 'none';
+      pdfPanel.style.display = 'none';
+      this.panel!.style.display = 'block';
+    };
+    const hide = (): void => {
+      cvTab.classList.remove('active');
+      this.panel!.style.display = 'none';
+    };
+    cvTab.addEventListener('click', show);
+    // 叠加监听——不动既有处理器（pdf_view 同款纪律）
+    docTab.addEventListener('click', hide);
+    gridTab.addEventListener('click', hide);
+    pdfTab.addEventListener('click', hide);
+  }
+
+  // -----------------------------------------------------------------------
+  // 会话初始化（双实例 + encode_diff 晚加入者追赶）
+  // -----------------------------------------------------------------------
+
+  private initSessions(): void {
+    if (!this.ctor) return;
+    try {
+      this.main = new SessionBox(new this.ctor(BigInt(MAIN_CLIENT_ID), UNDO_LIMIT));
+      this.ai = new SessionBox(new this.ctor(BigInt(AI_CLIENT_ID), UNDO_LIMIT));
+      this.catchUpAi();
+      this.refreshAll();
+    } catch (e) {
+      const fail = wasmFail(e);
+      this.main = null;
+      this.ai = null;
+      this.showStatus(`session init failed (${fail.code}): ${fail.message}`, true);
+    }
+  }
+
+  /** AI 端追赶主端（encode_diff vs AI 的 state_vector——真实协同语义；
+   * 同步流中的常规路径是事件 updates 转发，此面用于构造/恢复期）。 */
+  private catchUpAi(): void {
+    if (!this.main || !this.ai) return;
+    try {
+      const diff = this.main.face.encode_diff(this.ai.face.state_vector());
+      if (diff.length > 0) this.ai.face.apply_update(diff);
+    } catch (e) {
+      const fail = wasmFail(e);
+      this.showStatus(`ai catch-up failed (${fail.code}): ${fail.message}`, true);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 命令执行（时钟推进 + typed 包裹 + 泵）
+  // -----------------------------------------------------------------------
+
+  /** 裸执行（不泵——批量路径由调用方统一泵一次）。 */
+  private execRaw(
+    box: SessionBox,
+    actor: 'human' | 'ai',
+    cmdJson: string,
+  ): CvExec {
+    box.advance();
+    try {
+      const receipt = JSON.parse(box.face.execute(actor, cmdJson)) as CommandReceiptJ;
+      return { ok: true, receipt };
+    } catch (e) {
+      return wasmFail(e);
+    }
+  }
+
+  /** 执行 + 泵（单命令路径——提交后立即排空事件/转发/渲染）。 */
+  private exec(actor: 'human' | 'ai', cmdJson: string): CvExec {
+    if (!this.main) return BRIDGE_ABSENT;
+    const r = this.execRaw(this.main, actor, cmdJson);
+    this.pump();
+    return r;
+  }
+
+  /** 批量原子执行 + 泵（#352 execute_batch 消费面——#454 橡皮擦
+   * 松手单事务提交）：整批全成或全不成，整批 = 单一撤销单元。 */
+  private execBatch(actor: 'human' | 'ai', cmdsJson: string): CvBatchExec {
+    if (!this.main) return BRIDGE_ABSENT;
+    this.main.advance();
+    let r: CvBatchExec;
+    try {
+      const receipt = JSON.parse(this.main.face.execute_batch(actor, cmdsJson)) as BatchReceiptJ;
+      r = { ok: true, receipt };
+    } catch (e) {
+      r = wasmFail(e);
+    }
+    this.pump();
+    return r;
+  }
+
+  private buildAddNodeJson(x: number, y: number, label: string): string {
+    return JSON.stringify({
+      t: 'add_node', id: null, x, y, w: NODE_W, h: NODE_H,
+      props: { label },
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // 事件泵（双实例排空式轮询 → 跨实例转发 → touched 局部渲染）
+  // -----------------------------------------------------------------------
+
+  /** 事件泵（双实例排空式轮询 → 跨实例转发 → touched 局部渲染）。
+   * 返回是否有事件流过（false = 空转——状态行不被常态行覆写，瞬时
+   * 消息[错误/提示]保留到下一次真实变更）。 */
+  private transportSend: ((bytes: Uint8Array) => void) | null = null;
+
+  private pump(): boolean {
+    if (!this.main || !this.ai) return false;
+    const dirtyMain = new Set<string>();
+    let dirtyAi = false;
+    let flowed = false;
+    // 转发产生的 remote 事件在下一轮排空——循环至两端同轮全空
+    for (let round = 0; round < PUMP_MAX_ROUNDS; round++) {
+      let any = false;
+
+      const mainEvs = this.takeEvents(this.main, 'main', dirtyMain);
+      if (mainEvs.length > 0) { any = true; flowed = true; }
+      for (const ev of mainEvs) {
+        if (ev.source === 'remote' || ev.source === 'maintenance') continue; // 不回发
+        for (const b64 of ev.updates) {
+          this.applyToPeer(this.ai, base64ToBytes(b64), 'ai');
+          // 跨页传输（§九.5 双端 web 化——collab_channel 注册；对端
+          // 以 remote 面应用，不回声）。
+          if (this.transportSend) {
+            try {
+              this.transportSend(base64ToBytes(b64));
+            } catch {
+              // 传输面瞬时失败不阻断本页（CRDT 幂等——对端 catch-up 兜底）
+            }
+          }
+        }
+      }
+
+      const aiEvs = this.takeEvents(this.ai, 'ai', null);
+      if (aiEvs.length > 0) { any = true; flowed = true; dirtyAi = true; }
+      for (const ev of aiEvs) {
+        if (ev.source === 'remote' || ev.source === 'maintenance') continue;
+        for (const b64 of ev.updates) {
+          this.applyToPeer(this.main, base64ToBytes(b64), 'main');
+        }
+      }
+
+      if (!any) break;
+    }
+    if (dirtyMain.size > 0) this.renderTouched(dirtyMain);
+    if (dirtyAi) this.renderAiMirror();
+    if (flowed) this.syncStatus();
+    return flowed;
+  }
+
+  /** 排空一端事件队列 → 日志 + touched 收集，返回事件数组。 */
+  private takeEvents(
+    box: SessionBox,
+    side: 'main' | 'ai',
+    dirty: Set<string> | null,
+  ): CanvasEventJ[] {
+    let raw: string;
+    try {
+      raw = box.face.take_events_json();
+    } catch (e) {
+      this.showStatus(`event poll failed (${wasmFail(e).code})`, true);
+      return [];
+    }
+    let evs: CanvasEventJ[];
+    try {
+      evs = JSON.parse(raw) as CanvasEventJ[];
+    } catch {
+      return [];
+    }
+    for (const ev of evs) {
+      this.eventSeq += 1;
+      this.eventLog.push({
+        seq: this.eventSeq,
+        side,
+        source: ev.source,
+        actor: ev.actor ?? null,
+        updates: ev.updates.length,
+        touched: ev.touched,
+      });
+      if (this.eventLog.length > EVENT_LOG_CAP) this.eventLog.splice(0, this.eventLog.length - EVENT_LOG_CAP);
+      if (dirty) for (const id of ev.touched) dirty.add(id);
+    }
+    return evs;
+  }
+
+  private applyToPeer(box: SessionBox, bytes: Uint8Array, side: 'main' | 'ai'): void {
+    try {
+      box.face.apply_update(bytes);
+    } catch (e) {
+      const fail = wasmFail(e);
+      this.showStatus(`sync to ${side} peer failed (${fail.code}): ${fail.message}`, true);
+    }
+  }
+
+  // ── 跨页传输钩（§九.5 双端 web 化——collab_channel 注册）──────
+
+  /** 注册跨页传输（pump 将 main 侧 command/undo/redo 产出字节外送）。 */
+  registerTransport(send: (bytes: Uint8Array) => void): void {
+    this.transportSend = send;
+  }
+
+  /** 远端 update → 双实例（main + ai 均 remote 面——pump 不回发；
+   * 单发 main 会让 ai 镜像滞后，双发维持三端收敛不变量）。 */
+  applyRemote(bytes: Uint8Array): void {
+    if (!this.main || !this.ai) return;
+    this.applyToPeer(this.main, bytes, 'main');
+    this.applyToPeer(this.ai, bytes, 'ai');
+  }
+
+  /** main 状态向量（晚加入端 catch-up 面）。 */
+  mainStateVector(): Uint8Array | null {
+    return this.main ? this.main.face.state_vector() : null;
+  }
+
+  /** main 差量（对端 sv 之后的新事务）。 */
+  mainEncodeDiff(sv: Uint8Array): Uint8Array | null {
+    if (!this.main) return null;
+    try {
+      return this.main.face.encode_diff(sv);
+    } catch {
+      return null;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 渲染（保留模式：touched 局部失效；DOM 池 id → element）
+  // -----------------------------------------------------------------------
+
+  /** 缓存刷新单对象（object_json；null = 已删——缓存/DOM/选中清除）。 */
+  private refreshObject(id: string): void {
+    if (!this.main) return;
+    let raw: string | null = null;
+    try {
+      raw = this.main.face.object_json(id);
+    } catch {
+      raw = null;
+    }
+    if (raw === null) {
+      this.objects.delete(id);
+      this.selected.delete(id);
+    } else {
+      try {
+        this.objects.set(id, JSON.parse(raw) as CanvasObjectJ);
+      } catch {
+        // 形态异常——保守删除（渲染层自愈面）
+        this.objects.delete(id);
+      }
+    }
+  }
+
+  /** touched 集 → 缓存刷新 + 依赖闭包（相连边/所属分组）重渲染。 */
+  private renderTouched(ids: Iterable<string>): void {
+    const all = new Set<string>();
+    for (const id of ids) {
+      this.refreshObject(id);
+      all.add(id);
+      this.collectDependents(id, all);
+    }
+    for (const id of all) this.renderObject(id);
+    this.applySelectionClasses();
+  }
+
+  /** id 的几何依赖（边端点引用/分组成员引用）——节点动则边与包围盒动。 */
+  private collectDependents(id: string, out: Set<string>): void {
+    for (const obj of this.objects.values()) {
+      if (obj.kind === 'edge' && (obj.from === id || obj.to === id)) out.add(obj.id);
+      else if (obj.kind === 'group' && obj.members.includes(id)) out.add(obj.id);
+    }
+  }
+
+  /** 全量重建（构造/恢复/异常自愈路径——bench 全量口径备用面）。 */
+  private refreshAll(): void {
+    if (!this.main) return;
+    this.objects.clear();
+    this.selected.clear();
+    try {
+      const objs = JSON.parse(this.main.face.objects_json()) as CanvasObjectJ[];
+      for (const o of objs) this.objects.set(o.id, o);
+    } catch (e) {
+      this.showStatus(`objects_json failed (${wasmFail(e).code})`, true);
+    }
+    if (this.layerGroups) this.layerGroups.replaceChildren();
+    if (this.layerEdges) this.layerEdges.replaceChildren();
+    if (this.layerNodes) this.layerNodes.replaceChildren();
+    if (this.layerStrokes) this.layerStrokes.replaceChildren();
+    this.els.clear();
+    for (const id of this.objects.keys()) this.renderObject(id);
+    this.renderAiMirror();
+    this.applySelectionClasses();
+  }
+
+  private layerFor(kind: 'node' | 'edge' | 'group' | 'stroke'): SVGGElement | null {
+    if (kind === 'node') return this.layerNodes;
+    if (kind === 'edge') return this.layerEdges;
+    if (kind === 'stroke') return this.layerStrokes;
+    return this.layerGroups;
+  }
+
+  /** DOM 池取用（缺则建——保留模式增量面）。 */
+  private ensureEl(id: string, kind: 'node' | 'edge' | 'group' | 'stroke'): SVGElement | null {
+    const existing = this.els.get(id);
+    if (existing && existing.isConnected) return existing;
+    const layer = this.layerFor(kind);
+    if (!layer) return null;
+    let el: SVGElement;
+    if (kind === 'node') {
+      const g = document.createElementNS(SVG_NS, 'g');
+      g.classList.add('node');
+      const r = document.createElementNS(SVG_NS, 'rect');
+      r.setAttribute('rx', '6');
+      const t = document.createElementNS(SVG_NS, 'text');
+      t.setAttribute('x', '8');
+      t.setAttribute('y', '22');
+      g.append(r, t);
+      el = g;
+    } else if (kind === 'edge') {
+      const l = document.createElementNS(SVG_NS, 'line');
+      l.classList.add('edge');
+      el = l;
+    } else if (kind === 'stroke') {
+      // #426：填充 path（outline 多边形——perfect-freehand 官方口径，
+      // 非 stroke 折线）。
+      const p = document.createElementNS(SVG_NS, 'path');
+      p.classList.add('stroke');
+      el = p;
+    } else {
+      const g = document.createElementNS(SVG_NS, 'g');
+      g.classList.add('group');
+      const r = document.createElementNS(SVG_NS, 'rect');
+      r.classList.add('group-box');
+      const t = document.createElementNS(SVG_NS, 'text');
+      t.classList.add('group-label');
+      g.append(r, t);
+      el = g;
+    }
+    el.dataset.id = id;
+    layer.appendChild(el);
+    this.els.set(id, el);
+    return el;
+  }
+
+  private removeEl(id: string): void {
+    const el = this.els.get(id);
+    if (el) el.remove();
+    this.els.delete(id);
+  }
+
+  /** 以视口中心为锚的缩放（按钮路径——复用 zoomAt 锥制/幂等）。 */
+  private zoomCenter(factor: number): void {
+    const rect = this.svg?.getBoundingClientRect();
+    if (!rect) return;
+    this.zoomAt(rect.width / 2, rect.height / 2, factor);
+  }
+
+  /** 单对象渲染（缓存 → DOM；缺对象 = DOM 移除）。renderSeq 随入口
+   * 递增（#367——与 camSeq 分离：相机变更不计入渲染计数）。 */
+  private renderObject(id: string): void {
+    this.renderSeq += 1;
+    const obj = this.objects.get(id);
+    if (!obj) {
+      this.removeEl(id);
+      return;
+    }
+    if (obj.kind === 'node') {
+      const g = this.ensureEl(id, 'node') as SVGGElement | null;
+      if (!g) return;
+      g.setAttribute('transform', `translate(${obj.x},${obj.y})`);
+      const rect = g.firstElementChild as SVGRectElement | null;
+      if (rect === null) {
+        // 池元素形态异常（kind 错配/子树被外置清空）——渲染层自愈：
+        // 丢弃池项重建（ensureEl 对已断开条目走新建路径）。
+        console.error(`canvas renderObject: pooled element for ${id} has no children (tag ${g.tagName}) — rebuilding`);
+        g.remove();
+        this.els.delete(id);
+        const g2 = this.ensureEl(id, 'node') as SVGGElement | null;
+        if (!g2 || !g2.firstElementChild) return;
+        g2.setAttribute('transform', `translate(${obj.x},${obj.y})`);
+        (g2.firstElementChild as SVGRectElement).setAttribute('width', `${obj.w}`);
+        (g2.firstElementChild as SVGRectElement).setAttribute('height', `${obj.h}`);
+        (g2.lastElementChild as SVGTextElement).textContent = obj.props.label ?? obj.id;
+        return;
+      }
+      rect.setAttribute('width', `${obj.w}`);
+      rect.setAttribute('height', `${obj.h}`);
+      const text = g.lastElementChild as SVGTextElement;
+      text.textContent = obj.props.label ?? obj.id;
+    } else if (obj.kind === 'edge') {
+      const line = this.ensureEl(id, 'edge') as SVGLineElement | null;
+      if (!line) return;
+      const a = obj.from !== null ? this.objects.get(obj.from) : undefined;
+      const b = obj.to !== null ? this.objects.get(obj.to) : undefined;
+      // 端点缺失（并发删除的悬空边）——读模型暴露 + 视觉悬空标记
+      const ax = a ? a.x + EDGE_DX : 0;
+      const ay = a ? a.y + EDGE_DY : 0;
+      const bx = b ? b.x + EDGE_DX : 0;
+      const by = b ? b.y + EDGE_DY : 0;
+      line.setAttribute('x1', `${ax}`);
+      line.setAttribute('y1', `${ay}`);
+      line.setAttribute('x2', `${bx}`);
+      line.setAttribute('y2', `${by}`);
+      line.classList.toggle('dangling', !a || !b);
+    } else if (obj.kind === 'stroke') {
+      // #426：笔迹渲染——原始采样点 + 工具/线宽 → outline 填充 path
+      // （消费侧重算，与预览同源 strokePathD；highlighter = 渲染态
+      // 半透明）。字段缺失防御：null 工具/色宽 → 缺省笔形态。
+      const path = this.ensureEl(id, 'stroke') as SVGPathElement | null;
+      if (!path) return;
+      const tool: 'pen' | 'highlighter' = obj.tool ?? 'pen';
+      const width = obj.width ?? BRUSH_WIDTH;
+      path.setAttribute('d', strokePathD(obj.points, tool, width));
+      path.setAttribute('fill', obj.color ?? BRUSH_COLOR);
+      path.setAttribute('fill-opacity',
+        tool === 'highlighter' ? `${STROKE_HL_OPACITY}` : '1');
+    } else {
+      const g = this.ensureEl(id, 'group') as SVGGElement | null;
+      if (!g) return;
+      const box = this.groupBBox(obj);
+      const rect = g.firstElementChild as SVGRectElement;
+      const text = g.lastElementChild as SVGTextElement;
+      if (box) {
+        rect.setAttribute('x', `${box.x}`);
+        rect.setAttribute('y', `${box.y}`);
+        rect.setAttribute('width', `${box.w}`);
+        rect.setAttribute('height', `${box.h}`);
+        rect.style.display = '';
+        text.setAttribute('x', `${box.x + 4}`);
+        text.setAttribute('y', `${box.y + 13}`);
+        text.textContent = `group ${obj.members.length}`;
+      } else {
+        // 无节点成员（纯边/空组）——无几何可围
+        rect.style.display = 'none';
+        text.setAttribute('x', '4');
+        text.setAttribute('y', '13');
+        text.textContent = `group ${obj.members.length}`;
+      }
+    }
+  }
+
+  /** 分组包围盒（成员节点几何并集 + 外扩；非节点成员无几何面）。 */
+  private groupBBox(obj: CanvasObjectJ): { x: number; y: number; w: number; h: number } | null {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const m of obj.members) {
+      const o = this.objects.get(m);
+      if (!o || o.kind !== 'node') continue;
+      x0 = Math.min(x0, o.x);
+      y0 = Math.min(y0, o.y);
+      x1 = Math.max(x1, o.x + o.w);
+      y1 = Math.max(y1, o.y + o.h);
+    }
+    if (x0 === Infinity) return null;
+    return {
+      x: x0 - GROUP_PAD,
+      y: y0 - GROUP_PAD,
+      w: x1 - x0 + GROUP_PAD * 2,
+      h: y1 - y0 + GROUP_PAD * 2,
+    };
+  }
+
+  private applySelectionClasses(): void {
+    for (const [id, el] of this.els) {
+      el.classList.toggle('selected', this.selected.has(id));
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // AI 镜像（只读 SVG——全量重建；小规模演示面）
+  // -----------------------------------------------------------------------
+
+  private renderAiMirror(): void {
+    if (!this.ai || !this.aiSvg) return;
+    let objs: CanvasObjectJ[] = [];
+    try {
+      objs = JSON.parse(this.ai.face.objects_json()) as CanvasObjectJ[];
+    } catch {
+      return;
+    }
+    const byId = new Map<string, CanvasObjectJ>();
+    for (const o of objs) byId.set(o.id, o);
+    const frag = document.createDocumentFragment();
+    const mk = (tag: string): SVGElement => document.createElementNS(SVG_NS, tag);
+    // 分组 → 边 → 节点（与主画布同层次序）
+    for (const o of objs) {
+      if (o.kind !== 'group') continue;
+      const g = mk('g');
+      g.classList.add('group');
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const m of o.members) {
+        const n = byId.get(m);
+        if (!n || n.kind !== 'node') continue;
+        x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y);
+        x1 = Math.max(x1, n.x + n.w); y1 = Math.max(y1, n.y + n.h);
+      }
+      if (x0 !== Infinity) {
+        const r = mk('rect');
+        r.classList.add('group-box');
+        r.setAttribute('x', `${x0 - GROUP_PAD}`);
+        r.setAttribute('y', `${y0 - GROUP_PAD}`);
+        r.setAttribute('width', `${x1 - x0 + GROUP_PAD * 2}`);
+        r.setAttribute('height', `${y1 - y0 + GROUP_PAD * 2}`);
+        g.appendChild(r);
+      }
+      frag.appendChild(g);
+    }
+    for (const o of objs) {
+      if (o.kind !== 'edge') continue;
+      const a = o.from !== null ? byId.get(o.from) : undefined;
+      const b = o.to !== null ? byId.get(o.to) : undefined;
+      const l = mk('line');
+      l.classList.add('edge');
+      if (!a || !b) l.classList.add('dangling');
+      l.setAttribute('x1', `${a ? a.x + EDGE_DX : 0}`);
+      l.setAttribute('y1', `${a ? a.y + EDGE_DY : 0}`);
+      l.setAttribute('x2', `${b ? b.x + EDGE_DX : 0}`);
+      l.setAttribute('y2', `${b ? b.y + EDGE_DY : 0}`);
+      frag.appendChild(l);
+    }
+    for (const o of objs) {
+      if (o.kind !== 'node') continue;
+      const g = mk('g');
+      g.classList.add('node');
+      g.setAttribute('transform', `translate(${o.x},${o.y})`);
+      const r = mk('rect');
+      r.setAttribute('width', `${o.w}`);
+      r.setAttribute('height', `${o.h}`);
+      r.setAttribute('rx', '6');
+      const t = mk('text');
+      t.setAttribute('x', '8');
+      t.setAttribute('y', '22');
+      t.textContent = o.props.label ?? o.id;
+      g.append(r, t);
+      frag.appendChild(g);
+    }
+    // #426 笔迹（墨迹居顶——与主画布同层次序；全量重建口径）。
+    for (const o of objs) {
+      if (o.kind !== 'stroke') continue;
+      const p = mk('path');
+      p.classList.add('stroke');
+      const tool: 'pen' | 'highlighter' = o.tool ?? 'pen';
+      p.setAttribute('d', strokePathD(o.points, tool, o.width ?? BRUSH_WIDTH));
+      p.setAttribute('fill', o.color ?? BRUSH_COLOR);
+      p.setAttribute('fill-opacity',
+        tool === 'highlighter' ? `${STROKE_HL_OPACITY}` : '1');
+      frag.appendChild(p);
+    }
+    this.aiSvg.replaceChildren(frag);
+  }
+
+  // -----------------------------------------------------------------------
+  // 相机层（#367——视图态；卸载命题：applyCamera 零对象渲染）
+  // -----------------------------------------------------------------------
+
+  /** 应用相机：**恰一次** transform 写入（tldraw tl-html-layer 同构）。
+   * 不触碰对象 DOM、不调 renderObject——camSeq 递增、renderSeq 不动。 */
+  private applyCamera(): void {
+    this.cameraEl?.setAttribute(
+      'transform',
+      `translate(${this.cam.x},${this.cam.y}) scale(${this.cam.z})`,
+    );
+    this.camSeq += 1;
+    if (this.zoomLabel) {
+      this.zoomLabel.textContent = `${Math.round(this.cam.z * 100)}%`;
+    }
+  }
+
+  /** 世界坐标 → 视口坐标（svg 原点系——相机线性变换）。 */
+  private worldToView(x: number, y: number): { x: number; y: number } {
+    return { x: x * this.cam.z + this.cam.x, y: y * this.cam.z + this.cam.y };
+  }
+
+  /** 以视口锚点为中心缩放：锚下世界坐标保持不动（光标跟随缩放）。 */
+  private zoomAt(viewX: number, viewY: number, factor: number): void {
+    const z0 = this.cam.z;
+    const z1 = Math.min(CAM_Z_MAX, Math.max(CAM_Z_MIN, z0 * factor));
+    if (z1 === z0) return; // 钳制边界零变更（幂等——camSeq 不虚增）
+    // 反解锚点世界坐标（z0/旧 pan），再按 z1 复位 pan 使锚点回原视口位。
+    const wx = (viewX - this.cam.x) / z0;
+    const wy = (viewY - this.cam.y) / z0;
+    this.cam.z = z1;
+    this.cam.x = viewX - wx * z1;
+    this.cam.y = viewY - wy * z1;
+    this.applyCamera();
+  }
+
+  /** 屏幕像素平移（拖拽增量直加——无缩放语义）。 */
+  private panBy(dx: number, dy: number): void {
+    if (dx === 0 && dy === 0) return;
+    this.cam.x += dx;
+    this.cam.y += dy;
+    this.applyCamera();
+  }
+
+  /** 适配视图：对象包围盒外扩 5% 居中（空画布 = 复位语义）。 */
+  private fitView(): void {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const o of this.objects.values()) {
+      if (o.kind === 'node') {
+        x0 = Math.min(x0, o.x); y0 = Math.min(y0, o.y);
+        x1 = Math.max(x1, o.x + o.w); y1 = Math.max(y1, o.y + o.h);
+      } else if (o.kind === 'group') {
+        const b = this.groupBBox(o);
+        if (b) {
+          x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y);
+          x1 = Math.max(x1, b.x + b.w); y1 = Math.max(y1, b.y + b.h);
+        }
+      }
+    }
+    const vw = this.svg?.clientWidth ?? 0;
+    const vh = this.svg?.clientHeight ?? 0;
+    if (!Number.isFinite(x0) || vw <= 0 || vh <= 0) {
+      this.resetCamera();
+      return;
+    }
+    const pad = 1 + CAM_FIT_PAD;
+    const z = Math.min(
+      CAM_Z_MAX,
+      Math.max(CAM_Z_MIN, Math.min(vw / ((x1 - x0) * pad || 1), vh / ((y1 - y0) * pad || 1))),
+    );
+    this.cam.z = z;
+    this.cam.x = (vw - (x1 - x0) * z) / 2 - x0 * z;
+    this.cam.y = (vh - (y1 - y0) * z) / 2 - y0 * z;
+    this.applyCamera();
+  }
+
+  /** 复位：z=1、pan=0。 */
+  private resetCamera(): void {
+    this.cam = { x: 0, y: 0, z: 1 };
+    this.applyCamera();
+  }
+
+  // -----------------------------------------------------------------------
+  // 交互层（pointer O(n) 命中 → DOM 预览 → pointerup 单次提交）
+  // -----------------------------------------------------------------------
+
+  /** 屏幕坐标 → SVG 世界坐标（#367 后含相机：CTM = 相机层 transform
+   * 之逆——命中/几何零改动自动正确）。 */
+  private toSvgPoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
+    const svg = this.svg as SVGSVGElement;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return { x: 0, y: 0 };
+    const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse());
+    return { x: p.x, y: p.y };
+  }
+
+  /** 应用级 O(n) 节点命中（bench canvas_hit 口径——不用 DOM 命中）。 */
+  private hitNode(x: number, y: number): CanvasObjectJ | null {
+    for (const obj of this.objects.values()) {
+      if (obj.kind !== 'node') continue;
+      if (x >= obj.x && x <= obj.x + obj.w && y >= obj.y && y <= obj.y + obj.h) return obj;
+    }
+    return null;
+  }
+
+  /** 分组命中（包围盒内；节点优先——点在节点上不选组）。 */
+  private hitGroup(x: number, y: number): CanvasObjectJ | null {
+    for (const obj of this.objects.values()) {
+      if (obj.kind !== 'group') continue;
+      const box = this.groupBBox(obj);
+      if (!box) continue;
+      if (x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h) return obj;
+    }
+    return null;
+  }
+
+  private installHandlers(): void {
+    const svg = this.svg;
+    if (!svg) return;
+
+    svg.addEventListener('pointerdown', (e) => {
+      // #367 中键 = 平移（任意处——含节点上方；纯视图层，先于一切分支）。
+      if (e.button === 1) {
+        this.pan = { lastX: e.clientX, lastY: e.clientY };
+        this.svg?.classList.add('panning');
+        svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        return;
+      }
+      // bridge_absent（无模型面）：视图层交互照常——背景左键 = 平移；
+      // 命中/命令面无对象可命中，自然短路。
+      if (!this.main) {
+        if (e.button === 0) {
+          this.pan = { lastX: e.clientX, lastY: e.clientY };
+          this.svg?.classList.add('panning');
+          svg.setPointerCapture(e.pointerId);
+          e.preventDefault();
+        }
+        return;
+      }
+      const p = this.toSvgPoint(e);
+
+      // #426 画笔模式：左键落笔即采样（墨迹居顶——不做节点/分组
+      // 命中，覆盖节点上方也可画；中键 pan 已在前置分支收走）。
+      if (this.brushMode && e.button === 0) {
+        // #454（#44 步 4）橡皮擦态：起拖只建预览集（零命令——
+        // 命中笔迹变暗；松手才单事务批删）。与画笔分支互斥于工具位。
+        if (this.brushTool === 'eraser') {
+          this.eraserLive = { hits: new Set(), last: [p.x, p.y] };
+          this.eraserHitTest(p.x, p.y, p.x, p.y);
+          svg.setPointerCapture(e.pointerId);
+          e.preventDefault();
+          return;
+        }
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.classList.add('cv-brush-preview');
+        // 步 3 预览同步：所见即所提交（色/宽/工具与载荷同源——
+        // 荧光笔预览即半透明，消除 #426 预览黑/成品深灰的视觉错位）。
+        path.setAttribute('fill', this.brushColor);
+        path.setAttribute('fill-opacity',
+          this.brushTool === 'highlighter' ? `${STROKE_HL_OPACITY}` : '1');
+        this.layerStrokes?.appendChild(path);
+        this.brushLive = { pts: [[p.x, p.y]], el: path, tool: this.brushTool };
+        svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        return;
+      }
+
+      // 连线模式：点两个节点建边（一次性）
+      if (this.edgeMode) {
+        const node = this.hitNode(p.x, p.y);
+        if (this.edgeSource === null) {
+          if (node) {
+            this.edgeSource = node.id;
+            this.setEdgeSourceClass(node.id);
+            this.showStatus(`edge mode: now click the target node (esc to cancel)`);
+          } else {
+            this.setEdgeMode(false);
+          }
+        } else if (node && node.id !== this.edgeSource) {
+          const r = this.exec('human', JSON.stringify({
+            t: 'add_edge', id: null, from: this.edgeSource, to: node.id, props: {},
+          }));
+          this.setEdgeMode(false);
+          if (r.ok) this.showStatus(`edge added (${r.receipt.id})`);
+          else this.showStatus(`edge rejected (${r.code}): ${r.message}`, true);
+        } else {
+          this.setEdgeMode(false); // 点空/点自身 = 取消
+        }
+        e.preventDefault();
+        return;
+      }
+
+      const node = this.hitNode(p.x, p.y);
+      if (node) {
+        if (e.shiftKey) {
+          // 多选（分组入口）——shift 按下不起拖拽
+          if (this.selected.has(node.id)) this.selected.delete(node.id);
+          else this.selected.add(node.id);
+          this.applySelectionClasses();
+        } else {
+          if (!this.selected.has(node.id)) {
+            this.selected.clear();
+            this.selected.add(node.id);
+            this.applySelectionClasses();
+          }
+          // 拖拽起手：纯 DOM 预览，pointerup 单次 move_node 提交
+          this.drag = {
+            id: node.id,
+            baseX: node.x,
+            baseY: node.y,
+            offX: p.x - node.x,
+            offY: p.y - node.y,
+            lastX: node.x,
+            lastY: node.y,
+            moved: false,
+          };
+          svg.setPointerCapture(e.pointerId);
+          const el = this.els.get(node.id);
+          el?.classList.add('dragging');
+        }
+        e.preventDefault();
+        return;
+      }
+
+      const group = this.hitGroup(p.x, p.y);
+      if (group) {
+        this.selected.clear();
+        this.selected.add(group.id);
+        this.applySelectionClasses();
+        return;
+      }
+
+      // #367 背景左键拖拽 = 平移（空白命中——清选后起 pan 态；
+      // 平移纯视图像素增量，零对象渲染）。
+      this.selected.clear();
+      this.applySelectionClasses();
+      if (e.button === 0) {
+        this.pan = { lastX: e.clientX, lastY: e.clientY };
+        this.svg?.classList.add('panning');
+        svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+      }
+    });
+
+    // #367 滚轮 = 以光标为锚缩放（Excalidraw 惯例；触控板高分辨率事件
+    // 钦定单次 |deltaY| 防跳级）。preventDefault：容器不滚动（相机取代）。
+    svg.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const dy = Math.max(-CAM_WHEEL_MAX_DELTA, Math.min(CAM_WHEEL_MAX_DELTA, e.deltaY));
+      this.zoomAt(e.clientX - rect.left, e.clientY - rect.top, Math.exp(-dy * CAM_WHEEL_K));
+    }, { passive: false });
+
+    svg.addEventListener('pointermove', (e) => {
+      // #426 在笔采样（优先于 pan/drag——画笔态无 pan 起手[背景左键
+      // 被画笔分支收走]，中键 pan 不进画笔态）。
+      if (this.brushLive) {
+        const live = this.brushLive;
+        const p = this.toSvgPoint(e);
+        const pts = live.pts;
+        const last = pts[pts.length - 1];
+        const dx = p.x - last[0];
+        const dy = p.y - last[1];
+        if (dx * dx + dy * dy >= BRUSH_SAMPLE_DIST * BRUSH_SAMPLE_DIST) {
+          pts.push([p.x, p.y]);
+          live.el.setAttribute('d',
+            strokePathD(pts, live.tool, this.brushWidth));
+        }
+        return;
+      }
+      // #454 在擦扫描（段级命中——prev→cur 线段扫过带；命中即入
+      // 预览集，零命令。与 pan/drag 互斥同在笔）。
+      if (this.eraserLive) {
+        const p = this.toSvgPoint(e);
+        this.eraserHitTest(this.eraserLive.last[0], this.eraserLive.last[1], p.x, p.y);
+        this.eraserLive.last = [p.x, p.y];
+        return;
+      }
+      // #367 平移优先于拖拽（互斥态——pan 起手时无节点命中）。
+      if (this.pan) {
+        this.panBy(e.clientX - this.pan.lastX, e.clientY - this.pan.lastY);
+        this.pan.lastX = e.clientX;
+        this.pan.lastY = e.clientY;
+        return;
+      }
+      if (!this.drag) return;
+      const p = this.toSvgPoint(e);
+      const nx = p.x - this.drag.offX;
+      const ny = p.y - this.drag.offY;
+      if (nx === this.drag.lastX && ny === this.drag.lastY) return;
+      this.drag.lastX = nx;
+      this.drag.lastY = ny;
+      // 提交阈值：取整后偏离原位才算拖拽（微抖/双击的两段 down-up 不入核）
+      this.drag.moved =
+        Math.round(nx) !== Math.round(this.drag.baseX)
+        || Math.round(ny) !== Math.round(this.drag.baseY);
+      if (this.drag.moved) this.previewMove(this.drag.id, nx, ny);
+    });
+
+    const endDrag = (commit: boolean): void => {
+      // #367 平移态优先收尾（不提交任何命令）。
+      if (this.pan) {
+        this.pan = null;
+        this.svg?.classList.remove('panning');
+        return;
+      }
+      // #426 在笔收尾：pointerup = 提交（取消 = cancelBrushLive——
+      // 在笔态与 pan/drag 互斥，不落后续分支）。
+      if (this.brushLive) {
+        if (commit) this.commitBrushLive();
+        else this.cancelBrushLive();
+        return;
+      }
+      // #454 在擦收尾：pointerup = 单事务批删（取消 = 预览集作废
+      // 零命令——与在笔同纪律）。
+      if (this.eraserLive) {
+        if (commit) this.commitEraserLive();
+        else this.cancelEraserLive();
+        return;
+      }
+      const d = this.drag;
+      if (!d) return;
+      this.drag = null;
+      const el = this.els.get(d.id);
+      el?.classList.remove('dragging');
+      if (!commit) {
+        // 取消：预览回滚到缓存真值（节点 + 相连边 + 所属分组包围盒）
+        const restore = new Set<string>([d.id]);
+        this.collectDependents(d.id, restore);
+        for (const id of restore) this.renderObject(id);
+        return;
+      }
+      if (!d.moved) return; // 原地点击 = 纯选中，无提交
+      // LWW 提交粒度：一次拖拽 = 一次 move_node（取整——像素网格稳定断言面）
+      const r = this.exec('human', JSON.stringify({
+        t: 'move_node', id: d.id, x: Math.round(d.lastX), y: Math.round(d.lastY),
+      }));
+      if (!r.ok) {
+        this.showStatus(`move rejected (${r.code}): ${r.message}`, true);
+        this.renderObject(d.id); // 预览回滚
+      }
+    };
+    svg.addEventListener('pointerup', () => endDrag(true));
+    svg.addEventListener('pointercancel', () => endDrag(false));
+
+    // 双击 = 行内编辑 label（set_props 终态替换——客户端合并旧键）
+    svg.addEventListener('dblclick', (e) => {
+      if (!this.main) return;
+      const p = this.toSvgPoint(e);
+      const node = this.hitNode(p.x, p.y);
+      if (node) this.startLabelEdit(node.id);
+    });
+
+    // 键盘：Delete 删除选中 / Escape 退出连线模式（面板可见且焦点不在
+    // 输入位——computed display 兼容 CSS 初始态[inline style 尚未写过]）
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' && e.key !== 'Delete' && e.key !== 'Backspace') return;
+      if (!this.panel || getComputedStyle(this.panel).display === 'none') return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
+        || t.isContentEditable)) return;
+      if (e.key === 'Escape') {
+        this.setEdgeMode(false);
+        // #426 ESC：在笔取消（预览撤除零命令）+ 画笔模式退出。
+        if (this.brushMode) this.setBrushMode(false);
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && this.selected.size > 0) {
+        e.preventDefault();
+        this.deleteSelection();
+      }
+    });
+
+    this.wireToolbar();
+  }
+
+  /** 拖拽预览（纯 DOM——不逐帧入核；bench canvas_drag 口径）。 */
+  private previewMove(id: string, x: number, y: number): void {
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    const el = this.els.get(id);
+    el?.setAttribute('transform', `translate(${rx},${ry})`);
+    // 预览位临时覆盖（几何计算走显式坐标，不改缓存）
+    const previewPos = new Map<string, { x: number; y: number }>([[id, { x: rx, y: ry }]]);
+    const posOf = (oid: string): { x: number; y: number } | null => {
+      const pv = previewPos.get(oid);
+      if (pv) return pv;
+      const o = this.objects.get(oid);
+      return o ? { x: o.x, y: o.y } : null;
+    };
+    for (const obj of this.objects.values()) {
+      if (obj.kind === 'edge' && (obj.from === id || obj.to === id)) {
+        const line = this.els.get(obj.id) as SVGLineElement | undefined;
+        if (!line) continue;
+        const a = obj.from !== null ? posOf(obj.from) : null;
+        const b = obj.to !== null ? posOf(obj.to) : null;
+        line.setAttribute('x1', `${a ? a.x + EDGE_DX : 0}`);
+        line.setAttribute('y1', `${a ? a.y + EDGE_DY : 0}`);
+        line.setAttribute('x2', `${b ? b.x + EDGE_DX : 0}`);
+        line.setAttribute('y2', `${b ? b.y + EDGE_DY : 0}`);
+      } else if (obj.kind === 'group' && obj.members.includes(id)) {
+        const g = this.els.get(obj.id) as SVGGElement | undefined;
+        if (!g) continue;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const m of obj.members) {
+          const pos = posOf(m);
+          const o = this.objects.get(m);
+          if (!pos || !o || o.kind !== 'node') continue;
+          x0 = Math.min(x0, pos.x); y0 = Math.min(y0, pos.y);
+          x1 = Math.max(x1, pos.x + o.w); y1 = Math.max(y1, pos.y + o.h);
+        }
+        if (x0 !== Infinity) {
+          const rect = g.firstElementChild as SVGRectElement;
+          rect.setAttribute('x', `${x0 - GROUP_PAD}`);
+          rect.setAttribute('y', `${y0 - GROUP_PAD}`);
+          rect.setAttribute('width', `${x1 - x0 + GROUP_PAD * 2}`);
+          rect.setAttribute('height', `${y1 - y0 + GROUP_PAD * 2}`);
+          const text = g.lastElementChild as SVGTextElement;
+          text.setAttribute('x', `${x0 - GROUP_PAD + 4}`);
+          text.setAttribute('y', `${y0 - GROUP_PAD + 13}`);
+        }
+      }
+    }
+  }
+
+  private setEdgeSourceClass(id: string | null): void {
+    for (const [eid, el] of this.els) {
+      if (el.classList.contains('node')) el.classList.toggle('edge-source', eid === id);
+    }
+  }
+
+  private setEdgeMode(on: boolean): void {
+    this.edgeMode = on;
+    if (!on) {
+      this.edgeSource = null;
+      this.setEdgeSourceClass(null);
+    }
+    // #426 模式互斥：开连线 = 收画笔（在笔取消——不提交）。
+    if (on && this.brushMode) this.setBrushMode(false);
+    const btn = this.buttons.get('canvas-edge-mode-btn');
+    btn?.classList.toggle('active', on);
+    if (on) this.showStatus('edge mode: click the source node (esc to cancel)');
+    else this.syncStatus();
+  }
+
+  /** #426 画笔模式切换（互斥于连线模式；off = 在笔取消——预览撤除、
+   * 零命令提交，同 ESC 语义）。 */
+  private setBrushMode(on: boolean): void {
+    this.brushMode = on;
+    // off = 在笔/在擦双取消（零命令——同 ESC 语义）。
+    if (!on) {
+      this.cancelBrushLive();
+      this.cancelEraserLive();
+    }
+    if (on && this.edgeMode) {
+      this.edgeMode = false;
+      this.edgeSource = null;
+      this.setEdgeSourceClass(null);
+      this.buttons.get('canvas-edge-mode-btn')?.classList.remove('active');
+    }
+    const btn = this.buttons.get('canvas-brush-btn');
+    btn?.classList.toggle('active', on);
+    if (on) this.showStatus(this.brushModeHint());
+    else this.syncStatus();
+  }
+
+  /** #454 工具分叉的状态行提示（绘制/擦除——选择器切工具时同源）。 */
+  private brushModeHint(): string {
+    return this.brushTool === 'eraser'
+      ? 'eraser mode: drag over strokes to erase (esc to cancel)'
+      : 'brush mode: drag to draw a stroke (esc to cancel)';
+  }
+
+  /** 在笔取消（ESC/模式切换——预览元素撤除，零命令）。 */
+  private cancelBrushLive(): void {
+    if (!this.brushLive) return;
+    this.brushLive.el.remove();
+    this.brushLive = null;
+  }
+
+  /** 在笔收尾提交（pointerup：pts ≥ 2 = 一次 add_stroke——单一撤销
+   * 单元；单击不成笔，引擎域校验同判据）。 */
+  private commitBrushLive(): void {
+    const live = this.brushLive;
+    if (!live) return;
+    this.brushLive = null;
+    live.el.remove();
+    if (live.pts.length < 2 || !this.main) return;
+    // 步 3：色/宽从选择器状态透传，工具用落笔捕获值（笔迹身份
+    // 起笔即固定——预览同源，提交即所见）。
+    const r = this.exec('human', JSON.stringify({
+      t: 'add_stroke', id: null,
+      points: live.pts,
+      color: this.brushColor,
+      width: this.brushWidth,
+      tool: live.tool,
+    }));
+    if (r.ok) this.showStatus(`stroke added (${r.receipt.id})`);
+    else this.showStatus(`stroke rejected (${r.code}): ${r.message}`, true);
+  }
+
+  /** #454 在擦命中测试（段级——prev→cur 扫过带）：点到段距离 <
+   * 笔迹 width/2 + ERASER_RADIUS 即命中（采样密度 ≥1 世界单位，
+   * 点级测试充分）。命中即入预览集 + DOM 变暗（零命令）。 */
+  private eraserHitTest(ax: number, ay: number, bx: number, by: number): void {
+    const live = this.eraserLive;
+    if (!live) return;
+    for (const [id, obj] of this.objects) {
+      if (obj.kind !== 'stroke' || live.hits.has(id)) continue;
+      const half = (obj.width ?? BRUSH_WIDTH) / 2 + ERASER_RADIUS;
+      const r2 = half * half;
+      for (const [px, py] of obj.points) {
+        if (segDistSq(px, py, ax, ay, bx, by) <= r2) {
+          live.hits.add(id);
+          this.els.get(id)?.classList.add('cv-eraser-hit');
+          break;
+        }
+      }
+    }
+  }
+
+  /** #454 在擦批删（两段式第二段）：整拖 = 一次 execute_batch
+   * （#352 单事务——一次 Ctrl+Z 全恢复）；预览类防御性先行清除
+   * （正常路径由 touched 渲染接管——元素已删）。 */
+  private commitEraserLive(): void {
+    const live = this.eraserLive;
+    this.eraserLive = null;
+    if (!live) return;
+    for (const id of live.hits) this.els.get(id)?.classList.remove('cv-eraser-hit');
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    if (live.hits.size === 0) {
+      this.showStatus('eraser: no stroke under the drag');
+      return;
+    }
+    const cmds = [...live.hits].map((id) => ({ t: 'remove_object', id }));
+    const r = this.execBatch('human', JSON.stringify(cmds));
+    if (r.ok) {
+      this.showStatus(`erased ${live.hits.size} stroke(s) — one undo restores all`);
+    } else {
+      this.showStatus(`erase rejected (${r.code}): ${r.message}`, true);
+    }
+  }
+
+  /** #454 在擦取消（ESC/模式切换/pointercancel——预览类清除，
+   * 零命令：预览集作废，同在笔取消纪律）。 */
+  private cancelEraserLive(): void {
+    const live = this.eraserLive;
+    this.eraserLive = null;
+    if (!live) return;
+    for (const id of live.hits) this.els.get(id)?.classList.remove('cv-eraser-hit');
+  }
+
+  private deleteSelection(): void {
+    if (!this.main || this.selected.size === 0) return;
+    const ids = [...this.selected];
+    for (const id of ids) {
+      const r = this.exec('human', JSON.stringify({ t: 'remove_object', id }));
+      if (!r.ok) this.showStatus(`delete ${id} rejected (${r.code}): ${r.message}`, true);
+    }
+    this.selected.clear();
+    this.applySelectionClasses();
+  }
+
+  // -----------------------------------------------------------------------
+  // 行内 label 编辑（双击 → input → set_props 终态替换[客户端合并]）
+  // -----------------------------------------------------------------------
+
+  private startLabelEdit(id: string): void {
+    const obj = this.objects.get(id);
+    if (!obj || obj.kind !== 'node' || !this.scrollEl) return;
+    this.commitLabelEdit(); // 单编辑位
+    const input = document.createElement('input');
+    input.id = 'canvas-edit-input';
+    input.type = 'text';
+    input.value = obj.props.label ?? '';
+    // #367 相机随动：世界坐标 → 视口坐标（svg 填充 scroll 容器且零
+    // 边距——视口系 = scroll 内容系；宽随 z 缩放，字号保持可读）。
+    const pos = this.worldToView(obj.x, obj.y + obj.h + 2);
+    input.style.left = `${pos.x}px`;
+    input.style.top = `${pos.y}px`;
+    input.style.width = `${Math.max(obj.w, 80) * this.cam.z}px`;
+    this.scrollEl.appendChild(input);
+    this.editInput = input;
+    this.editingId = id;
+    input.focus();
+    input.select();
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation(); // 文档级 Delete/Escape 不劫持编辑位
+      if (e.key === 'Enter') this.commitLabelEdit();
+      else if (e.key === 'Escape') this.cancelLabelEdit();
+    });
+    input.addEventListener('blur', () => this.commitLabelEdit());
+  }
+
+  private commitLabelEdit(): void {
+    const input = this.editInput;
+    const id = this.editingId;
+    if (!input || id === null) return;
+    this.editInput = null;
+    this.editingId = null;
+    const value = input.value;
+    input.remove();
+    const obj = this.objects.get(id);
+    if (!obj) return;
+    if ((obj.props.label ?? '') === value) return; // 零脏短路
+    const r = this.exec('human', JSON.stringify({
+      t: 'set_props', id, props: { ...obj.props, label: value },
+    }));
+    if (!r.ok) this.showStatus(`label edit rejected (${r.code}): ${r.message}`, true);
+  }
+
+  private cancelLabelEdit(): void {
+    const input = this.editInput;
+    if (!input) return;
+    this.editInput = null;
+    this.editingId = null;
+    input.remove();
+  }
+
+  // -----------------------------------------------------------------------
+  // 工具条
+  // -----------------------------------------------------------------------
+
+  private wireToolbar(): void {
+    const on = (id: string, fn: () => void): void => {
+      const btn = this.buttons.get(id);
+      btn?.addEventListener('click', fn);
+    };
+
+    on('canvas-add-node-btn', () => this.toolbarAddNode());
+    on('canvas-edge-mode-btn', () => this.setEdgeMode(!this.edgeMode));
+    on('canvas-brush-btn', () => this.setBrushMode(!this.brushMode));
+    on('canvas-group-btn', () => this.toolbarGroup());
+    on('canvas-ungroup-btn', () => this.toolbarUngroup());
+    // #367 相机按钮：± 步进以视口中心为锚（factor 与滚轮单步同量级；
+    // in = 放大（×1.1），out = 缩小（÷1.1）——与滚轮 deltaY 符号口径一致）。
+    on('canvas-zoom-in-btn', () => this.zoomCenter(1.1));
+    on('canvas-zoom-out-btn', () => this.zoomCenter(1 / 1.1));
+    on('canvas-fit-btn', () => this.fitView());
+    on('canvas-cam-reset-btn', () => this.resetCamera());
+    on('canvas-undo-btn', () => this.toolbarUndo());
+    on('canvas-redo-btn', () => this.toolbarRedo());
+    on('canvas-ai-add-btn', () => this.aiAddNode());
+    on('canvas-ai-add-btn2', () => this.aiAddNode());
+    on('canvas-save-btn', () => this.toolbarSave());
+    on('canvas-restore-btn', () => this.toolbarRestore());
+    on('canvas-clear-btn', () => this.toolbarClear());
+  }
+
+  /** 默认落位：6 列错峰（AI 视窗 1200×800 内可见）。 */
+  private defaultSpot(): { x: number; y: number } {
+    let n = 0;
+    for (const o of this.objects.values()) if (o.kind === 'node') n += 1;
+    return { x: 40 + (n % 6) * 160, y: 40 + Math.floor(n / 6) * 90 };
+  }
+
+  private toolbarAddNode(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    const spot = this.defaultSpot();
+    const n = this.countKind('node') + 1;
+    const r = this.exec('human', this.buildAddNodeJson(spot.x, spot.y, `Node ${n}`));
+    if (r.ok) this.showStatus(`node added (${r.receipt.id}) — drag to move, double-click to rename`);
+    else this.showStatus(`add rejected (${r.code}): ${r.message}`, true);
+  }
+
+  private toolbarGroup(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    const members = [...this.selected].sort();
+    if (members.length < 2) {
+      this.showStatus('group: select 2+ objects first (shift-click)', true);
+      return;
+    }
+    const r = this.exec('human', JSON.stringify({ t: 'group_objects', group_id: null, members }));
+    if (r.ok) {
+      this.selected.clear();
+      this.selected.add(r.receipt.group_id ?? '');
+      this.applySelectionClasses();
+      this.showStatus(`grouped (${r.receipt.group_id}) — click inside the dashed box, then ungroup`);
+    } else {
+      this.showStatus(`group rejected (${r.code}): ${r.message}`, true);
+    }
+  }
+
+  private toolbarUngroup(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    const groups = [...this.selected].filter((id) => this.objects.get(id)?.kind === 'group');
+    if (groups.length === 0) {
+      this.showStatus('ungroup: select a group first (click inside its dashed box)', true);
+      return;
+    }
+    for (const gid of groups) {
+      const r = this.exec('human', JSON.stringify({ t: 'ungroup', group_id: gid }));
+      if (!r.ok) this.showStatus(`ungroup rejected (${r.code}): ${r.message}`, true);
+    }
+    this.selected.clear();
+    this.applySelectionClasses();
+  }
+
+  private toolbarUndo(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    this.main.advance();
+    let ok = false;
+    try {
+      ok = this.main.face.undo('human');
+    } catch (e) {
+      this.showStatus(`undo failed (${wasmFail(e).code})`, true);
+    }
+    this.pump();
+    this.showStatus(ok ? 'undo' : 'undo: nothing to undo');
+  }
+
+  private toolbarRedo(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    this.main.advance();
+    let ok = false;
+    try {
+      ok = this.main.face.redo('human');
+    } catch (e) {
+      this.showStatus(`redo failed (${wasmFail(e).code})`, true);
+    }
+    this.pump();
+    this.showStatus(ok ? 'redo' : 'redo: nothing to redo');
+  }
+
+  private toolbarSave(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    try {
+      this.lastSnapshot = this.main.face.authoritative_snapshot();
+      this.showStatus(`snapshot saved (${this.lastSnapshot.length} bytes, ${this.objects.size} objects)`);
+    } catch (e) {
+      const fail = wasmFail(e);
+      this.showStatus(`snapshot failed (${fail.code}): ${fail.message}`, true);
+    }
+  }
+
+  /** 快照恢复（#451 方案 A——快照恢复优先）：main 与 AI 镜像双端都从
+   * 快照重建，恢复会话不追赶对端差分。
+   *
+   * 原实现（缺陷）：restore 后用 `ai.encode_diff(box_sv)` 让恢复会话
+   * 追赶 AI 端快照后的进展——clear 的删除 tombstone 随差分灌回，刚
+   * 从快照复活的对象被再次删除（恢复后 0 objects）。快照恢复的产品
+   * 语义（回到 T1）与 CRDT 收敛语义（收敛到最新）在同一按钮上冲突，
+   * 收敛赢——本修复让恢复赢。
+   *
+   * 为什么 AI 镜像也重建：镜像持着 tombstone 就等于页内留着回灌源
+   * （镜像新操作汇入 main 无害，但镜像自身视图与 main 永久发散——
+   * `__canvasSyncState().converged` 不变量破坏）。从同一快照重建后
+   * 页内 tombstone 清零，双端同回 T1；恢复后的新本地编辑经 pump 正常
+   * 互通（对快照存活 id 的再编辑 = Yjs 重新 insert，跨页对端亦复活）。
+   *
+   * 边界（有意不做，登记在 #451）：跨页 sync_resp 携带他页 tombstone
+   * 时仍会覆盖本页恢复态——跨页「快照恢复 vs 收敛」需产品级裁定
+   * （镜像不跨页，collab_channel 只走 main 实例，见其文件头纪律）。 */
+  private toolbarRestore(): void {
+    if (!this.main || !this.ctor) { this.showBridgeAbsent(); return; }
+    if (!this.lastSnapshot) {
+      this.showStatus('restore: no snapshot saved yet', true);
+      return;
+    }
+    try {
+      this.restoreSeq += 1;
+      const clientId = RESTORE_CLIENT_BASE + this.restoreSeq;
+      const box = new SessionBox(this.ctor.restore(BigInt(clientId), UNDO_LIMIT, this.lastSnapshot));
+      // AI 镜像同快照重建（不追赶——差分回灌即 #451 缺陷本体）。
+      if (this.ai) {
+        const aiClientId = AI_RESTORE_CLIENT_BASE + this.restoreSeq;
+        this.ai = new SessionBox(
+          this.ctor.restore(BigInt(aiClientId), UNDO_LIMIT, this.lastSnapshot));
+      }
+      this.main = box;
+      this.selected.clear();
+      this.refreshAll();
+      this.pump();
+      this.showStatus(`restored from snapshot (client ${clientId}, ${this.objects.size} objects) — undo stacks reset`);
+    } catch (e) {
+      const fail = wasmFail(e);
+      this.showStatus(`restore failed (${fail.code}): ${fail.message}`, true);
+    }
+  }
+
+  private toolbarClear(): void {
+    if (!this.main) { this.showBridgeAbsent(); return; }
+    const ids = [...this.objects.keys()];
+    for (const id of ids) {
+      this.execRaw(this.main, 'human', JSON.stringify({ t: 'remove_object', id }));
+    }
+    this.pump();
+    this.showStatus(`cleared (${ids.length} objects removed — undo per object)`);
+  }
+
+  /** AI 端实例执行 add_node（actor 'ai'——AI 撤销栈）+ 泵同步。 */
+  private aiAddNode(): CvId {
+    if (!this.ai || !this.main) return BRIDGE_ABSENT;
+    let n = 0;
+    try {
+      const objs = JSON.parse(this.ai.face.objects_json()) as CanvasObjectJ[];
+      for (const o of objs) if (o.kind === 'node') n += 1;
+    } catch {
+      n = 0;
+    }
+    const cmd = this.buildAddNodeJson(
+      500 + (n % 4) * 140, 300 + Math.floor(n / 4) * 80, `AI node ${n + 1}`);
+    this.ai.advance();
+    try {
+      const receipt = JSON.parse(this.ai.face.execute('ai', cmd)) as CommandReceiptJ;
+      this.pump();
+      return { ok: true, id: receipt.id ?? '', outcome: receipt.outcome };
+    } catch (e) {
+      const fail = wasmFail(e);
+      this.showStatus(`ai add rejected (${fail.code}): ${fail.message}`, true);
+      return fail;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 状态行
+  // -----------------------------------------------------------------------
+
+  private countKind(kind: 'node' | 'edge' | 'group' | 'stroke'): number {
+    let n = 0;
+    for (const o of this.objects.values()) if (o.kind === kind) n += 1;
+    return n;
+  }
+
+  private showBridgeAbsent(): void {
+    this.showStatus(BRIDGE_ABSENT.message, true);
+  }
+
+  private showStatus(text: string, isError = false): void {
+    if (!this.statusEl) return;
+    this.statusEl.textContent = text;
+    this.statusEl.classList.toggle('cv-error', isError);
+  }
+
+  /** 常态状态行（对象计数/撤销深度/画布指纹）。 */
+  private syncStatus(): void {
+    if (!this.statusEl) return;
+    if (!this.main) {
+      this.statusEl.textContent = t('cv.modelPending');
+      this.statusEl.classList.add('cv-error');
+      return;
+    }
+    let undo = 0, redo = 0, fp = '';
+    try {
+      undo = this.main.face.undo_depth('human');
+      redo = this.main.face.redo_depth('human');
+      fp = this.main.face.canvas_fingerprint();
+    } catch {
+      // 只读面异常——状态行降级（不阻断渲染）
+    }
+    this.statusEl.classList.remove('cv-error');
+    this.statusEl.textContent =
+      `nodes ${this.countKind('node')} · edges ${this.countKind('edge')}`
+      + ` · groups ${this.countKind('group')} · undo ${undo} · redo ${redo}`
+      + ` · fp ${fp.slice(0, 22)}`;
+    // #3 UI 批 E：空态引导同步（对象计数零 = 显示；非零 = 隐藏）。
+    this.syncGuide();
+  }
+
+  /** #3 UI 批 E：空态引导同步（node+edge+group 全零 = 显示）。 */
+  private syncGuide(): void {
+    if (!this.guideEl) return; // 无壳页（bench）早退路径——卡片未挂载
+    const empty =
+      this.countKind('node') + this.countKind('edge') + this.countKind('group') === 0;
+    this.guideEl.hidden = !empty;
+  }
+
+  // -----------------------------------------------------------------------
+  // window 探针面（测试/宿主）
+  // -----------------------------------------------------------------------
+
+  private installProbes(): void {
+    window.__canvasReady = false; // setupCanvasView 成功后置 true
+    window.__canvasState = () => ({
+      objects: this.objects.size,
+      nodes: this.countKind('node'),
+      edges: this.countKind('edge'),
+      groups: this.countKind('group'),
+      // #426：笔迹计数（画笔 e2e 断言面）。
+      strokes: this.countKind('stroke'),
+      undoDepth: this.main ? this.safeDepth('undo') : 0,
+      redoDepth: this.main ? this.safeDepth('redo') : 0,
+      wasm: this.ctor !== null,
+      camera: { x: this.cam.x, y: this.cam.y, z: this.cam.z },
+      camSeq: this.camSeq,
+      renderSeq: this.renderSeq,
+    });
+    // #367 相机探针：无 wasm 也可测（视图层独立——bridge_absent 纪律）。
+    window.__canvasCamera = () => ({
+      ok: true,
+      x: this.cam.x,
+      y: this.cam.y,
+      z: this.cam.z,
+      camSeq: this.camSeq,
+      renderSeq: this.renderSeq,
+    });
+    window.__canvasObjects = (side?: 'main' | 'ai') => {
+      const box = side === 'ai' ? this.ai : this.main;
+      if (!box) return [];
+      try {
+        return JSON.parse(box.face.objects_json()) as CanvasObjectJ[];
+      } catch {
+        return [];
+      }
+    };
+    window.__canvasAddNode = (x, y, label) => {
+      if (!this.main) return BRIDGE_ABSENT;
+      const r = this.exec('human', this.buildAddNodeJson(x, y, label ?? `Node ${this.countKind('node') + 1}`));
+      return r.ok
+        ? { ok: true, id: r.receipt.id ?? '', outcome: r.receipt.outcome }
+        : r;
+    };
+    window.__canvasMoveNode = (id, x, y) => this.exec(
+      'human', JSON.stringify({ t: 'move_node', id, x, y }));
+    window.__canvasExecute = (actor, cmdJson) => this.exec(actor, cmdJson);
+    window.__canvasUndo = () => {
+      if (!this.main) return false;
+      this.main.advance();
+      let ok = false;
+      try {
+        ok = this.main.face.undo('human');
+      } catch {
+        ok = false;
+      }
+      this.pump();
+      return ok;
+    };
+    window.__canvasRedo = () => {
+      if (!this.main) return false;
+      this.main.advance();
+      let ok = false;
+      try {
+        ok = this.main.face.redo('human');
+      } catch {
+        ok = false;
+      }
+      this.pump();
+      return ok;
+    };
+    window.__canvasSnapshotRoundtrip = () => {
+      if (!this.main || !this.ctor) {
+        return { ...BRIDGE_ABSENT, objects: [] as CanvasObjectJ[] };
+      }
+      try {
+        const snap = this.main.face.authoritative_snapshot();
+        this.restoreSeq += 1;
+        const tmp = this.ctor.restore(
+          BigInt(RESTORE_CLIENT_BASE + this.restoreSeq), UNDO_LIMIT, snap);
+        const tmpObjects = JSON.parse(tmp.objects_json()) as CanvasObjectJ[];
+        const mainObjects = JSON.parse(this.main.face.objects_json()) as CanvasObjectJ[];
+        const equal = JSON.stringify(tmpObjects) === JSON.stringify(mainObjects);
+        return equal
+          ? { ok: true as const, objects: tmpObjects }
+          : { ok: false as const, objects: tmpObjects, code: 'roundtrip_mismatch',
+              message: 'restored objects differ from the source session' };
+      } catch (e) {
+        const fail = wasmFail(e);
+        return { ...fail, objects: [] as CanvasObjectJ[] };
+      }
+    };
+    window.__canvasFingerprint = (id) => {
+      if (!this.main) return BRIDGE_ABSENT;
+      try {
+        return { ok: true, fp: this.main.face.object_fingerprint(id) };
+      } catch (e) {
+        return wasmFail(e);
+      }
+    };
+    window.__canvasSyncState = () => {
+      if (!this.main || !this.ai) {
+        return { main: 0, ai: 0, converged: false, wasm: this.ctor !== null };
+      }
+      try {
+        const a = this.main.face.objects_json();
+        const b = this.ai.face.objects_json();
+        return {
+          main: (JSON.parse(a) as CanvasObjectJ[]).length,
+          ai: (JSON.parse(b) as CanvasObjectJ[]).length,
+          converged: a === b,
+          wasm: true,
+        };
+      } catch {
+        return { main: -1, ai: -1, converged: false, wasm: true };
+      }
+    };
+    window.__canvasAiAddNode = () => this.aiAddNode();
+    window.__canvasEvents = (limit = 20) => {
+      const n = Math.max(0, Math.min(limit, this.eventLog.length));
+      return this.eventLog.slice(this.eventLog.length - n).map((e) => ({ ...e, touched: [...e.touched] }));
+    };
+  }
+
+  private safeDepth(which: 'undo' | 'redo'): number {
+    if (!this.main) return 0;
+    try {
+      return which === 'undo'
+        ? this.main.face.undo_depth('human')
+        : this.main.face.redo_depth('human');
+    } catch {
+      return 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 接线（main.ts 调用——wasm 模块懒加载）
+// ---------------------------------------------------------------------------
+
+/**
+ * 启动 Canvas 面板。`loadWasm` 惰性解析 wasm-bindgen 模块（main.ts 传
+ * 运行时 URL import——pkg 重建后 WasmCanvas 即在，无需重打 main.js）。
+ * WasmCanvas 面可选：pkg 旧构建时面板 inert-but-alive，探针全部 typed
+ * bridge_absent（e2e SKIP 门）。任何失败都不向顶层抛出。
+ */
+/** 活跃实例（setup 完成→替换；跨页传输钩[§九.5]的注册入口）。 */
+let activeUI: CanvasViewUI | null = null;
+
+/** 活跃 Canvas 视图（setup 未完成 = null——调用方自行判空）。 */
+export function canvasUI(): CanvasViewUI | null {
+  return activeUI;
+}
+
+export function setupCanvasView(loadWasm: () => Promise<WasmModule>): void {
+  window.__canvasReady = false;
+  void (async (): Promise<void> => {
+    try {
+      const mod = await loadWasm();
+      if (typeof mod.default === 'function') {
+        await wasmBoot(mod); // 单飞门（幂等——main 已 init 则秒回）
+      }
+      activeUI = new CanvasViewUI(mod);
+      window.__canvasReady = true;
+      // activeUI 模块级持有（跨页传输钩注册面）——无 GC 顾虑
+    } catch (e) {
+      const panel = document.getElementById('canvas-panel');
+      if (panel) panel.textContent = `canvas panel boot failed: ${String(e)}`;
+    }
+  })();
+}

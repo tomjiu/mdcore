@@ -1,0 +1,30 @@
+{
+  "name": "mdcore-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "R9: CM6 View <-> mdcore-wasm (Rust core) bridge. Same bundle the host shell (tao+wry+GTK3, ADR-H1) loads from dist/.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:wasm": "./build-wasm.sh",
+    "build:wasm:pdf": "./build-pdf-wasm.sh",
+    "build:full": "./build-wasm.sh && ./build-pdf-wasm.sh && node build.mjs",
+    "serve": "python3 -m http.server 8123 --directory dist",
+    "typecheck": "tsc --noEmit",
+    "test": "python3 tests/web_smoke.py"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.36.5",
+    "pdfjs-dist": "^6.4.299",
+    "perfect-freehand": "^1.2.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

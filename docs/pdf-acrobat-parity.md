@@ -1,0 +1,77 @@
+# Acrobat Reader 功能对照清单（parity matrix）
+
+> issue #229（R5·P1 验收产物）。口径：**Acrobat Reader（免费阅读器）常用
+> 功能面 × mdcore 现状**，每项附证据锚点（代码 `文件:行` / 测试函数名——
+> 不凭印象）。高频面（打开/渲染/表单/签名/标注/打印）另有自动化验收：
+> `crates/pdf/tests/pdfm_acrobat_parity.rs`（6 测试——打印面除外，见
+> §缺口清单）。
+>
+> 基线：2026-11-06 @ `main` 4ac0788。范围声明：mdcore = mdc-pdf 引擎 +
+> mang-shell 壳 + web 面（pdf.js 数据面）；Acrobat 侧基线 = Reader 常用
+> 行为（不含 Pro 专有编辑功能）。
+
+## 总览（12 面）
+
+| # | 面 | Reader 基线 | mdcore 现状 | 证据锚点 | 分级 |
+|---|---|---|---|---|---|
+| 1 | 打开 | 开 PDF/页数/文档属性 | **对齐**（双引擎装载 + fail-fast 校验） | `document.rs:132` `PdfSession::open`、`engine_pdfium.rs:98`、`writer_lopdf.rs:83`；测试 `parity_open_all_fixtures_*`、`pdfb_skeleton::open_validates…` | — |
+| 2 | 渲染 | 位图渲染/缩放 | **对齐**（引擎面；壳侧无位图渲染——文本行模型） | `render.rs:42` `Rasterizer::rasterize`、`engine_pdfium.rs:324`（8192px/64Mpx 钳制）；测试 `parity_render_first_page_bitmap`、`pdfc_engine` 锁 8-10 | 长尾③ |
+| 3 | 书签/大纲 | 大纲树导航 | **对齐**（读面） | `outline.rs`、`engine_pdfium.rs:260`；测试 `pdfc_engine::outline_positive_tree…` | 长尾④ |
+| 4 | 链接 | 点击跳转/外链 | **部分**（读全；无导航路由、无创建） | `links.rs:70` `read_links`（/Dest/命名树/GoTo/URI）；测试 `pdff3_render_ext::links_*`（17 件语料 661 条） | 长尾① |
+| 5 | 表单填写 | 填值/保存/扁平化 | **对齐**（真增量修订 + CJK 外观） | `forms.rs:438/914/1178/1473`；测试 `parity_form_fill_save_reopen`、`pdfg_forms`(11)、`pdfj_forms_adv`(14)、`pdfl_forms_incremental`(7) | — |
+| 6 | 签名 | 验签/签署/修订完整性 | **部分**（读 + 结构验证 + 已签名保护；不验签不签署） | `signature.rs:589` `read_signatures`、`forms.rs:1761` `has_signed_signature_fields`；测试 `parity_signature_read_and_signed_probe`、`pdfi_signature`(7) | 长尾⑥ |
+| 7 | 盖章 | 图章注释/公章 | **对齐**（注释 Stamp + 内容流图片盖章双路径） | `annotation.rs:198`、`stamp.rs:723` `stamp_image`（PNG/JPEG/透明度）；测试 `pdfh_stamp`(8)、`pdff2_annotate` Stamp 往返 | 长尾⑧ |
+| 8 | 标注 | 高亮/批注/注释管理 | **对齐**（11 kind 读/写/删 + 渲染可见 + Acrobat 互通公共面） | `annotate.rs:514` `PdfAnnotator`、`annotation.rs:153`；测试 `parity_annotation_add_persist_remove`、`pdfd_writer`(16)、`pdff2_annotate`(11) | 长尾⑨ |
+| 9 | 打印 | 页面设置/缩放/注释打印开关 | **部分**（三层引擎/web 已合：引擎面渲染原语已合并（#354/PR #373）；web 面已通：打印态 PDF 页参与 + 全页渲染 + 一页一纸；壳面系统打印流已交付待审——方案 C 系统打印，PR #508/#507 在审） | web：`web/index.html` `@media print`（`body[data-pdf-active]` 判据）+ `web/src/pdf_view.ts` `printDocument`/`renderAllPages`；测试 `web/tests/pdf_print.py`（8 锁含 `page.pdf()` 真分页主锁）。引擎：`crates/pdf/src/print.rs`（#354/PR #373 已合并——DPI 驱动/页区间/注释开关 + `parity_print_render_dpi_range_annotations`）。壳：`mang-shell/src/print.rs`（#507/PR #508 在审——Win 打印动词/macOS open -p/CUPS lp） | **P1（#240 分层跟进中——待 PR #508 合并后可评「对齐」）** |
+| 10 | 搜索 | 全文搜索/高亮定位 | **对齐**（引擎 rect 几何命中已落地——长尾②收口） | `command.rs` `Command::Search`/`SearchHit.rects`（`serde(default)` 加性面）、`document.rs` search（引擎路径走 `page_text_geometry`——char 对齐契约 + 行分组矩形；注入路径/引擎不支持 = 诚实空集）；`engine_pdfium.rs` `page_text_geometry`（`all()` 文本 + 逐字符 `FPDFText_GetCharBox`，6 夹具实证 1:1 对齐）；测试 `pdfc_engine::search_hit_rects_*`(2)+`page_text_geometry_alignment_contract` | — |
+| 11 | OCR | Reader 无此功能 | **对齐（超 Reader）**（tesseract 外进程，中英混合） | `ocr.rs:107` `ocr_page`（200DPI→PGM→tesseract）；测试 `pdff4_ocr`(5，环境门控) | 长尾⑩ |
+| 12 | 文档安全 | 权限位/口令/证书 | **部分**（打开扫描八族 + 限额 + 加密写拒；无解密/权限位模型） | `security.rs`、`security_scan.rs:41` `open_scan`；测试 `pdfe_security`(12)、`pdfb_skeleton::encrypted_assessment_denies_writes…` | 长尾⑤⑦ |
+
+> 状态口径：**对齐** = 用户旅程闭环可自动化验收；**部分** = 数据面/读面在
+> 而关键交互面缺；**缺失** = 0%。
+
+## 高频面自动化验收（issue 任务 3）
+
+`crates/pdf/tests/pdfm_acrobat_parity.rs`（双特性 `engine-lopdf,engine-pdfium`）：
+
+| 高频面 | 测试 | 旅程断言 |
+|---|---|---|
+| 打开 | `parity_open_all_fixtures_pdfium_loads_and_counts` / `parity_open_all_fixtures_lopdf_writer_parses` | 7 夹具（普通/书签/表单×3/签名/扫描）双路装载 + 页数锚 |
+| 渲染 | `parity_render_first_page_bitmap` | 300→388 等比 + w*h*4 合同 + 非全零 + 白底主导 |
+| 表单 | `parity_form_fill_save_reopen` | 填中文值 → 增量保存（前缀逐位）→ 重开可见 |
+| 签名 | `parity_signature_read_and_signed_probe` | 读签名（结构/签名人）+ 已签名探针阴阳双态 |
+| 标注 | `parity_annotation_add_persist_remove` | 增→存（增量）→重开可见→删→重开零残留 |
+| 打印 | web e2e `pdf_print.py`（#240 层③：CSS 面 + 全页渲染 + `page.pdf()` 真分页 ≥3 页主锁） | 打印态 PDF 页参与（位图即内容）+ 编辑器打印回归锁 + 顶栏死选择器修正 |
+
+## 缺口清单（分级入册——不静默）
+
+### P1（缺陷级，已开 issue 跟进）
+
+| 缺口 | issue | 说明 |
+|---|---|---|
+| ① 打印管线 | #240 | 高频验收面分层收口中：引擎面打印渲染原语已拆 #354（PR #373 在审）；web 面已交付（#240 层③——打印态 PDF 页参与，`web/tests/pdf_print.py`）；壳面系统打印对话框（Windows/macOS/CUPS）待接。页面设置/缩放模式/注释打印开关随壳面层落地 |
+
+### 长尾登记（按性价比排序，暂不开单——排期总纲滚动评估）
+
+| # | 缺口 | 级 | 说明与锚点 |
+|---|---|---|---|
+| ① | 链接点击导航未接宿主 | P2 | 数据面就绪（`links.rs` 读全 /Dest/命名树/URI），壳/web 未接 click→page 路由与外链策略——接线即可闭环 |
+| ③ | 壳侧无位图渲染 | P2 | mang-shell `pdf_doc.rs` 走文本行模型；web 面有完整 canvas 渲染（`pdf_view.ts` LRU 64MB）——壳侧渲染待 #68 阅读面 |
+| ④ | 书签编辑/命名目标 | P3 | 仅页目标读面（`outline.rs`）；web `buildOutlineJson` 恒空树（`pdf_view.ts:192` 登记） |
+| ⑤ | 加密档解密/权限位模型 | P3 | **P 位读面已落地**（#493：`OpenAssessment.encryption`——仍加密态承载 8 命名位 + 处理器标识；策略遵从=Lead 裁定面不越权）；余：口令输入 UI、解密、读/打印路径遵从 |
+| ④ | 书签编辑/命名目标 | P3 | 读面（`outline.rs`）；**web 大纲树已接**（#463：`pdf.js getOutline` → 树 UI + 点击跳页 + 会话 ctor 实数据注入，e2e `pdf_outline.py` 10 锁）；书签**编辑**/命名目标仍不在 |
+| ⑤ | 加密档解密/权限位模型 | P3 | 曾解密档只读放行写拒（S5 策略）；无口令输入 UI、无 /Encrypt P 位遵从 |
+| ⑥ | 验签/签署 | P3 | 结构验签在（`signature.rs`）；密码学校验（链/时间戳/摘要复算）与签署域不在 v1——pdfi_signature 头注如实登记 |
+| ⑦ | /Info/XMP 元数据 | P3 | **/Info 面板已接**（#472：web `getMetadata` → 属性抽屉 13 字段 + 评估汇总，e2e `pdf_props.py` 8 锁）；XMP 原始面仍不在 |
+| ⑧ | /Name 标准图章图形/动态图章/骑缝章 | P4 | `/Approved` 等标准图形映射不做（`docs/pdf-annotate.md` 边界）；公章内容流盖章已在 |
+| ⑨ | 注释透明度 /Popup/回复流/列表面板 | P4 | 11 kind 公共面在；**列表面板最小面已接**（#475：AnnotListed 可视化 + 点击跳页，e2e `pdf_annot_list.py` 6 锁）；排序/筛选/导出仍不在 |
+| ⑩ | OCR 识别结果写回可搜索 PDF | P4 | 当前只出文本（`ocr.rs`）；无扫描页自动检测 |
+
+## 维护纪律
+
+- 本清单为 **#229 验收基线**：新增 PDF 能力或缺口修复时同步更新对应行
+  （证据锚点必须可点开复核——`文件:行` 或测试函数名）；
+- 长尾项滚动评估：排期总纲（#230）每轮按 ①-⑩ 顺序重估性价比，升级为
+  issue 时在本表回填编号并从长尾表移除；
+- 高频面测试与清单同步：`pdfm_acrobat_parity.rs` 的新增/变更测试必须在
+  §高频面表登记。

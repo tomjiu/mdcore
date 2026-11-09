@@ -1,0 +1,47 @@
+target/
+
+# s5a-env：打包产物目录（deb 等——不入库，packaging/ 脚本可再生）
+build/
+
+# R-1 大文件夹具（生成器 + 度量脚本入库；大二进制不入库——
+# 生成：见 test-artifacts/large-file/ 各生成器头注）
+test-artifacts/large-file/*.docx
+test-artifacts/large-file/*.xlsx
+test-artifacts/large-file/*.pdf
+test-artifacts/large-file/results-r1.json
+
+# S2-1 pdf-organize 语料（生成器 + 取件脚本 + MANIFEST + README 入库；
+# PDF 二进制不入库——主语料 37MB/92 件重建见该目录 README，
+# realworld/ 轻量子集取件见 fetch_corpus.py）
+test-artifacts/pdf-organize-corpus/**/*.pdf
+# S2-4 OCR 语言包（取件脚本 + README 入库；traineddata 二进制不入库
+# ——chi_sim 2.4MB > 2MB 纪律，取件见该目录 fetch_tessdata.sh）
+test-artifacts/ocr-tessdata/*.traineddata
+
+# #264 真实 PDF 语料（取件脚本 + PROVENANCE + README 入库；
+# PDF 二进制不入库——28.3MB/78 件，取件见该目录 fetch_corpus.py）
+test-artifacts/pdf-corpus/**/*.pdf
+
+# #265 XLSX 结构面语料（取件脚本 + PROVENANCE + README 入库；
+# xlsx 二进制不入库——1.2MB/28 件，取件见该目录 fetch_corpus.py）
+test-artifacts/xlsx-structural-corpus/**/*.xlsx
+
+# sdk/python：uv/venv 虚拟环境不入库（uv 会在 .venv 内自放 .gitignore，
+# 此处兜底 python -m venv 等无自忽略的场景）
+.venv/
+__pycache__/
+
+# #219 tab_workflow_tests：CWD 相对形态去重测试的临时夹具（测试自清，崩溃残留兜底）
+mang-shell/mdc-tab-rel-*/
+
+# #210 pdfium 取件位（本地 fetch / CI 下载产物——二进制不入库；
+# 版本 pin 与 SHA256 校验见 windows-test.yml 下载步骤）
+# #633 修正：原 `bin/` 通配会误伤 crates/*/src/bin（cargo bin 目录，
+# shell-native 先例本就被跟踪）——收窄为仅仓根取件位。
+/bin/
+
+# #416：开发草稿/日志防再入（根目录下划线草稿曾是 #132/#134 rebase 散佚件
+# 唯一存世拷贝——已抢救移植后清出；防止再次误提交）
+/_*.txt
+/.t.log
+*.log

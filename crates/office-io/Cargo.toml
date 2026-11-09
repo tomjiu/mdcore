@@ -1,0 +1,105 @@
+[package]
+name = "mdc-office-io"
+version.workspace = true
+edition = "2021"
+description = "Office 域 XLSX IO 引擎侧基础设施（xlsx-r1 阶段 B + xlsx-r2 Phase 1）：容器预扫门（声明值四检查）+ 尺寸诚实性门（谎言头闭环，zip 8.6 读界无内建强制的策略层补面）+ calamine 读取包装（表名/值矩阵/公式文本/合并/超链接五 API 面，v2 实体补偿）+ 新建工作簿写 API（rust_xlsxwriter 包装，引擎类型零泄漏 + 流式纪律 typed 拦截）+ 统一错误三分（拒绝/容器损坏/解析错误）。三方依赖 = 分析仓 ADR-O1 已验证候选（calamine/zip/rust_xlsxwriter，版本按 xlsx-r1/DEPS.md 锁定）；对 mdcore 零编译依赖（三域纪律）。"
+
+# xlsx-r1 阶段 B 双 crate 方案 A（分析仓 xlsx-r1/REPORT.md §2）：
+# mdc-office 保持纯 std 零三方依赖（T1 自锁测试不变量），IO 三方
+# 依赖承载于本 crate（workspace 第八成员，循 mdc-pdf/mdc-settings
+# 一事一 crate 先例）。
+#
+# 版本锁定依据 = 分析仓 xlsx-r1/DEPS.md §1（2026-10-13 核验）：
+# - calamine 0.36（lock 钉 0.36.1，MIT）：仅读取四 API 面；
+# - zip 8.6（lock 钉 8.6.0，MIT 单许可）：容器双门。与
+#   calamine/rust_xlsxwriter 传递面（zip ^8.6）对齐——多版本并存
+#   消除；zip 8.6 读界无声明值强制（lie86 探针定谳），谎言头防线
+#   由策略层 verify_actual_sizes 承载（src/io.rs 门 2）。
+#   供应链注记：zip 活跃线在 zip-rs/zip2 仓（crates.io 包名 zip），
+#   zip-rs/zip master 停滞 0.6.x 禁作参照（ADR-O1 O1-5）。
+#
+# xlsx-r2 Phase 1（2026-10-14，用户三阶段指令）：rust_xlsxwriter
+# 由 dev-dependency 升产品依赖——C2 写面产品化（正式写 API =
+# src/write.rs）。许可证 MIT OR Apache-2.0 按 MIT 履行（DEPS.md §1
+# 阶段 B 修正登记；NOTICES v1.4 增量：dev/lock 面分类账条目升
+# 正文产品面）。闭包零新增（rust_xlsxwriter 传递依赖仅 zip，已在）。
+#
+# dev-dependencies（测试面，不进产品闭包）：
+# - flate2：谎言头测试的原始 deflate 流构造（与 zip 内部同源，非
+#   第二实现）。
+
+[dependencies]
+calamine = "0.36"
+# #22 P2-2：DOCX 表格合并读取通道——docx-rs 0.4.22 `TableCellProperty`
+# 字段私有且无 getter（builder 面独占），`Serialize` derive 是模型面唯一
+# 公开读通道（gridSpan/verticalMerge）；serde_json 已在 workspace 闭包
+# （mdcore-wasm 产品面），零 lock 增量。
+serde_json = "1"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# xlsx-r2 Phase 2（2026-10-14，用户三阶段指令）：门 3 部件良构性
+# 校验件。quick-xml 0.41.0 原已在产品闭包（calamine 传递依赖，NOTICES
+# v1.4 正文在档）——升直依赖零闭包增量、零 lock 变化；仅用于流式
+# 结构校验（check_end_names 默认 true + 深度计数），不做实体展开
+# （GeneralRef 透传不解析——十亿笑声面免疫）。
+quick-xml = "0.41"
+# xlsx-r2 Phase 3（2026-10-14，用户三阶段指令）：DOCX 模型级读/写
+# 切片引擎（ADR-O1 O1-3 选型：bokuweb/docx-rs 0.4.22，MIT——办公件
+# 浅克隆 LICENSE 一手直读）。default-features = false 关闭 image 特性
+# （png/tiff/gif/bmp/jpeg 巨树不入闭包）；闭包增量 = docx-rs + base64
+# 两项（NOTICES v1.5 增量）；其余依赖（zip 8.6/quick-xml/serde 族/
+# thiserror/smallvec）全部原位。供应链观察项（office-e §4）：
+# 上游已合入下游 fork 功能线（FORK_CHANGES.md）——锁版本 + 破坏性
+# 变更先跑读侧往返测试（tests/docx_roundtrip.rs 即此纪律的常驻化）。
+docx-rs = { version = "0.4", default-features = false }
+# S3 任务 1（issue #113）：重算接入——rebuild 面公式引擎依赖。
+# mdc-formula = workspace 内 path 依赖（#112 引入：ironcalc_base 0.9.1
+# 包装，MIT OR Apache-2.0——调研定谳在 issue #110 评论在档）。零 lock
+# 增量（mdc-formula 及其闭包已在 workspace Cargo.lock——office-io 与
+# mdcore-wasm 的既有边均不受影响）。wasm32 面：ironcalc_base 依赖
+# js-sys（wasm 原生面）+ chrono/csv/regex 族（均 wasm32 兼容）——
+# mdcore-wasm 传递编译由 wasm32 check 门验证。
+mdc-formula = { path = "../formula" }
+# #276（审计 P1-4/B-1/B-6）：消毒六面接线——office-io 读/写/重放三
+# 出口消费 mdc-office 的 url_policy 与 xml_entities（此前全仓零接线：
+# rg mdc_office:: 生产面 = 0，敌意 docx javascript: 超链接经读面直转
+# GFM、rebuild 重放仅长度/NUL 防线、escape_text 双源漂移）。mdc-office
+# 纯 std 零三方依赖（T1 自锁）——本边零闭包增量、零 lock 三方新增。
+mdc-office = { path = "../office" }
+
+# ---------------------------------------------------------------------------
+# t19（2026-10-14）：rust_xlsxwriter 依赖边目标分裂 + "wasm" 特性——
+# wasm32 运行时崩溃面修复（两项一手发现，e2e 实证；wasm32 check 编译
+# 期均不可见——t16「可行性探针一次过」只证编译不证运行）：
+#
+# 发现①：`Workbook::new()`（workbook.rs:419）→ `DocProperties::new()`
+# → `ExcelDateTime::utc_now()` → `SystemTime::now()`（datetime.rs:1308）
+# ——wasm32-unknown-unknown 无时间系统，运行时 panic（wasm trap
+# "unreachable"）。引擎 `wasm` 特性把该分支切到 `js_sys::Date::now()`
+# （datetime.rs:1320，cfg = feature"wasm" AND target"wasm32"）——原生
+# 构建 cfg not(all(...)) 恒真 → SystemTime 分支不变（行为零变化）。
+#
+# 发现②：`constant_memory` 特性使 `Worksheet::new()`（worksheet.rs:1742）
+# 对**每一张表**（含非流式普通表）急切 `tempfile_in(std::env::temp_dir())`
+# ——wasm32 无文件系统，`temp_dir()` panic "no filesystem on this
+# platform"（std sys/paths/unsupported.rs:52）。流式背书 = tempfile 是
+# 引擎结构性质（上游文档明示 constant_memory 不支持 wasm）→ 该特性
+# 仅保留在非 wasm32 目标；write.rs 流式 API（add_sheet_streaming）
+# wasm32 目标条件化缺席（模块文档登记）。
+#
+# 闭包零新包：js-sys 0.3.106 / wasm-bindgen 0.2.129 均已在 lock
+# （chrono / console_error_panic_hook 等既有边）——lock 唯一 diff =
+# rust_xlsxwriter 条目 dependencies 数组 +2 行（t16 path 边「最小必然
+# diff 如实登记」先例）。
+# ---------------------------------------------------------------------------
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rust_xlsxwriter = { version = "0.99", features = ["constant_memory", "wasm"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rust_xlsxwriter = { version = "0.99", features = ["wasm"] }
+
+[dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# #233（zip-exotica）：负向样本构造（与主依赖同版本同 feature——零新增
+# 编译面；构造器移植自研究仓 guard.rs @ 50e6332^，字节布局经研究仓
+# python 重建件 sha256 交叉验证）。
+zip = { version = "8.6", default-features = false, features = ["deflate"] }

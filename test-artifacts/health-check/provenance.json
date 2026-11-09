@@ -1,0 +1,35 @@
+{
+  "note": "阶段 B 竞品体检语料溯源（issue #29 任务 4 扒取铁律：只取输入数据不取代码；GPL 源仅数据；>2MB 不入库；provenance 全记）。M-1 门（test-artifacts/external-corpus/）已覆盖 commonmark/markdown-it/pandoc/poi 六件——本目录为其增量扩展（poi-docx 为 M-1 六件的全量扩展，不重复收录重叠件）。",
+  "sources": [
+    {
+      "path": "corpus/calamine/*.xlsx",
+      "repo": "tafia/calamine",
+      "commit": "c922fc0a0c3cc9901e7d0b7a40507140478e5912 (2026-10-22)",
+      "license": "MIT（LICENSE.calamine 同目录在档）",
+      "taken": "tests/*.xlsx 全量 75 件（≤2MiB 门槛全过，合计 ~1.1MiB）——含 OOM_alloc 系列（资源炸弹防御面）、date_1904（1904 纪元边界）、date_east_asian（CJK 日期）、biff5 富文本等边界样本；未取 .xls/.xlsb/.ods（mdcore office 面 xlsx-only）",
+      "size_bytes": 1134592
+    },
+    {
+      "path": "corpus/poi-docx/*.docx",
+      "repo": "apache/poi",
+      "commit": "ca95db92e50bc45914c38cd9dd5c93e5fd21c297 (trunk@2026-10-29, sparse fetch)",
+      "license": "Apache-2.0（ASF 政策；POI git 仓不携带顶层 LICENSE 文件——LICENSE.poi 为 apache.org 官方全文替代性存档，注明缘由）",
+      "taken": "test-data/document/*.docx 全量 129 件（130 件中 1 件 >2MiB 按铁律跳过——saut_page.docx 2,959,626B；合计 4,969,445B ≈ 4.74MiB）——真实世界回归样本：Word 各版本生成件、含畸形/崩溃回归件（51921-Word-Crash067 等）、修订/批注/域/文本框/嵌套表等结构面；未取 .doc/.docm（mdcore office 面 .docx-only）",
+      "size_bytes": 4969445
+    },
+    {
+      "path": "corpus/docx4j/*.docx",
+      "repo": "plutext/docx4j",
+      "commit": "b21e0172beb9e667f42a552ab37dd77c92dc1b48 (master@2026-10-29, sparse fetch)",
+      "license": "Apache-2.0（项目声明；仓无顶层 LICENSE 文件——LICENSE.docx4j 为 apache.org 官方全文替代性存档，注明缘由）",
+      "taken": "docx4j-core-tests/src/test/resources/**/*.docx 全量 501 件（全部 ≤2MiB，合计 10,069,129B ≈ 9.6MiB；路径分隔符平化为下划线保留目录上下文——revisions_147/fields_113/runprops_72/mc-fun_33/charts_32/OpenDoPE_18/text-extraction_16/AlteredParts_13/headers_footers_10/2010_8/OLE_5/strict_4 + 根级散件）——复杂结构真实样本：修订追踪/域代码/run 属性矩阵/MC 兼容/图表/OLE 嵌入/OpenDoPE 文档装配",
+      "size_bytes": 10069129
+    }
+  ],
+  "pending_sources": [
+    { "source": "docx-rs tests", "status": "不适用", "note": "仓内零存储 .docx 语料（bokuweb/docx-rs 全部测试文档为测试内程序化生成件——与本仓 examples/gen_* 夹具产线同模式），无可扒取数据面" },
+    { "source": "python-docx tests", "status": "评估中", "note": "测试多为生成件；待核存量夹具是否与既有语料重叠" },
+    { "source": "LibreOffice sw/qa/extras/ooxmlexport", "status": "未采集", "note": "LO 修 bug 边界样本——docx 写面为主且多为测试内生成件，需筛存储型读面适用子集" },
+    { "source": "pdf.js test corpus", "status": "未采集", "note": "PDF 边界——pkg_pdf 模型面适用" }
+  ]
+}

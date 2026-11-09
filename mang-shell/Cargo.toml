@@ -1,0 +1,147 @@
+# mang-shell —— GPUI 主线桌面外壳（#63 Lead 布局骨架）
+#
+# 独立 cargo workspace（循 third_party/zed 先例）：主仓门禁
+# （build/test/clippy/fmt）不触达本目录，自身门禁单独跑（见 PR 证据）。
+# 依赖面 = third_party/zed 搬运闭包（r42 起 32 crate，源码零修改口径）。
+#
+# 布局规格（#63 Lead 原文，逐项落实在 src/）：
+#   顶部：标题栏（自绘，可拖拽窗口）          → title_bar.rs
+#   左侧：图标条（36×36 按钮 / 间距 4 / 边距 8 → 实宽 52px）→ activity_bar.rs
+#   左栏：文件树（可折叠，260px）             → panels.rs
+#   中间：编辑区（主视图，flex）              → shell.rs
+#   右侧：属性/来源面板（可折叠，280px）      → panels.rs
+#   底部：状态栏                              → status_bar.rs
+#   面板边框用背景色差代替 1px 边框；主区 12-16px 内边距；无 AI 面板（MCP 暴露）
+[package]
+name = "mang-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "mang-shell"
+path = "src/main.rs"
+
+# #115：库目标（集成测试 tests/docx_edit_roundtrip.rs 复用编辑器模块树；
+# 与 bin 共用同一份源码——见 src/lib.rs 头注释）。
+[lib]
+name = "mang_shell"
+path = "src/lib.rs"
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0.86"
+# F2：工作区记忆落盘（settings.json）——serde_json 1.0（Cargo.lock 既有
+# 传递依赖版本，直接依赖面零新增编译成本；F5 最近列表共用此依赖）。
+serde_json = "1.0"
+# RPC 桥（#104 任务 2）：本机控制通道四件——serde（命令/响应 derive
+# 面；serde_derive 闭包内既有编译）、async-channel（命令队列 + 响应
+# oneshot；gpui 直接依赖同版本 2.5）、async-net（UnixListener/
+# UnixStream；smol 既有传递依赖同版本 2.0）、futures-lite（行读
+# AsyncReadExt；闭包内既有 2.6）。四者全在 Cargo.lock 既有集合内
+# ——零新增 crate。
+serde = { version = "1.0", features = ["derive"] }
+# #132 任务 2：正则查找（Cargo.lock 既有闭包——gpui 传递依赖 regex 1.13.1，
+# 此处只在清单里显式声明，**零新增 crate / 零 lock 变更**）。
+regex = "1.13"
+async-channel = "2.5"
+async-net = "2.0"
+futures-lite = "2.6"
+# 批 3（#68）：docx 只读渲染引擎依赖（path 接入，类型零泄漏面不变）
+# ——读面（read_docx 块序）+ 烟雾夹具生成（写面 save_to_vec）。
+mdc-office-io = { path = "../crates/office-io" }
+# 批 4（#68）：pdf 只读渲染引擎依赖（path 接入，类型零泄漏面不变）
+# ——读面（pdfium 文本层/书签树，engine-pdfium）+ 烟雾夹具生成
+# （lopdf 写面 generate，engine-lopdf——与 mdc-pdf 版本 pin 同源）。
+mdc-pdf = { path = "../crates/pdf", features = ["engine-pdfium", "engine-lopdf"] }
+gpui = { path = "../third_party/zed/crates/gpui", default-features = false }
+gpui_platform = { path = "../third_party/zed/crates/gpui_platform", features = [
+    "wayland",
+    "x11",
+] }
+theme = { path = "../third_party/zed/crates/theme" }
+ui = { path = "../third_party/zed/crates/ui" }
+# #385 批 3：menu crate（action 定义——ui 的直接依赖，闭包内零新增
+# 编译成本）。ModalHeader 的 dismiss 钮 dispatch menu::Cancel——本层
+# on_action 接住归一到 close_settings；批 4 menu_bar 键盘导航
+# （SelectFirst/Next/...）同源。
+menu = { path = "../third_party/zed/crates/menu" }
+# 日志面（#68 批 5 前置）：zlog 读 ZED_LOG/RUST_LOG——激活 gpui_wgpu
+# 适配器枚举与 gpui_windows DirectX 设备选择的既有 log 调用（此前无
+# logger，RUST_LOG 无效）。Apache-2.0，闭包内 crate（PROVENANCE 已录）。
+zlog = { path = "../third_party/zed/crates/zlog" }
+# r42 阶段 A（#68）：text + rope（Zed 编辑器 buffer 基座——rope 持文
+# + 锚点 + O(log n) 编辑，替换自研 Vec<String> 908 行；rope 经 text
+# 重导出消费，不单独列依赖）。GPL-3.0-or-later——记账见 PROVENANCE
+# r42 节（开源整体 GPL 无冲突；闭源时需替换）。
+text = { path = "../third_party/zed/crates/text" }
+# #133 任务 1：canvas 画布视图依赖（path 接入，类型零泄漏面不变）
+# ——会话恢复/读模型（CanvasSession::restore/objects）+ 渲染面
+# （CanvasRendering::from_session + export_svg）+ 落盘面
+# （authoritative_snapshot，yrs 二进制快照）。引擎纯 Rust 零 gpui
+# 依赖，接入面同 mdc-office-io/mdc-pdf 口径。
+mdc-canvas = { path = "../crates/canvas" }
+# #133 任务 1：canvas 位面通道的图像容器（image 的 Frame/ImageBuffer
+# 构造 RGBA 帧 + smallvec 帧容器——RenderImage::new 入参；R↔B 字节序
+# 交换见 canvas_view::rgba_to_bgra——RenderImage 是 BGRA 字节序）。均
+# gpui 闭包既有 crate（image 0.25 / smallvec 1.16），零新增编译面。
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+
+# #333：Wayland seat 前置探测（src/wayland_probe.rs——无 seat 合成器的
+# 优雅降级前置）。wayland-client 是 gpui_platform 的 wayland 特性既有
+# 传递依赖（Cargo.lock 0.31.15）——此处显式声明 = 零新增 crate / 零
+# lock 变更（循 serde_json/regex/async-channel 的「闭包内既有」先例）。
+# Linux 门控：wayland-client 依赖 unix 系统面，Windows/macOS 构建面
+# 不引入（模块内同 cfg 门控，跨平台无操作占位）。
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+
+[dev-dependencies]
+# #169：Cmd::ALL 运行时执行面——gpui TestAppContext（真实实体/窗口/
+# 上下文，无头）。test-support 仅测试编译期生效（feature 在 dev 与
+# normal 依赖间不 unify——shipped 依赖图不变）；拉入 proptest 等
+# 传递 dev 件，不进 bin/lib 正式面。
+gpui = { path = "../third_party/zed/crates/gpui", default-features = false, features = ["test-support"] }
+# 烟雾夹具书签注入（测试面独占——不进 shipped 依赖图；版本与 mdc-pdf
+# 内 pin 同源 =0.46.0（#573 升级同步），default-features 同关）。
+lopdf = { version = "=0.46.0", default-features = false }
+# #156 标书 e2e（tests/docx_bid_e2e.rs）：zip 部件解压比对（A 段非目标
+# 部件恒等 + B 段 document.xml 结构断言）。Cargo.lock 既有条目
+#（mdc-office-io 传递依赖同版本同 feature）——零新增三方，零 lock 变更。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# #307 阶段①（tests/convert_quality.rs）：DOCX→PDF 转换质量门夹具
+# 构造（docx-rs builder——与 mdc-office-io 测试面同源同版本同 feature，
+# Cargo.lock 既有条目，零新增三方，零 lock 变更）。
+docx-rs = { version = "0.4", default-features = false }
+
+# 与 third_party/zed/Cargo.toml 保持同源（生效的 3 条）：gpui 的 async-task、
+# gpui_linux 的 calloop、wgpu-hal 传递的 khronos-egl 均被上游 patch 到自维护
+# fork（API 钉 rev），不 patch 则闭包在主解析图下取 crates.io 版编译漂移。
+# （third_party 侧另有 cpal 一条，不在本外壳依赖图内，未镜像——镜像会产生
+# 「patch not used」构建警告。）
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
+
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = false
+codegen-units = 16
+debug = "limited"
+
+[profile.dev.build-override]
+codegen-units = 16
+split-debuginfo = "unpacked"
+debug = "limited"
+
+[profile.dev.package]
+gpui_macros = { opt-level = 3 }
+ui_macros = { opt-level = 3 }
+
+[profile.release]
+debug = "limited"
+lto = "thin"

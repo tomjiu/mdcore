@@ -1,0 +1,34 @@
+[package]
+name = "mdcore-wasm"
+version.workspace = true
+edition = "2021"
+description = "Headless Core v0 的 WASM 绑定（WebView 内 CM6 View 的对端）"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# p5-t3：证据工作台 wasm 出口（内存会话——阶段 5 §八.1 前置件）。
+mdc-workbench = { path = "../workbench" }
+# p5-t5：画布会话 wasm 出口（§八.5 Canvas 表面——四表面第四员）。
+mdc-canvas = { path = "../canvas" }
+# 契约类型直依赖（RelationKind/ReviewStatus/Decimal 等——workbench 传递
+# 依赖已在 lock，零新增三方）。
+mdc-evidence = { path = "../evidence" }
+mdcore = { path = "../mdcore" }
+# t16：首个 office 消费边（REUSE.md §0「经 wasm 桥」路径；三域纪律——
+# 仅消费方依赖，office-io 不依赖 mdcore）。零三方闭包增量：office-io
+# 及其全部依赖已在本 workspace Cargo.lock。
+mdc-office-io = { path = "../office-io" }
+# p6-t3：协作会话 wasm 出口（阶段 6 §九.5/§九.8 协同双端 web 化——
+# WasmCollabSession）。零三方闭包增量：mdc-collab 及其依赖（yrs）
+# 已在本 workspace Cargo.lock（mdc-canvas 同载 yrs）。
+mdc-collab = { path = "../collab" }
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# #283：xlsx_grid 导出测试的部件级保真断言（源档 vs 导出产物逐部件
+# 字节比较）。与 mdc-office-io 主依赖同版本同 feature——零新增三方
+# 闭包（已在 workspace Cargo.lock）。
+zip = { version = "8.6", default-features = false, features = ["deflate"] }

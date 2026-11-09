@@ -1,0 +1,874 @@
+//! mdc-canvas 会话 wasm 出口（阶段 5 §八.5 Canvas 表面）。
+//!
+//! ## 定位
+//! [`WasmCanvas`] = mdc-canvas headless 会话的 wasm 句柄（四表面
+//! 第四员——与 [`crate::WasmCore`]/[`crate::xlsx_grid::WasmBook`]/
+//! [`crate::workbench::WasmWorkbench`] 同模式）。**单一真相**：领域
+//! 模型（节点/连线/分组）、命令校验、LWW 合并、双栈撤销、指纹、
+//! 事件——全部在 mdc-canvas；本模块零语义逻辑，只做边界互译
+//! （flat snake_case 命令 JSON ↔ `CanvasCommand` + typed 错误串）。
+//!
+//! ## 时钟注入
+//! wasm32 无 std 时间系统（`SystemTime::now()` = trap）——构造时经
+//! `SessionOptions::clock_ms` 注入宿主时钟（内部 `RefCell<u64>` +
+//! [`Self::set_clock_ms`] 推进——与 `WasmCore::set_clock_ms` 同纪律）。
+//!
+//! ## 事件面
+//! `take_events_json()` 轮询（排空式——`WasmCore::take_events` 先例）：
+//! 订阅闭包把 `CanvasEvent` 转 JSON 累积到内部缓冲，宿主 rAF 轮询取
+//! 走。`updates` 为逐事务 wire 字节的 base64（可独立 `apply_update`
+//! 转发——中继/对端直连直接消费）。
+//!
+//! ## 错误面
+//! typed JSON 串 `{"code":"cv_*","message":"..."}`——`CanvasError`
+//! 全变体一码一义（wb_* / pdf_* 先例）。
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use wasm_bindgen::prelude::*;
+
+use mdc_canvas::{
+    Actor, CanvasCommand, CanvasError, CanvasObject, CanvasSession, CommandOutcome, DriveMode,
+    ObjectKind, ReorderOp, SessionOptions, Side, StrokeTool,
+};
+
+// ---------------------------------------------------------------------------
+// 错误面
+// ---------------------------------------------------------------------------
+
+/// wasm 边界错误（typed 码——宿主可 JSON.parse）。
+#[derive(Debug)]
+pub struct CvError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CvError {
+    fn to_js(&self) -> JsValue {
+        JsValue::from_str(
+            &serde_json::json!({"code": self.code, "message": self.message}).to_string(),
+        )
+    }
+}
+
+impl From<CanvasError> for CvError {
+    fn from(e: CanvasError) -> Self {
+        let code = match &e {
+            CanvasError::Limit { .. } => "cv_limit",
+            CanvasError::Decode(_) => "cv_codec",
+            CanvasError::Panic(_) => "cv_panic",
+            CanvasError::InvalidInput(_) => "cv_invalid_input",
+            CanvasError::ObjectNotFound { .. } => "cv_object_not_found",
+            CanvasError::DuplicateId { .. } => "cv_duplicate_id",
+            CanvasError::EndpointNotFound { .. } => "cv_endpoint_not_found",
+            CanvasError::MemberNotFound { .. } => "cv_member_not_found",
+            CanvasError::NonFiniteGeometry { .. } => "cv_non_finite",
+            CanvasError::KindMismatch { .. } => "cv_kind_mismatch",
+            // #353：三态驾驶闸拒绝（User 模式拒 Ai / Ai 非法转移）。
+            CanvasError::ModeDenied { .. } => "cv_mode_denied",
+        };
+        CvError {
+            code,
+            message: format!("{e}"),
+        }
+    }
+}
+
+fn bad_json(what: &str, detail: String) -> CvError {
+    CvError {
+        code: "cv_bad_json",
+        message: format!("{what}: {detail}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// base64（updates wire 字节 ↔ 事件 JSON 字符串——零三方）
+// ---------------------------------------------------------------------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        out.push(B64[(b[0] >> 2) as usize] as char);
+        out.push(B64[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(b[2] & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 纯内核（JsValue-free——原生 cargo test 面）
+// ---------------------------------------------------------------------------
+
+/// flat 命令 JSON → `CanvasCommand`（`{"t":"add_node",...}` 八命令）。
+pub fn parse_cmd_core(json: &str) -> Result<CanvasCommand, CvError> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| bad_json("command", e.to_string()))?;
+    let t = v
+        .get("t")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| bad_json("command", "missing `t`".into()))?;
+    let opt_id = || -> Result<Option<String>, CvError> {
+        match v.get("id") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`id` must be string or null, got {other}"),
+            )),
+        }
+    };
+    // #404：可选父 frame 引用（string | null——null/缺省 = 顶层）。
+    let opt_parent = |field: &str| -> Result<Option<String>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
+            )),
+        }
+    };
+    let f = |field: &str| -> Result<f64, CvError> {
+        v.get(field)
+            .and_then(|x| x.as_f64())
+            .ok_or_else(|| bad_json("command", format!("missing/invalid `{field}`")))
+    };
+    let props = |field: &str| -> Result<BTreeMap<String, String>, CvError> {
+        match v.get(field) {
+            None => Ok(BTreeMap::new()),
+            Some(serde_json::Value::Object(m)) => {
+                let mut out = BTreeMap::new();
+                for (k, val) in m {
+                    let s = val.as_str().ok_or_else(|| {
+                        bad_json("command", format!("`{field}.{k}` must be string"))
+                    })?;
+                    out.insert(k.clone(), s.to_string());
+                }
+                Ok(out)
+            }
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be object, got {other}"),
+            )),
+        }
+    };
+    let s = |field: &str| -> Result<String, CvError> {
+        v.get(field)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| bad_json("command", format!("missing/invalid `{field}`")))
+    };
+    let str_vec = |field: &str| -> Result<Vec<String>, CvError> {
+        match v.get(field) {
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .map(|x| {
+                    x.as_str().map(str::to_string).ok_or_else(|| {
+                        bad_json("command", format!("`{field}` entries must be strings"))
+                    })
+                })
+                .collect(),
+            _ => Err(bad_json("command", format!("missing/invalid `{field}`"))),
+        }
+    };
+    // 笔迹点列：[[x,y],…]（perfect-freehand 消费形状）→ (x,y) 对。
+    let points = |field: &str| -> Result<Vec<(f64, f64)>, CvError> {
+        match v.get(field) {
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .map(|x| {
+                    let pair = x.as_array().ok_or_else(|| {
+                        bad_json("command", format!("`{field}` entries must be [x,y] pairs"))
+                    })?;
+                    if pair.len() != 2 {
+                        return Err(bad_json(
+                            "command",
+                            format!("`{field}` entries must be [x,y] pairs, got {x}"),
+                        ));
+                    }
+                    let x = pair[0].as_f64().ok_or_else(|| {
+                        bad_json(
+                            "command",
+                            format!("`{field}` x must be number, got {}", pair[0]),
+                        )
+                    })?;
+                    let y = pair[1].as_f64().ok_or_else(|| {
+                        bad_json(
+                            "command",
+                            format!("`{field}` y must be number, got {}", pair[1]),
+                        )
+                    })?;
+                    Ok((x, y))
+                })
+                .collect(),
+            _ => Err(bad_json("command", format!("missing/invalid `{field}`"))),
+        }
+    };
+    // #406：可选 caption（string | null——null/缺省 = 清除）。
+    let opt_caption = |field: &str| -> Result<Option<String>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(sv)) => Ok(Some(sv.clone())),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
+            )),
+        }
+    };
+    let tool = |field: &str| -> Result<StrokeTool, CvError> {
+        match s(field)?.as_str() {
+            "pen" => Ok(StrokeTool::Pen),
+            "highlighter" => Ok(StrokeTool::Highlighter),
+            other => Err(bad_json(
+                "command",
+                format!("`{field}` must be pen/highlighter, got {other}"),
+            )),
+        }
+    };
+    // #406：锚侧（top/right/bottom/left——null/缺省 = 清除回中心）。
+    let opt_side = |field: &str| -> Result<Option<Side>, CvError> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Side::from_wire(s).map(Some).ok_or_else(|| {
+                bad_json(
+                    "command",
+                    format!("`{field}` must be top/right/bottom/left or null, got {s}"),
+                )
+            }),
+            Some(other) => Err(bad_json(
+                "command",
+                format!("`{field}` must be string or null, got {other}"),
+            )),
+        }
+    };
+    match t {
+        "add_node" => Ok(CanvasCommand::AddNode {
+            id: opt_id()?,
+            x: f("x")?,
+            y: f("y")?,
+            w: f("w")?,
+            h: f("h")?,
+            props: props("props")?,
+        }),
+        "move_node" => Ok(CanvasCommand::MoveNode {
+            id: s("id")?,
+            x: f("x")?,
+            y: f("y")?,
+        }),
+        "resize_node" => Ok(CanvasCommand::ResizeNode {
+            id: s("id")?,
+            w: f("w")?,
+            h: f("h")?,
+        }),
+        "add_edge" => Ok(CanvasCommand::AddEdge {
+            id: opt_id()?,
+            from: s("from")?,
+            to: s("to")?,
+            props: props("props")?,
+        }),
+        "set_props" => Ok(CanvasCommand::SetProps {
+            id: s("id")?,
+            props: props("props")?,
+        }),
+        "remove_object" => Ok(CanvasCommand::RemoveObject { id: s("id")? }),
+        "group_objects" => Ok(CanvasCommand::GroupObjects {
+            group_id: opt_id()?,
+            members: str_vec("members")?,
+        }),
+        "ungroup" => Ok(CanvasCommand::Ungroup {
+            group_id: s("group_id")?,
+        }),
+        "add_stroke" => Ok(CanvasCommand::AddStroke {
+            id: opt_id()?,
+            points: points("points")?,
+            color: s("color")?,
+            width: f("width")?,
+            tool: tool("tool")?,
+        }),
+        "set_stroke_style" => Ok(CanvasCommand::SetStrokeStyle {
+            id: s("id")?,
+            color: s("color")?,
+            width: f("width")?,
+            tool: tool("tool")?,
+        }),
+        // #406：边路由/标题终态替换（锚侧 ×2 + caption——null/缺省 = 清除）。
+        "set_edge_route" => Ok(CanvasCommand::SetEdgeRoute {
+            id: s("id")?,
+            from_side: opt_side("from_side")?,
+            to_side: opt_side("to_side")?,
+            caption: opt_caption("caption")?,
+        }),
+        "reorder" => {
+            // #402：z 序重排（op = front/back/forward/backward）。
+            let op = ReorderOp::from_wire(&s("op")?).ok_or_else(|| {
+                bad_json(
+                    "command",
+                    "`op` must be front/back/forward/backward".to_string(),
+                )
+            })?;
+            Ok(CanvasCommand::Reorder { id: s("id")?, op })
+        }
+        // #405：标签命令（add_tag / remove_tag——集语义幂等）。
+        "add_tag" => Ok(CanvasCommand::AddTag {
+            id: s("id")?,
+            tag: s("tag")?,
+        }),
+        "remove_tag" => Ok(CanvasCommand::RemoveTag {
+            id: s("id")?,
+            tag: s("tag")?,
+        }),
+        // #404：frame 命令（create_frame / rename_frame / set_parent）。
+        "create_frame" => Ok(CanvasCommand::CreateFrame {
+            id: opt_id()?,
+            name: s("name")?,
+            x: f("x")?,
+            y: f("y")?,
+            w: f("w")?,
+            h: f("h")?,
+            parent: opt_parent("parent")?,
+        }),
+        "rename_frame" => Ok(CanvasCommand::RenameFrame {
+            id: s("id")?,
+            name: s("name")?,
+        }),
+        "set_parent" => Ok(CanvasCommand::SetParent {
+            id: s("id")?,
+            parent: opt_parent("parent")?,
+        }),
+        // #353：三态驾驶闸切换（Human 任意态；Ai 仅让出——自我提权被拒）。
+        "set_drive_mode" => {
+            let mode = DriveMode::from_wire(&s("mode")?).ok_or_else(|| {
+                bad_json(
+                    "command",
+                    "`mode` must be user/collaborative/ai".to_string(),
+                )
+            })?;
+            Ok(CanvasCommand::SetDriveMode { mode })
+        }
+        other => Err(bad_json(
+            "command",
+            format!("unknown command `{other}` (18 commands: add_node/move_node/resize_node/add_edge/set_props/remove_object/group_objects/ungroup/add_stroke/set_stroke_style/set_edge_route/reorder/add_tag/remove_tag/create_frame/rename_frame/set_parent/set_drive_mode)"),
+        )),
+    }
+}
+
+/// 批量命令 JSON（flat 命令对象数组）→ `Vec<CanvasCommand>`（#352）。
+/// 逐条复用 [`parse_cmd_core`]（单/批解析面同源——不另造语法）；
+/// 非数组/空数组拒收（空批在引擎层也有门，这里提前给出更近的错误）。
+pub fn parse_cmds_core(json: &str) -> Result<Vec<CanvasCommand>, CvError> {
+    let arr: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| bad_json("commands", e.to_string()))?;
+    let arr = match arr {
+        serde_json::Value::Array(a) => a,
+        other => {
+            return Err(bad_json(
+                "commands",
+                format!("expected JSON array of command objects, got {other}"),
+            ))
+        }
+    };
+    if arr.is_empty() {
+        return Err(bad_json("commands", "empty batch".into()));
+    }
+    arr.iter()
+        .map(|v| {
+            parse_cmd_core(
+                &serde_json::to_string(v).map_err(|e| bad_json("commands", e.to_string()))?,
+            )
+        })
+        .collect()
+}
+
+/// 批量回执 → JSON（#352）：逐命令 outcome 扁平化 + 批级撤销面。
+/// outcome 字段面与单命令 [`receipt_json`] 同构（kind + 键值对）。
+pub fn batch_receipt_json(r: &mdc_canvas::BatchReceipt) -> String {
+    let outs: Vec<String> = r
+        .outcomes
+        .iter()
+        .map(|o| {
+            let (kind, key, val) = match o {
+                CommandOutcome::NodeAdded { id } => ("node_added", "id", id.clone()),
+                CommandOutcome::NodeMoved { id } => ("node_moved", "id", id.clone()),
+                CommandOutcome::NodeResized { id } => ("node_resized", "id", id.clone()),
+                CommandOutcome::EdgeAdded { id } => ("edge_added", "id", id.clone()),
+                CommandOutcome::PropsSet { id } => ("props_set", "id", id.clone()),
+                CommandOutcome::ObjectRemoved { id } => ("object_removed", "id", id.clone()),
+                CommandOutcome::Grouped { group_id } => ("grouped", "group_id", group_id.clone()),
+                CommandOutcome::Ungrouped { group_id } => {
+                    ("ungrouped", "group_id", group_id.clone())
+                }
+                // #350 笔迹面：与单命令 receipt_json 同构
+                CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
+                CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+                // #406 边路由面：与单命令 receipt_json 同构
+                CommandOutcome::EdgeRouted { id } => ("edge_routed", "id", id.clone()),
+                // #402 z 序面：与单命令 receipt_json 同构
+                CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
+                // #405 标签面 + #404 frame 面：与单命令 receipt_json 同构
+                //（rebase 到新 main 后补——#352 母分支同样缺这五支，
+                // 本栈先行补齐，#369 rebase 时可直接取用）。
+                CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),
+                CommandOutcome::TagRemoved { id } => ("tag_removed", "id", id.clone()),
+                CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
+                CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
+                CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
+                // #353 驾驶闸：批入口已拒 SetDriveMode（会话本地策略非
+                // 载体变更），本臂批路径不可达——穷尽性保匹配全（语义
+                // 同单命令 receipt_json）。
+                CommandOutcome::DriveModeSet { mode } => {
+                    ("drive_mode_set", "mode", mode.wire().into())
+                }
+            };
+            format!(
+                "{{\"outcome\":\"{kind}\",\"{key}\":{}}}",
+                serde_json::to_string(&val).unwrap()
+            )
+        })
+        .collect();
+    format!(
+        "{{\"outcomes\":[{}],\"undo_depth\":{},\"undo_cleared\":{}}}",
+        outs.join(","),
+        r.undo_depth,
+        r.undo_cleared
+    )
+}
+
+fn kind_wire(k: ObjectKind) -> &'static str {
+    match k {
+        ObjectKind::Node => "node",
+        ObjectKind::Edge => "edge",
+        ObjectKind::Group => "group",
+        ObjectKind::Stroke => "stroke",
+        ObjectKind::Frame => "frame",
+    }
+}
+
+/// 读模型对象 → JSON（字段面与公开结构 1:1；笔迹四字段在非 Stroke
+/// 对象上为缺省形状——空点列/null，同 from/to 的 null 纪律）。
+pub fn object_json(o: &CanvasObject) -> String {
+    let props: Vec<String> = o
+        .props
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}:{}",
+                serde_json::to_string(k).unwrap(),
+                serde_json::to_string(v).unwrap()
+            )
+        })
+        .collect();
+    let members: Vec<String> = o
+        .members
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect();
+    // 笔迹点列 [[x,y],…]（perfect-freehand 消费形状）。
+    let points: Vec<String> = o.points.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
+    let opt_str = |v: &Option<String>| -> String {
+        match v {
+            Some(x) => serde_json::to_string(x).unwrap(),
+            None => "null".into(),
+        }
+    };
+    let width = match o.width {
+        Some(w) => format!("{w}"),
+        None => "null".into(),
+    };
+    let tool = match o.tool {
+        Some(StrokeTool::Pen) => "\"pen\"".to_string(),
+        Some(StrokeTool::Highlighter) => "\"highlighter\"".to_string(),
+        None => "null".to_string(),
+    };
+    // #405：标签集（排序 Vec → JSON 数组）。
+    let tags: Vec<String> = o
+        .tags
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect();
+    // #404：命名 + 父引用（null 缺省——同 from/to null 纪律）。
+    let opt_str_field = |v: &Option<String>| -> String {
+        match v {
+            Some(x) => serde_json::to_string(x).unwrap(),
+            None => "null".into(),
+        }
+    };
+    let name = opt_str_field(&o.name);
+    let parent = opt_str_field(&o.parent);
+    // #406：锚侧 + 标题（null 缺省——同 from/to null 纪律）。
+    let opt_side_str = |v: &Option<Side>| -> String {
+        match v {
+            Some(sv) => format!("\"{}\"", sv.wire()),
+            None => "null".to_string(),
+        }
+    };
+    let from_side = opt_side_str(&o.from_side);
+    let to_side = opt_side_str(&o.to_side);
+    let caption = opt_str(&o.caption);
+    format!(
+        "{{\"id\":{},\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"from\":{},\"to\":{},\"from_side\":{},\"to_side\":{},\"caption\":{},\"members\":[{}],\"points\":[{}],\"color\":{},\"width\":{},\"tool\":{},\"z_index\":{},\"tags\":[{}],\"name\":{},\"parent\":{},\"props\":{{{}}}}}",
+        serde_json::to_string(&o.id).unwrap(),
+        kind_wire(o.kind),
+        o.x,
+        o.y,
+        o.w,
+        o.h,
+        opt_str(&o.from),
+        opt_str(&o.to),
+        from_side,
+        to_side,
+        caption,
+        members.join(","),
+        points.join(","),
+        opt_str(&o.color),
+        width,
+        tool,
+        serde_json::to_string(&o.z_index).unwrap(),
+        tags.join(","),
+        name,
+        parent,
+        props.join(","),
+    )
+}
+
+/// 回执 → JSON（outcome 扁平化 + undo 面）。
+pub fn receipt_json(outcome: &CommandOutcome, undo_depth: usize, undo_cleared: bool) -> String {
+    let (kind, key, val) = match outcome {
+        CommandOutcome::NodeAdded { id } => ("node_added", "id", id.clone()),
+        CommandOutcome::NodeMoved { id } => ("node_moved", "id", id.clone()),
+        CommandOutcome::NodeResized { id } => ("node_resized", "id", id.clone()),
+        CommandOutcome::EdgeAdded { id } => ("edge_added", "id", id.clone()),
+        CommandOutcome::PropsSet { id } => ("props_set", "id", id.clone()),
+        CommandOutcome::ObjectRemoved { id } => ("object_removed", "id", id.clone()),
+        CommandOutcome::Grouped { group_id } => ("grouped", "group_id", group_id.clone()),
+        CommandOutcome::Ungrouped { group_id } => ("ungrouped", "group_id", group_id.clone()),
+        CommandOutcome::StrokeAdded { id } => ("stroke_added", "id", id.clone()),
+        CommandOutcome::StrokeStyled { id } => ("stroke_styled", "id", id.clone()),
+        // #406：边路由/标题已设。
+        CommandOutcome::EdgeRouted { id } => ("edge_routed", "id", id.clone()),
+        CommandOutcome::Reordered { id } => ("reordered", "id", id.clone()),
+        // #405：标签回执（幂等无变化也回此回执——同 reordered 纪律）。
+        CommandOutcome::TagAdded { id } => ("tag_added", "id", id.clone()),
+        CommandOutcome::TagRemoved { id } => ("tag_removed", "id", id.clone()),
+        // #404：frame 回执。
+        CommandOutcome::FrameCreated { id } => ("frame_created", "id", id.clone()),
+        CommandOutcome::FrameRenamed { id } => ("frame_renamed", "id", id.clone()),
+        CommandOutcome::ParentSet { id } => ("parent_set", "id", id.clone()),
+        // #353：驾驶模式已切（mode 字段——同回执面）。
+        CommandOutcome::DriveModeSet { mode } => ("drive_mode_set", "mode", mode.wire().into()),
+    };
+    format!(
+        "{{\"outcome\":\"{kind}\",\"{key}\":{},\"undo_depth\":{undo_depth},\"undo_cleared\":{undo_cleared}}}",
+        serde_json::to_string(&val).unwrap()
+    )
+}
+
+/// 事件 → JSON（updates base64——可独立 apply_update 转发）。
+pub fn event_json(
+    source: &mdc_canvas::CanvasChangeSource,
+    updates: &[Vec<u8>],
+    touched: &[String],
+) -> String {
+    let (source_s, actor) = match source {
+        mdc_canvas::CanvasChangeSource::Command { actor }
+        | mdc_canvas::CanvasChangeSource::Undo { actor }
+        | mdc_canvas::CanvasChangeSource::Redo { actor } => {
+            let s = match source {
+                mdc_canvas::CanvasChangeSource::Command { .. } => "command",
+                mdc_canvas::CanvasChangeSource::Undo { .. } => "undo",
+                _ => "redo",
+            };
+            (
+                s,
+                if matches!(actor, Actor::Human) {
+                    "human"
+                } else {
+                    "ai"
+                },
+            )
+        }
+        mdc_canvas::CanvasChangeSource::Remote => ("remote", ""),
+        mdc_canvas::CanvasChangeSource::Maintenance => ("maintenance", ""),
+    };
+    let ups: Vec<String> = updates
+        .iter()
+        .map(|u| format!("\"{}\"", b64_encode(u)))
+        .collect();
+    let ts: Vec<String> = touched
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect();
+    let actor_field = if actor.is_empty() {
+        String::new()
+    } else {
+        format!(",\"actor\":\"{actor}\"")
+    };
+    format!(
+        "{{\"source\":\"{source_s}\"{actor_field},\"updates\":[{}],\"touched\":[{}]}}",
+        ups.join(","),
+        ts.join(",")
+    )
+}
+
+fn parse_actor(s: &str) -> Result<Actor, CvError> {
+    match s {
+        "human" => Ok(Actor::Human),
+        "ai" => Ok(Actor::Ai),
+        other => Err(bad_json("actor", format!("unknown `{other}` (human|ai)"))),
+    }
+}
+
+/// #405：按标签检索（纯内核——wasm 方法薄委托，原生 cargo test 面）。
+pub fn list_by_tag_json_core(session: &CanvasSession, tag: &str) -> String {
+    let objs: Vec<String> = session.list_by_tag(tag).iter().map(object_json).collect();
+    format!("[{}]", objs.join(","))
+}
+
+// ---------------------------------------------------------------------------
+// wasm-bindgen 面
+// ---------------------------------------------------------------------------
+
+/// 画布会话句柄（模型层单一真相——领域模型/命令/LWW/双栈撤销/指纹/事件）。
+#[wasm_bindgen]
+pub struct WasmCanvas {
+    session: CanvasSession,
+    /// 宿主时钟（AtomicU64 + set_clock_ms 推进——wasm 无系统时间；
+    /// Send+Sync 满足 SessionOptions 边界，单线程无争用）。
+    clock: Arc<AtomicU64>,
+    /// 事件缓冲（Mutex 累积；take 排空——订阅闭包 Send 边界）。
+    events: Arc<std::sync::Mutex<Vec<String>>>,
+    /// 订阅保持（Drop = 退订——字段顺序：drop 先于 session）。
+    _sub: mdc_canvas::Subscription,
+}
+
+#[wasm_bindgen]
+impl WasmCanvas {
+    /// 新会话（client_id 建议全局唯一——自动 ID `{client_id}-{seq}`）。
+    #[wasm_bindgen(constructor)]
+    pub fn new(client_id: u64, undo_limit: Option<usize>) -> Result<WasmCanvas, JsValue> {
+        let clock = Arc::new(AtomicU64::new(0));
+        let clock_for_options = clock.clone();
+        let options = SessionOptions {
+            client_id,
+            undo_stack_limit: undo_limit,
+            clock_ms: Some(Arc::new(move || clock_for_options.load(Ordering::SeqCst))),
+            ..Default::default()
+        };
+        Self::build(options, clock)
+    }
+
+    /// 快照恢复（撤销栈不随快照走——既有语义）。
+    #[wasm_bindgen(static_method_of = WasmCanvas)]
+    pub fn restore(
+        client_id: u64,
+        undo_limit: Option<usize>,
+        snapshot: &[u8],
+    ) -> Result<WasmCanvas, JsValue> {
+        let clock = Arc::new(AtomicU64::new(0));
+        let clock_for_options = clock.clone();
+        let options = SessionOptions {
+            client_id,
+            undo_stack_limit: undo_limit,
+            clock_ms: Some(Arc::new(move || clock_for_options.load(Ordering::SeqCst))),
+            ..Default::default()
+        };
+        let mut session =
+            CanvasSession::restore(options, snapshot).map_err(|e| CvError::from(e).to_js())?;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = subscribe_bridge(&mut session, &events);
+        Ok(WasmCanvas {
+            session,
+            clock,
+            events,
+            _sub: sub,
+        })
+    }
+
+    fn build(options: SessionOptions, clock: Arc<AtomicU64>) -> Result<WasmCanvas, JsValue> {
+        let mut session = CanvasSession::open(options).map_err(|e| CvError::from(e).to_js())?;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = subscribe_bridge(&mut session, &events);
+        Ok(WasmCanvas {
+            session,
+            clock,
+            events,
+            _sub: sub,
+        })
+    }
+
+    /// 宿主时钟注入（epoch ms；撤销栈时间戳源——单调推进纪律）。
+    pub fn set_clock_ms(&self, ms: u64) {
+        self.clock.store(ms, Ordering::SeqCst);
+    }
+
+    /// 命令执行（八命令 flat JSON；回执 JSON）。
+    pub fn execute(&mut self, actor: &str, cmd_json: &str) -> Result<String, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        let cmd = parse_cmd_core(cmd_json).map_err(|e| e.to_js())?;
+        let receipt = self
+            .session
+            .execute(actor, cmd)
+            .map_err(|e| CvError::from(e).to_js())?;
+        Ok(receipt_json(
+            &receipt.outcome,
+            receipt.undo_depth,
+            receipt.undo_cleared,
+        ))
+    }
+
+    /// 批量命令原子执行（#352）：flat 命令对象数组 JSON；整批全成
+    /// 或全不成；整批 = 一个撤销单元。回执：
+    /// `{"outcomes":[{outcome,...},...],"undo_depth":N,"undo_cleared":B}`。
+    pub fn execute_batch(&mut self, actor: &str, cmds_json: &str) -> Result<String, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        let cmds = parse_cmds_core(cmds_json).map_err(|e| e.to_js())?;
+        let receipt = self
+            .session
+            .execute_batch(actor, cmds)
+            .map_err(|e| CvError::from(e).to_js())?;
+        Ok(batch_receipt_json(&receipt))
+    }
+
+    /// 撤销（按 origin 分栈）。#353：User 模式下 Ai 撤销被拒
+    /// （`cv_mode_denied`）；`Ok(false)` = 栈空。
+    pub fn undo(&mut self, actor: &str) -> Result<bool, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        self.session
+            .undo(actor)
+            .map_err(|e| CvError::from(e).to_js())
+    }
+
+    /// 重做（#353 同拒语义）。
+    pub fn redo(&mut self, actor: &str) -> Result<bool, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        self.session
+            .redo(actor)
+            .map_err(|e| CvError::from(e).to_js())
+    }
+
+    pub fn undo_depth(&self, actor: &str) -> Result<usize, JsValue> {
+        Ok(self
+            .session
+            .undo_depth(parse_actor(actor).map_err(|e| e.to_js())?))
+    }
+
+    pub fn redo_depth(&self, actor: &str) -> Result<usize, JsValue> {
+        Ok(self
+            .session
+            .redo_depth(parse_actor(actor).map_err(|e| e.to_js())?))
+    }
+
+    /// #353：驾驶模式读（wire 名 user/collaborative/ai——会话本地策略，
+    /// 无事件面，宿主轮询）。
+    pub fn drive_mode(&self) -> String {
+        self.session.drive_mode().wire().into()
+    }
+
+    /// #353：驾驶模式写（直写面——与 `set_drive_mode` 命令同语义同
+    /// 单一真相：Human 任意态；Ai 仅从 Ai 态让出，非法转移
+    /// `cv_mode_denied`）。
+    pub fn set_drive_mode(&mut self, actor: &str, mode: &str) -> Result<String, JsValue> {
+        let actor = parse_actor(actor).map_err(|e| e.to_js())?;
+        let mode = DriveMode::from_wire(mode).ok_or_else(|| {
+            bad_json("mode", format!("unknown `{mode}` (user|collaborative|ai)")).to_js()
+        })?;
+        self.session
+            .set_drive_mode(actor, mode)
+            .map_err(|e| CvError::from(e).to_js())?;
+        Ok(mode.wire().into())
+    }
+
+    /// 读模型快照（ID 字典序确定性）。
+    pub fn objects_json(&self) -> String {
+        let objs: Vec<String> = self.session.objects().iter().map(object_json).collect();
+        format!("[{}]", objs.join(","))
+    }
+
+    /// 单对象（`Option<String>` → JS `string | null`——不存在 = null，
+    /// 与宿主侧 `raw === null` 检查契约直配）。
+    pub fn object_json(&self, id: &str) -> Option<String> {
+        self.session.find_object(id).map(|o| object_json(&o))
+    }
+
+    /// #405：按标签检索（读模型 JSON——ID 字典序；AI 检索/过滤面）。
+    pub fn list_by_tag_json(&self, tag: &str) -> String {
+        list_by_tag_json_core(&self.session, tag)
+    }
+
+    /// 对象语义指纹（证据关联锚——"fnv64:{:016x}"）。
+    pub fn object_fingerprint(&self, id: &str) -> Result<String, JsValue> {
+        self.session
+            .object_fingerprint(id)
+            .map_err(|e| CvError::from(e).to_js())
+    }
+
+    /// 全画布指纹。
+    pub fn canvas_fingerprint(&self) -> String {
+        self.session.canvas_fingerprint()
+    }
+
+    /// 协同：状态向量。
+    pub fn state_vector(&self) -> Vec<u8> {
+        self.session.state_vector()
+    }
+
+    /// 协同：差量（remote_sv 之后的新事务 wire 字节）。
+    pub fn encode_diff(&self, remote_sv: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.session
+            .encode_diff(remote_sv)
+            .map_err(|e| CvError::from(e).to_js())
+    }
+
+    /// 协同：应用远端更新（panic 隔离；失败仍可重试广播——CRDT 幂等）。
+    pub fn apply_update(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+        self.session
+            .apply_update(bytes)
+            .map_err(|e| CvError::from(e).to_js())
+    }
+
+    /// 权威快照（二进制 wire——持久化由宿主决定）。
+    pub fn authoritative_snapshot(&self) -> Result<Vec<u8>, JsValue> {
+        self.session
+            .authoritative_snapshot()
+            .map_err(|e| CvError::from(e).to_js())
+    }
+
+    /// 事件轮询（排空式）：[{source,actor?,updates:<base64>[],touched:[]}]。
+    pub fn take_events_json(&self) -> String {
+        let mut buf = self.events.lock().unwrap();
+        let out = format!("[{}]", buf.join(","));
+        buf.clear();
+        out
+    }
+}
+
+/// 订阅桥：CanvasEvent → JSON 累积（Session 保持不可变借用——
+/// 订阅在 open/restore 后立即挂载）。
+fn subscribe_bridge(
+    session: &mut CanvasSession,
+    events: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> mdc_canvas::Subscription {
+    let sink = events.clone();
+    session.subscribe(move |ev: &mdc_canvas::CanvasEvent| {
+        if let Ok(mut buf) = sink.lock() {
+            buf.push(event_json(&ev.source, &ev.updates, &ev.touched));
+        }
+    })
+}
