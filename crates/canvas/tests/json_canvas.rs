@@ -324,3 +324,223 @@ fn export_drops_freeform_props_but_keeps_identity() {
     // 自由样式键不往返（JSON Canvas 无承载面——对象不丢的口径内）。
     assert_eq!(back[0].props.get("fill"), None);
 }
+
+// ---- #602：fromSide/toSide 双向桥（typed 字段同步 + 导出优先级）----
+
+use mdc_canvas::render::{CanvasRendering, PathCmd, Shape};
+use mdc_canvas::session::Side;
+
+/// #602 任务 1：导入把规范 side 填入 typed 字段（渲染读的一面）。
+#[test]
+fn import_fills_typed_sides() {
+    let objs = import_json_canvas(SPEC_SAMPLE).unwrap();
+    let e1 = objs.iter().find(|o| o.id == "e1").unwrap();
+    assert_eq!(e1.from_side, Some(Side::Right), "e1 fromSide → typed");
+    assert_eq!(e1.to_side, Some(Side::Left), "e1 toSide → typed");
+    let e2 = objs.iter().find(|o| o.id == "e2").unwrap();
+    assert_eq!(e2.from_side, None, "e2 无 fromSide → typed None");
+    assert_eq!(e2.to_side, Some(Side::Top), "e2 toSide → typed");
+}
+
+/// #602 验收：导入 left/right 边后，CanvasScene 渲染端点位于指定边中点
+/// 而非中心（from_objects 直接消费导入快照——typed 生效的铁证）。
+#[test]
+fn import_renders_side_anchors() {
+    let objs = import_json_canvas(SPEC_SAMPLE).unwrap();
+    let r = CanvasRendering::from_objects(&objs);
+    // 导入 Vec 序：nodes 先 edges 后——按形态定位（e1 双侧 = 全场唯一
+    // Path 折线；e2 单侧 = 全场唯一 Line）。
+    let path = r
+        .shapes
+        .iter()
+        .find(|(s, _)| matches!(s, Shape::Path { .. }))
+        .expect("e1 双侧指定应有折线");
+    match &path.0 {
+        Shape::Path { cmds, .. } => {
+            match cmds.first() {
+                Some(PathCmd::MoveTo(p)) => {
+                    assert_eq!((p.x, p.y), (260.0, 60.0), "e1 from = n1 右边中点")
+                }
+                other => panic!("e1 首命令应为 MoveTo，实际 {other:?}"),
+            }
+            match cmds.last() {
+                Some(PathCmd::LineTo(p)) => {
+                    assert_eq!((p.x, p.y), (320.0, 70.0), "e1 to = n2 左边中点")
+                }
+                other => panic!("e1 末命令应为 LineTo，实际 {other:?}"),
+            }
+        }
+        other => panic!("e1 双侧指定应为折线，实际 {other:?}"),
+    }
+    let line = r
+        .shapes
+        .iter()
+        .find(|(s, _)| matches!(s, Shape::Line { .. }))
+        .expect("e2 单侧应有直线");
+    match &line.0 {
+        Shape::Line { from, to, .. } => {
+            // e2：fromSide 缺 = n2 中心 (470,70)；toSide=top = n3 顶边中点 (470,180)。
+            assert_eq!((from.x, from.y), (470.0, 70.0), "e2 缺省 from = 中心");
+            assert_eq!((to.x, to.y), (470.0, 180.0), "e2 to = 顶边中点");
+        }
+        other => panic!("e2 单侧应为直线，实际 {other:?}"),
+    }
+}
+
+/// #602 非法 side 容错：typed None（渲染回落中心）+ props 保留原串
+/// （未知值不丢——向前兼容往返）。
+#[test]
+fn import_invalid_side_tolerated() {
+    let doc = r##"{
+      "nodes": [
+        {"id":"n1","type":"text","text":"a","x":0,"y":0,"width":100,"height":100},
+        {"id":"n2","type":"text","text":"b","x":300,"y":0,"width":100,"height":100}
+      ],
+      "edges": [
+        {"id":"e1","fromNode":"n1","toNode":"n2","fromSide":"diagonal","toSide":"LEFT"}
+      ]
+    }"##;
+    let objs = import_json_canvas(doc).unwrap();
+    let e1 = objs.iter().find(|o| o.id == "e1").unwrap();
+    assert_eq!(e1.from_side, None, "非法 fromSide → typed None");
+    assert_eq!(e1.to_side, None, "非规范大小写 toSide → typed None");
+    assert_eq!(
+        e1.props.get("jc:fromSide").map(String::as_str),
+        Some("diagonal"),
+        "未知值 props 保留（往返不丢）"
+    );
+    // 渲染回落中心直线（既有缺省行为；导入 Vec nodes 先 edges 后——
+    // 按形态定位全场唯一 Line）。
+    let r = CanvasRendering::from_objects(&objs);
+    let line = r
+        .shapes
+        .iter()
+        .find(|(s, _)| matches!(s, Shape::Line { .. }))
+        .expect("非法 side 应回落直线");
+    match &line.0 {
+        Shape::Line { from, to, .. } => {
+            assert_eq!((from.x, from.y), (50.0, 50.0), "from = 中心");
+            assert_eq!((to.x, to.y), (350.0, 50.0), "to = 中心");
+        }
+        other => panic!("非法 side 应回落直线，实际 {other:?}"),
+    }
+}
+
+/// #602 任务 2：导出 typed 值优先——SetEdgeRoute 后的新值不被旧 props
+/// 覆盖（typed 与 props 冲突时 typed 胜）。
+#[test]
+fn export_typed_wins_over_stale_props() {
+    let mut props = std::collections::BTreeMap::new();
+    props.insert("jc:fromSide".to_string(), "right".to_string());
+    props.insert("jc:toSide".to_string(), "left".to_string());
+    let objs = vec![CanvasObject {
+        id: "e1".into(),
+        kind: ObjectKind::Edge,
+        from: Some("n1".into()),
+        to: Some("n2".into()),
+        from_side: Some(Side::Top),
+        to_side: Some(Side::Bottom),
+        props,
+        ..Default::default()
+    }];
+    let v: serde_json::Value = serde_json::from_str(&export_json_canvas(&objs)).unwrap();
+    assert_eq!(v["edges"][0]["fromSide"], "top", "typed 胜过旧 props");
+    assert_eq!(v["edges"][0]["toSide"], "bottom", "typed 胜过旧 props");
+}
+
+/// #602 任务 2：旧快照 props 回落——typed None + props 有值时按 props
+/// 导出（#444 时代快照的兼容面）。
+#[test]
+fn export_falls_back_to_legacy_props() {
+    let mut props = std::collections::BTreeMap::new();
+    props.insert("jc:fromSide".to_string(), "right".to_string());
+    props.insert("jc:toSide".to_string(), "left".to_string());
+    let objs = vec![CanvasObject {
+        id: "e1".into(),
+        kind: ObjectKind::Edge,
+        from: Some("n1".into()),
+        to: Some("n2".into()),
+        props,
+        ..Default::default()
+    }];
+    let v: serde_json::Value = serde_json::from_str(&export_json_canvas(&objs)).unwrap();
+    assert_eq!(v["edges"][0]["fromSide"], "right", "旧快照 props 回落");
+    assert_eq!(v["edges"][0]["toSide"], "left", "旧快照 props 回落");
+}
+
+/// #602 验收：SetEdgeRoute(top,bottom) 后导出再导入，typed 值保留
+/// （session 真实命令链——AddEdge 携旧 props + SetEdgeRoute 终态替换）。
+#[test]
+fn set_edge_route_roundtrip_keeps_new_sides() {
+    use mdc_canvas::{Actor, CanvasCommand, CanvasSession, SessionOptions};
+    let mut s = CanvasSession::open(SessionOptions {
+        client_id: 7_306_101,
+        ..Default::default()
+    })
+    .unwrap();
+    for id in ["n1", "n2"] {
+        s.execute(
+            Actor::Human,
+            CanvasCommand::AddNode {
+                id: Some(id.into()),
+                x: if id == "n1" { 0.0 } else { 300.0 },
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+                props: Default::default(),
+            },
+        )
+        .unwrap();
+    }
+    // 宿主既有形态：导入边以 AddEdge + 旧 props 落库。
+    let mut props = std::collections::BTreeMap::new();
+    props.insert("jc:fromSide".to_string(), "right".to_string());
+    props.insert("jc:toSide".to_string(), "left".to_string());
+    s.execute(
+        Actor::Human,
+        CanvasCommand::AddEdge {
+            id: Some("e1".into()),
+            from: "n1".into(),
+            to: "n2".into(),
+            props,
+        },
+    )
+    .unwrap();
+    // 用户改路由：SetEdgeRoute 终态替换（typed 顶层键）。
+    s.execute(
+        Actor::Human,
+        CanvasCommand::SetEdgeRoute {
+            id: "e1".into(),
+            from_side: Some(Side::Top),
+            to_side: Some(Side::Bottom),
+            caption: None,
+        },
+    )
+    .unwrap();
+    // 导出（读模型快照——typed 新值 + props 旧值共存）→ 再导入。
+    let exported = export_json_canvas(&s.objects());
+    let back = import_json_canvas(&exported).unwrap();
+    let e1 = back.iter().find(|o| o.id == "e1").unwrap();
+    assert_eq!(e1.from_side, Some(Side::Top), "SetEdgeRoute 新值往返保留");
+    assert_eq!(e1.to_side, Some(Side::Bottom), "SetEdgeRoute 新值往返保留");
+    // 导出 JSON 本身即新值（typed 优先的直接证据）。
+    let v: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(v["edges"][0]["fromSide"], "top");
+    assert_eq!(v["edges"][0]["toSide"], "bottom");
+}
+
+/// #602 验收：缺省 side（双侧皆无）导出零 fromSide/toSide 键
+/// （不造伪值——向后兼容面）。
+#[test]
+fn export_omits_absent_sides() {
+    let objs = vec![CanvasObject {
+        id: "e1".into(),
+        kind: ObjectKind::Edge,
+        from: Some("n1".into()),
+        to: Some("n2".into()),
+        ..Default::default()
+    }];
+    let v: serde_json::Value = serde_json::from_str(&export_json_canvas(&objs)).unwrap();
+    assert!(v["edges"][0].get("fromSide").is_none(), "无 side 不导键");
+    assert!(v["edges"][0].get("toSide").is_none(), "无 side 不导键");
+}

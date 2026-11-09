@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde_json::{json, Value};
 
-use crate::session::{CanvasObject, ObjectKind};
+use crate::session::{CanvasObject, ObjectKind, Side};
 use crate::CanvasError;
 
 /// 原始节点型标记（file / link）。
@@ -158,6 +158,12 @@ fn import_node(v: &Value) -> Option<CanvasObject> {
 
 /// 单边导入（None = 跳过：缺 id/fromNode/toNode）。端点不校验存在性
 /// （悬空边在读模型合法——渲染跳过，同 Edge 既有纪律）。
+///
+/// #602：fromSide/toSide 双写——①typed 字段（渲染/路由读的一面，
+/// `Side::from_wire` 解析）；②props `jc:fromSide`/`jc:toSide` 原串
+/// （旧快照回落面 + 未知值不丢的往返保真）。非法 side：typed None
+/// （渲染回落中心——既有容错约定），props 保留原串（向前兼容：未来
+/// 规范新值不丢）。
 fn import_edge(v: &Value) -> Option<CanvasObject> {
     let obj = v.as_object()?;
     let id = obj.get("id")?.as_str()?.to_string();
@@ -176,11 +182,21 @@ fn import_edge(v: &Value) -> Option<CanvasObject> {
     if let Some(s) = obj.get("toSide").and_then(|v| v.as_str()) {
         props.insert(P_TO_SIDE.into(), s.into());
     }
+    let from_side = obj
+        .get("fromSide")
+        .and_then(|v| v.as_str())
+        .and_then(Side::from_wire);
+    let to_side = obj
+        .get("toSide")
+        .and_then(|v| v.as_str())
+        .and_then(Side::from_wire);
     Some(CanvasObject {
         id,
         kind: ObjectKind::Edge,
         from: Some(from),
         to: Some(to),
+        from_side,
+        to_side,
         props,
         ..Default::default()
     })
@@ -205,14 +221,23 @@ pub fn export_json_canvas(objects: &[CanvasObject]) -> String {
                 e.insert("id".into(), json!(o.id));
                 e.insert("fromNode".into(), json!(from));
                 e.insert("toNode".into(), json!(to));
-                for (jk, pk) in [
-                    ("label", P_LABEL),
-                    ("color", P_COLOR),
-                    ("fromSide", P_FROM_SIDE),
-                    ("toSide", P_TO_SIDE),
-                ] {
+                for (jk, pk) in [("label", P_LABEL), ("color", P_COLOR)] {
                     if let Some(v) = o.props.get(pk) {
                         e.insert(jk.into(), json!(v));
+                    }
+                }
+                // #602：side 双通道导出——typed 值优先（SetEdgeRoute 后的
+                // 新值不被旧 props 覆盖）；typed None + 旧快照 props 有值
+                // 时回落（#444 时代快照兼容面）；双缺省不导键（不造伪值）。
+                for (typed, pk, jk) in [
+                    (o.from_side, P_FROM_SIDE, "fromSide"),
+                    (o.to_side, P_TO_SIDE, "toSide"),
+                ] {
+                    let wire = typed
+                        .map(|s| s.wire().to_string())
+                        .or_else(|| o.props.get(pk).cloned());
+                    if let Some(w) = wire {
+                        e.insert(jk.into(), json!(w));
                     }
                 }
                 edges.push(Value::Object(e));
