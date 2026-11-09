@@ -152,3 +152,40 @@ fn file_tree_open_and_reopen_use_real_shell_without_entity_reentry(cx: &mut Test
         });
     }
 }
+
+#[gpui::test]
+fn tab_close_button_closes_document_and_honors_dirty_cancel(cx: &mut TestAppContext) {
+    let (shell, mut visual) = host(cx);
+    let close = visual
+        .debug_bounds("tab-close-0")
+        .expect("each document tab has a visible close button");
+    visual.update(|_, app| {
+        let editor = shell.read(app).editor().unwrap().clone();
+        editor.update(app, |editor, cx| {
+            editor.insert_text_at(0, 0, "unsaved ", cx)
+        });
+    });
+    visual.update(|window, app| window.draw(app).clear(app));
+    visual.simulate_click(close.center(), Default::default());
+    assert!(shell.read_with(&visual, |shell, _| shell.confirm.is_some()));
+    visual.update(|window, app| {
+        shell.update(app, |shell, cx| shell.resolve_confirm(2, window, cx));
+    });
+    assert_eq!(
+        shell.read_with(&visual, |shell, _| shell.tab_count()),
+        1,
+        "cancel retains the modified tab"
+    );
+    visual.update(|window, app| window.draw(app).clear(app));
+    let close = visual.debug_bounds("tab-close-0").unwrap();
+    visual.simulate_click(close.center(), Default::default());
+    visual.update(|window, app| {
+        shell.update(app, |shell, cx| shell.resolve_confirm(1, window, cx));
+    });
+    visual.update(|window, app| window.draw(app).clear(app));
+    assert_eq!(shell.read_with(&visual, |shell, _| shell.tab_count()), 0);
+    assert!(
+        visual.debug_bounds("editor-tabs").is_none(),
+        "last tab closes back to empty state"
+    );
+}
