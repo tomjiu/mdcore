@@ -1,0 +1,21 @@
+{
+  "deterministic": true,
+  "face": "multipage_render_determinism",
+  "head": {
+    "mdc_pdfium_lib_env": "/home/z/my-project/cb634/bin/lib/libpdfium.so",
+    "pdfium_lib": {
+      "path": "/home/z/my-project/cb634/target/debug/deps/libpdfium.so",
+      "provenance": "chromium/8086（CI ci-deps-v1 同轨铆定）",
+      "role": "exe 同目录（产品部署位）",
+      "sha256": "e995a89f11d48605a79a0e44f101ca3a621e5c3ef9ee311a1405e03b44dc5b19"
+    },
+    "poppler": null
+  },
+  "pages": 120,
+  "pages_distinct": true,
+  "probe_pages_1based": [
+    1,
+    60,
+    120
+  ]
+}

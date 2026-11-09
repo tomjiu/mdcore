@@ -216,13 +216,19 @@ impl PdfThumbnailsView {
             loop {
                 cx.background_executor().timer(THUMB_POLL_MS).await;
                 let mut done = false;
-                let _ = this.update(cx, |view, cx| {
+                // #634：`update` Err（实体释放）即 break——`let _ =` 忽略
+                // 释放错误会让循环持死定时器永不退（与 pdf_pages 同款
+                // 泄漏修复）。
+                match this.update(cx, |view, cx| {
                     view.drain_replies(cx);
                     if view.pending.is_empty() {
                         view.polling = false;
                         done = true;
                     }
-                });
+                }) {
+                    Ok(()) => {}
+                    Err(_) => break, // 实体已释放——轮询链随退。
+                }
                 if done {
                     break;
                 }
