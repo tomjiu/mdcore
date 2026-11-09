@@ -75,6 +75,7 @@
 //!   待开发机（与 #302 pdf_pages 同纪律）。
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -82,7 +83,7 @@ use gpui::{
     AnyElement, App, Context, DispatchPhase, FocusHandle, Focusable, KeyDownEvent, Pixels,
     ScrollEvent, SharedString, UniformListScrollHandle, Window, px,
 };
-use mdc_office_io::io::{Book, CellData, ReadOptions};
+use mdc_office_io::io::{Book, CellData, ReadOptions, read_book_from_bytes_with_options};
 use mdc_office_io::xlsx_edit::{CellEdit, XlsxEditor};
 use ui::prelude::*;
 
@@ -251,6 +252,113 @@ fn cell_display(cell: Option<&CellData>, formula: Option<&str>) -> String {
     }
 }
 
+// 合并格值与可见覆盖格分离；仅视图内部使用，不改变公开模型字段。
+type MergeValueCache = BTreeMap<(usize, u32, u32), String>;
+
+fn value_at_absolute(sheet: &GridSheet, anchor: (u32, u32)) -> String {
+    let Some(row) = anchor.0.checked_sub(sheet.start_row) else {
+        return String::new();
+    };
+    let Some(col) = anchor.1.checked_sub(sheet.start_col) else {
+        return String::new();
+    };
+    sheet
+        .cells
+        .get(row as usize)
+        .and_then(|r| r.get(col as usize))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn initial_merge_values(model: &XlsxGridModel) -> MergeValueCache {
+    let mut values = MergeValueCache::new();
+    for (index, sheet) in model.sheets.iter().enumerate() {
+        for span in &sheet.merge_spans {
+            values.insert(
+                (index, span.abs_anchor.0, span.abs_anchor.1),
+                value_at_absolute(sheet, span.abs_anchor),
+            );
+        }
+    }
+    values
+}
+
+fn display_cell_value(
+    model: &XlsxGridModel,
+    values: &MergeValueCache,
+    index: usize,
+    row: usize,
+    col: usize,
+) -> String {
+    let Some(sheet) = model.sheets.get(index) else {
+        return String::new();
+    };
+    if let Some(anchor) = span_anchor_abs(&sheet.merge_spans, row, col) {
+        return values
+            .get(&(index, anchor.0, anchor.1))
+            .cloned()
+            .unwrap_or_else(|| value_at_absolute(sheet, anchor));
+    }
+    sheet
+        .cells
+        .get(row)
+        .and_then(|r| r.get(col))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn refresh_committed_merge_value(
+    model: &XlsxGridModel,
+    values: &mut MergeValueCache,
+    index: usize,
+    row: usize,
+    col: usize,
+    value: &str,
+) {
+    if let Some(anchor) = model
+        .sheets
+        .get(index)
+        .and_then(|sheet| span_anchor_abs(&sheet.merge_spans, row, col))
+    {
+        values.insert((index, anchor.0, anchor.1), value.to_string());
+    }
+}
+
+// 会话字节经过原Office读面，保留格式/公式缓存；无merge不增加工作。
+// 回接时读取pending后的真源，不用旧model覆盖尚未落盘的原锚新值。
+fn merge_values_from_session(
+    model: &XlsxGridModel,
+    session: &XlsxEditor,
+) -> Result<MergeValueCache, String> {
+    let mut values = initial_merge_values(model);
+    if values.is_empty() {
+        return Ok(values);
+    }
+    let bytes = session
+        .save_to_vec()
+        .map_err(|e| format!("合并格会话读取失败：{e}"))?;
+    let book = read_book_from_bytes_with_options(&bytes, &ReadOptions { compat: true })
+        .map_err(|e| format!("合并格会话解析失败：{e}"))?;
+    for (index, sheet) in model.sheets.iter().enumerate() {
+        if sheet.merge_spans.is_empty() {
+            continue;
+        }
+        let actual = book
+            .sheets
+            .get(index)
+            .filter(|actual| actual.name == sheet.name)
+            .ok_or_else(|| format!("合并格会话表映射失配：{}", sheet.name))?;
+        for span in &sheet.merge_spans {
+            let (row, col) = span.abs_anchor;
+            values.insert(
+                (index, row, col),
+                cell_display(actual.typed.get_abs(row, col), actual.formula_at(row, col)),
+            );
+        }
+    }
+    Ok(values)
+}
+
 // ---------------------------------------------------------------------------
 // #389 阶段 2：编辑纯函数面（零 GPUI——单测锚点）
 // ---------------------------------------------------------------------------
@@ -318,8 +426,19 @@ fn commit_cell_edit(
     editor
         .set_cell(sheet_idx, &cell_ref, value)
         .map_err(|e| e.to_string())?;
-    if let Some(cell_row) = model.sheets[sheet_idx].cells.get_mut(row) {
-        if let Some(text) = cell_row.get_mut(col) {
+    // 更新真实锚在模型内的槽；锚在盒外时覆盖格仍保留原数据。
+    let sheet = &mut model.sheets[sheet_idx];
+    let anchor = span_anchor_abs(&sheet.merge_spans, row, col)
+        .unwrap_or((sheet.start_row + row as u32, sheet.start_col + col as u32));
+    if let (Some(actual_row), Some(actual_col)) = (
+        anchor.0.checked_sub(sheet.start_row),
+        anchor.1.checked_sub(sheet.start_col),
+    ) {
+        if let Some(text) = sheet
+            .cells
+            .get_mut(actual_row as usize)
+            .and_then(|r| r.get_mut(actual_col as usize))
+        {
             *text = buffer.to_string();
         }
     }
@@ -505,6 +624,7 @@ struct CellEditing {
 /// XLSX 网格视图实体（#389 阶段 2：含编辑会话）。
 pub struct XlsxGridView {
     model: XlsxGridModel,
+    merge_values: MergeValueCache,
     /// 当前表（簿序索引）。
     sheet_idx: usize,
     /// 逐列宽（px——当前表；表切换时重算）。
@@ -569,7 +689,9 @@ impl XlsxGridView {
         cx: &mut App,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let merge_values = initial_merge_values(&model);
         let mut this = Self {
+            merge_values,
             sheet_idx: 0,
             col_widths: Vec::new(),
             col_offsets: Vec::new(),
@@ -588,6 +710,12 @@ impl XlsxGridView {
             notice: None,
             model,
         };
+        if let Some(session) = this.editor.as_ref() {
+            match merge_values_from_session(&this.model, session) {
+                Ok(values) => this.merge_values = values,
+                Err(error) => this.error = Some(error),
+            }
+        }
         this.recompute_col_widths();
         this
     }
@@ -596,6 +724,7 @@ impl XlsxGridView {
     pub fn error_state(message: String, cx: &mut App) -> Self {
         Self {
             model: XlsxGridModel::default(),
+            merge_values: MergeValueCache::new(),
             sheet_idx: 0,
             col_widths: Vec::new(),
             col_offsets: Vec::new(),
@@ -828,13 +957,7 @@ impl XlsxGridView {
             cx.notify();
             return;
         }
-        let current = self
-            .sheet()
-            .cells
-            .get(row)
-            .and_then(|r| r.get(col))
-            .cloned()
-            .unwrap_or_default();
+        let current = display_cell_value(&self.model, &self.merge_values, self.sheet_idx, row, col);
         self.notice = None;
         self.editing = Some(CellEditing {
             row,
@@ -850,6 +973,18 @@ impl XlsxGridView {
         let Some(ed) = self.editing.take() else {
             return;
         };
+        if ed.buffer
+            == display_cell_value(
+                &self.model,
+                &self.merge_values,
+                self.sheet_idx,
+                ed.row,
+                ed.col,
+            )
+        {
+            self.notice = None;
+            return; // 确认未改：不创造原本不存在的空锚，不置脏。
+        }
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
@@ -862,6 +997,14 @@ impl XlsxGridView {
             &ed.buffer,
         ) {
             Ok(()) => {
+                refresh_committed_merge_value(
+                    &self.model,
+                    &mut self.merge_values,
+                    self.sheet_idx,
+                    ed.row,
+                    ed.col,
+                    &ed.buffer,
+                );
                 self.dirty = true;
                 self.notice = None;
             }
@@ -1165,12 +1308,13 @@ impl XlsxGridView {
                         .map(|ed| ed.buffer.clone())
                         .unwrap_or_default()
                 } else {
-                    sheet
-                        .cells
-                        .get(span.row_start)
-                        .and_then(|row| row.get(span.col_start))
-                        .cloned()
-                        .unwrap_or_default()
+                    display_cell_value(
+                        &self.model,
+                        &self.merge_values,
+                        self.sheet_idx,
+                        span.row_start,
+                        span.col_start,
+                    )
                 }
             } else {
                 String::new()
@@ -2131,5 +2275,268 @@ mod tests {
             "merge 范围原样保留（E5:G7）"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+    mod value_fix_io_tests {
+        use super::*;
+
+        pub(super) fn fixture_bytes(visible_top: bool) -> Vec<u8> {
+            use mdc_office_io::write::{CellValue, WorkbookWriter};
+            let mut book = WorkbookWriter::new();
+            {
+                let mut sheet = book.add_sheet("Anchor values").unwrap();
+                sheet.merge(4, 4, 6, 6, "", None).unwrap();
+                if visible_top {
+                    sheet
+                        .write(0, 5, CellValue::Text("marker".into()), None)
+                        .unwrap();
+                    sheet
+                        .write(4, 5, CellValue::Text("covered-value".into()), None)
+                        .unwrap();
+                }
+                sheet
+                    .write(5, 5, CellValue::Text("covered-value".into()), None)
+                    .unwrap();
+                sheet
+                    .write(6, 6, CellValue::Text("covered-tail".into()), None)
+                    .unwrap();
+            }
+            book.save_to_vec().unwrap()
+        }
+
+        fn model(bytes: &[u8]) -> XlsxGridModel {
+            let book =
+                read_book_from_bytes_with_options(bytes, &ReadOptions { compat: true }).unwrap();
+            XlsxGridModel::from_book(&book)
+        }
+
+        #[test]
+        fn empty_original_anchor_is_displayed_and_prefilled_as_empty() {
+            let bytes = fixture_bytes(false);
+            let model = model(&bytes);
+            let editor = XlsxEditor::open(&bytes).unwrap();
+            let values = merge_values_from_session(&model, &editor).unwrap();
+            assert_eq!(
+                (model.sheets[0].start_row, model.sheets[0].start_col),
+                (5, 5)
+            );
+            assert_eq!(display_cell_value(&model, &values, 0, 0, 0), "");
+            assert_eq!(model.sheets[0].cells[0][0], "covered-value");
+        }
+
+        #[test]
+        fn confirming_without_input_does_not_copy_the_covered_value() {
+            let bytes = fixture_bytes(false);
+            let mut model = model(&bytes);
+            let mut editor = XlsxEditor::open(&bytes).unwrap();
+            let mut values = merge_values_from_session(&model, &editor).unwrap();
+            let value = display_cell_value(&model, &values, 0, 0, 0);
+            commit_cell_edit(&mut editor, &mut model, 0, 0, 0, &value).unwrap();
+            refresh_committed_merge_value(&model, &mut values, 0, 0, 0, &value);
+            let mut reopened = XlsxEditor::open(&editor.save_to_vec().unwrap()).unwrap();
+            assert!(
+                reopened
+                    .cell_info(0, "E5")
+                    .unwrap()
+                    .map(|c| c.text)
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+            assert_eq!(
+                reopened.cell_info(0, "F6").unwrap().unwrap().text,
+                "covered-value"
+            );
+            assert_eq!(
+                reopened.cell_info(0, "G7").unwrap().unwrap().text,
+                "covered-tail"
+            );
+        }
+
+        #[test]
+        fn consecutive_edits_and_session_restore_keep_anchor_and_covered_data_separate() {
+            let bytes = fixture_bytes(false);
+            let mut model = model(&bytes);
+            let mut values = initial_merge_values(&model);
+            let mut editor = XlsxEditor::open(&bytes).unwrap();
+            commit_cell_edit(&mut editor, &mut model, 0, 0, 0, "first").unwrap();
+            refresh_committed_merge_value(&model, &mut values, 0, 0, 0, "first");
+            assert_eq!(display_cell_value(&model, &values, 0, 0, 0), "first");
+            assert_eq!(model.sheets[0].cells[0][0], "covered-value");
+            let restored = merge_values_from_session(&model, &editor).unwrap();
+            assert_eq!(display_cell_value(&model, &restored, 0, 0, 0), "first");
+            commit_cell_edit(&mut editor, &mut model, 0, 0, 0, "second").unwrap();
+            refresh_committed_merge_value(&model, &mut values, 0, 0, 0, "second");
+            assert_eq!(display_cell_value(&model, &values, 0, 0, 0), "second");
+            let saved = editor.save_to_vec().unwrap();
+            let mut reopened = XlsxEditor::open(&saved).unwrap();
+            assert_eq!(reopened.cell_info(0, "E5").unwrap().unwrap().text, "second");
+            assert_eq!(
+                reopened.cell_info(0, "F6").unwrap().unwrap().text,
+                "covered-value"
+            );
+            assert_eq!(
+                reopened.cell_info(0, "G7").unwrap().unwrap().text,
+                "covered-tail"
+            );
+            let book =
+                read_book_from_bytes_with_options(&saved, &ReadOptions { compat: true }).unwrap();
+            assert_eq!(
+                (book.sheets[0].merges[0].start, book.sheets[0].merges[0].end),
+                ((4, 4), (6, 6))
+            );
+        }
+    }
+
+    // 实际窗口事件路径；不把本case冒称本地真机/截图验证。
+    #[gpui::test]
+    fn original_anchor_double_click_reedit_session_restore_and_save(cx: &mut gpui::TestAppContext) {
+        let bytes = value_fix_io_tests::fixture_bytes(true);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("merge-values-{}-{nonce}.xlsx", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let model = XlsxGridModel::load(&path).unwrap();
+        assert_eq!(model.sheets[0].start_col, 5); // E5原锚在F列起的数据盒外。
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot = None;
+        let window = cx.add_window(|_, cx| {
+            let view = cx.new(|cx| XlsxGridView::new(model, path.clone(), cx));
+            slot = Some(view.clone());
+            GridHost(view)
+        });
+        let mut view = slot.unwrap();
+        let (x, y) = window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
+                    (GUTTER_W + v.col_offsets[0] + 5.0, 4.0 * ROW_H + ROW_H / 2.0)
+                })
+            })
+            .unwrap();
+        grid_redraw(&window, cx);
+        grid_click_at(&window, cx, x, y, 2);
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
+                    assert_eq!(v.selected_a1().as_deref(), Some("E5"));
+                    assert_eq!(
+                        v.editing.as_ref().unwrap().buffer,
+                        "",
+                        "空E5不应预填F5/F6覆盖值"
+                    );
+                    assert_eq!(display_cell_value(&v.model, &v.merge_values, 0, 4, 0), "");
+                })
+            })
+            .unwrap();
+        grid_key_down(&window, cx, grid_key_event("enter", None, false));
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
+                    assert!(!v.is_modified(), "确认未改不置脏");
+                })
+            })
+            .unwrap();
+        for (input, expected_before, expected_after) in
+            [("first", "", "first"), ("-second", "first", "first-second")]
+        {
+            grid_redraw(&window, cx);
+            grid_click_at(&window, cx, x, y, 2);
+            window
+                .update(cx, |_, _, cx| {
+                    view.update(cx, |v, _| {
+                        assert_eq!(v.editing.as_ref().unwrap().buffer, expected_before);
+                    })
+                })
+                .unwrap();
+            for ch in input.chars() {
+                let character = ch.to_string();
+                grid_key_down(
+                    &window,
+                    cx,
+                    grid_key_event(&character, Some(&character), false),
+                );
+            }
+            grid_key_down(&window, cx, grid_key_event("enter", None, false));
+            window
+                .update(cx, |_, _, cx| {
+                    view.update(cx, |v, _| {
+                        assert_eq!(
+                            display_cell_value(&v.model, &v.merge_values, 0, 4, 0),
+                            expected_after
+                        );
+                        assert_eq!(
+                            v.model.sheets[0].cells[4][0], "covered-value",
+                            "F5模型槽保持原值"
+                        );
+                    })
+                })
+                .unwrap();
+        }
+        // 模拟Shell会话银行：磁盘model仍旧，pending会话必须提供新E5值。
+        let (session, dirty) = window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
+                    let session = v.take_session().unwrap();
+                    (session, v.is_modified())
+                })
+            })
+            .unwrap();
+        let old_model = XlsxGridModel::load(&path).unwrap();
+        let next = window
+            .update(cx, |_, _, cx| {
+                cx.new(|cx| XlsxGridView::new_with_session(old_model, path.clone(), session, cx))
+            })
+            .unwrap();
+        window
+            .update(cx, |host, _, cx| {
+                next.update(cx, |v, _| v.set_modified(dirty));
+                host.0 = next.clone();
+                cx.notify();
+            })
+            .unwrap();
+        view = next;
+        grid_redraw(&window, cx);
+        grid_click_at(&window, cx, x, y, 2);
+        window
+            .update(cx, |_, _, cx| {
+                view.update(cx, |v, _| {
+                    assert_eq!(
+                        v.editing.as_ref().unwrap().buffer,
+                        "first-second",
+                        "旧model不得覆盖会话E5新值"
+                    );
+                })
+            })
+            .unwrap();
+        grid_key_down(&window, cx, grid_key_event("enter", None, false));
+        grid_redraw(&window, cx);
+        grid_key_down(&window, cx, grid_key_event("s", None, true));
+        let saved = std::fs::read(&path).unwrap();
+        let mut reopened = XlsxEditor::open(&saved).unwrap();
+        assert_eq!(
+            reopened.cell_info(0, "E5").unwrap().unwrap().text,
+            "first-second"
+        );
+        for reference in ["F5", "F6"] {
+            assert_eq!(
+                reopened.cell_info(0, reference).unwrap().unwrap().text,
+                "covered-value"
+            );
+        }
+        assert_eq!(
+            reopened.cell_info(0, "G7").unwrap().unwrap().text,
+            "covered-tail"
+        );
+        let book =
+            read_book_from_bytes_with_options(&saved, &ReadOptions { compat: true }).unwrap();
+        assert_eq!(
+            (book.sheets[0].merges[0].start, book.sheets[0].merges[0].end),
+            ((4, 4), (6, 6))
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
