@@ -123,6 +123,9 @@ mod docx_panic_guard;
 // RevisionMark + DocxWriter 修订段发射（对 DocxWriter 的分文件 impl
 // 桥——style/numbering 先例同款）。
 pub mod docx_revision;
+// #617：DOCX TOC 自动重算（读面标题树派生 + 内容寻址稳定书签名 +
+// PAGEREF 缓存语义——静态 TOC #196 的重算对偶面）。
+pub mod docx_toc;
 // #307 阶段①：DOCX → PDF 导出桥（LibreOffice headless 通道——探测/
 // 独立 profile/超时/分类错误含无 LO 安装指引）。
 pub mod anonymize;
