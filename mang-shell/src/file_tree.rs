@@ -32,6 +32,11 @@
 //! ShellApp 耦合经 [`FileTreeHooks`] 钩子注入（本模块 lib 化——
 //! 测试 CI 可见，outline_panel #571 先例二次应用）。
 //!
+//! #595 光标路径身份：所有行集变更（reload / forget_subtree /
+//! expand_to / 目录 toggle——键与点击）经 `mutate_rows_keep_cursor`
+//! 重绑定——序号只是显示位，**路径才是光标身份**（刷新增删行后
+//! Enter 打开的仍是当初选中的文件；目标不可见则清空光标）。
+//!
 //! #385 批 5b：行渲染迁 `ui::ListItem`（zed ui 组件族——缩进/hover/
 //! 选中/左右键接线经组件语义，非手写仿制）。**uniform_list 虚拟化保
 //! 留**（ui::List 为非虚拟化容器，「1000+ 文件只布局可视行」不变量
@@ -319,15 +324,42 @@ impl FileTree {
         cx.notify();
     }
 
+    /// #595：行集变更的光标重绑定——**路径身份优先**，防刷新后漂移误开。
+    ///
+    /// 变更前记下光标行的真实路径；变更后按路径在新可见行集中重定位
+    ///（同一文件仍是光标——Enter 打开的就是当初选中的那个）。路径
+    /// 消失/不可见（删除、折叠祖先、子树遗忘）→ 清空光标（None
+    /// 语义保持，Enter 真空操作不误开其它文件）。序号位移时滚动跟随
+    /// Nearest（复用 move_cursor 同策略——可视行不动，离屏行就近带回）。
+    /// 无光标时零副作用（None 不被凭空点亮）。
+    fn mutate_rows_keep_cursor(&mut self, mutate: impl FnOnce(&mut TreeState)) {
+        let selected_path = self
+            .selected
+            .and_then(|ix| {
+                let rows = self.state.visible_rows();
+                rows.get(ix).map(|row| row.path.clone())
+            });
+        mutate(&mut self.state);
+        self.selected = selected_path.and_then(|path| {
+            let rows = self.state.visible_rows();
+            rows.iter().position(|row| row.path == path)
+        });
+        if let Some(ix) = self.selected {
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
+    }
+
     /// #575：Enter 激活光标行（与点击同链）：目录 = 展开/折叠；
-    /// 文件 = open_file 钩子（bin 面含焦点落位）。
+    /// 文件 = open_file 钩子（bin 面含焦点落位）。#595：目录 toggle
+    /// 也经路径重绑定（光标留在被翻转的目录行，语义与身份都不漂）。
     fn activate_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.selected else { return };
         let Some(row) = self.state.visible_rows().get(ix).cloned() else {
             return;
         };
         if row.is_dir {
-            self.state.toggle(&row.path);
+            let path = row.path.clone();
+            self.mutate_rows_keep_cursor(|state| state.toggle(&path));
             cx.notify();
         } else {
             let hook = self.hooks.open_file.clone();
@@ -345,19 +377,22 @@ impl FileTree {
         self.state.set_active_file(path);
     }
 
-    /// #166：fs 变更后重读目录清单（转发到状态机）。
+    /// #166：fs 变更后重读目录清单（转发到状态机）。#595：经路径
+    /// 重绑定——刷新插入/删除行后光标仍是原文件，目标不可见则清空。
     pub fn reload(&mut self, dir: &Path) {
-        self.state.reload(dir);
+        self.mutate_rows_keep_cursor(|state| state.reload(dir));
     }
 
-    /// #166：丢弃已删除目录的展开态与缓存（转发到状态机）。
+    /// #166：丢弃已删除目录的展开态与缓存（转发到状态机）。#595：经
+    /// 路径重绑定——遗忘子树后光标下的行消失则清空，不误指其它路径。
     pub fn forget_subtree(&mut self, dir: &Path) {
-        self.state.forget_subtree(dir);
+        self.mutate_rows_keep_cursor(|state| state.forget_subtree(dir));
     }
 
-    /// #166：展开到文件（转发到状态机）。
+    /// #166：展开到文件（转发到状态机）。#595：经路径重绑定——展开
+    /// 增行位移后光标路径身份保持。
     pub fn expand_to(&mut self, file: &Path) {
-        self.state.expand_to(file);
+        self.mutate_rows_keep_cursor(|state| state.expand_to(file));
     }
 }
 
@@ -483,7 +518,9 @@ impl FileTree {
             let tree_focus = this.tree_focus.clone();
             tree_focus.focus(window, cx);
             if is_dir {
-                this.state.toggle(&path);
+                // #595：目录 toggle 也走路径重绑定（被点目录行即新光标
+                // 身份——统一不变量：所有行集变更经重绑定）。
+                this.mutate_rows_keep_cursor(|state| state.toggle(&path));
                 cx.notify();
             } else {
                 // #575：ShellApp 面 → open_file 钩子（bin 注入——lib 化）。
@@ -913,5 +950,221 @@ mod keyboard_tests {
             "Enter 文件 → open_file 钩子携该路径触发"
         );
         let _ = (dir_ix, dir_path);
+    }
+
+    // -------------------------------------------------------------------
+    // #595：刷新/行集变更后的光标路径身份（按路径重绑定，防误开）。
+    // 全部走真实 GPUI 键路（SelectNext / Confirm 派发 + FileTreeHooks
+    // 捕获）与真实临时目录——不测 index 补偿模拟器。
+    // -------------------------------------------------------------------
+
+    /// 光标行当前路径（断言辅助——经 selected 序号读真实行）。
+    fn selected_path(
+        tree: &Entity<FileTree>,
+        visual: &gpui::VisualTestContext,
+    ) -> Option<PathBuf> {
+        tree.read_with(visual, |t, _| {
+            let rows = t.state.visible_rows();
+            t.selected
+                .and_then(|ix| rows.get(ix))
+                .map(|row| row.path.clone())
+        })
+    }
+
+    /// 光标落位辅助：重置 None 后连续 SelectNext 直至目标路径
+    /// （真实键路；从 None 起步，步数 = 目标行号 + 1，确定性落位）。
+    fn focus_and_step_to(
+        tree: &Entity<FileTree>,
+        visual: &mut gpui::VisualTestContext,
+        target: &Path,
+    ) {
+        tree.update(visual, |t, _| t.selected = None);
+        let steps = tree.read_with(visual, |t, _| {
+            t.state
+                .visible_rows()
+                .iter()
+                .position(|r| r.path == target)
+                .expect("目标行在可见行集中")
+                + 1 // None 起：+1 次到达目标序号
+        });
+        let focus = tree.read_with(visual, |t, _| t.tree_focus.clone());
+        visual.update(|window, cx| focus.focus(window, cx));
+        for _ in 0..steps {
+            visual.dispatch_action(menu::SelectNext);
+        }
+        tree.read_with(visual, |t, _| {
+            let rows = t.state.visible_rows();
+            let row = rows.get(t.selected.unwrap()).unwrap();
+            assert_eq!(row.path, target, "键路落位：光标应在目标行");
+        });
+    }
+
+    /// #595 验收 1：刷新插入排序更早的行后，Enter 打开的仍是当初
+    /// 选中的文件（c.md），不是同序号的位移行（基线红：a.md）。
+    #[gpui::test]
+    fn reload_rebinds_cursor_by_path_not_index(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("kb-595-rebind");
+        let sub = root.join("sub");
+        let c_md = sub.join("c.md");
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let (tree, mut visual) = tree_window(cx, root.clone(), opened.clone());
+
+        // 真实键路：光标到 sub/c.md（行集 [root, sub, c.md, deep, A.md,
+        // b.md]，c.md index 2——expand_to 模拟 shell 打开文件后的展开同步）。
+        tree.update(&mut visual, |t, _| t.expand_to(&c_md));
+        focus_and_step_to(&tree, &mut visual, &c_md);
+
+        // fs 变更：sub 下新建 a.md（排序先于 c.md——行集前插一位）+ reload。
+        std::fs::write(sub.join("a.md"), "a").unwrap();
+        tree.update(&mut visual, |t, _| t.reload(&sub));
+
+        // Enter：必须仍是 c.md（不是同序号位移后的 a.md）。
+        visual.dispatch_action(menu::Confirm);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [c_md.clone()],
+            "#595 核心：刷新后 Enter 打开的仍是当初选中的 c.md（基线红：a.md）"
+        );
+        assert_eq!(
+            selected_path(&tree, &visual),
+            Some(c_md),
+            "光标路径身份保持"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #595 验收 2：删除更早条目（选中路径仍在）不跳；删除选中条目
+    /// 或折叠其祖先（forget_subtree）→ 清空光标，Enter 不触发别的路径。
+    #[gpui::test]
+    fn reload_removal_and_forget_clear_or_keep_cursor(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("kb-595-removal");
+        let sub = root.join("sub");
+        let a_md = root.join("A.md");
+        let c_md = sub.join("c.md");
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let (tree, mut visual) = tree_window(cx, root.clone(), opened.clone());
+        tree.update(&mut visual, |t, _| t.expand_to(&c_md));
+
+        // ① 光标在 A.md（index 4）；删除更早条目 sub/c.md + reload →
+        //    A.md 上移至 3。Enter 必须仍是 A.md（基线红：旧序号 4 落到
+        //    b.md 行 → 误开 b.md）。
+        focus_and_step_to(&tree, &mut visual, &a_md);
+        std::fs::remove_file(&c_md).unwrap();
+        tree.update(&mut visual, |t, _| t.reload(&sub));
+        visual.dispatch_action(menu::Confirm);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [a_md.clone()],
+            "更早条目删除后 Enter 仍是 A.md（不跳到 b.md 的旧序号）"
+        );
+
+        // ② 删除选中条目 A.md + reload → 光标清空；Enter 不触发别的
+        //    路径（基线红：序号 3 落到 b.md 行 → 误开 b.md）。
+        std::fs::remove_file(&a_md).unwrap();
+        tree.update(&mut visual, |t, _| t.reload(&root));
+        assert_eq!(
+            selected_path(&tree, &visual),
+            None,
+            "选中条目删除后光标清空（None 语义）"
+        );
+        let before_len = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        visual.dispatch_action(menu::Confirm);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [a_md],
+            "清空光标后 Enter 零新增打开（仅剩 ① 的那一次）"
+        );
+        assert_eq!(
+            tree.read_with(&visual, |t, _| t.state.visible_rows().len()),
+            before_len,
+            "Enter 不误触发目录展开（清空光标 = 真空操作）"
+        );
+
+        // ③ 折叠其祖先（右键删除目录 → forget_subtree 同款状态面）
+        //    ——新夹具防状态串扰：光标在 sub/c.md，遗忘 sub → 不可见
+        //    → 清空；Enter 不误开（基线红：序号落到 A.md 行 → 误开）。
+        let root3 = temp_fixture("kb-595-forget");
+        let sub3 = root3.join("sub");
+        let c_md3 = sub3.join("c.md");
+        let opened3: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let (tree3, mut visual3) = tree_window(cx, root3.clone(), opened3.clone());
+        tree3.update(&mut visual3, |t, _| t.expand_to(&c_md3));
+        focus_and_step_to(&tree3, &mut visual3, &c_md3);
+        tree3.update(&mut visual3, |t, _| t.forget_subtree(&sub3));
+        assert_eq!(
+            selected_path(&tree3, &visual3),
+            None,
+            "祖先折叠/子树遗忘后光标清空"
+        );
+        visual3.dispatch_action(menu::Confirm);
+        assert!(
+            opened3.lock().unwrap().is_empty(),
+            "Enter 不触发别的路径（基线红：误开 A.md）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root3);
+    }
+
+    /// #595 验收 3：大树（超视口滚动面）+ expand_to 增行后仍保持
+    /// 正确路径；目录 Enter 折叠/展开后光标仍在该目录行；None 状态
+    /// 与上下界夹取不回归。
+    #[gpui::test]
+    fn big_tree_expand_and_dir_toggle_keep_cursor(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("kb-595-big");
+        // 40 个文件（f00–f39）——行集 44 条 > 视口（400px/22px≈18 行），
+        // 光标行必然经历虚拟化滚动面。
+        for i in 0..40 {
+            std::fs::write(root.join(format!("f{i:02}.md")), "f").unwrap();
+        }
+        let last = root.join("f39.md");
+        let sub = root.join("sub");
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let (tree, mut visual) = tree_window(cx, root.clone(), opened.clone());
+
+        // 光标到末行 f39（None 起步 44 步，含末界夹取面）。
+        focus_and_step_to(&tree, &mut visual, &last);
+
+        // expand_to(sub/deep/d.md)——行集前插 4 行（sub/deep 展开）。
+        tree.update(&mut visual, |t, _| {
+            t.expand_to(&sub.join("deep").join("d.md"))
+        });
+        assert_eq!(
+            selected_path(&tree, &visual),
+            Some(last.clone()),
+            "增行位移后光标路径身份保持（f39 仍选中；基线红：序号落到 f36）"
+        );
+        visual.dispatch_action(menu::Confirm);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            [last.clone()],
+            "大树滚动 + expand_to 后 Enter 仍打开当初选中的 f39"
+        );
+
+        // 目录 Enter：光标到 sub → Enter 展开 → 光标仍在 sub 行（目录
+        // 折叠/展开语义 + 光标身份都不回归）。
+        focus_and_step_to(&tree, &mut visual, &sub);
+        let sub_len_before = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        visual.dispatch_action(menu::Confirm);
+        let after = tree.read_with(&visual, |t, _| {
+            let rows = t.state.visible_rows();
+            (
+                rows.len(),
+                t.selected
+                    .and_then(|ix| rows.get(ix))
+                    .map(|r| r.path.clone()),
+            )
+        });
+        assert_ne!(after.0, sub_len_before, "Enter 目录 → 展开态翻转");
+        assert_eq!(after.1, Some(sub.clone()), "折叠/展开后光标仍在该目录行");
+        assert_eq!(opened.lock().unwrap().len(), 1, "目录 Enter 不开文件");
+
+        // 无光标状态回归：None + reload + Enter → 不开、不崩。
+        tree.update(&mut visual, |t, _| t.selected = None);
+        std::fs::write(root.join("f99.md"), "f").unwrap();
+        tree.update(&mut visual, |t, _| t.reload(&root));
+        assert_eq!(selected_path(&tree, &visual), None, "None 光标 reload 后仍 None");
+        visual.dispatch_action(menu::Confirm);
+        assert_eq!(opened.lock().unwrap().len(), 1, "无光标 Enter 零副作用");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
