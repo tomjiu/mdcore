@@ -757,6 +757,18 @@ impl XlsxGridView {
         self.dirty
     }
 
+    /// 编辑态只读探针（#604 shell 收口回归断言——双击进入/Enter
+    /// 提交后确认缓冲生命周期，跨模块只读不触内部结构）。
+    pub fn editing_active(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// 状态条文案只读探针（#604 失败面断言——编辑会话拒因/保存错误
+    /// 的非静默示警面，跨模块只读）。
+    pub fn notice_message(&self) -> Option<String> {
+        self.notice.clone()
+    }
+
     /// 脏标记回置（shell 会话银行回接时随行——`ensure_xlsx_grid` 消费）。
     pub fn set_modified(&mut self, dirty: bool) {
         self.dirty = dirty;
