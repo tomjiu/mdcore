@@ -151,3 +151,9 @@ pub mod file_tree;
 /// parse_log 等）随模块进 lib 树（原挂 bin = 假绿——本批修复）。
 #[path = "git_panel.rs"]
 pub mod git_panel;
+
+/// #555：XLSX 合并单元格几何（范围携带 + guard 裁剪 + 命中映射 +
+/// span 像素/边框分段——纯函数层零 GPUI 依赖，`xlsx_grid_view`
+/// 的模型/绘制/编辑接线消费）。
+#[path = "xlsx_merge_geometry.rs"]
+pub mod xlsx_merge_geometry;

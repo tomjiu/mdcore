@@ -119,6 +119,9 @@ mod tab_bar;
 mod theme_switch;
 mod title_bar;
 mod xlsx_grid_view;
+// #555：XLSX 合并单元格几何（xlsx_grid_view 的纯函数几何层——bin 根
+// 声明，lib.rs 侧 `pub mod xlsx_merge_geometry;` 双根同款）。
+mod xlsx_merge_geometry;
 
 // #333：Wayland seat 前置探测（Linux 门控见模块内 cfg；跨平台无操作
 // 占位）——在 application() 之前拦截「无 wl_seat 合成器」场景，把

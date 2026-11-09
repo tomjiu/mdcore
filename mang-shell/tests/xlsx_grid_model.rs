@@ -154,6 +154,11 @@ fn grid_model_from_book_is_pure() {
         );
         assert_eq!(sa.truncated, sb.truncated, "护栏标记");
         assert_eq!(sa.merges, sb.merges, "合并计数");
+        // #555：合并范围纯函数性（显示坐标 + guard 裁剪结果逐段相等）。
+        assert_eq!(
+            sa.merge_spans, sb.merge_spans,
+            "合并范围逐段相等（无隐藏状态/坐标漂移）"
+        );
     }
     assert_eq!(a.truncated_sheets, b.truncated_sheets, "护栏计数");
 }
