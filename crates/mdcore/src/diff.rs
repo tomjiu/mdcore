@@ -13,14 +13,24 @@
 //! Modified 块 → #413 `insert_run_revised`/`delete_run_revised` 落成
 //! Word 修订标记；Modified 块经 L2 定位到片段。
 //!
-//! ## 对齐策略（issue 三步——按 #415 现状裁剪）
+//! ## 对齐策略（issue 三步——按 #415/#456 现状裁剪）
 //!
 //! issue 原文「① 按 block_id 匹配（如果稳定）② 按内容相似度 ③ 纯
-//! 增删」。**#415 在档：块 ID 重编号撞号缺陷（P0-1）未修，ID 当前
-//! 不是稳定锚**——独立 parse 的两版文档 ID 空间各自从 1 发号（位置
-//! 序），按 ID 对齐会把无关块配成对（错锚）。因此 v0 **不作 ID 锚**
-//! （ID 仅在 [`BlockDiff::old_id`]/[`BlockDiff::new_id`] 报告，供
-//! 消费方展示/追踪），对齐全走内容面：
+//! 增删」。**#415/#456 已闭：P0-1 重编号撞号修复 + 身份验收合入**
+//! （#244→PR #249 meta v2 ID 持久化 + r30 三条不变性锁）——同谱系
+//! 文档（capture/restore、save→open meta v2——ID 同源）的块 ID
+//! 是最强锚。但两份**独立** `from_markdown` 的 ID 空间各自位置序
+//! 发号（1..N，重叠），跨谱系按 ID 对齐 = 错锚。因此入口分两形：
+//!
+//! - [`diff_documents`] / [`diff_markdown`]（默认）：**不作 ID 锚**
+//!   （ID 仅在 [`BlockDiff::old_id`]/[`BlockDiff::new_id`] 报告），
+//!   对齐全走内容面——语义零漂移；
+//! - [`diff_documents_lineage`]（#599）：显式同谱系入口——调用方
+//!   声明两侧 ID 同源，第 0 步 ID pass 优先占用唯一配对（同 ID
+//!   异文 → Modified，不受文本阈值拆分；同 ID 改 kind → 显式
+//!   拆分 Removed+Added——见下）。
+//!
+//! 内容面步序（两入口共用 [`align`] 实现）：
 //!
 //! 1. **精确匹配**：`(BlockKind, 归一化文本)` 签名——行尾空白与
 //!    末行换行归一（重排序列化不产生伪差），代码块/公式内部逐字
@@ -29,14 +39,19 @@
 //!    相似度贪心配对（阈值 [`SIMILARITY_THRESHOLD`]，窗口
 //!    [`SIMILARITY_WINDOW`] 界住平方面）；
 //! 3. **剩余**：旧侧未配 = Removed，新侧未配 = Added；
-//! 4. **Moved 判定**：精确配对做 LIS（最长递增子序列，O(n log n)）
-//!    ——LIS 内 = Unchanged（原位）、LIS 外 = Moved（纯移动 ≠ 删除
-//!    + 新增）。相似配对（Modified）不参与 Moved 二分：
+//! 4. **Moved 判定**：同文 ID 对（谱系入口）与精确文本对**共用**
+//!    全局 LIS（最长递增子序列，O(n log n)）——LIS 内 = Unchanged
+//!    （原位）、LIS 外 = Moved（纯移动 ≠ 删除 + 新增）。相似配对
+//!    （Modified）不参与 Moved 二分：
 //!    - 内容变化为主标签（Modified）；
 //!    - 位置变化可由 old_index/new_index 观察（如实不折叠）。
 //!
-//! #415 修复后可加「ID 先行匹配」作为第 0 步（同谱系文档——保存档
-//! vs 编辑档——ID 是最强锚），本模块的对齐管线已按可插拔步序组织。
+//! **同 ID 改 BlockKind（#599 契约）**：谱系入口的 ID pass 仅配
+//! 同 kind 的同 ID 对——kind 变更（如段落→标题）**显式拆分**为
+//! Removed（旧型携旧侧 ID）+ Added（新型携新侧 ID，同一 ID 值——
+//! 身份仍可观察），不输出双侧异型的 Modified（[`BlockDiff::block_kind`]
+//! 双侧同型契约不得默默破坏）。文本 pass 同样要求同 kind，拆分
+//! 结果与内容面自然一致。
 //!
 //! ## L2：行内 diff（零新依赖的 clean-room Myers）
 //!
@@ -133,10 +148,35 @@ const SIMILARITY_WINDOW: usize = 96;
 /// Moved/Modified 按新序，Removed 按旧序插回其邻位之后）。
 ///
 /// 等价糖衣 [`diff_markdown`]（两段 MD 直 diff）。
+///
+/// **默认入口不作 ID 锚**（两侧可能各自独立 parse——位置序 ID 空间
+/// 重叠，错锚；见模块文档）。同谱系（ID 同源）请走
+/// [`diff_documents_lineage`]。
 pub fn diff_documents(old: &Core, new: &Core) -> Vec<BlockDiff> {
     let old_blocks = flatten(old);
     let new_blocks = flatten(new);
     align(&old_blocks, &new_blocks)
+}
+
+/// #599：同谱系块级 diff——第 0 步 ID pass 优先占用唯一配对。
+///
+/// **谱系前提（调用方声明）**：两侧 Core 的块 ID 同源——capture/
+/// restore、`save_document`→`open_document`（meta v2 ID 持久化）
+/// 等路径。两份独立 `from_markdown` 的 ID 空间各自位置序发号
+/// （重叠），走本入口 = 错锚（伪 Modified）。
+///
+/// 语义（相对 [`diff_documents`] 的唯一增量 = 第 0 步）：
+/// - 同 ID 同 kind：优先配对（唯一占用）——异文 → Modified
+///   （不受 [`SIMILARITY_THRESHOLD`] 拆分），同文 → 参与全局 LIS
+///   （Unchanged/Moved 判定与精确文本对共用）；
+/// - 同 ID 改 kind：显式拆分 Removed（旧型）+ Added（新型）——
+///   [`BlockDiff::block_kind`] 双侧同型契约保持（见模块文档）；
+/// - 后续精确/相似 pass 跳过已占 old/new（不覆盖配对、不复用
+///   new、不丢事件）。
+pub fn diff_documents_lineage(old: &Core, new: &Core) -> Vec<BlockDiff> {
+    let old_blocks = flatten(old);
+    let new_blocks = flatten(new);
+    align_with_id_pass(&old_blocks, &new_blocks)
 }
 
 /// MD 文本直 diff（`from_markdown` 双侧 + [`diff_documents`]）。
@@ -190,15 +230,58 @@ fn normalize_block_text(text: &str) -> String {
 }
 
 /// 对齐主体（纯函数——旧/新扁平块 → diff 序）。
+///
+/// 默认面（内容锚）——语义与 #414 交付零漂移。谱系面见
+/// [`align_with_id_pass`]（共用 [`align_impl`]，第 0 步 ID pass 开）。
 fn align(old: &[FlatBlock], new: &[FlatBlock]) -> Vec<BlockDiff> {
-    // 配对表：old_idx → new_idx（精确 + 相似两 pass 填充）。
+    align_impl(old, new, false)
+}
+
+/// #599：谱系对齐（第 0 步 ID pass 开——见 [`diff_documents_lineage`]）。
+fn align_with_id_pass(old: &[FlatBlock], new: &[FlatBlock]) -> Vec<BlockDiff> {
+    align_impl(old, new, true)
+}
+
+/// 对齐实现（`id_pass` = 谱系入口的第 0 步开关；步序见模块文档）。
+fn align_impl(old: &[FlatBlock], new: &[FlatBlock], id_pass: bool) -> Vec<BlockDiff> {
+    // 配对表：old_idx → new_idx（ID/精确/相似三 pass 填充）。
     let mut pair_old_new: Vec<Option<usize>> = vec![None; old.len()];
     let mut paired_new = vec![false; new.len()];
+    // 同文配对表（ID 同文对 + 精确文本对——共用全局 LIS）。
+    let mut exact: Vec<(usize, usize)> = Vec::new();
+
+    // --- pass 0（仅谱系入口）：同 ID 优先占用唯一配对。同 ID 同 kind
+    //     才配（改 kind = 显式拆分 Removed+Added——模块文档契约）；
+    //     同文 ID 对入 exact（与精确文本对共用 LIS）；异文 ID 对
+    //     仅占位（Modified——组装段判定）。新侧 ID 首现胜（同谱系
+    //     ID 唯一是树不变量，防御位不取尽）。
+    if id_pass {
+        use std::collections::HashMap;
+        let mut id_map: HashMap<u64, usize> = HashMap::with_capacity(new.len());
+        for (j, b) in new.iter().enumerate() {
+            id_map.entry(b.id.0).or_insert(j);
+        }
+        for (i, b) in old.iter().enumerate() {
+            let Some(&j) = id_map.get(&b.id.0) else {
+                continue;
+            };
+            if paired_new[j] || old[i].kind != new[j].kind {
+                continue; // 已占（防御）/ 改 kind（显式拆分——不配）
+            }
+            pair_old_new[i] = Some(j);
+            paired_new[j] = true;
+            if same_text(&old[i].text, &new[j].text) {
+                exact.push((i, j)); // 同文 ID 对共用全局 LIS
+            }
+        }
+    }
 
     // --- pass 1：精确签名匹配（同内容重复块按先到先配——多副本
     // 场景（同文重复段）按序配对，语义稳定可预测）。签名键 =
     // (kind 判别值, 归一文本)——BlockKind 无 Hash derive（树模块
     // 原有 derive 面不为本模块扩），无字段枚举 `as u8` 即稳定判别。
+    // 已占面（ID pass）跳过：旧侧已配不重配；新侧队首已占则丢弃
+    // 继续弹（已占位不可复用——不覆盖 ID 配对/不偷 new 块）。
     use std::collections::{HashMap, VecDeque};
     // 键借用两侧切片的文本（old/new 同函数存活——零 clone，万块级
     // 文档的匹配主面免 2N 次字符串拷贝）。
@@ -209,13 +292,19 @@ fn align(old: &[FlatBlock], new: &[FlatBlock]) -> Vec<BlockDiff> {
             .or_default()
             .push_back(j);
     }
-    let mut exact: Vec<(usize, usize)> = Vec::new();
     for (i, b) in old.iter().enumerate() {
+        if pair_old_new[i].is_some() {
+            continue; // ID pass 已占
+        }
         if let Some(queue) = sig_map.get_mut(&(b.kind as u8, b.text.as_str())) {
-            if let Some(j) = queue.pop_front() {
+            while let Some(j) = queue.pop_front() {
+                if paired_new[j] {
+                    continue; // ID pass 已占（不可复用）——丢弃继续弹
+                }
                 pair_old_new[i] = Some(j);
                 paired_new[j] = true;
                 exact.push((i, j));
+                break;
             }
         }
     }
