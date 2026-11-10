@@ -1,0 +1,2160 @@
+{
+  "task": "#634 PDFium 正确显示专项——引擎层显示矩阵",
+  "generator": "gen_display_matrix.py（确定性生成；reportlab 基础 + pypdf 后处理/独立几何）",
+  "geometry_source": "pypdf 独立解析（跨引擎断言基准——不信任 pdfium 自报）",
+  "poppler_reference": "pdftoppm -cropbox -gray -r <dpi>（显示域口径与 pdfium 对齐）",
+  "fixtures": [
+    {
+      "file": "chinese_embedded.pdf",
+      "notes": "嵌入 NotoSansSC 子集——两引擎字形一致（IoU 单列 0.70：文本页大量抗锯齿边缘格在软墨量两侧分布，实测基线 0.733）",
+      "probe_pages": [
+        1,
+        2
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.7
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 2,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "chinese_missing_font.pdf",
+      "notes": "非嵌入 CID STSong-Light——两引擎字体回退形态漂移（低阈值单列，实测校准）",
+      "probe_pages": [
+        1,
+        2
+      ],
+      "parity": {
+        "ncc_min": 0.8,
+        "ink_iou_min": 0.6
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 2,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "scanned_gray.pdf",
+      "notes": "整页灰度 JPEG 扫描件——零文本层，DCT 解码对照",
+      "probe_pages": [
+        1
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "vector_graphics.pdf",
+      "notes": "纯矢量线/矩形/圆/贝塞尔——抗锯齿形态对照",
+      "probe_pages": [
+        1
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "transparency_blend.pdf",
+      "notes": "ExtGState alpha 混合——半透明叠加形态对照",
+      "probe_pages": [
+        1
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "cropped_mediabox.pdf",
+      "notes": "MediaBox 842×596 + CropBox [101,51,741,545]——裁剪生效 + 显示域≠MediaBox",
+      "probe_pages": [
+        1
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            842.0,
+            596.0
+          ],
+          "crop_box": [
+            101.0,
+            51.0,
+            741.0,
+            545.0
+          ],
+          "rotate": 0,
+          "display_size_pt": [
+            640.0,
+            494.0
+          ]
+        }
+      ]
+    },
+    {
+      "file": "rotation_matrix.pdf",
+      "notes": "/Rotate 90 与 180——方向特征像素断言（旋转正确显示）",
+      "probe_pages": [
+        1,
+        2
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 90,
+          "display_size_pt": [
+            841.8898,
+            595.2756
+          ]
+        },
+        {
+          "page": 2,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 180,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "landscape_mixed.pdf",
+      "notes": "3 页真异 MediaBox（纵/横/方）——页尺寸混排",
+      "probe_pages": [
+        1,
+        2,
+        3
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 2,
+          "media_box": [
+            0.0,
+            0.0,
+            841.8898,
+            595.2756
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            841.8898,
+            595.2756
+          ]
+        },
+        {
+          "page": 3,
+          "media_box": [
+            0.0,
+            0.0,
+            600.0,
+            600.0
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            600.0,
+            600.0
+          ]
+        }
+      ]
+    },
+    {
+      "file": "multipage_120.pdf",
+      "notes": "120 页——多页确定性与跨文档面",
+      "probe_pages": [
+        1,
+        60,
+        120
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 2,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 3,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 4,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 5,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 6,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 7,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 8,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 9,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 10,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 11,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 12,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 13,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 14,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 15,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 16,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 17,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 18,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 19,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 20,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 21,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 22,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 23,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 24,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 25,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 26,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 27,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 28,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 29,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 30,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 31,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 32,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 33,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 34,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 35,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 36,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 37,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 38,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 39,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 40,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 41,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 42,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 43,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 44,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 45,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 46,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 47,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 48,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 49,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 50,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 51,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 52,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 53,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 54,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 55,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 56,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 57,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 58,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 59,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 60,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 61,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 62,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 63,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 64,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 65,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 66,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 67,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 68,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 69,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 70,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 71,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 72,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 73,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 74,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 75,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 76,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 77,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 78,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 79,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 80,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 81,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 82,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 83,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 84,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 85,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 86,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 87,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 88,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 89,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 90,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 91,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 92,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 93,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 94,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 95,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 96,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 97,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 98,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 99,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 100,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 101,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 102,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 103,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 104,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 105,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 106,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 107,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 108,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 109,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 110,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 111,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 112,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 113,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 114,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 115,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 116,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 117,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 118,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 119,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        },
+        {
+          "page": 120,
+          "media_box": [
+            0.0,
+            0.0,
+            595.2756,
+            841.8898
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            595.2756,
+            841.8898
+          ]
+        }
+      ]
+    },
+    {
+      "file": "tiny_note.pdf",
+      "notes": "40×720 极窄页（aspect 18）——极端纵横比",
+      "probe_pages": [
+        1
+      ],
+      "parity": {
+        "ncc_min": 0.9,
+        "ink_iou_min": 0.72
+      },
+      "pages": [
+        {
+          "page": 1,
+          "media_box": [
+            0.0,
+            0.0,
+            40.0,
+            720.0
+          ],
+          "crop_box": null,
+          "rotate": 0,
+          "display_size_pt": [
+            40.0,
+            720.0
+          ]
+        }
+      ]
+    }
+  ]
+}
