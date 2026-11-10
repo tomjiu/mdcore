@@ -127,6 +127,9 @@ impl WorkerClient {
     ) -> Result<WorkerClient, LokError> {
         let exe = worker_bin
             .map(PathBuf::from)
+            // 运行时覆盖（部署时 worker 不在宿主同目录——如安装器
+            // resources/ 布局；集成测试经此注入 cargo 构建产物）。
+            .or_else(|| std::env::var_os("MDC_LOK_WORKER_BIN").map(PathBuf::from))
             .or_else(|| {
                 std::env::current_exe()
                     .ok()
@@ -692,5 +695,250 @@ impl<'a> DocHandle<'a> {
 
     pub fn close(&self) -> Result<Value, LokError> {
         self.client.request("close", json!({}))
+    }
+}
+
+// ============================================================================
+// B2：可拥有的产品会话（#49 工作线 B → #50 C 线消费契约）
+// ============================================================================
+
+/// 可拥有的文档会话——GPUI 宿主（#50 C 线）的产品接入形态。
+///
+/// 与 [`DocHandle`]（借用 `&WorkerClient`，smoke/内部测试用）不同：本类型
+/// **拥有** worker 子进程与全部通道，无生命周期参数——可直接放进 GPUI
+/// Entity / 状态树并在线程间 move（`Send`）。所有方法 `&self`/`&mut self`，
+/// 不自引用、不捕获借用。
+///
+/// ## 线程与阻塞契约（C 线必读）
+///
+/// - 方法是**同步阻塞**的（等 worker 应答，多数毫秒级；`open` 首启含
+///   LO hook_2 可达数秒）。**不要在 UI 线程上直接调用**——GPUI 宿主应
+///   在后台任务线程调用，UI 线程只消费 [`Self::take_events`] 的回调流。
+/// - 会话与文档一一对应（单文档 worker 契约）：一文档一会话一进程；
+///   多文档 = 多会话（`open` 多次，独立 profile 不互锁——smoke 实测）。
+/// - 事件通道一次性：[`Self::take_events`] 第一次调用返回 `Receiver`，
+///   由调用方持有轮询；之后可用 [`Self::try_recv_event`] /
+///   [`Self::recv_event_timeout`]（通道被取走后这些方法内部经共享
+///   暂存转发，语义不丢）。
+///
+/// ## dirty / revision 契约
+///
+/// - `dirty`：编辑类操作（`type_text` / `uno(notify=true)`）成功置位；
+///   **仅 `save_as` 成功清位**（超时/worker 死亡/保存失败一律保留——
+///   `LokError` 返回即未清）。
+/// - `revision`：宿主侧单调计数，**每次成功编辑 +1、`save_as` 成功 +1**；
+///   初始 0。C 线用它丢弃过期 tile（编辑后旧 tile 作废）。worker 侧
+///   回调流尚不携带 revision（B4 计划下沉到 worker 并随事件回传——
+///   已登记 #50 缺口）。
+pub struct DocSession {
+    client: WorkerClient,
+    dirty: bool,
+    revision: u64,
+    loaded_url: String,
+}
+
+impl DocSession {
+    /// 打开文档一步到位：spawn worker（独立 profile）→ load →
+    /// initializeForRendering（`DeviceFormFactor=desktop`）。
+    ///
+    /// `runtime`：None = 发现序自动定位（`MDC_LOK_HOME`/`MDC_LOK_LIB` →
+    /// 部署位 → 平台常见位；见 [`crate::runtime`]）。`session_root`：
+    /// 会话目录根（profile/诊断产物落这里，建议每会话独立子目录——
+    /// 本方法自动追加 `session-<pid>` 语义由调用方保证，直接传唯一
+    /// 路径即可）。
+    pub fn open(
+        runtime: Option<&crate::runtime::LokRuntime>,
+        session_root: &Path,
+        url: &str,
+        options: Option<&str>,
+    ) -> Result<DocSession, LokError> {
+        // runtime=None = 发现序自动定位（MDC_LOK_HOME / MDC_LOK_LIB →
+        // 部署位 → 平台常见位）；显式传入用于测试与多运行时选择。
+        let discovered;
+        let rt = match runtime {
+            Some(r) => r,
+            None => {
+                discovered = crate::runtime::discover()
+                    .map_err(|e| LokError::Protocol(format!("LOK 运行时发现失败：{e}")))?;
+                &discovered
+            }
+        };
+        let client = WorkerClient::spawn(Some(rt), session_root, None, None)?;
+        let mut a = json!({"url": url});
+        if let Some(o) = options {
+            a["options"] = json!(o);
+        }
+        client.request("load", a)?;
+        // 与 smoke 全链一致：init_rendering 空 args（25.2 实测
+        // initializeForRendering("DeviceFormFactor=desktop") 触发内核
+        // Application Error——参数格式按版本有分叉，产品默认不传，见
+        // docs/lok-session-contract.md「不稳定参数」节）。
+        client.request("init_rendering", json!({}))?;
+        Ok(DocSession {
+            client,
+            dirty: false,
+            revision: 0,
+            loaded_url: url.to_string(),
+        })
+    }
+
+    /// 已加载文档的 URL（load 参数原样）。
+    pub fn loaded_url(&self) -> &str {
+        &self.loaded_url
+    }
+
+    /// 会话 pid（诊断/进程管理）。
+    pub fn pid(&self) -> u32 {
+        self.client.session_pid()
+    }
+
+    /// 会话目录（profile 与诊断产物所在）。
+    pub fn session_dir(&self) -> &Path {
+        self.client.session_dir()
+    }
+
+    /// 文档脏位（见类型文档「dirty / revision 契约」）。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// 宿主侧 revision（见类型文档「dirty / revision 契约」）。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn edit_ok(&mut self) {
+        self.dirty = true;
+        self.revision += 1;
+    }
+
+    /// 事件通道（一次性取走；见类型文档「线程与阻塞契约」）。
+    pub fn take_events(&self) -> Option<Receiver<Event>> {
+        self.client.take_events()
+    }
+
+    pub fn try_recv_event(&self) -> Option<Event> {
+        self.client.try_recv_event()
+    }
+
+    pub fn recv_event_timeout(&self, dur: Duration) -> Option<Event> {
+        self.client.recv_event_timeout(dur)
+    }
+
+    /// worker 是否已死（死后所有请求明确 `LokError::WorkerDied`）。
+    pub fn is_dead(&self) -> bool {
+        self.client.is_dead()
+    }
+
+    /// 死亡详情 + stderr 尾部（诊断）。
+    pub fn death_detail(&self) -> String {
+        self.client.death_detail()
+    }
+
+    /// getDocumentSize → (宽, 高) twips。
+    pub fn size(&self) -> Result<(i64, i64), LokError> {
+        let v = self.client.request("size", json!({}))?;
+        Ok((
+            v.get("width_twips").and_then(Value::as_i64).unwrap_or(0),
+            v.get("height_twips").and_then(Value::as_i64).unwrap_or(0),
+        ))
+    }
+
+    /// paintTile：tile 像素经 side file（BMP）返回，JSON 含
+    /// `tile`（BMP 路径）/`tile_mode`/统计（见 worker op_paint）。
+    pub fn paint(
+        &self,
+        canvas_w: usize,
+        canvas_h: usize,
+        tile_x: i32,
+        tile_y: i32,
+        tile_w: i32,
+        tile_h: i32,
+    ) -> Result<Value, LokError> {
+        self.client.request(
+            "paint",
+            json!({
+                "canvas_w": canvas_w, "canvas_h": canvas_h,
+                "tile_x": tile_x, "tile_y": tile_y,
+                "tile_w": tile_w, "tile_h": tile_h,
+            }),
+        )
+    }
+
+    /// 键入文本（逐字符 KEYINPUT+KEYUP；选区被替换——标准编辑语义）。
+    /// 成功：dirty=true、revision+1。
+    pub fn type_text(&mut self, text: &str) -> Result<(), LokError> {
+        for ch in text.chars() {
+            self.client
+                .request("post_key", json!({"char": ch as i32, "key_code": 0}))?;
+        }
+        self.edit_ok();
+        Ok(())
+    }
+
+    /// postUnoCommand——编辑/变更类 UNO（如 `.uno:Undo`/`.uno:Redo`/
+    /// `.uno:SelectAll`）。成功：dirty=true、revision+1。
+    /// 查询类（ExecuteSearch 查找等）用 [`Self::uno_query`]。
+    pub fn uno(&mut self, command: &str, args: Option<&str>) -> Result<Value, LokError> {
+        let mut a = json!({"command": command, "notify": false});
+        if let Some(s) = args {
+            a["args"] = json!(s);
+        }
+        let r = self.client.request("uno", a)?;
+        self.edit_ok();
+        Ok(r)
+    }
+
+    /// 非变更类 UNO（不置脏、不动 revision）。
+    pub fn uno_query(&self, command: &str, args: Option<&str>) -> Result<Value, LokError> {
+        let mut a = json!({"command": command, "notify": false});
+        if let Some(s) = args {
+            a["args"] = json!(s);
+        }
+        self.client.request("uno", a)
+    }
+
+    /// getTextSelection（mime 用 `text/plain;charset=utf-8`——裸
+    /// `text/plain` 不是 transferable flavor，返回空）。
+    pub fn text_selection(&self, mime: &str) -> Result<(String, String), LokError> {
+        let v = self
+            .client
+            .request("text_selection", json!({"mime": mime}))?;
+        Ok((
+            v.get("mime")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            v.get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ))
+    }
+
+    /// saveAs 新文件（**不得等于源文件**——worker 硬守卫拒绝）。成功：
+    /// dirty=false、revision+1（保存也是新状态，C 线据此失效旧 tile）。
+    /// 失败：dirty/revision 均不动。
+    pub fn save_as(&mut self, url: &str, format: &str) -> Result<Value, LokError> {
+        let r = self
+            .client
+            .request("save_as", json!({"url": url, "format": format}))?;
+        self.dirty = false;
+        self.revision += 1;
+        Ok(r)
+    }
+
+    /// 逻辑关闭（单文档 worker：close 后本会话 doc 请求明确
+    /// `E_NO_DOCUMENT`；**不调 LO destroy**——teardown abort 规避，
+    /// 落盘只依赖 save_as）。
+    pub fn close(&self) -> Result<Value, LokError> {
+        self.client.request("close", json!({}))
+    }
+
+    /// 结束会话：close + kill（SIGKILL 兜底；跳过 LO atexit——
+    /// `SfxBaseModel` teardown abort 规避，产物只认 saveAs 落盘）。
+    pub fn shutdown(self) {
+        let _ = self.close();
+        self.client.kill();
     }
 }
