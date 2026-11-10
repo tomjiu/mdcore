@@ -647,4 +647,91 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// git 门（缺 git 全跳不伪装——git_diff_real_repo 同口径）。
+    fn git_present() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// 真 git 子进程（失败 panic——门已保证在场）。
+    fn sh(root: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-C", root.to_string_lossy().as_ref()])
+            .args(args)
+            .output()
+            .expect("git 应可执行（git_present 门已过）");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// #47 A5：状态栏 git 分支**真实文案**——真 git 仓 + 真 `git checkout`
+    /// （非合成 HEAD 文件）：初始分支 → `-b feat/x` → checkout 回 →
+    /// `--detach`。`git_branch_at_cached` 的 HEAD mtime 失效面在真实
+    /// git 操作下的运行时证据（状态栏每次重渲消费此函数——真实文案
+    /// 随真实分支切换翻转）。
+    #[test]
+    fn git_branch_real_repo_real_checkout_tracks() {
+        if !git_present() {
+            eprintln!("\n══════ SKIP（环境缺件）══════\n  无 git——#47 A5 真 git 分支跟踪未真跑\n═════════════════════════\n");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("mdc-a5-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, &["init", "-q"]);
+        sh(&dir, &["config", "user.email", "probe@local"]);
+        sh(&dir, &["config", "user.name", "probe"]);
+        std::fs::write(dir.join("seed.md"), "S\n").unwrap();
+        sh(&dir, &["add", "seed.md"]);
+        sh(&dir, &["commit", "-q", "-m", "init"]);
+
+        // ① 初始分支（默认分支名不硬编码——从 HEAD 直读，缓存与其一致）。
+        let initial = git_branch_at(&dir).expect("真仓初始分支在案");
+        assert_eq!(
+            git_branch_at_cached(&dir).as_deref(),
+            Some(initial.as_str()),
+            "缓存首读 = 直读（真仓初始分支）"
+        );
+        // 命中（同 HEAD）。
+        assert_eq!(
+            git_branch_at_cached(&dir).as_deref(),
+            Some(initial.as_str()),
+            "同 HEAD 二读命中缓存"
+        );
+
+        // ② 真 `git checkout -b`（真写 .git/HEAD + refs）→ 缓存失效跟新。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sh(&dir, &["checkout", "-q", "-b", "feat/real"]);
+        assert_eq!(
+            git_branch_at_cached(&dir).as_deref(),
+            Some("feat/real"),
+            "真 checkout -b 后缓存失效跟踪新分支（状态栏真实文案面）"
+        );
+
+        // ③ checkout 回初始分支 → 跟踪回。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sh(&dir, &["checkout", "-q", &initial]);
+        assert_eq!(
+            git_branch_at_cached(&dir).as_deref(),
+            Some(initial.as_str()),
+            "真 checkout 回原分支后跟踪回"
+        );
+
+        // ④ detached HEAD → "(detached)"（真 git 分离态如实报告）。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sh(&dir, &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            git_branch_at_cached(&dir).as_deref(),
+            Some("(detached)"),
+            "真 --detach 后如实报 (detached)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
