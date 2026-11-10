@@ -1,17 +1,36 @@
 //! worker 侧运行时：LOK 内核绑定 + 请求分发 + 回调转发。
 //!
-//! ## 线程模型（原型）
+//! ## 线程模型（B1：unipoll 主循环集成）
 //!
 //! ```text
-//! 宿主 pipe ──stdin──▶ 主线程（请求循环：所有 LOK 调用串行在此执行）
+//! 宿主 pipe ──stdin──▶ reader 线程（只读字节 → channel）
+//!                                          │ Note::Ask/Woken/Closed
+//! LO 内核 ──runLoop──▶ 主线程（poll 回调：同步分发请求 = 主循环上下文）
 //!                        │
 //! LO 内核线程 ──回调──▶ 事件队列 ──▶ 写线程（独占 stdout：应答+事件同串行化）
 //! 宿主 pipe ◀──stdout── 写线程
 //! ```
 //!
+//! **为什么 unipoll**（异步事件黑洞实录，gates/633.md）：LO 的
+//! `postKeyEvent/postMouseEvent/postUnoCommand` 均为 `postKeyEventAsync`
+//! → `Application::PostUserEvent` 入队（unotxdoc.cxx:4015-4018），消费依赖
+//! `lo_startmain` 线程泵主循环；外部宿主场景实测该线程可整段沉睡
+//! （wchan=futex，CPU 0.05s/6s 非忙等）→ 排队键鼠/UNO 事件黑洞 →
+//! **编辑静默丢失**（smoke 复跑 4 连败：超时/像素不变/保存产物缺文本）。
+//! 修复 = `SAL_LOK_OPTIONS=unipoll`（hook_2 前生效）+ 主线程进
+//! `runLoop`（poll 回调里消费请求通道 = 内核主循环上下文同步分发；
+//! unipoll 下 `postEventAsync` 直调 `LOKPostAsyncEvent`——lokhelper.cxx
+//! :1283-1290，同步确定；ElyOffice Linux 同款模型）。只设 env 不进
+//! runLoop 会 SIGSEGV（实测 rc=-11）——两者必须配套，缺一不可。
+//!
 //! 回调在 LO 内核线程触发（ElyOffice 实证）→ 只入队（持锁极短），由写线程
 //! 单点写帧，避免应答/事件交错。写线程管道断裂（宿主已死）→ worker 硬退出
 //! （孤儿清理）。
+//!
+//! **fd 0 抢救**（`steal_stdin_fd`）：LO 内嵌组件（python 等）可能直接读
+//! fd 0 与 reader 线程竞争读者、撕碎帧流 → dup 保管道、fd 0 换空设备
+//! （本仓 Linux 实测复现：连续 post_key 中途偶发挂起；ElyOffice Windows
+//! 同款教训）。
 //!
 //! ## 环境卫生（ElyOffice 实证教训，spawn 前由宿主与 worker 双侧设置）
 //!
@@ -115,6 +134,8 @@ pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
         Some(mode) => fake_dispatch_loop(mode, &tx),
         None => {
             let boot = boot.expect("真实 worker 需要 WorkerBoot（--session-dir）");
+            // fd 0 抢救在任何 LO 初始化之前（hook_2 内嵌组件可能读 fd 0）
+            let protocol_fd = steal_stdin_fd();
             let state = match bind_kernel(&boot, &tx) {
                 Ok(st) => st,
                 Err((code, msg)) => {
@@ -124,10 +145,10 @@ pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
                         "boot-failed",
                         json!({"code": code, "message": msg}),
                     )));
-                    no_kernel_loop(&tx, code, msg);
+                    no_kernel_loop(protocol_fd, &tx, code, msg);
                 }
             };
-            request_loop(state, &tx)
+            unipoll_loop(state, &tx, protocol_fd)
         }
     }
 }
@@ -176,6 +197,9 @@ fn env_hygiene() {
     unsafe {
         std::env::set_var("SAL_NOLOCK_PROFILE", "1");
         std::env::set_var("SAL_DISABLE_OPENCL", "1");
+        // unipoll 主循环契约（模块头「为什么 unipoll」）：必须在 hook_2
+        // 之前生效；宿主 spawn 侧也设（client.rs，幂等双保险）。
+        std::env::set_var("SAL_LOK_OPTIONS", "unipoll");
         if cfg!(windows) {
             std::env::set_var("SAL_SKIA", "raster");
         } else {
@@ -325,6 +349,10 @@ fn bind_kernel(
             "setOptionalFeatures",
         ),
         (abi::kit_offsets::GET_VERSION_INFO, "getVersionInfo"),
+        // B1：unipoll 主循环的硬依赖（缺槽 = 本 worker 不支持该运行时，
+        // boot-failed 明确报错——不回退直调模式：直调有异步事件黑洞，
+        // 产品不可用，宁可明确失败）。
+        (abi::kit_offsets::RUN_LOOP, "runLoop"),
     ];
     for (off, name) in need {
         if !abi::has_member(n, off, std::mem::size_of::<usize>()) {
@@ -783,69 +811,259 @@ impl WorkerState {
 }
 
 // 写线程 Sender 的线程局部（doc 回调注册时需要从 op_load 内拿到；
-// request_loop 启动时注入）。
+// unipoll_loop 启动时注入）。
 thread_local! {
     static WRITER_TX: std::cell::RefCell<Option<Sender<ToWriter>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// 真实请求循环（主线程串行执行所有 LOK 调用）。
-fn request_loop(mut state: WorkerState, tx: &Sender<ToWriter>) -> ! {
-    WRITER_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    loop {
-        let frame = match protocol::read_frame(&mut reader) {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                // 宿主关了 stdin：干净关机
-                let _ = state.op_close();
-                let _ = tx.send(ToWriter::Frame(protocol::life_event_frame(
-                    "bye",
-                    json!({"reason": "stdin-eof"}),
-                )));
-                let _ = tx.send(ToWriter::Quit);
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                hard_exit(0);
+/// 把 stdin 从 fd 0 上「偷走」：dup 到新 fd，fd 0 换成空设备。
+/// 返回接管协议流的文件句柄（失败时退回普通 stdin——LO 未抢时不影响）。
+///
+/// 动机见模块头「fd 0 抢救」：LO 内嵌组件（python 等）直接读 fd 0 会与
+/// 协议读线程形成竞争读者，把帧流撕碎 → 宿主超时但 worker 未死。
+fn steal_stdin_fd() -> std::fs::File {
+    use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn dup(fd: RawFd) -> RawFd;
+        fn dup2(old: RawFd, new: RawFd) -> RawFd;
+    }
+    #[cfg(windows)]
+    unsafe extern "C" {
+        fn _dup(fd: RawFd) -> RawFd;
+        fn _dup2(old: RawFd, new: RawFd) -> RawFd;
+    }
+
+    let devnull_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let ok = (|| -> Option<std::fs::File> {
+        unsafe {
+            #[cfg(unix)]
+            let saved = dup(0);
+            #[cfg(windows)]
+            let saved = _dup(0);
+            if saved < 0 {
+                return None;
             }
-            Err(e) => {
-                let _ = tx.send(ToWriter::Frame(protocol::life_event_frame(
-                    "bye",
-                    json!({"reason": "oversize", "message": e.to_string()}),
-                )));
-                let _ = tx.send(ToWriter::Quit);
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                hard_exit(2);
+            // 换 fd 0 前先把 saved 交给 File 管理（防提前返回泄漏）。
+            let protocol = std::fs::File::from_raw_fd(saved);
+            let nul = std::fs::File::open(devnull_path).ok()?;
+            let nul_fd = nul.into_raw_fd();
+            #[cfg(unix)]
+            let rc = dup2(nul_fd, 0);
+            #[cfg(windows)]
+            let rc = _dup2(nul_fd, 0);
+            // nul_fd 已复制到 0，关闭原句柄（unix dup2 后原 fd 仍开）。
+            #[cfg(unix)]
+            if rc >= 0 {
+                libc_close(nul_fd);
             }
-        };
-        let v: Value = match serde_json::from_slice(&frame) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = tx.send(ToWriter::Frame(protocol::err_frame(
-                    0,
-                    codes::BAD_REQUEST,
-                    &format!("帧不是合法 JSON：{e}"),
-                )));
-                continue;
+            #[cfg(windows)]
+            let _ = rc;
+            #[cfg(windows)]
+            unsafe extern "C" {
+                fn _close(fd: RawFd) -> RawFd;
             }
-        };
-        let id = protocol::req_u64(&v, "id").unwrap_or(0);
-        let op = protocol::req_str(&v, "op").unwrap_or_default();
-        let result = dispatch(&mut state, &op, &v);
-        let frame = match result {
-            Ok(val) => protocol::answer_or_oversize(id, protocol::ok_frame(id, val)),
-            Err((code, msg)) => protocol::err_frame(id, code, &msg),
-        };
-        if tx.send(ToWriter::Frame(frame)).is_err() {
-            hard_exit(4);
+            #[cfg(windows)]
+            if rc >= 0 {
+                _close(nul_fd);
+            }
+            if rc < 0 {
+                // fd 0 替换失败：协议流退回原句柄（仍可工作，只是失去
+                // fd 0 隔离——Windows 实测门复核项）。
+                return Some(protocol);
+            }
+            Some(protocol)
+        }
+    })();
+    match ok {
+        Some(f) => f,
+        None => {
+            // dup 失败（罕见）：退回普通 stdin。
+            unsafe { std::fs::File::from_raw_fd(0) }
         }
     }
 }
 
-/// 内核绑定失败后的请求循环（协议活、LOK 请求全部明确报错）。
-fn no_kernel_loop(tx: &Sender<ToWriter>, code: &'static str, msg: String) -> ! {
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+#[cfg(unix)]
+unsafe extern "C" {
+    fn close(fd: i32) -> i32;
+}
+
+/// unix 下关 fd 的安全别名（避免与 std 的 close 符号冲突）。
+#[cfg(unix)]
+unsafe fn libc_close(fd: i32) -> i32 {
+    close(fd)
+}
+
+/// 真实主循环（B1：unipoll 集成）：主线程进 LOK `runLoop`，宿主请求在
+/// poll 回调里同步分发（内核主循环上下文）；reader 线程只管 stdin→
+/// channel 并 wake（模块头「线程模型」与「为什么 unipoll」）。
+fn unipoll_loop(state: WorkerState, tx: &Sender<ToWriter>, protocol_fd: std::fs::File) -> ! {
+    WRITER_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
+
+    // reader 线程：协议流（抢救后的 fd）→ channel；只读字节，JSON 解析
+    // 与分发都在主线程（poll 回调）——保证所有 LOK 调用串行于主循环。
+    let (note_tx, note_rx) = std::sync::mpsc::channel::<Note>();
+    let reader_tx = note_tx.clone();
+    let reader = std::thread::Builder::new()
+        .name("lok-reader".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(protocol_fd);
+            loop {
+                match protocol::read_frame(&mut reader) {
+                    Ok(Some(f)) => {
+                        if reader_tx.send(Note::Ask(f)).is_err() {
+                            break; // 主循环已退出
+                        }
+                    }
+                    Ok(None) => {
+                        // 宿主关了 stdin：干净关机（退出码 0）
+                        let _ = reader_tx.send(Note::Closed(0));
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("mdc-lok-worker: 帧读取失败：{e}");
+                        let _ = reader_tx.send(Note::Closed(2));
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn lok-reader");
+    let _ = reader;
+
+    // wake 通道注册：内核其他线程要主循环干活时叫醒 poll（runLoop 契约）。
+    let _ = WAKE_TX.set(std::sync::Mutex::new(note_tx));
+
+    let ctx = LoopCtx {
+        state,
+        tx: tx.clone(),
+        rx: note_rx,
+    };
+    // runLoop 槽位已在 bind_kernel 的 nSize 守卫查过（缺槽走 boot-failed）。
+    let run_loop = unsafe { (*ctx.state.kit_class).run_loop }
+        .expect("runLoop 槽位（bind_kernel nSize 守卫已查）");
+    let kit = ctx.state.kit;
+    let ctx_ptr = Box::into_raw(Box::new(ctx)) as *mut c_void;
+    unsafe { run_loop(kit, Some(unipoll_poll), Some(unipoll_wake), ctx_ptr) };
+    // runLoop 返回 = 内核主循环正常退出：干净收尾。
+    let mut ctx = unsafe { Box::from_raw(ctx_ptr.cast::<LoopCtx>()) };
+    loop_exit(&mut ctx, 0, "run-loop-returned");
+}
+
+/// 主循环待办：宿主请求帧 / 内核唤醒 / 对端关闭（携退出码）。
+enum Note {
+    Ask(Vec<u8>),
+    Woken,
+    /// 0 = stdin EOF（干净），2 = 帧读取失败（对齐旧 request_loop 语义）。
+    Closed(i32),
+}
+
+/// unipoll 上下文（进入 runLoop 后经 data 指针回到这里）。
+struct LoopCtx {
+    state: WorkerState,
+    tx: Sender<ToWriter>,
+    rx: Receiver<Note>,
+}
+
+/// wake 通道（内核任意线程 → 主循环 poll）。
+static WAKE_TX: std::sync::OnceLock<std::sync::Mutex<Sender<Note>>> = std::sync::OnceLock::new();
+
+/// unipoll poll 回调：内核空闲时在此等待；请求到达即在本（主）线程同步
+/// 分发。timeout 语义（微秒，LO runLoop 契约）：0=非阻塞，负=无限等，
+/// 正=上限。返回非零 = 有事件已处理（LO 随后泵内部队列）。
+unsafe extern "C" fn unipoll_poll(data: *mut c_void, timeout_us: c_int) -> c_int {
+    let ctx = &mut *data.cast::<LoopCtx>();
+    let note = match timeout_us {
+        0 => match ctx.rx.try_recv() {
+            Ok(n) => n,
+            Err(_) => return 0,
+        },
+        t if t < 0 => match ctx.rx.recv() {
+            Ok(n) => n,
+            Err(_) => loop_exit(ctx, 0, "reader-gone"),
+        },
+        t => match ctx.rx.recv_timeout(std::time::Duration::from_micros(
+            t.clamp(0, 10_000_000) as u64
+        )) {
+            Ok(n) => n,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return 0,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                loop_exit(ctx, 0, "reader-gone")
+            }
+        },
+    };
+    match note {
+        Note::Woken => 1,
+        Note::Closed(code) => {
+            loop_exit(ctx, code, if code == 0 { "stdin-eof" } else { "oversize" })
+        }
+        Note::Ask(frame) => {
+            handle_frame(ctx, frame);
+            1
+        }
+    }
+}
+
+/// unipoll wake 回调：内核其他线程要主循环干活时叫醒 poll。
+unsafe extern "C" fn unipoll_wake(_data: *mut c_void) {
+    if let Some(tx) = WAKE_TX.get() {
+        let _ = tx.lock().expect("wake 通道锁中毒").send(Note::Woken);
+    }
+}
+
+/// 单帧处理（JSON 解析 + 分发 + 应答；语义对齐旧 request_loop）。
+fn handle_frame(ctx: &mut LoopCtx, frame: Vec<u8>) {
+    let v: Value = match serde_json::from_slice(&frame) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ctx.tx.send(ToWriter::Frame(protocol::err_frame(
+                0,
+                codes::BAD_REQUEST,
+                &format!("帧不是合法 JSON：{e}"),
+            )));
+            return;
+        }
+    };
+    let id = protocol::req_u64(&v, "id").unwrap_or(0);
+    let op = protocol::req_str(&v, "op").unwrap_or_default();
+    let result = dispatch(&mut ctx.state, &op, &v);
+    let frame = match result {
+        Ok(val) => protocol::answer_or_oversize(id, protocol::ok_frame(id, val)),
+        Err((code, msg)) => protocol::err_frame(id, code, &msg),
+    };
+    if ctx.tx.send(ToWriter::Frame(frame)).is_err() {
+        hard_exit(4);
+    }
+}
+
+/// 主循环退出（runLoop 返回 / 对端关闭 / reader 消失）：关文档 + bye +
+/// 硬退出。退出码：0=干净，2=帧读取失败，4=宿主管道断。
+fn loop_exit(ctx: &mut LoopCtx, code: i32, reason: &str) -> ! {
+    let _ = ctx.state.op_close();
+    if code != 4 {
+        // 管道已断时不再可靠发 bye（写线程自己会 hard_exit(4)）。
+        let _ = ctx.tx.send(ToWriter::Frame(protocol::life_event_frame(
+            "bye",
+            json!({"reason": reason}),
+        )));
+        let _ = ctx.tx.send(ToWriter::Quit);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    hard_exit(code);
+}
+
+/// 内核绑定失败后的请求循环（协议活、LOK 请求全部明确报错）。协议流用
+/// 抢救出的 fd（fd 0 已被换成空设备，stdin 不可再用）。
+fn no_kernel_loop(
+    protocol_fd: std::fs::File,
+    tx: &Sender<ToWriter>,
+    code: &'static str,
+    msg: String,
+) -> ! {
+    let mut reader = BufReader::new(protocol_fd);
     loop {
         let frame = match protocol::read_frame(&mut reader) {
             Ok(Some(f)) => f,

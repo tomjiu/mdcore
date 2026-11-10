@@ -558,27 +558,71 @@ fn export_canonical_bytes_reexport_identical() {
     assert_eq!(e1, e2, "二次导出须逐字节恒等（规范形固定点）");
 }
 
-/// #406 残余登记面锁定：产品边 caption（一等字段 + 渲染消费，#447
-/// 交付面）在 JSON Canvas 导出即丢——规范边仅 label。本测试把
-/// 「登记的损失」锁成机械事实：升级路径（label 空时 caption→label /
-/// `jc:caption` 专键往返）属 #406 裁决位——实施时须同步更新本测试
-/// 与模块文档映射表（不许可静默漂移，也不可顺手造伪值）。
+/// #61 案 B（裁决落定）：边 caption 走 `jc:caption` 专键——label 语义
+/// 隔离锁定。演进链：#636 曾以 `edge_caption_export_loss_registered`
+/// 把「导出即丢」的登记损失锁成机械事实（裁决位占位）；#61 两案裁决
+/// 取案 B（`jc:caption` 专键往返——保信息、留单向出口，否决案 A 的
+/// caption→label 回填：跨语义污染 #447 渲染消费面且回读不可逆）后，
+/// 本测试改锁新语义：caption 与 label 双键并存、互不顶替、无值不造键。
 #[test]
-fn edge_caption_export_loss_registered() {
+fn edge_caption_label_semantics_isolated() {
     let mut objs = import_json_canvas(SPEC_SAMPLE).unwrap();
     let e1 = objs.iter_mut().find(|o| o.id == "e1").unwrap();
     e1.caption = Some("审批通过".into());
     let exported = export_json_canvas(&objs);
-    // 损失面现状：caption 文本不出现在导出产物。
-    assert!(
-        !exported.contains("审批通过"),
-        "caption 导出即丢（模块文档登记的损失面）"
-    );
-    // label 语义不被污染（既不顶替 label 也不造伪键）。
     let v: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    // label 原语义保持：既有值不被 caption 顶替（案 A 的否决理由）。
     assert_eq!(v["edges"][0]["label"], "包含", "label 原语义保持");
-    // 再导入：caption 为 None（丢失可观察——不造伪值）。
-    let back = import_json_canvas(&exported).unwrap();
+    // caption 专键承载：说明语义不混入标签通道。
+    assert_eq!(
+        v["edges"][0]["jc:caption"], "审批通过",
+        "caption 走 jc:caption 专键（#61 案 B）"
+    );
+    // 无 caption 的边（e2）不导出空专键——不造伪值。
+    assert!(
+        v["edges"][1].get("jc:caption").is_none(),
+        "无 caption 的边不导 jc:caption 键（不造伪值）"
+    );
+}
+
+/// #61 案 B 验收 3-①：导出含 caption 的边 → JSON 出现 `jc:caption`
+/// 键且值逐字精确（键存在面 + 值正确面——Unicode/引号类内容不作转义
+/// 级改动，serde_json 保证 JSON 合法即可）。
+#[test]
+fn edge_caption_export_jc_key() {
+    let mut objs = import_json_canvas(SPEC_SAMPLE).unwrap();
+    let e1 = objs.iter_mut().find(|o| o.id == "e1").unwrap();
+    e1.caption = Some("审批通过：报价含税".into());
+    let exported = export_json_canvas(&objs);
+    assert!(
+        exported.contains("jc:caption"),
+        "导出产物出现 jc:caption 键"
+    );
+    let v: serde_json::Value = serde_json::from_str(&exported).unwrap();
+    assert_eq!(
+        v["edges"][0]["jc:caption"], "审批通过：报价含税",
+        "jc:caption 值逐字还原"
+    );
+}
+
+/// #61 案 B 验收 3-②：重导入 → caption 一等字段还原（往返对称断
+/// ——案 B 的核心价值：双向对称，字节不丢）；二次导出与首次逐字节
+/// 恒等（规范形固定点——沿用既有 roundtrip 纪律）。
+#[test]
+fn edge_caption_reimport_restores() {
+    let mut objs = import_json_canvas(SPEC_SAMPLE).unwrap();
+    let e1 = objs.iter_mut().find(|o| o.id == "e1").unwrap();
+    e1.caption = Some("审批通过".into());
+    let first = export_json_canvas(&objs);
+    // 重导入：caption 字段还原（对照 #636 时代的 None——丢失可观察）。
+    let back = import_json_canvas(&first).unwrap();
     let e1_back = back.iter().find(|o| o.id == "e1").unwrap();
-    assert_eq!(e1_back.caption, None, "再导入 caption 丢失（无伪值）");
+    assert_eq!(
+        e1_back.caption,
+        Some("审批通过".to_string()),
+        "重导入 caption 字段还原（往返对称）"
+    );
+    // 二次导出：字节恒等（jc:caption 是规范形的一部分——非临时通道）。
+    let second = export_json_canvas(&back);
+    assert_eq!(first, second, "二次导出逐字节恒等（规范形固定点）");
 }

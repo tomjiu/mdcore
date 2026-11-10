@@ -208,6 +208,8 @@ pub mod kit_offsets {
     off!(REGISTER_CALLBACK, register_callback);
     off!(SET_OPTIONAL_FEATURES, set_optional_features);
     off!(GET_VERSION_INFO, get_version_info);
+    // B1：unipoll 主循环（worker unipoll_loop 进 runLoop；缺槽 = boot-failed）
+    off!(RUN_LOOP, run_loop);
 }
 
 /// Doc 成员 offset 表（绑定面止于 get_text_selection#18）。

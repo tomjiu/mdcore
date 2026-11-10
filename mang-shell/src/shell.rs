@@ -3111,6 +3111,13 @@ impl ShellApp {
     }
 }
 
+/// A1（#47 批次 2）：右 dock 让位临界宽——窗口宽低于此值时右栏在渲染期
+/// 让位（编辑区保 ≥240px 可用宽：三固定栏 52+260+280=592px，760px
+/// 最小窗宽下编辑区实测仅 108px）。**不改写 `right_open` 用户开关态**：
+/// 宽度恢复后右栏按原开关态自动回归。900px 取值使临界处编辑区恰保
+/// ≥240px（width-652=248，probe 实测口径）。
+const RIGHT_DOCK_YIELD_WIDTH: Pixels = px(900.);
+
 impl Render for ShellApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // #164 1c：首帧计时（首个 render = 首帧呈现；消费后恒 None——
@@ -3119,6 +3126,11 @@ impl Render for ShellApp {
             crate::perf::stage("first-frame", since);
         }
         let colors = cx.theme().colors().clone();
+        // A1（#47 批次 2）：窄窗右栏让位（渲染期判定——viewport 宽低于
+        // RIGHT_DOCK_YIELD_WIDTH 时右栏不占位，编辑区保可用宽；right_open
+        // 用户开关态不被改写，宽度恢复后按原开关态回归）。
+        let right_open_effective =
+            self.right_open && window.viewport_size().width >= RIGHT_DOCK_YIELD_WIDTH;
         let title = self.title_with(cx);
         // #209：菜单栏数据（每次渲染重建——结构随文档/主题/最近列表快照
         // 变化；标题行与浮层共用一份，构建成本 = 小字符串拼装）。
@@ -3405,7 +3417,9 @@ impl Render for ShellApp {
                         .child(self.panel_resize_handle(PanelSide::Left, cx))
                     })
                     .child(editor_column(self, cx))
-                    .when(self.right_open, |el| {
+                    // A1（#47 批次 2）：窄窗右栏让位（渲染期判定；right_open
+                    // 用户开关态不被改写——宽度恢复后按原开关态回归）。
+                    .when(right_open_effective, |el| {
                         // G4：右栏左缘 4px 拖拽热区
                         el.child(self.panel_resize_handle(PanelSide::Right, cx))
                             // #289-⑤：右栏单一视图——属性/来源（设置已改
@@ -3418,7 +3432,9 @@ impl Render for ShellApp {
                     })
                     // #289-⑤：右缘 dock 条（属性/来源开关归右缘——
                     // 恒在，右栏收起时是唯一入口；zed 折叠 dock 同构）。
-                    .child(right_dock::right_dock_strip(self.right_open, cx)),
+                    // A1（#47 批次 2）：入参用有效态——窄窗让位期间呈
+                    // 收起观感，点击仍切换 right_open 逻辑态。
+                    .child(right_dock::right_dock_strip(right_open_effective, cx)),
             )
             // F1：提示横幅（状态栏上方一条——有消息时才渲染）。
             .map(|el| match self.notice_board.message() {

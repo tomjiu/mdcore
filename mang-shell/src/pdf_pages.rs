@@ -76,10 +76,13 @@
 //! ## 已知边界（v1 登记）
 //!
 //! - **页尺寸不均的档**：uniform_list 等高槽——异形页按首页纵横比
-//!   定槽高，真图内接呈现（`ObjectFit::Contain` 缺省），不裁不拉；
-//!   异形页上的右键拖框坐标按等比槽近似（拖框落点在异形页上有
-//!   letterbox 偏移——与「异形页内接呈现」同源边界，登记待后续轮）；
-//!   #422 查找高亮每页独立取几何换算（拉伸页按轴独立缩放，同源边界）；
+//!   定槽高，真图**内接呈现**（#634：等比缩放居中 + 上下/左右
+//!   letterbox——[`PdfPagesView::contain_box`] 单点解析，位图不再
+//!   非等比拉伸）；#634：异形页上的右键拖框 / 查找高亮 / 跳转滚动
+//!   全部按内容盒换算（letterbox 偏移在 contain_box 扣除——v1
+//!   「等比槽近似」边界收口）；
+//!   #422 查找高亮 quad 四角经页变换 `user_to_screen` 映射（旋转页
+//!   高亮不再错位——替换 v1 的层几何轴缩放）；
 //! - **页面视图内查找（#422）**：Ctrl+F 不切视图直接开页内查找条——
 //!   文本层后台线程索引 + 页上黄色高亮 + Enter/Shift+Enter（Ctrl+G）
 //!   导航 + 「n/m」计数；扫描件无文本层 → 如实「无匹配」（不虚装）；
@@ -116,11 +119,13 @@ use gpui::{
     StyledText, UniformListScrollHandle, Window, px,
 };
 use image::{Frame, ImageBuffer};
+use mdc_pdf::annotation::Point;
 use mdc_pdf::engine::DocumentEngine;
 use mdc_pdf::engine_pdfium::PdfiumEngine;
-use mdc_pdf::page::PageIndex;
+use mdc_pdf::page::{PageGeometry, PageIndex, Rotation};
 use mdc_pdf::render::{RenderKey, RenderRequest, RenderedPage};
 use mdc_pdf::table::PositionedChar;
+use mdc_pdf::transform::PageTransform;
 use mdc_pdf::worker::{RenderWorker, WorkerReply};
 use mdc_pdf::writer::IncrementalSave;
 use smallvec::SmallVec;
@@ -193,15 +198,16 @@ fn zoom_raster_width(mode: ZoomMode, aspect: f32, page_pt_w: f32, vw: f32, vh: f
 /// #421：缩放百分比（相对实际大小）——Custom 档直接报倍率（量子化
 /// 只影响光栅缓存键，不折进来——菜单预设 50% 报 50 不报 54）；预设
 /// 档从光栅宽派生（适宽随视口变化，百分比如实反映）。纯函数（单测
-/// 锚点）。
-fn zoom_mode_percent(mode: ZoomMode, page_pt_w: f32, vw: f32, vh: f32) -> u32 {
+/// 锚点）。#634：`aspect` 实参化（首页显示纵横比）——替换 v1 硬编码
+/// A4 魔数 1.414，非 A4 档预设百分比不再按 A4 折算。
+fn zoom_mode_percent(mode: ZoomMode, aspect: f32, page_pt_w: f32, vw: f32, vh: f32) -> u32 {
     if let ZoomMode::Custom(z) = mode {
         return (z * 100.).round().clamp(10., 800.) as u32;
     }
     if page_pt_w <= 0. {
         return 100;
     }
-    let w = zoom_raster_width(mode, 1.414, page_pt_w, vw, vh) as f32;
+    let w = zoom_raster_width(mode, aspect, page_pt_w, vw, vh) as f32;
     (w / page_pt_w * 100.).round().clamp(10., 800.) as u32
 }
 
@@ -324,9 +330,9 @@ struct PageTextLayer {
     chars: Vec<PositionedChar>,
     /// 小写拼接文本（匹配面——大小写不敏感查询的单一事实源）。
     lower: String,
-    /// 页几何（pt；高亮换算的轴缩放基准——用户空间 → 槽像素）。
-    width_pt: f32,
-    height_pt: f32,
+    /// 页变换（#634：几何 + 旋转单一事实源——高亮 quad 四角映射与
+    /// 跳转滚动的 `user_to_screen` 基准，替换 v1 的宽高轴缩放）。
+    transform: PageTransform,
 }
 
 /// 索引线程 → 视图回流消息（通道关闭 = 查找条已关，线程自然退出）。
@@ -581,8 +587,50 @@ impl PdfPagesView {
     }
 
     /// 槽高（px）：适宽 × 首页纵横比（纯函数——单测锚点）。
+    ///
+    /// #634：0.5px 量子化——Taffy 布局对行高做半像素网格对齐（div
+    /// 测量 814.585 → 814.5），而滚动换算（`submit_visible` 的
+    /// `offset_y / slot_h`）走解析值；两源差在百页档累积（60 行差
+    /// ~5px）会把 `top_visible_page` 读数截断到 59（跳页读回失败，
+    /// view_chain 实测抓红）。量子化后 uniform_list 测量行高与换算
+    /// 槽高**单源一致**；0.5px 步进对显示无感。
     fn slot_height(fit_w: u32, aspect: f32) -> f32 {
-        fit_w as f32 * aspect
+        ((fit_w as f32 * aspect) * 2.).round() / 2.
+    }
+
+    /// #634：槽内内容盒（letterbox）——位图按本页显示纵横比等比内接
+    /// 于等高槽（首页纵横比基准），返回 `(内容盒宽, 高, x 偏移,
+    /// y 偏移)`。
+    ///
+    /// 异形页（页尺寸不均 / 旋转交换 / 极窄档）真图**内接呈现**的
+    /// 单点解析：渲染位图、查找高亮、右键拖框、跳转滚动四个消费面
+    /// 共用——letterbox 偏移同源，显示与命中测试不漂移。
+    fn contain_box(fit_w: f32, slot_h: f32, page_aspect: f32) -> (f32, f32, f32, f32) {
+        let slot_aspect = if fit_w > 0. { slot_h / fit_w } else { 1.414 };
+        let (cw, ch) = if page_aspect >= slot_aspect {
+            (slot_h / page_aspect.max(1e-3), slot_h) // 页更高：高满槽，左右留白
+        } else {
+            (fit_w, fit_w * page_aspect) // 页更扁：宽满槽，上下留白
+        };
+        (cw, ch, (fit_w - cw) / 2., (slot_h - ch) / 2.)
+    }
+
+    /// #634：位图内接盒——以渲染回执位图的实际纵横比（本页显示口径）
+    /// 求 contain_box（未就绪/尺寸退化时按槽满幅回退）。
+    fn image_contain_box(
+        image: &gpui::RenderImage,
+        fit_w: f32,
+        slot_h: f32,
+    ) -> (f32, f32, f32, f32) {
+        // `size` 越界/退化帧返回 0×0——按槽满幅回退（stale 兜底同路）。
+        let s = image.size(0);
+        let (iw, ih) = (s.width.0 as f32, s.height.0 as f32);
+        let (iw, ih) = if iw > 0. && ih > 0. {
+            (iw, ih)
+        } else {
+            (fit_w, slot_h)
+        };
+        Self::contain_box(fit_w, slot_h, ih / iw)
     }
 
     /// 滚到指定页（0 基——书签跳转锚；越界钳到末页）。
@@ -661,7 +709,7 @@ impl PdfPagesView {
 
     /// #421：当前缩放百分比（相对实际大小——chip 显示与菜单基准）。
     fn zoom_percent(&self, vw: f32, vh: f32) -> u32 {
-        zoom_mode_percent(self.zoom_mode, self.page_pt_w, vw, vh)
+        zoom_mode_percent(self.zoom_mode, self.aspect, self.page_pt_w, vw, vh)
     }
 
     /// 当前生效倍率（任意模式 → 光栅宽/pt 宽；预设态步进缩放的起算
@@ -858,19 +906,24 @@ impl PdfPagesView {
             .cloned()
     }
 
-    /// 回执轮询循环（16ms 定时 try_recv——待办清空退出；实体释放自然止）。
+    /// 回执轮询循环（16ms 定时 try_recv——待办清空退出；实体释放
+    /// 自然止）。#634：`update` Err（实体已释放）即 break——v1 的
+    /// `let _ =` 忽略释放错误会让循环持死定时器永不退（泄漏）。
     fn spawn_poll_loop(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
                 let mut done = false;
-                let _ = this.update(cx, |view, cx| {
+                match this.update(cx, |view, cx| {
                     view.drain_replies(cx);
                     if view.pending.is_empty() {
                         view.polling = false;
                         done = true;
                     }
-                });
+                }) {
+                    Ok(()) => {}
+                    Err(_) => break, // 实体已释放——轮询链随退。
+                }
                 if done {
                     break;
                 }
@@ -939,25 +992,33 @@ impl PdfPagesView {
         let image = self
             .render_key(&key)
             .and_then(|k| self.cache.get(&k).cloned());
-        // #422：本页查找高亮层（页级换算——层几何 → 槽像素，轴独立
-        // 缩放；当前命中橙色加描边，其余黄色）。
+        // #422：本页查找高亮层（#634：quad 四角页变换映射 + 内容盒
+        // letterbox；当前命中橙色加描边，其余黄色）。
         let highlights = self.search_highlights(idx as u32, fit_w as f32, slot_h);
         match image {
             Some(image) => {
+                // #634：位图等比内接（contain）——本页显示纵横比 ≠ 首页
+                //（槽基准）时不再非等比拉伸；高亮层同坐标系（内容盒 +
+                // letterbox 偏移，contain_box 单源）。
+                let (cw, ch, ox, oy) = Self::image_contain_box(&image, fit_w as f32, slot_h);
                 let img = gpui::img(ImageSource::Render(image))
                     .id(gpui::ElementId::NamedInteger("pdf-page".into(), idx as u64))
-                    .w(px(fit_w as f32))
-                    .h(px(slot_h))
+                    .w(px(cw))
+                    .h(px(ch))
+                    .absolute()
+                    .left(px(ox))
+                    .top(px(oy))
                     .flex_none()
                     .rounded_sm()
                     .shadow_md();
-                if highlights.is_empty() {
-                    return img.into_any_element();
-                }
                 div()
                     .id(gpui::SharedString::from(format!("pdf-page-hit-{idx}")))
                     .relative()
                     .flex_none()
+                    // #634：槽尺寸显式声明（位图 absolute 定位不撑开容器
+                    //——uniform_list 行高与 debug_selector 观测面依赖它）。
+                    .w(px(fit_w as f32))
+                    .h(px(slot_h))
                     .child(img)
                     .children(highlights)
                     .into_any_element()
@@ -977,16 +1038,28 @@ impl PdfPagesView {
                         .and_then(|k| self.cache.get(&k).cloned())
                 };
                 if let Some(image) = stale {
-                    return gpui::img(ImageSource::Render(image))
-                        .id(gpui::ElementId::NamedInteger(
-                            "pdf-page-stale".into(),
-                            idx as u64,
-                        ))
+                    // #634：旧宽位图同样等比内接（自身纵横比 contain）。
+                    let (cw, ch, ox, oy) = Self::image_contain_box(&image, fit_w as f32, slot_h);
+                    return div()
+                        .id(gpui::SharedString::from(format!("pdf-page-stale-{idx}")))
+                        .relative()
+                        .flex_none()
                         .w(px(fit_w as f32))
                         .h(px(slot_h))
-                        .flex_none()
-                        .rounded_sm()
-                        .shadow_md()
+                        .child(
+                            gpui::img(ImageSource::Render(image))
+                                .id(gpui::ElementId::NamedInteger(
+                                    "pdf-page-stale".into(),
+                                    idx as u64,
+                                ))
+                                .w(px(cw))
+                                .h(px(ch))
+                                .absolute()
+                                .left(px(ox))
+                                .top(px(oy))
+                                .rounded_sm()
+                                .shadow_md(),
+                        )
                         .into_any_element();
                 }
                 div()
@@ -1015,8 +1088,10 @@ impl PdfPagesView {
         }
     }
 
-    /// #422：本页查找高亮元素族（用户空间 pt → 槽像素；空 = 本页无
-    /// 命中或查找未开）。当前命中 = 橙色 + 描边；其余 = 黄色。
+    /// #422：本页查找高亮元素族（#634：quad 四角经页变换
+    /// `user_to_screen` 映射 + 内容盒 letterbox 归一——旋转页高亮
+    /// 不再错位；空 = 本页无命中或查找未开）。当前命中 = 橙色 + 描边；
+    /// 其余 = 黄色。
     fn search_highlights(&self, page: u32, fit_w: f32, slot_h: f32) -> Vec<AnyElement> {
         let Some(search) = self.search.as_ref() else {
             return Vec::new();
@@ -1024,10 +1099,22 @@ impl PdfPagesView {
         if search.matches.is_empty() {
             return Vec::new();
         }
-        let layer = search.layers.get(&page);
-        let (sx, sy) = layer
-            .map(|l| (fit_w / l.width_pt.max(1.), slot_h / l.height_pt.max(1.)))
-            .unwrap_or((1., 1.));
+        let Some(layer) = search.layers.get(&page) else {
+            return Vec::new();
+        };
+        // #634：本页显示域（含旋转）——内容盒与 DPI 的基准。
+        let d = layer.transform.display_size();
+        let page_aspect = if d.width > 0. {
+            d.height / d.width
+        } else {
+            1.414
+        };
+        let (cw, _ch, ox, oy) = Self::contain_box(fit_w, slot_h, page_aspect);
+        let dpi = if d.width > 0. {
+            cw / d.width * 72.0
+        } else {
+            72.0
+        };
         let mut out = Vec::new();
         for (mi, m) in search.matches.iter().enumerate() {
             if m.page != page {
@@ -1035,10 +1122,40 @@ impl PdfPagesView {
             }
             let is_current = mi == search.current;
             for (qi, q) in m.quads.iter().enumerate() {
-                let x = q.left * sx;
-                let y = slot_h - q.top * sy;
-                let w = (q.right - q.left) * sx;
-                let h = (q.top - q.bottom) * sy;
+                // 四角用户空间 → 屏幕（含旋转 + y 翻转；90° 倍旋转下
+                // 仍轴对齐——min/max 组盒与 screen_rect_to_quad 同哲）。
+                let tl = layer.transform.user_to_screen(
+                    Point {
+                        x: q.left,
+                        y: q.top,
+                    },
+                    dpi,
+                );
+                let tr = layer.transform.user_to_screen(
+                    Point {
+                        x: q.right,
+                        y: q.top,
+                    },
+                    dpi,
+                );
+                let bl = layer.transform.user_to_screen(
+                    Point {
+                        x: q.left,
+                        y: q.bottom,
+                    },
+                    dpi,
+                );
+                let br = layer.transform.user_to_screen(
+                    Point {
+                        x: q.right,
+                        y: q.bottom,
+                    },
+                    dpi,
+                );
+                let x = tl.0.min(tr.0).min(bl.0).min(br.0).max(0.) + ox;
+                let y = tl.1.min(tr.1).min(bl.1).min(br.1).max(0.) + oy;
+                let w = (tr.0.max(br.0).max(tl.0).max(bl.0) - (x - ox)).max(2.);
+                let h = (bl.1.max(br.1).max(tl.1).max(tr.1) - (y - oy)).max(2.);
                 let mut el = div()
                     .id(gpui::SharedString::from(format!(
                         "pdf-hit-{page}-{mi}-{qi}"
@@ -1120,13 +1237,28 @@ impl PdfPagesView {
         let (vw, vh) = self.viewport_size;
         let fit_w = self.raster_width(vw, vh);
         let controller = self.annotate.as_mut().expect("刚初始化");
-        // DPI：位图 px / 显示域 pt × 72（等比槽近似——异形页 letterbox
-        // 边界见模块文档 v1 登记）。#421：基准 = 当前光栅宽（缩放后拖
-        // 框坐标与位图像素 1:1 同域——验收 3 坐标正确性的关键；视口
-        // 未记录时各模式均落 WIDTH_MIN 兜底）。
+        // #634：本页内容盒（letterbox）——槽坐标先扣偏移再进变换；
+        // DPI 基准 = 内容盒宽/显示域宽（等比内接后内容盒 1px ≠ 槽 1px，
+        // 与 search_highlights / jump_search 同源）。#421：基准 = 当前
+        // 光栅宽（缩放后拖框坐标与位图同域——验收 3 坐标正确性的关键；
+        // 视口未记录时各模式均落 WIDTH_MIN 兜底）。
         let transform = controller.page_transform(page)?;
-        let display_w = transform.display_size().width.max(1.0);
-        let dpi = fit_w as f32 / display_w * 72.0;
+        let d = transform.display_size();
+        let page_aspect = if d.width > 0. {
+            d.height / d.width
+        } else {
+            1.414
+        };
+        let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
+        let (cw, _ch, ox, oy) = Self::contain_box(fit_w as f32, slot_h, page_aspect);
+        let dpi = if d.width > 0. {
+            cw / d.width * 72.0
+        } else {
+            72.0
+        };
+        // 槽坐标 → 内容盒像素（letterbox 偏移扣除——异形页拖框落点
+        // 不再带留白偏差）。
+        let (x0, y0, x1, y1) = (x0 - ox, y0 - oy, x1 - ox, y1 - oy);
         // 三手势派发（issue #302 验收 1：高亮/下划线/便签）。
         match self.annotate_tool {
             AnnotateTool::Highlight => {
@@ -1219,14 +1351,17 @@ impl PdfPagesView {
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
                 let mut stop = false;
-                let _ = this.update(cx, |view, cx| {
+                match this.update(cx, |view, cx| {
                     view.drain_search_index(cx);
                     if view.search.is_none() || view.search.as_ref().is_some_and(|s| s.indexed_done)
                     {
                         view.search_polling = false;
                         stop = true;
                     }
-                });
+                }) {
+                    Ok(()) => {}
+                    Err(_) => break, // #634：实体已释放——轮询链随退。
+                }
                 if stop {
                     break;
                 }
@@ -1322,7 +1457,8 @@ impl PdfPagesView {
         }
         let fit_w = Self::fit_width(vw);
         let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
-        // 页内 y：层几何轴缩放（拉伸页独立 y 轴——同源边界注释见模块头）。
+        // 页内 y：#634——quad 顶边经页变换映射到屏幕（含旋转 + y 翻转）
+        // + 内容盒 letterbox 偏移（替换 v1 的层几何轴缩放）。
         let layer = self
             .search
             .as_ref()
@@ -1330,9 +1466,25 @@ impl PdfPagesView {
             .cloned();
         let y_in_slot = layer
             .as_ref()
-            .filter(|l| l.height_pt > 0.)
-            .and_then(|l| m.quads.first().map(|q| (q, slot_h / l.height_pt)))
-            .map(|(q, sy)| slot_h - q.top * sy)
+            .and_then(|l| {
+                let d = l.transform.display_size();
+                if d.width <= 0. {
+                    return None;
+                }
+                let (cw, _ch, _ox, oy) =
+                    Self::contain_box(fit_w as f32, slot_h, d.height / d.width);
+                let dpi = cw / d.width * 72.0;
+                m.quads.first().map(|q| {
+                    let (_sx, sy) = l.transform.user_to_screen(
+                        Point {
+                            x: q.left,
+                            y: q.top,
+                        },
+                        dpi,
+                    );
+                    oy + sy
+                })
+            })
             .unwrap_or(0.);
         let target = (m.page as f32 * slot_h + y_in_slot - vh * 0.3).max(0.);
         // uniform_list 滚动偏移直设（负值向下——gpui 滚动语义）。
@@ -2054,12 +2206,16 @@ fn index_document(bytes: Arc<Vec<u8>>, page_count: u32, tx: Sender<SearchIndexMs
         }
     };
     for page in 0..page_count {
-        // 页几何（pt）——高亮换算的轴缩放基准；取不到按 A4 兜底
-        //（595×842——只影响高亮落点精度，不影响匹配面）。
-        let (width_pt, height_pt) = engine
+        // #634：页变换（几何 + 旋转单一事实源——高亮 quad 四角映射基
+        // 准）；取不到按 A4 兜底（只影响高亮落点精度，不影响匹配面）。
+        let transform = engine
             .page_geometry(PageIndex(page))
-            .map(|g| (g.effective_width(), g.effective_height()))
-            .unwrap_or((595., 842.));
+            .ok()
+            .and_then(|g| PageTransform::from_geometry(&g).ok())
+            .unwrap_or_else(|| {
+                PageTransform::from_geometry(&PageGeometry::default())
+                    .expect("A4 兜底几何必可构造变换")
+            });
         match engine.positioned_chars(PageIndex(page)) {
             Ok(chars) => {
                 let lower = chars
@@ -2069,8 +2225,7 @@ fn index_document(bytes: Arc<Vec<u8>>, page_count: u32, tx: Sender<SearchIndexMs
                 let layer = PageTextLayer {
                     chars,
                     lower,
-                    width_pt,
-                    height_pt,
+                    transform,
                 };
                 if tx.send(SearchIndexMsg::Layer(Box::new(layer))).is_err() {
                     return; // 查找条已关——线程即止。
@@ -2219,8 +2374,12 @@ mod tests {
         assert!((PdfPagesView::slot_height(800, 1.5) - 1200.).abs() < 1e-6);
         // 宽高比 1.415（A4 近似——避开 clippy::approx_constant 对
         // √2 近似值的误报；测试输入参数，非常量计算）：
-        // 640 × 1.415 = 905.6。
-        assert!((PdfPagesView::slot_height(640, 1.415) - 905.6).abs() < 0.01);
+        // 640 × 1.415 = 905.6 → #634 0.5px 量子化保持 905.5。
+        assert!((PdfPagesView::slot_height(640, 1.415) - 905.5).abs() < 0.01);
+        // #634：量子化语义——解析值对齐半像素网格（Taffy 行高测量
+        // 同网格；uniform_list 测量与滚动换算单源一致）。
+        assert_eq!(PdfPagesView::slot_height(576, 1.41421), 814.5);
+        assert_eq!(PdfPagesView::slot_height(577, 1.41421), 816.0);
     }
 
     #[test]
@@ -2337,8 +2496,12 @@ mod tests {
         let layer = PageTextLayer {
             lower: text.to_lowercase(),
             chars,
-            width_pt: 595.,
-            height_pt: 842.,
+            transform: PageTransform::from_geometry(&PageGeometry::simple(
+                595.,
+                842.,
+                Rotation::Deg0,
+            ))
+            .expect("A4 简单几何必可构造变换"),
         };
         // 大小写折叠：小写查询命中大写原文。
         let hits = find_in_layer(&layer, "kafka");
@@ -2812,30 +2975,42 @@ mod tests {
     fn zoom_mode_percent_custom_exact_and_preset_derived() {
         // Custom：直报倍率——量子化只影响缓存键不影响报数。
         assert_eq!(
-            zoom_mode_percent(ZoomMode::Custom(0.5), 595., 1024., 768.),
+            zoom_mode_percent(ZoomMode::Custom(0.5), 1.414, 595., 1024., 768.),
             50
         );
         assert_eq!(
-            zoom_mode_percent(ZoomMode::Custom(1.0), 595., 1024., 768.),
+            zoom_mode_percent(ZoomMode::Custom(1.0), 1.414, 595., 1024., 768.),
             100
         );
         assert_eq!(
-            zoom_mode_percent(ZoomMode::Custom(2.0), 595., 1024., 768.),
+            zoom_mode_percent(ZoomMode::Custom(2.0), 1.414, 595., 1024., 768.),
             200
         );
         // ActualSize：光栅 640 / 595 = 107.6% → 108%（量化折入——如
         // 实报当前生效光栅比例）。
         assert_eq!(
-            zoom_mode_percent(ZoomMode::ActualSize, 595., 1024., 768.),
+            zoom_mode_percent(ZoomMode::ActualSize, 1.414, 595., 1024., 768.),
             108
         );
         // FitWidth：适宽 1024 / 595 = 172.1% → 172%。
         assert_eq!(
-            zoom_mode_percent(ZoomMode::FitWidth, 595., 1024., 768.),
+            zoom_mode_percent(ZoomMode::FitWidth, 1.414, 595., 1024., 768.),
             172
         );
         // pt 宽无效（兜底路径防 0 除）→ 100。
-        assert_eq!(zoom_mode_percent(ZoomMode::FitWidth, 0., 1024., 768.), 100);
+        assert_eq!(
+            zoom_mode_percent(ZoomMode::FitWidth, 1.414, 0., 1024., 768.),
+            100
+        );
+        // #634：非 A4 档——横 A4（aspect 0.707）FitPage 光栅宽由
+        // vh/aspect 派生，百分比与 A4 魔数口径可分辨（aspect 实参化
+        // 的行为面：非 A4 档预设百分比不再按 A4 折算）。
+        let landscape = zoom_mode_percent(ZoomMode::FitPage, 0.707, 842., 1024., 768.);
+        let a4magic = zoom_mode_percent(ZoomMode::FitPage, 1.414, 842., 1024., 768.);
+        assert_ne!(
+            landscape, a4magic,
+            "横 A4 与 A4 魔数口径的 FitPage 百分比应可分辨"
+        );
     }
 
     /// 缩放域护栏常量自洽（PDF_ZOOM_MIN/MAX 与 issue 交互面一致）。

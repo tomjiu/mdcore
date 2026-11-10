@@ -6,6 +6,11 @@ description = "LibreOfficeKit 隔离 worker 原型（#633）：LOK 内核动态�
 
 [dependencies]
 serde_json.workspace = true
+# B4：verify.rs 保存产物独立校验的 deflate 解压（Cargo.lock 现解析
+# 版本直依赖——pdfium-render/lopdf 传递引入已编译，零新编译单元，
+# 循 mdc-pdf sha2 先例）。
+flate2 = "1.1.10"
+
 
 [[bin]]
 name = "mdc-lok-worker"

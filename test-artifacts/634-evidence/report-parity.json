@@ -1,0 +1,424 @@
+{
+  "face": "parity_vs_poppler",
+  "head": {
+    "mdc_pdfium_lib_env": "/home/z/my-project/cb634/bin/lib/libpdfium.so",
+    "pdfium_lib": {
+      "path": "/home/z/my-project/cb634/target/debug/deps/libpdfium.so",
+      "provenance": "chromium/8086（CI ci-deps-v1 同轨铆定）",
+      "role": "exe 同目录（产品部署位）",
+      "sha256": "e995a89f11d48605a79a0e44f101ca3a621e5c3ef9ee311a1405e03b44dc5b19"
+    },
+    "poppler": "pdftoppm version 25.03.0"
+  },
+  "measure_mode": false,
+  "rows": [
+    {
+      "dpi": 46.45,
+      "file": "chinese_embedded.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.7330999970436096,
+      "ncc": 0.9506000280380249,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.699999988079071,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "chinese_embedded.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.7329999804496765,
+      "ncc": 0.9505000114440918,
+      "page": 2,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.699999988079071,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "chinese_missing_font.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.6826000213623047,
+      "ncc": 0.9351999759674072,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.6000000238418579,
+        "ncc_min": 0.800000011920929
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "chinese_missing_font.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.6826000213623047,
+      "ncc": 0.9351000189781189,
+      "page": 2,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.6000000238418579,
+        "ncc_min": 0.800000011920929
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "scanned_gray.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.8935999870300293,
+      "ncc": 0.98580002784729,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "vector_graphics.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.8880000114440918,
+      "ncc": 0.9882000088691711,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "transparency_blend.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.9599000215530396,
+      "ncc": 0.9973000288009644,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 43.2,
+      "file": "cropped_mediabox.pdf",
+      "grid": [
+        96,
+        74
+      ],
+      "ink_iou": 0.9991999864578247,
+      "ncc": 0.9998999834060669,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        296
+      ],
+      "poppler_bitmap": [
+        384,
+        297
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 32.84,
+      "file": "rotation_matrix.pdf",
+      "grid": [
+        96,
+        68
+      ],
+      "ink_iou": 0.9553999900817871,
+      "ncc": 0.9940000176429749,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        272
+      ],
+      "poppler_bitmap": [
+        384,
+        272
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "rotation_matrix.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.9354000091552734,
+      "ncc": 0.9898999929428101,
+      "page": 2,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "landscape_mixed.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.8198999762535095,
+      "ncc": 0.9763000011444092,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 32.84,
+      "file": "landscape_mixed.pdf",
+      "grid": [
+        96,
+        68
+      ],
+      "ink_iou": 0.8754000067710876,
+      "ncc": 0.9882000088691711,
+      "page": 2,
+      "pdfium_bitmap": [
+        384,
+        272
+      ],
+      "poppler_bitmap": [
+        384,
+        272
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.08,
+      "file": "landscape_mixed.pdf",
+      "grid": [
+        96,
+        96
+      ],
+      "ink_iou": 0.953499972820282,
+      "ncc": 0.9980999827384949,
+      "page": 3,
+      "pdfium_bitmap": [
+        384,
+        384
+      ],
+      "poppler_bitmap": [
+        384,
+        384
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "multipage_120.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.7555999755859375,
+      "ncc": 0.9539999961853027,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "multipage_120.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.7742999792098999,
+      "ncc": 0.9657999873161316,
+      "page": 60,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 46.45,
+      "file": "multipage_120.pdf",
+      "grid": [
+        96,
+        136
+      ],
+      "ink_iou": 0.8216000199317932,
+      "ncc": 0.9718000292778015,
+      "page": 120,
+      "pdfium_bitmap": [
+        384,
+        543
+      ],
+      "poppler_bitmap": [
+        384,
+        544
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    },
+    {
+      "dpi": 691.2,
+      "file": "tiny_note.pdf",
+      "grid": [
+        96,
+        1728
+      ],
+      "ink_iou": 0.9962000250816345,
+      "ncc": 0.9976999759674072,
+      "page": 1,
+      "pdfium_bitmap": [
+        384,
+        6912
+      ],
+      "poppler_bitmap": [
+        384,
+        6913
+      ],
+      "supersample": 4,
+      "thresholds": {
+        "ink_iou_min": 0.7200000286102295,
+        "ncc_min": 0.8999999761581421
+      }
+    }
+  ]
+}

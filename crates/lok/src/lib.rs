@@ -60,6 +60,7 @@ pub mod protocol;
 pub mod runtime;
 pub mod sha256;
 pub mod smoke;
+pub mod verify;
 pub mod worker;
 
 /// 帧长上限（字节）。响应与事件行超过即拒：worker 回 `E_OVERSIZE`

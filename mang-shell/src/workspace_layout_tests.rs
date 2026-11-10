@@ -153,6 +153,88 @@ fn file_tree_open_and_reopen_use_real_shell_without_entity_reentry(cx: &mut Test
     }
 }
 
+/// A1（#47 批次 2）：右 dock 窄窗让位——窗口宽低于临界值（900px）时右栏
+/// 在渲染期让位，编辑区保 ≥240px 可用宽；`right_open` 用户开关态不被
+/// 改写，宽度恢复后右栏按原开关态回归。
+#[gpui::test]
+fn right_dock_yields_below_critical_width_and_returns_when_restored(cx: &mut TestAppContext) {
+    let (shell, mut visual) = host(cx);
+    // 常宽（1280）：右栏在场（right_open 缺省开）。
+    visual.update(|window, app| window.draw(app).clear(app));
+    assert!(
+        visual.debug_bounds("right-panel").is_some(),
+        "precondition: right dock is rendered at normal width"
+    );
+    // 临界以下（760×480 = 强制的最小窗宽）：右栏让位。
+    visual.simulate_resize(size(px(760.), px(480.)));
+    visual.update(|window, app| window.draw(app).clear(app));
+    assert!(
+        visual.debug_bounds("right-panel").is_none(),
+        "right dock yields below the critical width"
+    );
+    let editor = visual
+        .debug_bounds("editor-content")
+        .expect("editor is rendered");
+    assert!(
+        editor.size.width >= px(240.),
+        "editor keeps a usable width after the dock yields: {:?}",
+        editor.size.width
+    );
+    let tabs = visual
+        .debug_bounds("editor-tabs")
+        .expect("tabs are rendered");
+    let left = visual
+        .debug_bounds("left-panel")
+        .expect("explorer is intact");
+    assert_eq!(
+        tabs.origin.x, editor.origin.x,
+        "tabs belong to the editor column while yielded"
+    );
+    assert!(
+        tabs.origin.x >= left.origin.x + left.size.width,
+        "tabs must not cross the explorer while yielded"
+    );
+    assert!(
+        shell.read_with(&visual, |shell, _| shell.right_open),
+        "the user's right_open toggle is not rewritten while yielded"
+    );
+    // 恢复宽度：右栏按原开关态回归。
+    visual.simulate_resize(size(px(1280.), px(800.)));
+    visual.update(|window, app| window.draw(app).clear(app));
+    assert!(
+        visual.debug_bounds("right-panel").is_some(),
+        "right dock returns when the width is restored"
+    );
+}
+
+/// A1（#47 批次 2）：最小窗宽（760×480，main.rs 强制的 window_min_size）
+/// 下布局保持——菜单/Git 入口可达、标签在编辑区上沿、编辑区可用。
+#[gpui::test]
+fn layout_holds_at_enforced_minimum_window_size(cx: &mut TestAppContext) {
+    let (_shell, mut visual) = host(cx);
+    visual.simulate_resize(size(px(760.), px(480.)));
+    visual.update(|window, app| window.draw(app).clear(app));
+    let title = visual.debug_bounds("title-bar").unwrap();
+    let menus = visual.debug_bounds("menu-bar-titles").unwrap();
+    assert!(menus.size.width > px(120.) && menus.size.height > px(20.));
+    assert!(menus.origin.x >= title.origin.x && menus.origin.y >= title.origin.y);
+    let git = visual.debug_bounds("act-git").unwrap();
+    assert_eq!(git.size, size(px(36.), px(36.)));
+    let tabs = visual.debug_bounds("editor-tabs").unwrap();
+    let editor = visual.debug_bounds("editor-content").unwrap();
+    let left = visual.debug_bounds("left-panel").unwrap();
+    assert_eq!(
+        tabs.origin.x, editor.origin.x,
+        "tabs belong to the editor column"
+    );
+    assert!(tabs.origin.x >= left.origin.x + left.size.width);
+    assert!(
+        editor.size.width >= px(240.),
+        "editor keeps a usable width at the enforced minimum: {:?}",
+        editor.size.width
+    );
+}
+
 #[gpui::test]
 fn tab_close_button_closes_document_and_honors_dirty_cancel(cx: &mut TestAppContext) {
     let (shell, mut visual) = host(cx);
