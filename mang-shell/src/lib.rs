@@ -108,6 +108,12 @@ pub mod pdf_export_docx;
 #[path = "pdf_pages.rs"]
 pub mod pdf_pages;
 
+/// #50 C1：DOCX 页面视图（LOK 内核真源渲染——连续画布条带模型；
+/// 会话层 editor::docx_lok_session 异步接线，零 UI 线程阻塞；条带
+/// 几何纯函数进 lib 树供单测——无 LOK 运行时同样真跑）。
+#[path = "docx_pages.rs"]
+pub mod docx_pages;
+
 /// #420：PDF 页面缩略图侧栏（低 dpi 光栅化 → uniform_list 虚拟化懒加载
 /// ——≤60 页首批全量、>60 页只染可见窗；点击跳页 + 主视图滚动高亮
 /// 联动经壳注入钩子，与 pdf_pages 零写面耦合）。

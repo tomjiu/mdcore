@@ -390,6 +390,17 @@ pub fn xlsx_toggle_label(grid_view: bool) -> &'static str {
     }
 }
 
+/// #50 C1：docx 视图切换钮文案：页面态显示「切换到文本视图」，文本
+/// 态显示「切换到页面视图」（语义同 [`pdf_toggle_label`]——
+/// status_bar.rs `docx-view-toggle` 消费。零内联字面量纪律同源）。
+pub fn docx_toggle_label(page_view: bool) -> &'static str {
+    if page_view {
+        "切换到文本视图"
+    } else {
+        "切换到页面视图"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -110,6 +110,9 @@ mod pdf_annotate;
 // lib.rs 侧 `pub mod pdf_export_docx;` 双根声明，bin 侧缺声明会 E0433）。
 mod pdf_export_docx;
 mod pdf_pages;
+// #50 C1：DOCX LOK 页面视图（bin 根声明——shell.rs 壳接线消费；与
+// lib.rs 双根同文件复用，缺此声明 bin 面 E0432——#420 同源病灶）。
+mod docx_pages;
 // #420：PDF 页面缩略图侧栏（bin 根声明——shell.rs 壳接线消费；与
 // lib.rs 双根同文件复用，缺此声明 bin 面 E0432）。
 mod pdf_thumbs;

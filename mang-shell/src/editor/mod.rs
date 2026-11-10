@@ -54,6 +54,9 @@ pub mod commands;
 pub mod display_map; // r42 阶段 B（#68）：buffer <-> 显示行列映射（软换行 + 折叠）
 pub mod docx_doc;
 pub mod docx_edit_bridge; // #115：docx 可编辑化——Buffer ↔ DocxEditor 可逆映射
+// #50 C1：DOCX LOK 会话层（宿主侧异步包装——线程演员 + mpsc 回执；
+// GPUI 零依赖，零 crates/lok 私有域触碰）。
+pub mod docx_lok_session;
 pub mod fence; // #205：fence 缓存重建（纯逻辑：FenceCursor 推进 + 增量/全量）
 pub mod find_bar;
 pub mod highlight;

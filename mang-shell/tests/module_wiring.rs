@@ -199,6 +199,14 @@ const WIRED_MODULES: &[(&str, &str, &[&str])] = &[
         "shell.rs",
         &["PdfPagesView"],
     ),
+    // #50 C1：docx LOK 页面视图——shell 挂载消费（editor_area 按模式分
+    // 派；状态栏页面/文本切换；会话层 editor::docx_lok_session 被
+    // docx_pages 消费——同一接线链）。
+    (
+        "docx_pages.rs（docx LOK 页面视图）",
+        "shell.rs",
+        &["DocxPagesView"],
+    ),
     (
         "editor/xlsx_doc.rs（xlsx 读面）",
         "document.rs",

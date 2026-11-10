@@ -50,6 +50,9 @@ use crate::keymap::{self, ShellAction};
 use crate::panels;
 use crate::pdf_pages::PdfPagesView;
 use crate::pdf_thumbs::{PdfThumbnailsView, PdfThumbsHooks};
+// #50 C1：docx 页面视图（LOK 内核真源渲染——会话层在
+// editor::docx_lok_session）。
+use crate::docx_pages::DocxPagesView;
 use crate::recent::RecentStore;
 use crate::right_dock;
 use crate::settings_panel;
@@ -188,6 +191,14 @@ pub struct ShellApp {
     /// 文本行模型。状态栏「页面/文本」钮切换；两视图各有查找面
     /// （#422：页面视图内查找条，不再强制切文本）。
     pdf_view_mode: bool,
+    /// #50 C1：docx 页面视图（当前 docx 标签的 LOK 内核渲染实体 +
+    /// 归属路径——生命周期与 pdf_pages 同模式：切标签重建/关标签
+    /// 丢弃；会话随实体 Drop 拆除）。
+    docx_pages: Option<(PathBuf, Entity<DocxPagesView>)>,
+    /// #50 C1：docx 显示模式（true = LOK 页面视图——缺省；false =
+    /// 行投影文本模型。状态栏「页面/文本」钮切换；文本态未保存编辑
+    /// 拒切页面态（toggle 卫——单一编辑真源）。
+    docx_view_mode: bool,
     /// #389 阶段 1：xlsx 网格视图（当前 xlsx 标签的真网格渲染实体 +
     /// 归属路径——生命周期与 pdf_pages 同模式：切标签重建/关标签丢弃）。
     xlsx_grid: Option<(PathBuf, Entity<XlsxGridView>)>,
@@ -448,6 +459,8 @@ impl ShellApp {
             ocr_rx: None,
             ocr_polling: false,
             pdf_view_mode: true,
+            docx_pages: None,
+            docx_view_mode: true,
             xlsx_grid: None,
             xlsx_sessions: std::collections::HashMap::new(),
             xlsx_grid_view_mode: true,
@@ -592,6 +605,24 @@ impl ShellApp {
             .tabs
             .get(idx)
             .is_some_and(|tab| tab.editor.read(cx).doc_kind() == "pdf");
+        // #50 C1：docx 页面态卫——LOK 页面视图 C1 只读渲染（保存面 C4
+        // 接线），且切换卫保证行投影恒干净 → Unmodified。**不走**
+        // Editor::save：docx 引擎保存无 dirty 卫，会在 LOK 会话脚下盲
+        // 目重写盘上文件（破坏单一编辑真源）。
+        let docx_page_owned = self
+            .tabs
+            .get(idx)
+            .filter(|tab| tab.editor.read(cx).doc_kind() == "docx")
+            .filter(|_| self.docx_view_mode)
+            .and_then(|tab| {
+                self.docx_pages
+                    .as_ref()
+                    .filter(|(owned, _)| *owned == tab.path)
+                    .map(|_| tab.path.clone())
+            });
+        if let Some(_owned) = docx_page_owned {
+            return SaveOutcome::Unmodified;
+        }
         if is_pdf {
             let tab_path = self.tabs.get(idx).map(|tab| tab.path.clone());
             if let Some(path) = tab_path {
@@ -935,6 +966,12 @@ impl ShellApp {
             .is_some_and(|ed| ed.read(cx).doc_kind() == "pdf")
     }
 
+    /// 当前活动标签是否 docx 态（#50 页面视图挂载判据）。
+    fn active_is_docx(&self, cx: &Context<Self>) -> bool {
+        self.editor()
+            .is_some_and(|ed| ed.read(cx).doc_kind() == "docx")
+    }
+
     /// 确保当前 pdf 标签的页视图实体在场（非 pdf 态 / 已在同路径实体
     /// 上 = 无操作）。切到不同 pdf 标签时重建（旧实体 drop——页缓存
     /// 随之释放，单实体生命周期与单 pdf 标签对齐）。
@@ -1007,6 +1044,57 @@ impl ShellApp {
         // #604：切换后重聚焦当前主显示面（页视图 ↔ 文本编辑器）。
         // 视图实体的焦点节点随渲染树增删——不重聚焦则句柄游离，键
         // 事件死在合成根（#422 同款；xlsx 网格/文本切换对称）。
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// #50 C1：确保当前 docx 标签的页面视图实体在场（生命周期与
+    /// ensure_pdf_pages 同模式：非 docx 态 / 已在同路径实体上 = 无操
+    /// 作；切标签重建）。会话在视图实体内自管（Drop 即拆 worker——
+    /// 会话层线程演员收尾）。
+    fn ensure_docx_pages(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.editor.read(cx).doc_kind() != "docx" {
+            return;
+        }
+        let path = tab.path.clone();
+        if let Some((owned, _)) = &self.docx_pages {
+            if *owned == path {
+                return;
+            }
+        }
+        // #50 C1：传路径（LOK 从盘装载——标签路径绑定单一真源）；打开
+        // 链/装载失败在视图内以 Boot::Failed 呈现（错误面板自带文本
+        // 视图后备提示——不白屏、不假绿）。
+        let entity = cx.new(|cx| DocxPagesView::new(path.clone(), cx));
+        self.docx_pages = Some((path, entity));
+        cx.notify();
+    }
+
+    /// #50 C1：切换 docx 显示模式（状态栏「页面/文本」钮）。
+    /// 互斥卫：文本态有未保存编辑拒切页面态——LOK 会话从盘装载，
+    /// 双编辑真源会静默分叉（先保存再切换）。
+    pub fn toggle_docx_view_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.active_is_docx(cx) {
+            return;
+        }
+        if !self.docx_view_mode && self.editor().is_some_and(|ed| ed.read(cx).is_modified()) {
+            self.show_notice(
+                "文本视图有未保存编辑——先保存（Ctrl+S）再切换到页面视图（单一编辑真源）".into(),
+                cx,
+            );
+            return;
+        }
+        self.docx_view_mode = !self.docx_view_mode;
+        if self.docx_view_mode {
+            self.ensure_docx_pages(cx);
+        } else {
+            // 切文本态：拆 LOK 会话（实体 Drop → worker 关停）——行
+            // 投影重新成为唯一编辑面。
+            self.docx_pages = None;
+        }
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -1655,6 +1743,8 @@ impl ShellApp {
                 });
                 let focus = editor.read(cx).focus_handle().clone();
                 let is_pdf = editor.read(cx).doc_kind() == "pdf";
+                // #50 C1：docx 页面态焦点路由同源（is_docx）。
+                let is_docx = editor.read(cx).doc_kind() == "docx";
                 self.tabs.push(TabItem {
                     path: path.clone(),
                     editor,
@@ -1678,6 +1768,9 @@ impl ShellApp {
                 }
                 // #289-④：pdf 标签 → 页视图落位（位图渲染主显示面）。
                 self.ensure_pdf_pages(cx);
+                // #50 C1：docx 标签 → LOK 页面视图落位（内核真源渲染
+                // 主显示面；缺内核时错误面板明示 + 文本视图后备）。
+                self.ensure_docx_pages(cx);
                 // #389 阶段 1：xlsx 标签 → 网格视图落位（真网格主显示面）。
                 self.ensure_xlsx_grid(cx);
                 cx.notify();
@@ -1687,6 +1780,14 @@ impl ShellApp {
                 if self.pdf_view_mode
                     && is_pdf
                     && let Some((_, view)) = self.pdf_pages.as_ref()
+                {
+                    return Some(view.read(cx).focus_handle(cx).clone());
+                }
+                // #50 C1：docx 页面态——主显示面是 LOK 页视图（编辑器
+                // 不在树内）：焦点改返页视图（#422 同源病灶预防）。
+                if self.docx_view_mode
+                    && is_docx
+                    && let Some((_, view)) = self.docx_pages.as_ref()
                 {
                     return Some(view.read(cx).focus_handle(cx).clone());
                 }
@@ -1718,6 +1819,9 @@ impl ShellApp {
         self.sync_outline(cx);
         // #289-④：pdf 标签 → 页视图随标签落位（同路径复用，异路径重建）。
         self.ensure_pdf_pages(cx);
+        // #50 C1：docx 标签 → LOK 页面视图随标签落位（同路径复用，异
+        // 路径重建——旧实体 Drop 拆会话）。
+        self.ensure_docx_pages(cx);
         // #389 阶段 1：xlsx 标签 → 网格视图随标签落位（同路径复用，异路径重建）。
         self.ensure_xlsx_grid(cx);
         // #604：焦点句柄与 [`Self::focus_active`] 同源——视图模式态
@@ -1735,6 +1839,15 @@ impl ShellApp {
         if self.xlsx_grid_view_mode
             && tab.editor.read(cx).doc_kind() == "xlsx"
             && let Some((_, view)) = self.xlsx_grid.as_ref()
+        {
+            let focus = view.read(cx).focus_handle(cx).clone();
+            cx.notify();
+            return Some(focus);
+        }
+        // #50 C1：docx 页面态焦点路由（主显示面是 LOK 页视图）。
+        if self.docx_view_mode
+            && tab.editor.read(cx).doc_kind() == "docx"
+            && let Some((_, view)) = self.docx_pages.as_ref()
         {
             let focus = view.read(cx).focus_handle(cx).clone();
             cx.notify();
@@ -1797,6 +1910,13 @@ impl ShellApp {
                 self.xlsx_grid = None;
             }
         }
+        // #50 C1：docx 页面视图同款生命周期（关标签丢弃——会话随实
+        // 体 Drop 拆除，worker 关停）。
+        if let Some((owned, _)) = &self.docx_pages {
+            if *owned == closed_path {
+                self.docx_pages = None;
+            }
+        }
         // #389 阶段 2：会话银行同路径丢弃（关闭确认已保证 dirty 先
         // 保存/放弃——「不保存」选择到此处即弃；无确认路径（无脏）弃
         // 会话无损失）。
@@ -1820,6 +1940,8 @@ impl ShellApp {
         self.ensure_pdf_pages(cx);
         // #389 阶段 1：新活动标签若是 xlsx → 网格视图随标签重建。
         self.ensure_xlsx_grid(cx);
+        // #50 C1：新活动标签若是 docx → LOK 页面视图随标签重建。
+        self.ensure_docx_pages(cx);
         // 焦点跟到新活动标签（空态回退 shell 根域）。
         self.focus_active(window, cx);
         cx.notify();
@@ -3323,6 +3445,7 @@ impl Render for ShellApp {
                     .map(|tree| tree.read(cx).root().to_path_buf()),
                 self.pdf_view_mode,
                 self.xlsx_grid_view_mode,
+                self.docx_view_mode,
                 cx,
             ))
             // G4：面板拖拽收尾钩（窗口级 mouseup——canvas paint 期每帧
@@ -3591,14 +3714,27 @@ fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoEle
         .filter(|ed| ed.read(cx).doc_kind() == "xlsx")
         .and_then(|_| shell.xlsx_grid_view_mode.then(|| ()))
         .and_then(|_| shell.xlsx_grid.as_ref().map(|(_, e)| e.clone()));
+    // #50 C1：docx 标签的 LOK 页面视图（内核真源渲染主显示面）——模
+    // 式开且有实体时替代文本行模型呈现（状态栏「页面/文本」钮切换
+    // 回退；错误/启动面板在视图内自呈现）。
+    let docx_pages_entity = shell
+        .editor()
+        .filter(|ed| ed.read(cx).doc_kind() == "docx")
+        .and_then(|_| shell.docx_view_mode.then(|| ()))
+        .and_then(|_| shell.docx_pages.as_ref().map(|(_, e)| e.clone()));
     let active_editor = shell.editor().cloned();
     // #420：缩略图侧栏（与页视图同生命周期；页视图在位才挂——文本
     // 模式/无 pdfium 不出空壳）。
     let pdf_thumbs_entity = pdf_pages_entity
         .as_ref()
         .and_then(|_| shell.pdf_thumbs.clone());
-    match (pdf_pages_entity, xlsx_grid_entity, active_editor) {
-        (Some(pages), _, _) => match pdf_thumbs_entity {
+    match (
+        pdf_pages_entity,
+        docx_pages_entity,
+        xlsx_grid_entity,
+        active_editor,
+    ) {
+        (Some(pages), _, _, _) => match pdf_thumbs_entity {
             Some(thumbs) => h_flex()
                 .id("pdf-view-with-thumbs")
                 .size_full()
@@ -3609,9 +3745,12 @@ fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoEle
                 .into_any_element(),
             None => pages.into_any_element(),
         },
-        (None, Some(grid), _) => grid.into_any_element(),
-        (None, None, Some(editor)) => editor.into_any_element(),
-        (None, None, None) => {
+        // #50 C1：docx 页面态——LOK 页视图替代行模型（互斥：pdf 臂在前
+        // 优先级不变，xlsx/editor 臂顺延）。
+        (None, Some(docx), _, _) => docx.into_any_element(),
+        (None, None, Some(grid), _) => grid.into_any_element(),
+        (None, None, None, Some(editor)) => editor.into_any_element(),
+        (None, None, None, None) => {
             // F5：最近列表数据（文件至多 8 / 工作区至多 3 展示面——
             // 记忆上限仍为 20/10，展示截断防长列表挤爆空态页）。
             let recent_files: Vec<PathBuf> = shell
