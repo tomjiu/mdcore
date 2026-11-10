@@ -380,6 +380,21 @@ impl FindState {
         self.refresh(buffer);
     }
 
+    /// 直接设定替换文本（与 `set_query` 对称的外部注入口）。
+    ///
+    /// #629 测试姿势修复：真实键盘路径按 UTF-8 字符逐个送达，`\n` 走
+    /// `key == "enter"` 分支（触发 ReplaceCurrent/JumpForward 而非插入），
+    /// 因此含换行的多行替换文本**不可能**经 `handle_key` 的 key_char 注入
+    /// ——此前测试把整段含 `\n` 文本塞单次 key_char，被 `is_control` 整串
+    /// 拒绝（全有或全无守卫），留下空 replacement 的假绿缺口。本直设器
+    /// 覆盖「宿主/测试以程序形态灌入替换文本」的真实可达面（渲染层粘贴
+    /// 同理可走此口），光标落尾；不触碰匹配计算（replacement 不参与
+    /// refresh——只在替换动作时被读取）。
+    pub fn set_replacement(&mut self, text: &str) {
+        self.replacement = text.to_string();
+        self.repl_cursor_col = self.replacement.chars().count();
+    }
+
     /// 正则模式开关状态（渲染层高亮钮）。
     pub fn is_regex(&self) -> bool {
         self.is_regex
