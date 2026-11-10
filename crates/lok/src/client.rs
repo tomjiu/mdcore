@@ -737,6 +737,18 @@ pub struct DocSession {
     loaded_url: String,
 }
 
+impl std::fmt::Debug for DocSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocSession")
+            .field("pid", &self.client.session_pid())
+            .field("dirty", &self.dirty)
+            .field("revision", &self.revision)
+            .field("url", &self.loaded_url)
+            .field("dead", &self.client.is_dead())
+            .finish()
+    }
+}
+
 impl DocSession {
     /// 打开文档一步到位：spawn worker（独立 profile）→ load →
     /// initializeForRendering（`DeviceFormFactor=desktop`）。
