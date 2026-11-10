@@ -4954,6 +4954,97 @@ mod tab_workflow_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #47 A1：右栏展示与当前视图相关——大纲面板随活动标签换绑
+    /// （sync_outline 的 stale 判定 → 重建）+ 行集内容跟随当前文档
+    /// 标题。开（新标签激活）/切回/关邻位/关末标签四面。
+    #[gpui::test]
+    fn right_panel_outline_follows_active_tab(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("outline-follow");
+        let a = write_md(&dir, "a.md", "# A1\n正文\n## A2\n尾段\n");
+        let b = write_md(&dir, "b.md", "# B1\n正文\n");
+
+        let (shell, window) = shell_window(cx);
+        window.update(cx, |_host, _window, cx| {
+            open(&shell, cx, a.clone());
+            open(&shell, cx, b.clone());
+        });
+
+        // ① 开双标签（b 激活）→ 大纲绑定 b 编辑器 + 行集 = B1 单行。
+        window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                let ed_b = shell.tab_editor(1).unwrap().clone();
+                let panel = shell
+                    .outline
+                    .as_ref()
+                    .expect("右栏大纲在场（激活标签有标题）")
+                    .clone();
+                assert_eq!(
+                    panel.read(cx).editor(),
+                    &ed_b,
+                    "开新标签 → 大纲绑定 = 活动标签（b）编辑器"
+                );
+                assert_eq!(
+                    panel.read(cx).row_labels(),
+                    vec!["H1 · B1"],
+                    "行集内容 = 当前文档（b）标题"
+                );
+            });
+        });
+
+        // ② 切回 a → 换绑 a + 行集 = A1/A2。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.activate_tab(0, window, cx);
+                let ed_a = shell.tab_editor(0).unwrap().clone();
+                let panel = shell.outline.as_ref().expect("切回后面板在场").clone();
+                assert_eq!(
+                    panel.read(cx).editor(),
+                    &ed_a,
+                    "切回 a → 大纲换绑 a 编辑器"
+                );
+                assert_eq!(
+                    panel.read(cx).row_labels(),
+                    vec!["H1 · A1", "H2 · A2"],
+                    "换绑后行集 = 当前文档（a）标题"
+                );
+            });
+        });
+
+        // ③ 关 a（活动标签，干净）→ 大纲随新活动标签（b）换绑。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_active_tab(window, cx);
+                assert_eq!(shell.tab_count(), 1, "关 a 后剩 b");
+                let ed_b = shell.tab_editor(0).unwrap().clone();
+                let panel = shell.outline.as_ref().expect("关后面板在场").clone();
+                assert_eq!(
+                    panel.read(cx).editor(),
+                    &ed_b,
+                    "关标签 → 大纲随新活动标签（b）换绑"
+                );
+                assert_eq!(
+                    panel.read(cx).row_labels(),
+                    vec!["H1 · B1"],
+                    "关标签后行集跟随新活动文档"
+                );
+            });
+        });
+
+        // ④ 关末标签（b）→ 空态：大纲随清（无标签无绑定）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_active_tab(window, cx);
+                assert_eq!(shell.tab_count(), 0);
+                assert!(
+                    shell.outline.is_none(),
+                    "末标签关闭 → 大纲空态清（右栏不挂游离编辑器）"
+                );
+            });
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #219 边界：循环切换在空态/单标签为 no-op；越界激活安全不改
     /// 状态（标签点击竞态/程序化调用的防御面）。
     #[gpui::test]
