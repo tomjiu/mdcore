@@ -678,7 +678,9 @@ mod tests {
     #[test]
     fn git_branch_real_repo_real_checkout_tracks() {
         if !git_present() {
-            eprintln!("\n══════ SKIP（环境缺件）══════\n  无 git——#47 A5 真 git 分支跟踪未真跑\n═════════════════════════\n");
+            eprintln!(
+                "\n══════ SKIP（环境缺件）══════\n  无 git——#47 A5 真 git 分支跟踪未真跑\n═════════════════════════\n"
+            );
             return;
         }
         let dir = std::env::temp_dir().join(format!("mdc-a5-git-{}", std::process::id()));
