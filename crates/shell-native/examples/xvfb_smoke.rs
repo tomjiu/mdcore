@@ -12,8 +12,14 @@
 //! 可选参数：`--url <url>`（默认 about:blank；web/dist 构建后可传
 //! file://…/web/dist/index.html）、`--smoke-sec <n>`（默认 6）。
 
+// #71 后续：GUI 面 = Linux-only（ADR-H1 tao+wry+GTK3/WebKitGTK 栈）。
+// 非 Linux 目标本示例仅保编译（空 main，与 src/bin/mdcore.rs 的门控
+// 形态一致）——此前无门控导致 `cargo check --all-targets --target
+// x86_64-pc-windows-msvc` 在本示例 E0432 编译红。
+#[cfg(target_os = "linux")]
 use mdshell_native::native::{run_smoke, ShellConfig};
 
+#[cfg(target_os = "linux")]
 fn main() {
     let mut url = String::from("about:blank");
     let mut sec: u64 = 6;
@@ -62,4 +68,10 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    // 保编译 stub（issue #4 / #71）：非 Linux 目标无 GUI 栈。
+    eprintln!("xvfb_smoke: GUI 壳仅支持 Linux（ADR-H1：tao+wry+GTK3/WebKitGTK 栈）");
 }
