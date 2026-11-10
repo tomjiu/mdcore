@@ -16,7 +16,7 @@
 //! | node type=group | `Group` + props{label} | 空间区域语义（Group 无显式成员——与 JSON Canvas 同为空间隐含）；#404 frame 合入后可升级映射 |
 //! | edge | `Edge` + props{label/color/jc:fromSide/jc:toSide} | 端点悬空合法（读模型既有纪律） |
 //! | stroke | （导出跳过） | JSON Canvas 无笔迹原语——导出损失面，登记 |
-//! | 边 caption | （导出跳过） | JSON Canvas 边无 caption 原语（仅 label）——产品一等字段 caption（#447 渲染消费）导出即丢，损失面登记（#406 残余；升级路径=裁决位：label 空时 caption→label / `jc:caption` 专键往返） |
+//! | 边 caption | `Edge` + `jc:caption` 键 | #61 裁决落定案 B：专键往返（typed 单通道——导出读 caption 字段、导入还原字段），字节不丢；互操作可见性走手工单向转 label（可逆），label 语义（#447 渲染消费）不污染。旧损失面登记见 #636 |
 //!
 //! # 兼容纪律
 //!
@@ -51,6 +51,9 @@ const P_URL: &str = "jc:url";
 const P_FROM_SIDE: &str = "jc:fromSide";
 /// 边终点侧。
 const P_TO_SIDE: &str = "jc:toSide";
+/// #61 案 B：边说明专键（caption 一等字段的 JSON Canvas 承载面
+/// ——规范边仅 label 无 caption 原语，专键往返保信息不丢）。
+const P_JC_CAPTION: &str = "jc:caption";
 /// 标签（节点 label / 边 label 共用键——渲染协议既有键）。
 const P_LABEL: &str = "label";
 /// Obsidian 调色板色（"1"-"6"）。
@@ -191,6 +194,12 @@ fn import_edge(v: &Value) -> Option<CanvasObject> {
         .get("toSide")
         .and_then(|v| v.as_str())
         .and_then(Side::from_wire);
+    // #61 案 B：jc:caption 专键 → caption 一等字段（typed 单通道，
+    // 与导出侧对称——不进 props，免双源分叉）。
+    let caption = obj
+        .get(P_JC_CAPTION)
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     Some(CanvasObject {
         id,
         kind: ObjectKind::Edge,
@@ -198,6 +207,7 @@ fn import_edge(v: &Value) -> Option<CanvasObject> {
         to: Some(to),
         from_side,
         to_side,
+        caption,
         props,
         ..Default::default()
     })
@@ -208,6 +218,7 @@ fn import_edge(v: &Value) -> Option<CanvasObject> {
 /// - 笔迹对象跳过（JSON Canvas 无笔迹原语——登记损失面）；
 /// - 悬空边（from/to 缺失）跳过（规范端点必非空——导出无效边不如
 ///   不导）；
+/// - 边 caption 走 `jc:caption` 专键（#61 案 B——见上方映射表）；
 /// - 非 mdc 样式自由键不导（格式无承载面；对象本体不丢）。
 pub fn export_json_canvas(objects: &[CanvasObject]) -> String {
     let mut nodes: Vec<Value> = Vec::new();
@@ -227,10 +238,15 @@ pub fn export_json_canvas(objects: &[CanvasObject]) -> String {
                         e.insert(jk.into(), json!(v));
                     }
                 }
-                // #406 残余登记面：产品边 caption（一等字段+渲染消费）
-                // 在此静默丢失——JSON Canvas 边仅 label 无 caption 原语
-                //（损失面登记见模块文档映射表；升级须经裁决，勿顺手
-                // 造伪键）。
+                // #61 案 B（裁决落定）：边 caption 走 `jc:caption` 专键
+                // ——typed 单通道（导出读一等字段，不进 props；caption
+                // 无 #444 时代快照包袱，且纯 string 无「未知枚举值
+                // 保真」问题，无需 side 那样的双通道）。互操作可见性
+                // 缺口走手工单向转 label（可逆）；反向（label 回填
+                // caption）不可逆，故不取。旧损失面登记见 #636。
+                if let Some(c) = &o.caption {
+                    e.insert(P_JC_CAPTION.into(), json!(c));
+                }
                 // #602：side 双通道导出——typed 值优先（SetEdgeRoute 后的
                 // 新值不被旧 props 覆盖）；typed None + 旧快照 props 有值
                 // 时回落（#444 时代快照兼容面）；双缺省不导键（不造伪值）。
