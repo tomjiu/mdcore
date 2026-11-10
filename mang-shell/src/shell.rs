@@ -4589,7 +4589,8 @@ mod tab_workflow_tests {
     fn write_docx_fixture(dir: &Path, name: &str) -> PathBuf {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.docx");
         let path = dir.join(name);
-        std::fs::copy(&src, &path).expect("夹具在场（cargo test gen_smoke_docx -- --ignored 生成）");
+        std::fs::copy(&src, &path)
+            .expect("夹具在场（cargo test gen_smoke_docx -- --ignored 生成）");
         path
     }
 
@@ -4683,15 +4684,16 @@ mod tab_workflow_tests {
                 // 锚点段（与 tests/docx_edit_e2e.rs 同款夹具锚点）。
                 let ed = shell.tab_editor(0).unwrap().clone();
                 let target = (0..ed.read(cx).line_count())
-                    .find(|&i| ed.read(cx).buffer_line(i).starts_with("平台采用云原生微服务架构"))
+                    .find(|&i| {
+                        ed.read(cx)
+                            .buffer_line(i)
+                            .starts_with("平台采用云原生微服务架构")
+                    })
                     .expect("锚点段在场（smoke.docx 夹具）");
                 ed.update(cx, |ed, cx| {
                     ed.insert_text_at(target, 2, "【改】", cx);
                 });
-                assert!(
-                    shell.tab_is_modified(0, cx).unwrap(),
-                    "文本态编辑 → 标签脏"
-                );
+                assert!(shell.tab_is_modified(0, cx).unwrap(), "文本态编辑 → 标签脏");
                 assert!(
                     ed.read(cx).buffer_line(target).contains("【改】"),
                     "行模型带编辑标记"
@@ -4721,12 +4723,13 @@ mod tab_workflow_tests {
                 assert_eq!(shell.tab_count(), 1, "取消不关标签");
                 let ed = shell.tab_editor(0).unwrap().clone();
                 assert!(
-                    ed.read(cx).buffer_line(
-                        (0..ed.read(cx).line_count())
-                            .find(|&i| ed.read(cx).buffer_line(i).contains("【改】"))
-                            .expect("编辑行在场")
-                    )
-                    .contains("【改】"),
+                    ed.read(cx)
+                        .buffer_line(
+                            (0..ed.read(cx).line_count())
+                                .find(|&i| ed.read(cx).buffer_line(i).contains("【改】"))
+                                .expect("编辑行在场")
+                        )
+                        .contains("【改】"),
                     "取消内容不变"
                 );
                 assert!(shell.tab_is_modified(0, cx).unwrap(), "取消仍脏");
@@ -4766,10 +4769,7 @@ mod tab_workflow_tests {
             open(&shell, cx, docx.clone());
             shell.update(cx, |shell, cx| {
                 assert!(!shell.docx_view_mode, "文本态跨关闭保持（shell 全局）");
-                assert!(
-                    shell.docx_pages.is_none(),
-                    "重开不建隐藏会话（文本态）"
-                );
+                assert!(shell.docx_pages.is_none(), "重开不建隐藏会话（文本态）");
                 let ed = shell.tab_editor(0).unwrap().clone();
                 let target = (0..ed.read(cx).line_count())
                     .find(|&i| ed.read(cx).buffer_line(i).contains("【改】"))
@@ -4887,11 +4887,7 @@ mod tab_workflow_tests {
         let reloaded = crate::editor::docx_doc::load_editable(&docx)
             .expect("退出保存产物可重开")
             .payload;
-        let line = reloaded
-            .text
-            .split('\n')
-            .nth(target)
-            .expect("锚点行在场");
+        let line = reloaded.text.split('\n').nth(target).expect("锚点行在场");
         assert!(
             line.contains("【退】"),
             "退出保存落盘锚点段带标记（得 {line}）"
@@ -4919,16 +4915,9 @@ mod tab_workflow_tests {
             .update(cx, |_host, window, cx| {
                 shell.update(cx, |shell, cx| {
                     shell.close_active_tab(window, cx);
-                    assert!(
-                        shell.confirm.is_some(),
-                        "脏标签关闭弹确认（保存失败前置）"
-                    );
+                    assert!(shell.confirm.is_some(), "脏标签关闭弹确认（保存失败前置）");
                     shell.resolve_confirm(0, window, cx);
-                    assert_eq!(
-                        shell.tab_count(),
-                        1,
-                        "保存失败不关标签（脏态保留不静默丢）"
-                    );
+                    assert_eq!(shell.tab_count(), 1, "保存失败不关标签（脏态保留不静默丢）");
                     assert!(
                         shell.tab_is_modified(0, cx).unwrap(),
                         "失败后仍脏（可重试）"
@@ -4958,10 +4947,7 @@ mod tab_workflow_tests {
         let reloaded = crate::editor::docx_doc::load_editable(&docx)
             .expect("重试保存产物可重开")
             .payload;
-        assert!(
-            reloaded.text.contains("【败】"),
-            "重试保存落盘锚点段带标记"
-        );
+        assert!(reloaded.text.contains("【败】"), "重试保存落盘锚点段带标记");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5009,11 +4995,7 @@ mod tab_workflow_tests {
                 shell.activate_tab(0, window, cx);
                 let ed_a = shell.tab_editor(0).unwrap().clone();
                 let panel = shell.outline.as_ref().expect("切回后面板在场").clone();
-                assert_eq!(
-                    panel.read(cx).editor(),
-                    &ed_a,
-                    "切回 a → 大纲换绑 a 编辑器"
-                );
+                assert_eq!(panel.read(cx).editor(), &ed_a, "切回 a → 大纲换绑 a 编辑器");
                 assert_eq!(
                     panel.read(cx).row_labels(),
                     vec!["H1 · A1", "H2 · A2"],
@@ -5568,10 +5550,7 @@ mod pdf_search_wiring_tests {
             .expect("取编辑器焦点句柄");
         window
             .update(cx, |_host, window, cx| {
-                assert!(
-                    ed_focus.contains_focused(window, cx),
-                    "前置：焦点在编辑器"
-                );
+                assert!(ed_focus.contains_focused(window, cx), "前置：焦点在编辑器");
             })
             .expect("前置断言");
 
@@ -6722,9 +6701,8 @@ mod statusbar_view_toggle_tests {
 
         // ① 宽窗：右栏在场（right_open 缺省开 + 1000 ≥ 900 临界）。
         redraw(&window, cx);
-        let (right_open0, right_width0) = shell.read_with(cx, |s, _| {
-            (s.right_open, f32::from(s.right_width))
-        });
+        let (right_open0, right_width0) =
+            shell.read_with(cx, |s, _| (s.right_open, f32::from(s.right_width)));
         assert!(right_open0, "前置：right_open 用户态开（缺省）");
         assert!(
             right_width0 > 0. && right_width0 < 900.,
@@ -6732,11 +6710,7 @@ mod statusbar_view_toggle_tests {
         );
         let hot_x = right_hotzone_x(right_width0, 1000.);
         mouse_down_at(&window, cx, hot_x, 300.);
-        let drag0 = shell.read_with(cx, |s, _| {
-            s.panel_drag
-                .as_ref()
-                .map(|d| (d.side, d.last_x))
-        });
+        let drag0 = shell.read_with(cx, |s, _| s.panel_drag.as_ref().map(|d| (d.side, d.last_x)));
         assert!(
             matches!(drag0, Some((PanelSide::Right, _))),
             "宽窗热区命中 → panel_drag = Some(Right)（实得 {drag0:?}）"
@@ -6757,8 +6731,7 @@ mod statusbar_view_toggle_tests {
         assert_eq!(viewport_w, 760., "尺寸事件生效（viewport 760px）");
         let hot_x_narrow = right_hotzone_x(right_width0, 760.);
         mouse_down_at(&window, cx, hot_x_narrow, 300.);
-        let (drag1, right_open1) =
-            shell.read_with(cx, |s, _| (s.panel_drag.clone(), s.right_open));
+        let (drag1, right_open1) = shell.read_with(cx, |s, _| (s.panel_drag.clone(), s.right_open));
         assert!(
             drag1.is_none(),
             "窄窗让位 → 热区不渲染 → MouseDown 零命中（panel_drag 仍 None）"
@@ -6774,7 +6747,13 @@ mod statusbar_view_toggle_tests {
         mouse_down_at(&window, cx, hot_x, 300.);
         let drag2 = shell.read_with(cx, |s, _| s.panel_drag.clone());
         assert!(
-            matches!(drag2, Some(PanelDragState { side: PanelSide::Right, .. })),
+            matches!(
+                drag2,
+                Some(PanelDragState {
+                    side: PanelSide::Right,
+                    ..
+                })
+            ),
             "恢复宽窗 → 热区回归 → 命中恢复（panel_drag = Some(Right)）"
         );
     }
@@ -8069,4 +8048,3 @@ mod xlsx_save_close_tests {
             .unwrap();
     }
 }
-

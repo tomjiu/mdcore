@@ -308,7 +308,9 @@ fn layout_holds_at_hidpi_scale_factor_and_returns(cx: &mut TestAppContext) {
         "HiDPI 档 Git 入口在场（可达性）"
     );
     let left = visual.debug_bounds("left-panel").expect("HiDPI 档左栏完整");
-    let tabs = visual.debug_bounds("editor-tabs").expect("HiDPI 档标签栏在场");
+    let tabs = visual
+        .debug_bounds("editor-tabs")
+        .expect("HiDPI 档标签栏在场");
     let editor = visual
         .debug_bounds("editor-content")
         .expect("HiDPI 档编辑区在场");
@@ -346,10 +348,7 @@ fn layout_holds_at_hidpi_scale_factor_and_returns(cx: &mut TestAppContext) {
         assert_eq!(a.origin, b.origin, "{name} 原点回落一致");
         assert_eq!(a.size, b.size, "{name} 尺寸回落一致");
     };
-    let (
-        (t0, m0, g0, l0, tb0, e0, r0),
-        (t1, m1, g1, l1, tb1, e1, r1),
-    ) = (baseline, restored);
+    let ((t0, m0, g0, l0, tb0, e0, r0), (t1, m1, g1, l1, tb1, e1, r1)) = (baseline, restored);
     same("title-bar", &t0, &t1);
     same("menu-bar-titles", &m0, &m1);
     same("act-git", &g0, &g1);
