@@ -112,6 +112,12 @@ impl OutlinePanel {
         &self.editor
     }
 
+    /// 行标签只读序（#47 A1：shell 级标签切换测试的断言面——右栏
+    /// 内容随当前视图的运行时证据；同 `editor()` 先例：面板只读面）。
+    pub fn row_labels(&self) -> Vec<&str> {
+        self.rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
     /// 行集是否为空（left_panel 沿用「无标题不渲染分组」的批 5a 前语义）。
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
