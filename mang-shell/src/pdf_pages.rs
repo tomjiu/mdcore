@@ -27,8 +27,10 @@
 //!
 //! ## 渲染管线（懒加载）
 //!
-//! - **uniform_list 虚拟化**：页槽等高（首页纵横比 × 适宽），只有
-//!   可见页（±1 页过扫描）进渲染——百页档不爆内存；
+//! - **uniform_list → gpui::list 变高虚拟化**（D2 尾巴，#51）：页槽
+//!   高按**本页几何**（每页纵横比 × 适宽——构造期 `page_aspects`
+//!   全量预读），只有可见页（±1 页过扫描）进渲染——百页档不爆
+//!   内存；混合横竖/大小页各页各高，不再被首页等高槽统一；
 //! - **懒光栅**：render 期按滚动偏移算可见区间，未缓存页经
 //!   [`RenderWorker::submit`] 派单（专用渲染线程——UI 不卡帧）；
 //! - **轮询收账**：提交时起一个 16ms 定时循环 `try_recv` 收回执，
@@ -53,10 +55,13 @@
 //! - **状态**：[`ZoomMode`]——FitWidth（v1 现状适宽，默认零变化）/
 //!   FitPage（整页可见）/ ActualSize（1pt:1px，百分比基准）/ Custom
 //!   （相对实际大小的倍率——滚轮/键盘步进/预设档落此态）；
-//! - **口径单点**：[`PdfPagesView::raster_width`] 是光栅宽的唯一解析点
-//!   ——submit_visible（可见区间）/ render_page_slot（槽宽）/ commit_
+//! - **口径单点**：[`PdfPagesView::raster_width`] 是逻辑光栅宽的唯一
+//!   解析点——submit_visible（可见区间）/ render_page_slot（槽宽）/ commit_
 //!   annotation（DPI）三消费点同源调用：**缩放后批注坐标正确性的
 //!   关键**（issue 验收 3——#304 坐标变换的 DPI 基准随缩放同步）；
+//!   #643：请求密度口径 = [`PdfPagesView::device_raster_width`]（逻辑宽
+//!   × 窗口缩放因子——HiDPI 不发虚），位图密度与显示尺寸解耦，
+//!   显示几何/坐标换算全部保持逻辑域；
 //! - **渲染关联**：RenderKey 键含（页, 宽）——缩放即宽变即新键，旧位
 //!   图自然 miss 重光栅（无需改键结构；缓存预算不变 LRU 回收）；
 //! - **交互**：Ctrl+滚轮（capture 期窗口级拦截——止冒泡防列表随缩
@@ -75,12 +80,11 @@
 //!
 //! ## 已知边界（v1 登记）
 //!
-//! - **页尺寸不均的档**：uniform_list 等高槽——异形页按首页纵横比
-//!   定槽高，真图**内接呈现**（#634：等比缩放居中 + 上下/左右
-//!   letterbox——[`PdfPagesView::contain_box`] 单点解析，位图不再
-//!   非等比拉伸）；#634：异形页上的右键拖框 / 查找高亮 / 跳转滚动
-//!   全部按内容盒换算（letterbox 偏移在 contain_box 扣除——v1
-//!   「等比槽近似」边界收口）；
+//! - **页尺寸不均的档**（D2 尾巴收口）：gpui::list **按页几何槽高**
+//!   ——异形页各页各高，真图满槽呈现（同 aspect 槽即无留白）；
+//!   #634/#635：异形页上的右键拖框 / 查找高亮 / 跳转滚动仍按
+//!   内容盒换算（[`PdfPagesView::contain_box`] 单点解析——旧位图
+//!   宽度回退时等比内接不拉伸）；
 //!   #422 查找高亮 quad 四角经页变换 `user_to_screen` 映射（旋转页
 //!   高亮不再错位——替换 v1 的层几何轴缩放）；
 //! - **页面视图内查找（#422）**：Ctrl+F 不切视图直接开页内查找条——
@@ -115,8 +119,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, DispatchPhase, FocusHandle, Focusable, ImageSource,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollEvent,
-    StyledText, UniformListScrollHandle, Window, px,
+    KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent,
+    Pixels, ScrollDelta, ScrollEvent, StyledText, Window, px,
 };
 use image::{Frame, ImageBuffer};
 use mdc_pdf::annotation::Point;
@@ -142,6 +146,14 @@ pub const WIDTH_QUANTUM: u32 = 64;
 pub const WIDTH_MIN: u32 = 256;
 /// 光栅宽上限（px）——4K 屏适宽 + 余量；引擎侧 S3-L2 仍有独立钳制。
 pub const WIDTH_MAX: u32 = 4096;
+/// #643：设备像素光栅宽上限（px）——引擎 S3-L2 单边钳制同值（8192）。
+/// HiDPI 倍率后的请求再高也必被引擎截断——壳侧先钳，键与产物不
+/// 失控。逻辑宽 [`WIDTH_MAX`]（4096）× 常见最高倍率 2.0 恰达此界。
+pub const WIDTH_MAX_DEVICE: u32 = 8192;
+/// #51 D2 尾巴：gpui::list 的上下过扫描（px）——视口外预渲染带，
+/// 快速滚动不闪白；槽几何本身按页解析（变高），与 uniform_list
+/// 时代的 ±1 行过扫描语义相当（一页高的 1/3~2/3，取决于本页槽高）。
+const LIST_OVERDRAW: Pixels = px(320.);
 /// 页面缓存字节预算（192MB——A4 适宽 BGRA ≈ 1.4MB/页，可容百页级
 /// 工作集；超预算 LRU 逐出，回滚再光栅）。
 pub const CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
@@ -228,8 +240,13 @@ pub struct PdfPagesView {
     bytes: Arc<Vec<u8>>,
     /// 总页数（构造期主线程一次性读取；0 = 引擎面失败走 error 态）。
     page_count: usize,
-    /// 首页纵横比（高/宽，含旋转归一）——uniform 槽高的基准。
+    /// 首页纵横比（高/宽，含旋转归一）——#421 缩放档（FitPage 基准）
+    /// 与 #420 缩略图侧栏槽高的基准；页面槽高本身已按页解析（D2 尾巴）。
     aspect: f32,
+    /// #51 D2 尾巴：每页纵横比（高/宽，含旋转归一——构造期逐页
+    /// `page_geometry` 全量预读）——gpui::list 变高槽的基准。单页
+    /// 几何缺失回退文档级 [`Self::aspect`]；error 态为空表。
+    page_aspects: Vec<f32>,
     /// 渲染工人（专用线程 + 看门狗换代；error 态为 None）。
     worker: Option<RenderWorker<PdfiumEngine>>,
     /// 页面缓存（RenderKey 键控——含 annotation_rev；LRU 字节预算）。
@@ -271,8 +288,9 @@ pub struct PdfPagesView {
     dirty: bool,
     /// 回执轮询循环进行中（防重复起循环）。
     polling: bool,
-    /// 虚拟列表滚动句柄（scroll_to_page / 可见区间推算共用）。
-    scroll: UniformListScrollHandle,
+    /// 变高虚拟列表状态（gpui::list——页空间锚定：scroll_to_page /
+    /// 可见区间推算 / 缩放锚共用；D2 尾巴替换 uniform_list 等高槽）。
+    scroll: ListState,
     /// 焦点域（键盘域占位——v1 无键位面，滚轮/拖滚动条不依赖焦点）。
     focus_handle: FocusHandle,
     /// 视口尺寸（宽, 高）——最近一次消费值（覆盖 canvas 每帧回写
@@ -281,6 +299,9 @@ pub struct PdfPagesView {
     /// 视口尺寸回写通道（覆盖 canvas paint 回调持有同款 Rc——零实体
     /// 更新零重入；不注册命中区，不挡列表滚轮）。
     viewport: Rc<Cell<Option<(f32, f32)>>>,
+    /// #643：窗口缩放因子（render 期从 `Window::scale_factor` 每帧
+    /// 同步——跨显示器拖拽换档自然生效；1.0 = 单倍屏零行为变化）。
+    scale_factor: f32,
     /// 引擎面错误（构造期 open 失败——面板明示，不白屏）。
     error: Option<String>,
     /// #422：页内查找态（None = 查找条未开；开条期间常驻——层索引
@@ -469,33 +490,47 @@ impl PdfPagesView {
     pub fn new(bytes: Vec<u8>, cx: &mut App) -> Self {
         let bytes = Arc::new(bytes);
         let focus_handle = cx.focus_handle();
-        // 几何预读（一次性）：页数 + 首页纵横比 + 首页 pt 宽（前 3 页
+        // 几何预读（一次性）：页数 + 文档级首页纵横比/pt 宽（前 3 页
         // 取首个有效几何——封面页偶有异形，首页族比单首页稳；#421：
-        // pt 宽 = ActualSize/百分比基准）。失败 → error 态面板。
-        let (page_count, aspect, page_pt_w) = match PdfiumEngine::open((*bytes).clone()) {
-            Ok(engine) => {
-                let count = engine.page_count() as usize;
-                let geo = (0..count.min(3))
-                    .filter_map(|i| engine.page_geometry(PageIndex(i as u32)).ok())
-                    .find(|g| g.effective_width() > 0. && g.effective_height() > 0.);
-                let (aspect, pt_w) = match geo {
-                    Some(g) => (
-                        g.effective_height() / g.effective_width(),
-                        g.effective_width(),
-                    ),
-                    None => (1.414, PAGE_PT_W_FALLBACK),
-                };
-                (count, aspect, pt_w)
-            }
-            Err(err) => {
-                return Self::error_state(
-                    bytes,
-                    focus_handle,
-                    cx.focus_handle(),
-                    format!("pdfium 引擎打开失败：{err:?}"),
-                );
-            }
-        };
+        // pt 宽 = ActualSize/百分比基准）+ **每页纵横比全量表**
+        // （#51 D2 尾巴——list 变高槽的基准；单页缺失回退文档级）。
+        // 失败 → error 态面板。
+        let (page_count, aspect, page_pt_w, page_aspects) =
+            match PdfiumEngine::open((*bytes).clone()) {
+                Ok(engine) => {
+                    let count = engine.page_count() as usize;
+                    let valid_geo = |i: usize| {
+                        engine
+                            .page_geometry(PageIndex(i as u32))
+                            .ok()
+                            .filter(|g| g.effective_width() > 0. && g.effective_height() > 0.)
+                    };
+                    let geo = (0..count.min(3)).filter_map(valid_geo).next();
+                    let (aspect, pt_w) = match geo {
+                        Some(g) => (
+                            g.effective_height() / g.effective_width(),
+                            g.effective_width(),
+                        ),
+                        None => (1.414, PAGE_PT_W_FALLBACK),
+                    };
+                    let aspects: Vec<f32> = (0..count)
+                        .map(|i| {
+                            valid_geo(i)
+                                .map(|g| g.effective_height() / g.effective_width())
+                                .unwrap_or(aspect)
+                        })
+                        .collect();
+                    (count, aspect, pt_w, aspects)
+                }
+                Err(err) => {
+                    return Self::error_state(
+                        bytes,
+                        focus_handle,
+                        cx.focus_handle(),
+                        format!("pdfium 引擎打开失败：{err:?}"),
+                    );
+                }
+            };
         // 看门狗工人：工厂持字节快照，首代/替代代都在渲染线程内构造
         // （工厂 panic 不炸宿主帧——worker.rs 既有纪律）。
         let factory_bytes = bytes.clone();
@@ -510,6 +545,7 @@ impl PdfPagesView {
             bytes,
             page_count,
             aspect,
+            page_aspects,
             page_pt_w,
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
@@ -526,10 +562,15 @@ impl PdfPagesView {
             annotate_hint: None,
             dirty: false,
             polling: false,
-            scroll: UniformListScrollHandle::new(),
+            // 变高 list：条目数 + 均匀高提示（首页档位 WIDTH_MIN 口径的
+            // 槽高——首帧滚动条不打醤；可见项布局当帧实测替换，混合
+            // 尺寸档随滚动精确化）。
+            scroll: ListState::new(page_count, ListAlignment::Top, LIST_OVERDRAW)
+                .with_uniform_item_height(px(Self::slot_height(WIDTH_MIN, aspect))),
             focus_handle,
             viewport_size: (0., 0.),
             viewport: Rc::new(Cell::new(None)),
+            scale_factor: 1.0,
             error: None,
             search: None,
             search_focus: cx.focus_handle(),
@@ -550,6 +591,7 @@ impl PdfPagesView {
             bytes,
             page_count: 0,
             aspect: 1.414,
+            page_aspects: Vec::new(),
             page_pt_w: PAGE_PT_W_FALLBACK,
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
@@ -566,10 +608,11 @@ impl PdfPagesView {
             annotate_hint: None,
             dirty: false,
             polling: false,
-            scroll: UniformListScrollHandle::new(),
+            scroll: ListState::new(0, ListAlignment::Top, LIST_OVERDRAW),
             focus_handle,
             viewport_size: (0., 0.),
             viewport: Rc::new(Cell::new(None)),
+            scale_factor: 1.0,
             error: Some(message),
             search: None,
             search_focus,
@@ -586,16 +629,58 @@ impl PdfPagesView {
         quantize_width(w as u32)
     }
 
-    /// 槽高（px）：适宽 × 首页纵横比（纯函数——单测锚点）。
+    /// 槽高（px）：适宽 × 纵横比（纯函数——单测锚点）。
     ///
     /// #634：0.5px 量子化——Taffy 布局对行高做半像素网格对齐（div
-    /// 测量 814.585 → 814.5），而滚动换算（`submit_visible` 的
-    /// `offset_y / slot_h`）走解析值；两源差在百页档累积（60 行差
+    /// 测量 814.585 → 814.5），而滚动换算（gpui::list 树高度与
+    /// `page_top_offset` 累计）走解析值；两源差在百页档累积（60 行差
     /// ~5px）会把 `top_visible_page` 读数截断到 59（跳页读回失败，
-    /// view_chain 实测抓红）。量子化后 uniform_list 测量行高与换算
-    /// 槽高**单源一致**；0.5px 步进对显示无感。
+    /// view_chain 实测抓红）。量子化后 list 测量行高与解析槽高
+    /// **单源一致**；0.5px 步进对显示无感。
     fn slot_height(fit_w: u32, aspect: f32) -> f32 {
         ((fit_w as f32 * aspect) * 2.).round() / 2.
+    }
+
+    /// #51 D2 尾巴：本页纵横比（高/宽——含旋转归一）。构造期几何
+    /// 缺失的页回退文档级 [`Self::aspect`]（error 态空表同样回退）——
+    /// 每页槽高的单一事实源。
+    fn page_aspect_of(&self, idx: usize) -> f32 {
+        self.page_aspects.get(idx).copied().unwrap_or(self.aspect)
+    }
+
+    /// #51 D2 尾巴：本页槽高（px）——**按本页几何**（混合横竖/大小
+    /// 页各页各高，不再被首页等高槽统一）；下限 1px 防除零。
+    fn page_slot_height(&self, fit_w: u32, idx: usize) -> f32 {
+        Self::slot_height(fit_w, self.page_aspect_of(idx)).max(1.)
+    }
+
+    /// #51 D2 尾巴：页顶累计偏移（内容 px）——0..idx 页槽高和
+    /// （jump_search 页级定位基准；纯解析面，与 list 测量同网格）。
+    fn page_top_offset(&self, fit_w: u32, idx: usize) -> f32 {
+        (0..idx)
+            .map(|i| Self::slot_height(fit_w, self.page_aspect_of(i)))
+            .sum()
+    }
+
+    /// #51 D2 尾巴：内容 y → 页空间锚点（纯函数——jump_search/页内
+    /// 定位共用；越界钳末页顶）。页槽高与槽宽同源量子化（0.5px
+    /// 网格），与 gpui::list 的 SumTree 高度单源一致。
+    fn content_offset_to_page(page_aspects: &[f32], fit_w: u32, y: f32) -> ListOffset {
+        let mut acc = 0.;
+        for (i, &aspect) in page_aspects.iter().enumerate() {
+            let h = Self::slot_height(fit_w, aspect).max(1.);
+            if y < acc + h {
+                return ListOffset {
+                    item_ix: i,
+                    offset_in_item: px(y - acc),
+                };
+            }
+            acc += h;
+        }
+        ListOffset {
+            item_ix: page_aspects.len().saturating_sub(1),
+            offset_in_item: px(0.),
+        }
     }
 
     /// #634：槽内内容盒（letterbox）——位图按本页显示纵横比等比内接
@@ -633,13 +718,19 @@ impl PdfPagesView {
         Self::contain_box(fit_w, slot_h, ih / iw)
     }
 
-    /// 滚到指定页（0 基——书签跳转锚；越界钳到末页）。
+    /// 滚到指定页（0 基——书签跳转锚；越界钳到末页）。D2 尾巴：
+    /// gpui::list 的锚点在**页空间**（item_ix）——不依赖像素换算，
+    /// 混合尺寸档亦精确（旧 uniform_list 的 offset 直设需先算
+    /// 「首页槽高 × 页号」，异尺寸档会错位）。
     pub fn scroll_to_page(&self, page: usize) {
         if self.page_count == 0 {
             return;
         }
         let idx = page.min(self.page_count - 1);
-        self.scroll.scroll_to_item(idx, gpui::ScrollStrategy::Top);
+        self.scroll.scroll_to(ListOffset {
+            item_ix: idx,
+            offset_in_item: px(0.),
+        });
     }
 
     /// #420：源字节（缩略图侧栏共享同源字节快照——零拷贝零重复内存；
@@ -670,7 +761,8 @@ impl PdfPagesView {
     #[cfg(test)]
     pub fn page_ready_for_test(&self, page: usize) -> bool {
         let (vw, vh) = self.viewport_size;
-        let fit_w = self.raster_width(vw, vh);
+        // #643：键口径 = 设备像素宽（与 submit_visible 同源）。
+        let fit_w = self.device_raster_width(vw, vh);
         self.render_key(&(page as u32, fit_w))
             .is_some_and(|k| self.cache.contains(&k))
     }
@@ -682,11 +774,44 @@ impl PdfPagesView {
         self.raster_width(vw, vh)
     }
 
+    /// #51 D3 测试读数：当前**设备像素**光栅宽（pending 键宽同口径——
+    /// HiDPI 测试窗口 sf≠1 时与逻辑宽不同域，断言面必用本读数）。
+    #[cfg(test)]
+    pub fn device_raster_width_for_test(&self) -> u32 {
+        let (vw, vh) = self.viewport_size;
+        self.device_raster_width(vw, vh)
+    }
+
+    /// #643 测试写面：窗口缩放因子注入（无真窗口环境的唯一样本点）。
+    #[cfg(test)]
+    pub fn set_scale_factor_for_test(&mut self, sf: f32) {
+        self.scale_factor = sf;
+    }
+
     /// #634 测试读数：缓存（已用字节, 条目数）——预算受限不变量断言
     /// （LRU 逐出语义的单元面在 crates/pdf cache 单测）。
     #[cfg(test)]
     pub fn cache_stats_for_test(&self) -> (usize, usize) {
         (self.cache.bytes(), self.cache.len())
+    }
+
+    /// #51 D3 测试读数：在飞作业键宽族——陈旧取消面断言（缩放风暴后
+    /// pending 只应含当前设备宽键；empty = 无在飞）。
+    #[cfg(test)]
+    pub fn pending_widths_for_test(&self) -> Vec<u32> {
+        self.pending.values().map(|k| k.1).collect()
+    }
+
+    /// #51 D3 测试读数：缓存条目的宽度族——旧宽残留观测（陈旧取消只
+    /// 截停在飞面，已落缓存条目交 LRU 自然逐出——本读数断言「旧宽
+    /// 不新增」的基线差分）。
+    #[cfg(test)]
+    pub fn cache_widths_for_test(&self) -> Vec<u32> {
+        self.cache
+            .entries()
+            .into_iter()
+            .map(|(k, _)| k.width_px)
+            .collect()
     }
 
     /// #634 测试读数：引擎面错误（坏文件视图态断言——面板明示面同源）。
@@ -707,6 +832,23 @@ impl PdfPagesView {
         zoom_raster_width(self.zoom_mode, self.aspect, self.page_pt_w, vw, vh)
     }
 
+    /// #643：窗口缩放因子（防御域 [1.0, 4.0]——低于 1 不降密度
+    /// （逻辑宽即保底清晰度），高于 4 由 [`WIDTH_MAX_DEVICE`] 钳制
+    /// 同效）。异常报告值（0/负）同样落回 1.0。
+    fn sf_clamped(&self) -> f32 {
+        self.scale_factor.clamp(1.0, 4.0)
+    }
+
+    /// #643：设备像素光栅宽——[`Self::raster_width`]（逻辑）× 缩放
+    /// 因子，独立量化钳制。**PageKey / RenderRequest 的口径**（位图
+    /// 请求密度）；显示几何（槽高 / contain_box / 高亮 / 批注 DPI）
+    /// 仍走逻辑宽——位图密度与显示尺寸解耦（等比内接按位图自身
+    /// 纵横比），密度提升零坐标换算影响。单倍屏（sf = 1.0）与 v1
+    /// 完全同值（缓存键零迁移）。
+    fn device_raster_width(&self, vw: f32, vh: f32) -> u32 {
+        device_quantize_width((self.raster_width(vw, vh) as f32 * self.sf_clamped()) as u32)
+    }
+
     /// #421：当前缩放百分比（相对实际大小——chip 显示与菜单基准）。
     fn zoom_percent(&self, vw: f32, vh: f32) -> u32 {
         zoom_mode_percent(self.zoom_mode, self.aspect, self.page_pt_w, vw, vh)
@@ -721,9 +863,9 @@ impl PdfPagesView {
         self.raster_width(vw, vh) as f32 / self.page_pt_w
     }
 
-    /// #421：切换缩放模式（滚动锚保持——内容 offset 按槽高比例缩放，
-    /// 缩放前后视口内容位置不跳页；槽高刷新由下一帧 uniform_list 重测
-    /// 自然完成）。预设菜单点击亦走此画口（菜单即关）。
+    /// #421：切换缩放模式（滚动锚保持——见 [`Self::rescale_scroll_offset`]；
+    /// 槽高刷新由下一帧 gpui::list 重测自然完成——可见项每帧实测
+    /// 替换，视口内即新几何）。预设菜单点击亦走此画口（菜单即关）。
     fn set_zoom_mode(&mut self, mode: ZoomMode, cx: &mut Context<Self>) {
         let (vw, vh) = self.viewport_size;
         let old_w = self.raster_width(vw, vh) as f32;
@@ -763,27 +905,24 @@ impl PdfPagesView {
         cx.notify();
     }
 
-    /// 滚动锚保持：内容坐标 offset ×（新槽高/旧槽高）——首页纵横比
-    /// 恒定，槽高与光栅宽同比，页锚即内容锚（issue 验收 4：切换页面/
-    /// 缩放后视口内容位置不跳）。首帧视口未记录（0×n=0）与同宽零变
-    /// 无操作。
+    /// 滚动锚保持（D2 尾巴重写）：**锚点从像素空间换到页空间**——顶部
+    /// 页号不动 + 页内偏移按本页槽高比例缩放（槽高与光栅宽同比，
+    /// 页锚即内容锚；issue 验收 4「缩放/旋转不跳页」在混合尺寸档同样
+    /// 成立——旧像素直设法在异尺寸档会跳页）。gpui::list 的 layout 以
+    /// 锚点页起排、页高当帧实测（渲染回调里已是新槽高），锚点页之
+    /// 下的未渲染页随滚动逐页修正。首帧视口未记录（逻辑锚恒首页）
+    /// 与同宽零变无操作。
     fn rescale_scroll_offset(&mut self, old_w: f32, new_w: f32) {
-        if old_w <= 0. || (new_w - old_w).abs() < 0.5 {
+        if old_w <= 0. || (new_w - old_w).abs() < 0.5 || self.page_count == 0 {
             return;
         }
+        let top = self.scroll.logical_scroll_top();
+        let idx = top.item_ix.min(self.page_count - 1);
         let ratio = new_w / old_w;
-        let state = self.scroll.0.borrow();
-        let offset = state.base_handle.offset();
-        // #634 修正：gpui 滚动句柄为**负向约定**（下滚 = 负 y——与
-        // submit_visible 的 #420 修正同源，见 uniform_list
-        // `first_visible_element_ix` 的 `-offset` 实现）。原
-        // `f32::from(offset.y).max(0.)` 把负向 offset 全部钳成 0 →
-        // 缩放换档后视口**恒跳回首页**（#421 验收 4「缩放后不跳页」
-        // 被破——#421 交付时该面无 e2e 覆盖，#634 视图链核验抓红）。
-        // 取负归正为内容坐标，回写时还原负向（1296 行 px(-clamped)
-        // 同款先例）。
-        let y = (-f32::from(offset.y)).max(0.) * ratio;
-        state.base_handle.set_offset(gpui::point(px(0.), px(-y)));
+        self.scroll.scroll_to(ListOffset {
+            item_ix: idx,
+            offset_in_item: top.offset_in_item * ratio,
+        });
     }
 
     /// #421：预设行是否为当前态（Custom 档比倍率近似——0.5% 内视为
@@ -845,23 +984,57 @@ impl PdfPagesView {
             return; // 首帧视口未记录——覆盖 canvas 本帧落位，下一帧起算。
         }
         // #421：光栅宽单点口径（缩放模式解析——FitWidth 与 v1 同值）。
+        // #643：请求密度走设备像素宽（HiDPI 不发虚）——键与请求同
+        // 口径；显示几何（槽高）仍按逻辑宽。
         let fit_w = self.raster_width(vw, vh);
-        let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
-        // 滚动偏移（内容坐标）。gpui 滚动句柄为**负向约定**（下滚 =
-        // 负 y——uniform_list 自身以 `-offset` 推可见行，见其
-        // `first_visible_element_ix` 实现）；取负归正为内容坐标。
-        // （#420 修正：原 `.max(0.)` 把负向 offset 全部钳成 0——
-        // 滚动后 `first` 观测窗恒首页、top_page 读数恒 0。）
-        let offset_y = (-f32::from(self.scroll.0.borrow().base_handle.offset().y)).max(0.);
-        let first = (((offset_y / slot_h) as i64).saturating_sub(1)).max(0) as u32;
-        // #420：顶部可见页实时记录（精确槽对齐读数——独立于渲染
-        // `first` 的 -1 观测余量：scroll_to_page(N, Top) 后读数 = N）。
-        self.top_page = ((offset_y / slot_h) as u32).min(self.page_count.saturating_sub(1) as u32);
-        let visible_rows = (((vh / slot_h).ceil() as i64) + 2).max(1) as u32;
-        let last = (first + visible_rows).min(self.page_count as u32);
+        let dev_w = self.device_raster_width(vw, vh);
+        // D2 尾巴：可见区间从 gpui::list **页空间锚点**（item_ix =
+        // 顶部页）起算——不再依赖「offset_y / 首页槽高」的等高换算
+        // （混合尺寸档该除法会错位）；±1 页过扫描与 v1 同义。
+        let top = self.scroll.logical_scroll_top();
+        let idx = top.item_ix.min(self.page_count.saturating_sub(1));
+        self.top_page = idx as u32;
+        let top_off = f32::from(top.offset_in_item)
+            .max(0.)
+            .min(self.page_slot_height(fit_w, idx).max(0.5));
+        let first = idx.saturating_sub(1) as u32;
+        // 往下逐页累计本页槽高直至填满视口（每页各高——异尺寸档不再
+        // 按首页槽高线性假设）。
+        let mut last = idx;
+        let mut filled = self.page_slot_height(fit_w, idx) - top_off;
+        while filled < vh && last + 1 < self.page_count {
+            last += 1;
+            filled += self.page_slot_height(fit_w, last);
+        }
+        let last = (last + 2).min(self.page_count) as u32; // exclusive + 1 页过扫描
+        // #51 D3：陈旧在飞作业取消——缩放/HiDPI 换档使 dev_w 变化时，
+        // 旧宽在飞作业若放行完成会落**旧键**（LRU 最近位挤占当前键——
+        // 快速缩放抖动收口）。取消 = 排队面令牌 + 在飞登记摘除：已
+        // 开跑作业的迟到 Done 走「机械丢弃」既有路径（pending miss，
+        // 不落缓存）；Cancelled 回执同理（取消 ≠ 失败——同宽回访时
+        // 自然重新派单，不进 failed 永久标记）。
+        let stale_ids: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, k)| k.1 != dev_w)
+            .map(|(id, _)| *id)
+            .collect();
+        if !stale_ids.is_empty() {
+            let worker = self
+                .worker
+                .as_mut()
+                .expect("submit_visible 头部已过 None 门（worker 必在）");
+            for id in stale_ids {
+                worker.cancel(id);
+                self.pending.remove(&id);
+            }
+        }
+        // #51 D3：可见页优先——顶部可见页先入队（worker FIFO），过
+        // 扫描邻居（idx-1）殿后：跳页/滚动后的用户感知延迟 = 首屏
+        // 页一跳渲染即回（旧行为先渲 idx-1 再渲顶部页）。
         let mut submitted = false;
-        for page in first..last {
-            let key = (page, fit_w);
+        for page in idx as u32..last {
+            let key = (page, dev_w);
             if self
                 .render_key(&key)
                 .is_some_and(|k| self.cache.contains(&k))
@@ -876,6 +1049,22 @@ impl PdfPagesView {
             });
             self.pending.insert(id, key);
             submitted = true;
+        }
+        if first < idx as u32 {
+            let key = (first, dev_w);
+            if !(self
+                .render_key(&key)
+                .is_some_and(|k| self.cache.contains(&k))
+                || self.failed.contains(&key)
+                || self.pending.values().any(|k| *k == key))
+            {
+                let id = self.worker.as_mut().unwrap().submit(RenderRequest {
+                    page: PageIndex(key.0),
+                    width_px: key.1,
+                });
+                self.pending.insert(id, key);
+                submitted = true;
+            }
         }
         if submitted && !self.polling {
             self.polling = true;
@@ -975,7 +1164,7 @@ impl PdfPagesView {
         }
     }
 
-    /// 可见页元素（uniform_list 回调——读缓存出位图，未就绪出占位框：
+    /// 可见页元素（gpui::list 回调——读缓存出位图，未就绪出占位框：
     /// 渲染中 / 失败两态；pending 态先走 #637 同页旧宽回退）。#302④：
     /// 页面槽上叠透明 canvas——paint 期注册右键拖框观察器（窗口级
     /// on_mouse_event + 自身 bounds 过滤，与 shell 面板拖拽收尾钩同
@@ -986,8 +1175,12 @@ impl PdfPagesView {
         // #421：光栅宽单点口径（首帧视口未记录时各模式均落 WIDTH_MIN
         // ——与 v1 兜底同值；ActualSize/Custom 档不依赖视口，首帧即准）。
         let fit_w = self.raster_width(vw, vh);
-        let key = (idx as u32, fit_w);
-        let slot_h = Self::slot_height(fit_w, self.aspect);
+        // #643：缓存键口径 = 设备像素宽（与 submit_visible 同源——sf
+        // 换档自然 miss 重光栅）；显示几何（槽高/内容盒/高亮）仍用
+        // 逻辑宽。
+        let key = (idx as u32, self.device_raster_width(vw, vh));
+        // D2 尾巴：本页槽高（异尺寸档各页各高——不再被首页纵横比统一）。
+        let slot_h = self.page_slot_height(fit_w, idx);
         let page_no = idx + 1;
         let image = self
             .render_key(&key)
@@ -1034,7 +1227,7 @@ impl PdfPagesView {
                 } else {
                     let keys: Vec<RenderKey> =
                         self.cache.entries().into_iter().map(|(k, _)| k).collect();
-                    Self::nearest_fallback_key(&keys, idx as u32, fit_w)
+                    Self::nearest_fallback_key(&keys, idx as u32, key.1)
                         .and_then(|k| self.cache.get(&k).cloned())
                 };
                 if let Some(image) = stale {
@@ -1236,6 +1429,10 @@ impl PdfPagesView {
         // submit/render 同源）。
         let (vw, vh) = self.viewport_size;
         let fit_w = self.raster_width(vw, vh);
+        // D2 尾巴：本页槽高（拖框 letterbox 按本页几何——异尺寸档
+        // 留白偏移不串页）。在 controller 可变借用前算好（纯几何面
+        // 不依赖标注态）。
+        let slot_h = self.page_slot_height(fit_w, page as usize);
         let controller = self.annotate.as_mut().expect("刚初始化");
         // #634：本页内容盒（letterbox）——槽坐标先扣偏移再进变换；
         // DPI 基准 = 内容盒宽/显示域宽（等比内接后内容盒 1px ≠ 槽 1px，
@@ -1249,7 +1446,6 @@ impl PdfPagesView {
         } else {
             1.414
         };
-        let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
         let (cw, _ch, ox, oy) = Self::contain_box(fit_w as f32, slot_h, page_aspect);
         let dpi = if d.width > 0. {
             cw / d.width * 72.0
@@ -1433,8 +1629,8 @@ impl PdfPagesView {
     }
 
     /// 命中导航（Enter / Shift+Enter / Ctrl+G / 计数条箭头钮）：
-    /// 环回推进 + 滚动到当前命中（页级 uniform 槽 + 页内像素偏移
-    /// 直算——目标置于视口上部 30% 处）。
+    /// 环回推进 + 滚动到当前命中（**页空间锚点**——目标置于视口
+    /// 上部 30% 处）。
     fn jump_search(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(search) = self.search.as_mut() else {
             return;
@@ -1449,14 +1645,16 @@ impl PdfPagesView {
             (search.current + len - 1) % len
         };
         let m = search.matches[search.current].clone();
-        // 槽几何（与 submit_visible 同源算式）。
+        // 槽几何（与 submit_visible/render_page_slot 同源算式——
+        // #421 raster_width 单点口径；D2 尾巴同批修正：旧实现取
+        // FitWidth 直算，缩放档下跳转 y 与实际槽高不同域）。
         let (vw, vh) = self.viewport_size;
         if vw <= 0. {
             cx.notify();
             return;
         }
-        let fit_w = Self::fit_width(vw);
-        let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
+        let fit_w = self.raster_width(vw, vh);
+        let slot_h = self.page_slot_height(fit_w, m.page as usize);
         // 页内 y：#634——quad 顶边经页变换映射到屏幕（含旋转 + y 翻转）
         // + 内容盒 letterbox 偏移（替换 v1 的层几何轴缩放）。
         let layer = self
@@ -1486,15 +1684,20 @@ impl PdfPagesView {
                 })
             })
             .unwrap_or(0.);
-        let target = (m.page as f32 * slot_h + y_in_slot - vh * 0.3).max(0.);
-        // uniform_list 滚动偏移直设（负值向下——gpui 滚动语义）。
-        let max_offset = (self.page_count as f32 * slot_h - vh).max(0.);
-        let clamped = target.min(max_offset);
-        self.scroll
-            .0
-            .borrow_mut()
-            .base_handle
-            .set_offset(gpui::Point::new(px(0.), px(-clamped)));
+        // D2 尾巴：目标 y = **本页**顶累计偏移 + 页内偏移（异尺寸档不再
+        // 「页号 × 首页槽高」线性假设）。
+        let target = (self.page_top_offset(fit_w, m.page as usize) + y_in_slot - vh * 0.3).max(0.);
+        let total: f32 = (0..self.page_count)
+            .map(|i| Self::slot_height(fit_w, self.page_aspect_of(i)))
+            .sum();
+        let clamped = target.min((total - vh).max(0.));
+        // gpui::list 页空间锚点（内容 y → (页, 页内偏移)）——比像素
+        // 直设多一层换算，但换来回随测量精确（SumTree 同网格）。
+        self.scroll.scroll_to(Self::content_offset_to_page(
+            &self.page_aspects,
+            fit_w,
+            clamped,
+        ));
         cx.notify();
     }
 
@@ -1723,6 +1926,8 @@ impl Focusable for PdfPagesView {
 
 impl Render for PdfPagesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // #643：窗口缩放因子捕获（每帧同步——派单前，首帧即新口径）。
+        self.scale_factor = _window.scale_factor();
         // 派单（render 期直接改 self——uniform_list 回调期只读，无重入面）。
         self.submit_visible(cx);
         let colors = cx.theme().colors().clone();
@@ -1747,7 +1952,6 @@ impl Render for PdfPagesView {
         let viewport_cell = self.viewport.clone();
         let viewport_entity = entity.clone();
         let zoom_entity = entity.clone();
-        let page_count = self.page_count;
         // #421：缩放百分比（首帧视口未记录时用下限兜底——与 v1 适宽
         // hint 同款下限口径，不闪屏错值）。
         let zoom_pct = self.zoom_percent(
@@ -1758,25 +1962,31 @@ impl Render for PdfPagesView {
         let annotate_error = self.annotate_error.clone();
         let annotate_hint = self.annotate_hint.clone();
         let focus = self.focus_handle.clone();
-        let list = gpui::uniform_list(
-            "pdf-pages",
-            page_count,
-            move |visible: std::ops::Range<usize>, _window: &mut Window, cx: &mut App| {
-                visible
-                    .clone()
-                    .filter_map(|idx| {
-                        let slot = entity
-                            .update(cx, |view, cx| view.render_page_slot(idx, cx))
-                            .ok()?;
-                        Some(annotate_overlay(slot, idx, entity.clone()))
-                    })
-                    .collect::<Vec<AnyElement>>()
+        let scroll = self.scroll.clone();
+        // D2 尾巴：uniform_list（等高槽）→ gpui::list（**变高**——按页
+        // 几何槽高）。复用 GPUI 已有滚动列表能力：SumTree 高度累计 +
+        // 页空间锚点 + 可见项实测，不另造文档排版引擎。条目回调签名
+        // 从「区间 → 批」变「单条」（list 逐条请求）；实体释放仅在
+        // 拆树窗口，防御性空 div。
+        let list = gpui::list(
+            scroll,
+            move |idx: usize, _window: &mut Window, cx: &mut App| match entity
+                .update(cx, |view, cx| view.render_page_slot(idx, cx))
+            {
+                Ok(slot) => annotate_overlay(slot, idx, entity.clone()),
+                Err(_) => div().into_any_element(),
             },
         )
-        .track_scroll(&self.scroll)
-        .debug_selector(|| "pdf-pages-list".into())
         .w_full()
         .h_full();
+        // 观测面包装：list 元素自身无 Interactivity/调试选择器——
+        // 外层 div 挂 id + debug_selector（debug_bounds("pdf-pages-list")
+        // 既有断言面不迁移；尺寸代理 = list 满充容器，等值）。
+        let list = div()
+            .id("pdf-pages-list")
+            .debug_selector(|| "pdf-pages-list".into())
+            .size_full()
+            .child(list);
         // #302④：批注路径错误横幅（最近一次——不静默丢，用户可重试）。
         let error_banner = annotate_error.map(|message| {
             div()
@@ -2257,6 +2467,52 @@ pub(crate) fn rendered_page_to_image(page: &RenderedPage) -> Option<gpui::Render
     )))
 }
 
+/// #51 D2 尾巴（测试素材）：3 页**异尺寸**合成 PDF——宽扁 400×200 /
+/// 高瘦 200×300 / 正方 300×300（每页纵横比 0.5 / 1.5 / 1.0），无外部
+/// 依赖（`bitmap_only_pdf_bytes` 同款手写语法）。变高槽、页空间锚点
+/// 与混合尺寸阅读面的共用夹具（`#[cfg(test)]` 不入产线）。
+#[cfg(test)]
+pub(crate) fn mixed_size_pdf_bytes_for_tests() -> Vec<u8> {
+    let pages: [(u32, u32, &str); 3] = [
+        (400, 200, "q 0.8 0.2 0.2 rg 10 10 100 50 re f Q\n"),
+        (200, 300, "q 0.2 0.6 0.2 rg 10 10 80 120 re f Q\n"),
+        (300, 300, "q 0.2 0.2 0.8 rg 10 10 150 150 re f Q\n"),
+    ];
+    let mut objects: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>".to_string(),
+    ];
+    for (i, (w, h, content)) in pages.iter().enumerate() {
+        let content_id = 4 + i * 2; // 页对象 3/5/7，内容流对象紧随其后 4/6/8
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Resources << >> /Contents {content_id} 0 R >>"
+        ));
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{content}endstream",
+            content.len()
+        ));
+    }
+    let mut pdf = "%PDF-1.4\n".to_string();
+    let mut offsets = vec![0];
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
+    for offset in offsets.iter().skip(1) {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    pdf.into_bytes()
+}
+
 // ---------------------------------------------------------------------------
 // #302④：右键拖框观察器（页槽叠加透明 canvas——paint 期窗口级注册）
 // ---------------------------------------------------------------------------
@@ -2350,12 +2606,71 @@ pub fn quantize_width(w: u32) -> u32 {
     (clamped.div_ceil(WIDTH_QUANTUM) * WIDTH_QUANTUM).min(WIDTH_MAX)
 }
 
+/// #643：设备像素光栅宽量子化 + 域钳制（纯函数——单测锚点）。下限
+/// 同 [`WIDTH_MIN`]（更窄无读面）；上限 [`WIDTH_MAX_DEVICE`]（= 引擎
+/// S3-L2 单边钳制值——更高请求必被引擎截断，键与产物失配白费预算）。
+/// 量子化步长沿用 [`WIDTH_QUANTUM`]（sf 换档低频，键稳定性重于重
+/// 光栅频率）。
+pub fn device_quantize_width(w: u32) -> u32 {
+    let clamped = w.clamp(WIDTH_MIN, WIDTH_MAX_DEVICE);
+    (clamped.div_ceil(WIDTH_QUANTUM) * WIDTH_QUANTUM).min(WIDTH_MAX_DEVICE)
+}
+
 // ─── 纯函数面单测（零引擎依赖——CI 无 libpdfium 同样真跑） ──────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// #643：设备宽量化护栏（上限 = 引擎 S3-L2 钳制值）。
+    #[test]
+    fn device_quantize_width_clamps_and_rounds_up() {
+        assert_eq!(device_quantize_width(256), 256);
+        // 64 步长向上对齐（与逻辑宽同款量子化护栏思想）。
+        assert_eq!(device_quantize_width(300), 320);
+        // 上限 = 引擎单边钳制值；更高请求壳侧先钳（键不失控）。
+        assert_eq!(device_quantize_width(u32::MAX), WIDTH_MAX_DEVICE);
+        assert_eq!(device_quantize_width(0), WIDTH_MIN);
+    }
+
+    /// #643：HiDPI 密度接线不变量——请求密度随 sf 升档，显示几何
+    /// （槽高）保持逻辑域；单倍屏与 v1 完全同值（缓存键零迁移）。
+    #[gpui::test]
+    fn hidpi_device_width_scales_display_stays_logical(cx: &mut gpui::TestAppContext) {
+        let view = cx.update(|app| {
+            app.new(|cx| {
+                PdfPagesView::error_state(
+                    Arc::new(Vec::new()),
+                    cx.focus_handle(),
+                    cx.focus_handle(),
+                    "测试态：引擎缺席（几何口径面不依赖 worker）".into(),
+                )
+            })
+        });
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.viewport_size = (1000., 800.);
+                let logical = v.raster_width(1000., 800.);
+                // 单倍屏：设备宽 = 逻辑宽——v1 行为与缓存键完全兼容。
+                assert_eq!(v.device_raster_width(1000., 800.), logical);
+                // 2x 屏：请求密度翻倍（64 步长量化对齐）。
+                v.set_scale_factor_for_test(2.0);
+                assert_eq!(
+                    v.device_raster_width(1000., 800.),
+                    device_quantize_width(logical * 2)
+                );
+                // 显示几何不随 sf 变：槽高仍按逻辑宽（uniform_list
+                // 行高稳定——HiDPI 换档不重排）。
+                let slot_h = PdfPagesView::slot_height(logical, v.aspect);
+                v.set_scale_factor_for_test(1.0);
+                assert_eq!(slot_h, PdfPagesView::slot_height(logical, v.aspect));
+                // sf 域防御：异常低报不降密度（逻辑宽即保底清晰度）。
+                v.set_scale_factor_for_test(0.5);
+                assert_eq!(v.device_raster_width(1000., 800.), logical);
+            })
+        });
+    }
 
     #[test]
     fn quantize_width_clamps_and_rounds_up() {
@@ -2377,13 +2692,16 @@ mod tests {
         // 640 × 1.415 = 905.6 → #634 0.5px 量子化保持 905.5。
         assert!((PdfPagesView::slot_height(640, 1.415) - 905.5).abs() < 0.01);
         // #634：量子化语义——解析值对齐半像素网格（Taffy 行高测量
-        // 同网格；uniform_list 测量与滚动换算单源一致）。
-        // （#58 合入的 1.41421 字面量触 clippy::approx_constant（1.99
-        // deny 默认）——改精确 `SQRT_2` 常量，断言结果不变：576×√2
-        // = 814.59 → 814.5；577×√2 = 815.93 → 816.0。随 C2 批修复
-        // main 门红——D 线知悉即可。）
-        assert_eq!(PdfPagesView::slot_height(576, std::f64::consts::SQRT_2 as f32), 814.5);
-        assert_eq!(PdfPagesView::slot_height(577, std::f64::consts::SQRT_2 as f32), 816.0);
+        // 同网格；uniform_list 测量与滚动换算单源一致）。aspect 用
+        // √2 常量（字面近似值触发 clippy::approx_constant）。
+        assert_eq!(
+            PdfPagesView::slot_height(576, std::f32::consts::SQRT_2),
+            814.5
+        );
+        assert_eq!(
+            PdfPagesView::slot_height(577, std::f32::consts::SQRT_2),
+            816.0
+        );
     }
 
     #[test]
@@ -2392,6 +2710,76 @@ mod tests {
         assert_eq!(PdfPagesView::fit_width(1024.), 1024);
         // 极窄视口 → 下限。
         assert_eq!(PdfPagesView::fit_width(10.), WIDTH_MIN);
+    }
+
+    /// #51 D2 尾巴：内容 y → 页空间锚点（纯函数——异尺寸档的换算
+    /// 正确性面；fit_w=576 × aspect [0.5/1.5/1.0] → 槽高 [288/864/576]）。
+    #[test]
+    fn content_offset_maps_y_to_page_space_anchor() {
+        let aspects = [0.5, 1.5, 1.0];
+        let off = PdfPagesView::content_offset_to_page(&aspects, 576, 0.);
+        assert_eq!(off.item_ix, 0, "y=0 → 首页顶");
+        assert_eq!(f32::from(off.offset_in_item), 0.);
+
+        let off = PdfPagesView::content_offset_to_page(&aspects, 576, 287.5);
+        assert_eq!(off.item_ix, 0, "页 0 内最后半像素（287.5 < 288）");
+        assert!((f32::from(off.offset_in_item) - 287.5).abs() < 0.01);
+
+        // 页边界：288 恰落页 1 顶（半开区间 [0,288) 归页 0）。
+        let off = PdfPagesView::content_offset_to_page(&aspects, 576, 288.);
+        assert_eq!(off.item_ix, 1);
+        assert_eq!(f32::from(off.offset_in_item), 0.);
+
+        // 页 1 中部：累计 288 + 712 = 1000。
+        let off = PdfPagesView::content_offset_to_page(&aspects, 576, 1000.);
+        assert_eq!(off.item_ix, 1);
+        assert!((f32::from(off.offset_in_item) - 712.).abs() < 0.01);
+
+        // 越界钳末页顶（总高 288+864+576=1728 之后 → 末页锚）。
+        let off = PdfPagesView::content_offset_to_page(&aspects, 576, 5000.);
+        assert_eq!(off.item_ix, 2);
+        assert_eq!(f32::from(off.offset_in_item), 0.);
+
+        // 空表防御：零页档钳 item_ix=0（error 态不进本路径，防御面）。
+        let off = PdfPagesView::content_offset_to_page(&[], 576, 10.);
+        assert_eq!(off.item_ix, 0);
+    }
+
+    /// #51 D2 尾巴：**异尺寸合成件**的每页几何捕获 + 每页槽高——
+    /// 混合横竖/大小页不再被首页等高槽统一（真引擎开档；缺库环境
+    /// 按 first_painted 同款 SKIP 门跳过）。
+    #[gpui::test]
+    fn mixed_size_pages_capture_per_page_aspects(cx: &mut gpui::TestAppContext) {
+        let view =
+            cx.update(|app| app.new(|cx| PdfPagesView::new(mixed_size_pdf_bytes_for_tests(), cx)));
+        if let Some(err) = view.read_with(cx, |v, _| v.error.clone()) {
+            if std::env::var_os("MDC_PDFIUM_LIB").is_none() && err.contains("pdfium") {
+                eprintln!("SKIP: 每页几何捕获需要 PDFium 库：{err}");
+                return;
+            }
+            panic!("异尺寸夹具必须打开成功（配齐 PDFium）：{err}");
+        }
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.page_count(), 3, "三页异尺寸夹具");
+            // 每页纵横比：宽扁 0.5 / 高瘦 1.5 / 正方 1.0（MediaBox 实测）。
+            for (idx, want) in [(0usize, 0.5f32), (1, 1.5), (2, 1.0)] {
+                let got = v.page_aspect_of(idx);
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "页 {idx} 纵横比 {got} ≠ 夹具值 {want}（每页几何捕获）"
+                );
+            }
+            // 每页槽高（fit_w=576）：288 / 864 / 576——异尺寸档各页各高。
+            for (idx, want) in [(0usize, 288f32), (1, 864.), (2, 576.)] {
+                let got = v.page_slot_height(576, idx);
+                assert!((got - want).abs() < 0.5, "页 {idx} 槽高 {got} ≠ {want}");
+            }
+            // 页顶累计偏移：0 / 288 / 1152（跳转 y 的页级定位基准）。
+            for (idx, want) in [(0usize, 0f32), (1, 288.), (2, 1152.)] {
+                let got = v.page_top_offset(576, idx);
+                assert!((got - want).abs() < 0.5, "页 {idx} 顶偏移 {got} ≠ {want}");
+            }
+        });
     }
 
     /// #637：回退键选择器——同页多宽择最近、rev 优先、异页不取、
@@ -2642,7 +3030,8 @@ mod tests {
             cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(2));
             if view.read_with(&visual, |v, _| {
-                let width = v.raster_width(v.viewport_size.0, v.viewport_size.1);
+                // #643：键口径 = 设备像素宽（与 submit_visible 同源）。
+                let width = v.device_raster_width(v.viewport_size.0, v.viewport_size.1);
                 v.render_key(&(0, width))
                     .is_some_and(|key| v.cache.contains(&key))
             }) {

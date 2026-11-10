@@ -4,6 +4,13 @@
 //! ②前缀逐位保持；③重载往返（页数不变）；④加密拒 + DocMDP
 //! P1/P2/P3 全拒（typed 策略码）；⑤无元数据幂等透传；⑥批注修订 +
 //! 匿名化修订双链共存；⑦全绿（本文件即证）。
+//!
+//! 文件级 feature 门（照 pdff_organize 等本面 11 文件既有惯例）：
+//! 本测试 import `anonymize`/`writer`（`writer_lopdf` 产物）与裸
+//! `lopdf`——全部在 `engine-lopdf` 门后。#505 交付时本文件漏配门，
+//! 致 `cargo test -p mdc-pdf`（默认特性）编译红（E0432 ×17），
+//! 违反 crate 声明的「默认构建全绿」纪律（Cargo.toml 首注释）。
+#![cfg(feature = "engine-lopdf")]
 
 use lopdf::{dictionary, Object, Stream};
 use mdc_pdf::anonymize::anonymize_pdf_info;

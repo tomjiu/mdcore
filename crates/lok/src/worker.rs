@@ -76,6 +76,7 @@ pub struct WorkerState {
     profile: SessionProfile,
     session_dir: PathBuf,
     tile_counter: u64,
+    loaded_url: String,
 }
 
 unsafe impl Send for WorkerState {}
@@ -110,6 +111,7 @@ impl WorkerBoot {
 pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
     // 环境卫生（双侧：宿主 spawn 时也设过；幂等）
     env_hygiene();
+    let protocol_fd = steal_stdin_fd();
     #[cfg(windows)]
     windows_worker_preamble();
 
@@ -131,11 +133,9 @@ pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
     let _ = tx.send(ToWriter::Frame(hello));
 
     match fake {
-        Some(mode) => fake_dispatch_loop(mode, &tx),
+        Some(mode) => fake_dispatch_loop(mode, &tx, protocol_fd),
         None => {
             let boot = boot.expect("真实 worker 需要 WorkerBoot（--session-dir）");
-            // fd 0 抢救在任何 LO 初始化之前（hook_2 内嵌组件可能读 fd 0）
-            let protocol_fd = steal_stdin_fd();
             let state = match bind_kernel(&boot, &tx) {
                 Ok(st) => st,
                 Err((code, msg)) => {
@@ -331,6 +331,7 @@ fn bind_kernel(
         profile,
         session_dir: boot.session_dir.clone(),
         tile_counter: 0,
+        loaded_url: String::new(),
     };
 
     // nSize 成员守卫（issue「nSize/member 检查」）：绑定面全量检查
@@ -487,6 +488,7 @@ impl WorkerState {
             }
             self.doc = doc;
             self.doc_class = (*doc).p_class;
+            self.loaded_url = url.to_owned();
         }
         // 加载即注册 doc 级回调（失效/搜索结果/UNO 结果事件持续透传）
         unsafe {
@@ -753,6 +755,8 @@ impl WorkerState {
     ) -> DispatchResult {
         unsafe {
             self.doc_guard(abi::doc_offsets::SAVE_AS, "saveAs")?;
+            crate::save_guard::check(&self.loaded_url, url)
+                .map_err(|message| (codes::SAVE, message))?;
             let f = (*self.doc_class)
                 .save_as
                 .ok_or((codes::MEMBER, "缺 saveAs".to_string()))?;
@@ -822,79 +826,81 @@ thread_local! {
 ///
 /// 动机见模块头「fd 0 抢救」：LO 内嵌组件（python 等）直接读 fd 0 会与
 /// 协议读线程形成竞争读者，把帧流撕碎 → 宿主超时但 worker 未死。
+#[cfg(unix)]
 fn steal_stdin_fd() -> std::fs::File {
-    use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
-
-    #[cfg(unix)]
+    use std::os::fd::{AsRawFd, FromRawFd};
     unsafe extern "C" {
-        fn dup(fd: RawFd) -> RawFd;
-        fn dup2(old: RawFd, new: RawFd) -> RawFd;
+        fn dup(fd: c_int) -> c_int;
+        fn dup2(old: c_int, new: c_int) -> c_int;
     }
-    #[cfg(windows)]
-    unsafe extern "C" {
-        fn _dup(fd: RawFd) -> RawFd;
-        fn _dup2(old: RawFd, new: RawFd) -> RawFd;
+    let saved = unsafe { dup(0) };
+    if saved < 0 {
+        eprintln!("LOK protocol stdin duplication failed");
+        hard_exit(2);
     }
-
-    let devnull_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let ok = (|| -> Option<std::fs::File> {
-        unsafe {
-            #[cfg(unix)]
-            let saved = dup(0);
-            #[cfg(windows)]
-            let saved = _dup(0);
-            if saved < 0 {
-                return None;
-            }
-            // 换 fd 0 前先把 saved 交给 File 管理（防提前返回泄漏）。
-            let protocol = std::fs::File::from_raw_fd(saved);
-            let nul = std::fs::File::open(devnull_path).ok()?;
-            let nul_fd = nul.into_raw_fd();
-            #[cfg(unix)]
-            let rc = dup2(nul_fd, 0);
-            #[cfg(windows)]
-            let rc = _dup2(nul_fd, 0);
-            // nul_fd 已复制到 0，关闭原句柄（unix dup2 后原 fd 仍开）。
-            #[cfg(unix)]
-            if rc >= 0 {
-                libc_close(nul_fd);
-            }
-            #[cfg(windows)]
-            let _ = rc;
-            #[cfg(windows)]
-            unsafe extern "C" {
-                fn _close(fd: RawFd) -> RawFd;
-            }
-            #[cfg(windows)]
-            if rc >= 0 {
-                _close(nul_fd);
-            }
-            if rc < 0 {
-                // fd 0 替换失败：协议流退回原句柄（仍可工作，只是失去
-                // fd 0 隔离——Windows 实测门复核项）。
-                return Some(protocol);
-            }
-            Some(protocol)
-        }
-    })();
-    match ok {
-        Some(f) => f,
-        None => {
-            // dup 失败（罕见）：退回普通 stdin。
-            unsafe { std::fs::File::from_raw_fd(0) }
-        }
+    let protocol = unsafe { std::fs::File::from_raw_fd(saved) };
+    let nul = std::fs::File::open("/dev/null").unwrap_or_else(|e| {
+        eprintln!("LOK stdin isolation failed: {e}");
+        hard_exit(2);
+    });
+    if unsafe { dup2(nul.as_raw_fd(), 0) } < 0 {
+        eprintln!("LOK stdin isolation failed");
+        hard_exit(2);
     }
+    protocol
 }
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn close(fd: i32) -> i32;
-}
-
-/// unix 下关 fd 的安全别名（避免与 std 的 close 符号冲突）。
-#[cfg(unix)]
-unsafe fn libc_close(fd: i32) -> i32 {
-    close(fd)
+#[cfg(windows)]
+fn steal_stdin_fd() -> std::fs::File {
+    use std::os::windows::io::FromRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> *mut c_void;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn DuplicateHandle(
+            source_process: *mut c_void,
+            source: *mut c_void,
+            target_process: *mut c_void,
+            target: *mut *mut c_void,
+            access: u32,
+            inherit: i32,
+            options: u32,
+        ) -> i32;
+    }
+    #[link(name = "msvcrt")]
+    unsafe extern "C" {
+        fn _open(path: *const c_char, flags: c_int, ...) -> c_int;
+        fn _dup2(old: c_int, new: c_int) -> c_int;
+        fn _close(fd: c_int) -> c_int;
+    }
+    unsafe {
+        // Capture the Win32 pipe before the preamble redirects GetStdHandle to NUL.
+        // A CRT descriptor is not a Win32 HANDLE and cannot use FromRawFd.
+        let input = GetStdHandle(0xfffffff6);
+        let mut private = std::ptr::null_mut();
+        let process = GetCurrentProcess();
+        if input.is_null()
+            || input as isize == -1
+            || DuplicateHandle(process, input, process, &mut private, 0, 0, 2) == 0
+        {
+            eprintln!("LOK protocol stdin handle duplication failed");
+            hard_exit(2);
+        }
+        let protocol = std::fs::File::from_raw_handle(private);
+        // The private HANDLE stays readable when the CRT's fd 0 is replaced.
+        let nul = _open(c"NUL".as_ptr(), 0x8000);
+        if nul < 0 {
+            eprintln!("LOK CRT stdin isolation failed");
+            hard_exit(2);
+        }
+        let result = _dup2(nul, 0);
+        _close(nul);
+        if result != 0 {
+            eprintln!("LOK CRT stdin redirection failed");
+            hard_exit(2);
+        }
+        protocol
+    }
 }
 
 /// 真实主循环（B1：unipoll 集成）：主线程进 LOK `runLoop`，宿主请求在
@@ -1091,9 +1097,9 @@ fn no_kernel_loop(
 }
 
 /// 协议自测分发（无 LOK；client 集成测试恒跑用）。
-fn fake_dispatch_loop(mode: &str, tx: &Sender<ToWriter>) -> ! {
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+fn fake_dispatch_loop(mode: &str, tx: &Sender<ToWriter>, protocol_fd: std::fs::File) -> ! {
+    let mut reader = BufReader::new(protocol_fd);
+    let mut edits = 0;
     loop {
         let frame = match protocol::read_frame(&mut reader) {
             Ok(Some(f)) => f,
@@ -1111,6 +1117,15 @@ fn fake_dispatch_loop(mode: &str, tx: &Sender<ToWriter>) -> ! {
         let op = protocol::req_str(&v, "op").unwrap_or_default();
         let answer: Value = match (mode, op.as_str()) {
             (_, "ping") => protocol::ok_frame(id, json!({"pong": true})),
+            ("edit-fails-after-first", "post_key") => {
+                edits += 1;
+                if edits == 1 {
+                    protocol::ok_frame(id, json!({"edited": true}))
+                } else {
+                    protocol::err_frame(id, codes::BAD_REQUEST, "injected second edit failure")
+                }
+            }
+            ("edit-fails-after-first", _) => protocol::ok_frame(id, json!({})),
             ("echo", _) => protocol::ok_frame(id, json!({"echo": op})),
             ("hang", "slow") => {
                 // 永不回答（宿主超时看门狗测试；stdin 保活）

@@ -58,6 +58,7 @@ pub mod ffi;
 pub mod profile;
 pub mod protocol;
 pub mod runtime;
+mod save_guard;
 pub mod sha256;
 pub mod smoke;
 pub mod verify;

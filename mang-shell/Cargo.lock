@@ -3314,7 +3314,10 @@ name = "mdc-lok"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "same-file",
  "serde_json",
+ "url",
+ "zip",
 ]
 
 [[package]]

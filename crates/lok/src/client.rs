@@ -131,9 +131,10 @@ impl WorkerClient {
             // resources/ 布局；集成测试经此注入 cargo 构建产物）。
             .or_else(|| std::env::var_os("MDC_LOK_WORKER_BIN").map(PathBuf::from))
             .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("mdc-lok-worker")))
+                std::env::current_exe().ok().and_then(|p| {
+                    p.parent()
+                        .map(|d| d.join(format!("mdc-lok-worker{}", std::env::consts::EXE_SUFFIX)))
+                })
             })
             .ok_or_else(|| LokError::Protocol("无法定位 mdc-lok-worker 可执行文件".into()))?;
         if !exe.is_file() {
@@ -550,6 +551,7 @@ fn mark_dead(dead: &AtomicBool, detail: &Mutex<String>, why: &str) {
 pub struct DocHandle<'a> {
     client: &'a WorkerClient,
     dirty: std::cell::Cell<bool>,
+    loaded_url: String,
 }
 
 impl<'a> DocHandle<'a> {
@@ -564,13 +566,14 @@ impl<'a> DocHandle<'a> {
             a["options"] = json!(o);
         }
         client.request("load", a)?;
-        Ok(DocHandle::new(client))
+        Ok(DocHandle::new(client, url))
     }
 
-    fn new(client: &'a WorkerClient) -> DocHandle<'a> {
+    fn new(client: &'a WorkerClient, url: &str) -> DocHandle<'a> {
         DocHandle {
             client,
             dirty: std::cell::Cell::new(false),
+            loaded_url: url.to_owned(),
         }
     }
 
@@ -584,9 +587,8 @@ impl<'a> DocHandle<'a> {
 
     /// 任意请求的脏位包装：成功回调收到 result 后置位（编辑类 op）。
     fn edit_request(&self, op: &str, args: Value) -> Result<Value, LokError> {
-        let r = self.client.request(op, args)?;
         self.mark_dirty();
-        Ok(r)
+        self.client.request(op, args)
     }
 
     pub fn ping(&self) -> Result<Value, LokError> {
@@ -684,6 +686,7 @@ impl<'a> DocHandle<'a> {
 
     /// saveAs：**成功才清脏位**（issue 明文：超时/异常/失败不清）。
     pub fn save_as(&self, url: &str, format: &str) -> Result<Value, LokError> {
+        crate::save_guard::check(&self.loaded_url, url).map_err(LokError::Protocol)?;
         let r = self
             .client
             .request("save_as", json!({"url": url, "format": format}));
@@ -880,11 +883,16 @@ impl DocSession {
     /// 键入文本（逐字符 KEYINPUT+KEYUP；选区被替换——标准编辑语义）。
     /// 成功：dirty=true、revision+1。
     pub fn type_text(&mut self, text: &str) -> Result<(), LokError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        // A failed reply can follow an applied edit. Preserve conservative dirty
+        // and invalidate old tiles before sending the first mutating request.
+        self.edit_ok();
         for ch in text.chars() {
             self.client
                 .request("post_key", json!({"char": ch as i32, "key_code": 0}))?;
         }
-        self.edit_ok();
         Ok(())
     }
 
@@ -896,9 +904,8 @@ impl DocSession {
         if let Some(s) = args {
             a["args"] = json!(s);
         }
-        let r = self.client.request("uno", a)?;
         self.edit_ok();
-        Ok(r)
+        self.client.request("uno", a)
     }
 
     /// 非变更类 UNO（不置脏、不动 revision）。
@@ -932,6 +939,7 @@ impl DocSession {
     /// dirty=false、revision+1（保存也是新状态，C 线据此失效旧 tile）。
     /// 失败：dirty/revision 均不动。
     pub fn save_as(&mut self, url: &str, format: &str) -> Result<Value, LokError> {
+        crate::save_guard::check(&self.loaded_url, url).map_err(LokError::Protocol)?;
         let r = self
             .client
             .request("save_as", json!({"url": url, "format": format}))?;
@@ -952,5 +960,77 @@ impl DocSession {
     pub fn shutdown(self) {
         let _ = self.close();
         self.client.kill();
+    }
+}
+
+#[cfg(test)]
+mod save_safety_tests {
+    use super::*;
+
+    fn session(mode: &str, tag: &str) -> (DocSession, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "mdc-lok-save-safety-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("原 文.docx");
+        std::fs::write(&source, b"original source bytes").unwrap();
+        let worker = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("mdc-lok-worker{}", std::env::consts::EXE_SUFFIX));
+        let client =
+            WorkerClient::spawn(None, &root.join("ipc"), Some(&worker), Some(mode)).unwrap();
+        (
+            DocSession {
+                client,
+                dirty: false,
+                revision: 0,
+                loaded_url: crate::profile::file_url_of(&source),
+            },
+            root,
+        )
+    }
+
+    #[test]
+    fn source_guard_rejects_original_and_hard_link_without_clearing_dirty() {
+        let (mut session, root) = session("echo", "source");
+        session.dirty = true;
+        session.revision = 7;
+        let source = root.join("原 文.docx");
+        let alias = root.join("alias.docx");
+        std::fs::hard_link(&source, &alias).unwrap();
+        for target in [&source, &alias] {
+            let result = session.save_as(&crate::profile::file_url_of(target), "docx");
+            assert!(
+                result.is_err(),
+                "saving over the source or its hard link must fail"
+            );
+            assert!(session.is_dirty());
+            assert_eq!(session.revision(), 7);
+            assert_eq!(std::fs::read(&source).unwrap(), b"original source bytes");
+        }
+        session.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_text_edit_failure_preserves_dirty_and_revision() {
+        let (mut session, root) = session("edit-fails-after-first", "partial");
+        assert!(session.type_text("ab").is_err());
+        assert!(
+            session.is_dirty(),
+            "the first acknowledged character was edited"
+        );
+        assert!(session.revision() > 0);
+        session.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

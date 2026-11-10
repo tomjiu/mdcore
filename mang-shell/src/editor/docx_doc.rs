@@ -462,6 +462,12 @@ impl DocxPort for DocxEnginePort {
             .map_err(|e| e.to_string())
     }
 
+    fn reset_text(&mut self, idx: usize) -> Result<(), String> {
+        self.editor
+            .reset_paragraph_text(idx)
+            .map_err(|e| e.to_string())
+    }
+
     fn save(&self) -> Result<Vec<u8>, String> {
         self.editor.save_to_vec().map_err(|e| e.to_string())
     }

@@ -30,6 +30,20 @@
 //! - poppler 对 /Rotate 页默认先缩放后旋转（A4+90° 得 906×640）——
 //!   参照命令固化 `-scale-dimension-before-rotation` 得 640×453。
 //!
+//! # D1（#51 工作线 D）：活参照独立对照（PARITY 门控）
+//!
+//! 静态 manifest 网格由 Linux/poppler 25.03 预生成——无嵌入字体的
+//! 文本页（rotated_90 等）在异平台字体栈下与静态网格存在系统级漂移
+//! （Windows/poppler 26.09 实测 mean 0.2569 > 固定容差 0.24——#51
+//! D1 登记）。`MDC_634_REQUIRE_PARITY=1` 切换为**本机 pdftoppm 活参照**
+//! （命令与 manifest `poppler_command` 逐项一致；PPM P6 与参照 PNG
+//! 同渲染路径实测 100% 逐像素一致）：同机同版本同字体栈的独立对照
+//! ——排除字体栈差异，**阈值不放宽、断言不删减**；同时记录网格
+//! NCC / 像素级墨迹 IoU / 静态网格漂移（跨平台差异的量化面）。
+//! PARITY=1 而 pdftoppm 缺件 = panic（独立对照门要求真跑，SKIP 不计
+//! 通过）。跨平台版本差异由此以活参照证明（26.09 机器用 26.09 自证，
+//! 25.03 机器用 25.03 自证——poppler ≠ pdfium 的独立性不变）。
+//!
 //! 网格度量的数值口径与本仓 `scripts/display_corpus/build_corpus.py`
 //! **逐位对齐**：PIL L 灰度（整数 L24 公式）、floor 网格边界、
 //! 均值/255（白=1.0）、luma<200 判墨、±2px 高度差中心对齐（高者裁
@@ -41,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use mdc_pdf::engine::DocumentEngine;
 use mdc_pdf::engine_pdfium::PdfiumEngine;
-use mdc_pdf::page::PageIndex;
+use mdc_pdf::page::{PageIndex, Rotation};
 use mdc_pdf::render::{RenderRequest, RenderedPage};
 use mdc_pdf::worker::{RenderWorker, WorkerReply};
 
@@ -99,16 +113,36 @@ fn skip_banner(msg: &str, face: &str) {
     );
 }
 
+/// D1（#51）：缺件守卫统一出口——PARITY=1 时任何环境缺件（无库/
+/// 无独立参照）= **panic**（显示矩阵要求真跑与独立对照在场，SKIP
+/// 不计通过）；未设 PARITY 才走显式 SKIP 横幅（缺件环境可诊断）。
+/// 三个测试的库门与测试 1 的活参照门共用此出口——门语义单点，不漂移。
+fn missing_guard(msg: &str, face: &str) {
+    if parity_required() {
+        panic!(
+            "MDC_634_REQUIRE_PARITY=1 而 {face} 缺件：独立对照门要求真跑，\
+         缺库/缺参照不可 SKIP 计通过。错误全文：{msg}"
+        );
+    }
+    skip_banner(msg, face);
+}
+
 // ---------------------------------------------------------------------------
 // 网格度量（与 scripts/display_corpus/build_corpus.py 逐位对齐）
 // ---------------------------------------------------------------------------
 
 /// PIL `convert("L")` 的 L24 整数公式（亮度权重 299/587/114 + 半值
-/// 进位——精确镜像，不是近似）。
+/// 进位——精确镜像，不是近似）。RGB 入参形态（活参照 PPM 与引擎
+/// BGRA 两调用方共享同一数值口径）。
+#[inline]
+fn pil_luma_rgb(r: u8, g: u8, b: u8) -> u8 {
+    ((r as u32 * 19595 + g as u32 * 38470 + b as u32 * 7471 + 0x8000) >> 16) as u8
+}
+
+/// 引擎 BGRA 像素 → luma（内部走 [`pil_luma_rgb`] 同一公式）。
 #[inline]
 fn pil_luma(bgra: &[u8]) -> u8 {
-    let (b, g, r) = (bgra[0] as u32, bgra[1] as u32, bgra[2] as u32);
-    ((r * 19595 + g * 38470 + b * 7471 + 0x8000) >> 16) as u8
+    pil_luma_rgb(bgra[2], bgra[1], bgra[0])
 }
 
 /// BGRA 位图 → luma 行阵（行 0 = 渲染页顶部——与参照 row-major 一致）。
@@ -220,18 +254,213 @@ fn drain_one(
 
 /// 网格对照：返回最大逐格差（供证据行；越差即断言失败——报文件/页/
 /// 格坐标与两侧值）。
-fn grid_worst_diff(ours: &[Vec<f64>], reference: &serde_json::Value) -> f64 {
+fn grid_worst_diff(ours: &[Vec<f64>], reference: &[Vec<f64>]) -> f64 {
     let mut worst = 0f64;
-    let rows = reference
-        .as_array()
-        .expect("参照网格必须是二维数组（row-major）");
-    for (j, row) in rows.iter().enumerate() {
-        for (i, cell) in row.as_array().expect("参照网格行").iter().enumerate() {
-            let rv = cell.as_f64().expect("参照格值必须是数字");
-            worst = worst.max((ours[j][i] - rv).abs());
+    for (row_ours, row_ref) in ours.iter().zip(reference) {
+        assert_eq!(row_ours.len(), row_ref.len(), "参照网格列数合同");
+        for (v, rv) in row_ours.iter().zip(row_ref) {
+            worst = worst.max((v - rv).abs());
         }
     }
     worst
+}
+
+// ---------------------------------------------------------------------------
+// D1（#51 工作线 D）：活参照独立对照（PARITY 门控）
+// ---------------------------------------------------------------------------
+
+/// PARITY 环境变量（=1 时矩阵对照必须用本机 pdftoppm 活参照——
+/// 独立对照门要求真跑；缺 pdftoppm = panic，SKIP 不计通过）。
+const PARITY_ENV: &str = "MDC_634_REQUIRE_PARITY";
+
+fn parity_required() -> bool {
+    std::env::var(PARITY_ENV).map(|v| v == "1").unwrap_or(false)
+}
+
+/// PATH 中 pdftoppm 版本（无 → None；stderr 形如 "pdftoppm version 25.03.0"）。
+fn pdftoppm_version() -> Option<String> {
+    let out = std::process::Command::new("pdftoppm")
+        .arg("-v")
+        .output()
+        .ok()?;
+    let txt = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    txt.lines()
+        .find_map(|l| l.split_once("version ").map(|(_, v)| v.trim().to_string()))
+}
+
+/// PPM P6 解析（pdftoppm 默认输出——与参照 PNG 同渲染路径仅编码不同，
+/// 实测 100% 逐像素一致：同页 PNG/PPM 双渲对拍 289920/289920 像素全同）。
+/// 返回 (w, h, RGB 字节)。头部：magic + 宽/高/maxval 三整数，`#` 行注释。
+fn parse_ppm_p6(data: &[u8]) -> (usize, usize, Vec<u8>) {
+    let mut pos = 0usize;
+    let mut tokens: Vec<String> = Vec::with_capacity(4);
+    while tokens.len() < 4 {
+        while pos < data.len() && data[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos < data.len() && data[pos] == b'#' {
+            while pos < data.len() && data[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        let start = pos;
+        while pos < data.len() && !data[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        assert!(
+            pos > start,
+            "PPM P6 头不完整（第 {} 个 token 处截断）",
+            tokens.len()
+        );
+        tokens.push(String::from_utf8_lossy(&data[start..pos]).into_owned());
+    }
+    pos += 1; // maxval 后恰一个空白分隔，其后为原始像素字节
+    assert_eq!(
+        tokens[0], "P6",
+        "pdftoppm 输出必须是 P6（实得 {}）",
+        tokens[0]
+    );
+    let w: usize = tokens[1].parse().expect("PPM 宽");
+    let h: usize = tokens[2].parse().expect("PPM 高");
+    let maxval: u16 = tokens[3].parse().expect("PPM maxval");
+    assert_eq!(maxval, 255, "pdftoppm P6 maxval 必须 255（实得 {maxval}）");
+    let rgb = data[pos..].to_vec();
+    assert_eq!(rgb.len(), w * h * 3, "PPM 像素缓冲长度（w×h×3）");
+    (w, h, rgb)
+}
+
+/// 活参照：本机 pdftoppm 渲染单页 → 灰度行阵（命令与 manifest
+/// `poppler_command` 逐项对齐——同宽 640/同 -cropbox/同旋转口径）。
+/// 返回行阵的行数即参照高（poppler ceil 口径，与静态 PNG 名义高一致）。
+/// 临时目录读后即清，不留测试残留面。
+fn live_reference_luma(bytes: &[u8], page: u32, raster_w: u32) -> Vec<Vec<u8>> {
+    let dir = std::env::temp_dir().join(format!(
+        "mdc634-live-{}-p{page}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("活参照临时目录创建");
+    let pdf_path = dir.join("probe.pdf");
+    std::fs::write(&pdf_path, bytes).expect("活参照探针写入");
+    let page1 = page + 1; // pdftoppm 1 基页号
+    let out = std::process::Command::new("pdftoppm")
+        .args([
+            "-r",
+            "96",
+            "-f",
+            &page1.to_string(),
+            "-l",
+            &page1.to_string(),
+            "-scale-to-x",
+            &raster_w.to_string(),
+            "-scale-to-y",
+            "-1",
+            "-cropbox",
+            "-scale-dimension-before-rotation",
+        ])
+        .arg(&pdf_path)
+        .arg(dir.join("ref"))
+        .output()
+        .expect("pdftoppm 调起（活参照门已在测试头验证在场）");
+    let ppm_data = std::fs::read_dir(&dir)
+        .expect("活参照目录读取")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "ppm").unwrap_or(false))
+        .map(|p| std::fs::read(p))
+        .expect("活参照 PPM 产出（唯一单页）");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "pdftoppm 活参照渲染失败：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (w, h, rgb) = parse_ppm_p6(&ppm_data.expect("PPM 字节读回"));
+    assert_eq!(w as u32, raster_w, "活参照宽必须精确 {raster_w}px");
+    (0..h)
+        .map(|y| {
+            (0..w)
+                .map(|x| {
+                    let i = (y * w + x) * 3;
+                    pil_luma_rgb(rgb[i], rgb[i + 1], rgb[i + 2])
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// 网格 NCC（归一化互相关——D1 记录指标：1.0 = 网格完全同形；
+/// 零方差面（双侧纯白）无定义按同形计 1.0——内容正确性由网格双指标
+/// 断言承担，NCC 仅证据记录面）。
+fn grid_ncc(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+    let flat_len = |g: &[Vec<f64>]| g.iter().map(|r| r.len()).sum::<usize>() as f64;
+    let (na, nb) = (flat_len(a), flat_len(b));
+    let (ma, mb) = (
+        a.iter().flatten().sum::<f64>() / na,
+        b.iter().flatten().sum::<f64>() / nb,
+    );
+    let (mut sa, mut sb, mut sab) = (0f64, 0f64, 0f64);
+    for (ra, rb) in a.iter().zip(b) {
+        for (va, vb) in ra.iter().zip(rb) {
+            let (da, db) = (va - ma, vb - mb);
+            sa += da * da;
+            sb += db * db;
+            sab += da * db;
+        }
+    }
+    if sa <= f64::EPSILON || sb <= f64::EPSILON {
+        return 1.0;
+    }
+    sab / (sa * sb).sqrt()
+}
+
+/// 像素级墨迹掩码 IoU（luma<200 判墨；D1 记录指标——掩码交并比）。
+fn ink_iou_px(a: &[Vec<u8>], b: &[Vec<u8>]) -> f64 {
+    let (mut inter, mut union) = (0u64, 0u64);
+    for (ra, rb) in a.iter().zip(b) {
+        for (va, vb) in ra.iter().zip(rb) {
+            let (ia, ib) = (*va < INK_THRESHOLD, *vb < INK_THRESHOLD);
+            inter += (ia && ib) as u64;
+            union += (ia || ib) as u64;
+        }
+    }
+    if union == 0 {
+        1.0 // 双侧无墨（纯白页）——按同形计
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// manifest 网格（serde Value）→ 行阵（统一对照函数消费）。
+fn grid_from_manifest(v: &serde_json::Value) -> Vec<Vec<f64>> {
+    v.as_array()
+        .expect("参照网格必须是二维数组（row-major）")
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .expect("参照网格行")
+                .iter()
+                .map(|c| c.as_f64().expect("参照格值必须是数字"))
+                .collect()
+        })
+        .collect()
+}
+
+/// 旋转枚举 → 度（pypdf manifest 对照形态）。
+fn rotation_deg(r: Rotation) -> i64 {
+    match r {
+        Rotation::Deg0 => 0,
+        Rotation::Deg90 => 90,
+        Rotation::Deg180 => 180,
+        Rotation::Deg270 => 270,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,11 +492,35 @@ fn engine_content_matches_poppler_reference() {
         mdc_pdf::deploy_check::render_report(&mdc_pdf::deploy_check::run_check())
     );
 
-    // 环境门先行（缺库 → 全测 SKIP；不让坏文件断言空转在库错误上）。
+    // D1（#51 工作线 D）：PARITY 门控——活参照独立对照必须在场。
+    let parity = parity_required();
+    let live_ver = pdftoppm_version();
+    if parity {
+        let ver = live_ver.as_deref().unwrap_or_else(|| {
+            panic!(
+                "MDC_634_REQUIRE_PARITY=1：活对照门要求 PATH 中有 pdftoppm（独立参照），\
+             缺件不可 SKIP 计通过（#51 D1：不以 SKIP/尺寸非空代替页面正确）"
+            )
+        });
+        eprintln!(
+            "#634 D1 活参照：本机 pdftoppm {ver}（参照命令与 manifest 逐项一致；\
+             对照阈值仍用 manifest 分页容差，不放宽）"
+        );
+    } else {
+        eprintln!(
+            "#634 D1：MDC_634_REQUIRE_PARITY 未设——参照 = 静态 manifest（poppler {}）；\
+             设 1 时切换为本机 pdftoppm 活参照（pdftoppm 在场：{}）",
+            manifest["poppler_version"],
+            live_ver.as_deref().unwrap_or("无"),
+        );
+    }
+
+    // 环境门先行（缺库：PARITY=1 → fail；否则 SKIP——不让坏文件断言
+    // 空转在库错误上）。
     if let Err(err) = PdfiumEngine::open(fixture_bytes("zh_embedded_font.pdf")) {
         let msg = format!("{err:?}");
         if is_missing_library_error(&msg) {
-            skip_banner(&msg, "引擎内容×几何矩阵");
+            missing_guard(&msg, "引擎内容×几何矩阵");
             return;
         }
         panic!("完好探针文件打开失败（真缺陷，非环境缺件）：{msg}");
@@ -275,6 +528,9 @@ fn engine_content_matches_poppler_reference() {
 
     let mut checked_files = 0usize;
     let mut checked_pages = 0usize;
+    // D1 记录面汇总（PARITY 模式——矩阵尾证据行：旋转/极端尺寸已逐页
+    // 断言，跨文档 NCC/IoU/漂移在此汇总）。
+    let (mut min_ncc, mut min_iou, mut max_static_drift) = (1f64, 1f64, 0f64);
     for (name, entry) in manifest["files"]
         .as_object()
         .expect("manifest.files 必须是对象")
@@ -302,7 +558,7 @@ fn engine_content_matches_poppler_reference() {
         // 快照重开——pdf_pages/pdf_thumbs 构造同款）。
         let engine = PdfiumEngine::open(bytes.clone())
             .unwrap_or_else(|e| panic!("{name}（完好文件）打开失败：{e:?}"));
-        let snapshot = Arc::new(bytes);
+        let snapshot = Arc::new(bytes.clone()); // D1：bytes 保留给活参照渲染（clone 一次，测试面）
         let mut worker = RenderWorker::watchdog(
             move || {
                 PdfiumEngine::open((*snapshot).clone())
@@ -337,8 +593,24 @@ fn engine_content_matches_poppler_reference() {
                 "{name} p{page} 有效高 {}pt ≠ pypdf 独立解析 {exp_h}pt（±0.75 容差）",
                 geo.effective_height()
             );
+            // D1：旋转标记逐页断言（离散语义零容差——rotated_90 p0=90°/
+            // p1=270°、rotated_180=180°、混合页随页登记；引擎枚举必须
+            // 与 pypdf /Rotate 逐位一致，容差断言不吸收错向旋转）。
+            let exp_rot = page_entry["pypdf"]["rotation"]
+                .as_i64()
+                .expect("pypdf rotation 字段");
+            assert_eq!(
+                rotation_deg(geo.rotation),
+                exp_rot,
+                "{name} p{page} 旋转标记：引擎 {:?} ≠ pypdf /Rotate {exp_rot}°",
+                geo.rotation
+            );
 
-            // ② 内容（640px 渲染 → 24×24 网格双指标 vs poppler 参照）。
+            // ② 内容（640px 渲染 → 24×24 网格双指标 vs 独立参照）。
+            //    D1（#51）：PARITY=1 → 本机 pdftoppm 活参照（同机同版本
+            //    同字体栈的独立对照——rotated_90 等无嵌入字体页的跨平台
+            //    字体栈差异被排除，阈值不放宽）；默认 → 静态 manifest
+            //    网格（poppler 25.03 观测口径，缺件环境可跑）。
             let job = worker.submit(RenderRequest {
                 page: PageIndex(page),
                 width_px: RASTER_W,
@@ -348,40 +620,102 @@ fn engine_content_matches_poppler_reference() {
                 rendered.width_px, RASTER_W,
                 "{name} p{page} 光栅宽必须按请求精确回显"
             );
-            let ref_h = ref_height(page_entry["ref_png"].as_str().expect("ref_png"));
             let our_h = rendered.height_px as usize;
-            assert!(
-                our_h.abs_diff(ref_h) <= 2,
-                "{name} p{page} 引擎高 {our_h}px ≠ poppler 参照高 {ref_h}px（差 >2px = \
-                 几何级发现，不在中心对齐带内吸收——报 Lead，不静默）"
-            );
-            let rows =
-                fit_height_to_reference(luma_rows(&rendered.bgra, RASTER_W as usize, our_h), ref_h);
+            // D1 规约（#51）：活参照双侧**同规约**——引擎位图与活参照
+            // PPM 都线性 fit 到 H_ref = round(640 × 高/宽)（pypdf 几何
+            // 基准——与 build_corpus.py 网格规约同基）。实测：规约不
+            // 匹配（引擎 fit 到 PPM 原生高、参照原生直出网格）引入
+            // ~0.02 级伪差（zh_embedded_font p1 ink 0.0916 > 0.085）；
+            // 同规约后 0.0468/0.07 双绿——**阈值不放宽**，差值即为纯
+            // 渲染差（poppler ≠ pdfium 的独立性不变）。静态模式沿用
+            // PNG 名义高（ceil）现状——13×25 已绿口径不动。
+            let (rows, live_fit) = if parity {
+                let live = live_reference_luma(&bytes, page, RASTER_W);
+                let live_h = live.len();
+                let h_ref = ((RASTER_W as f64) * exp_h / exp_w).round() as usize;
+                assert!(
+                    our_h.abs_diff(live_h) <= 2,
+                    "{name} p{page} 引擎高 {our_h}px ≠ 活参照高 {live_h}px（差 >2px = \
+                     几何级发现，不在中心对齐带内吸收——报 Lead，不静默）"
+                );
+                let live_fit = fit_height_to_reference(live, h_ref);
+                let rows = fit_height_to_reference(
+                    luma_rows(&rendered.bgra, RASTER_W as usize, our_h),
+                    h_ref,
+                );
+                (rows, Some(live_fit))
+            } else {
+                let ref_h = ref_height(page_entry["ref_png"].as_str().expect("ref_png"));
+                assert!(
+                    our_h.abs_diff(ref_h) <= 2,
+                    "{name} p{page} 引擎高 {our_h}px ≠ 参照高 {ref_h}px（差 >2px = \
+                     几何级发现，不在中心对齐带内吸收——报 Lead，不静默）"
+                );
+                (
+                    fit_height_to_reference(
+                        luma_rows(&rendered.bgra, RASTER_W as usize, our_h),
+                        ref_h,
+                    ),
+                    None,
+                )
+            };
             let (mean, ink) = grids(&rows);
+            let (ref_mean, ref_ink) = if let Some(live) = &live_fit {
+                grids(live)
+            } else {
+                (
+                    grid_from_manifest(&page_entry["grid_mean"]),
+                    grid_from_manifest(&page_entry["grid_ink"]),
+                )
+            };
             let tol_mean = page_entry["tol_mean_max_cell"]
                 .as_f64()
                 .expect("tol_mean_max_cell");
             let tol_ink = page_entry["tol_ink_max_cell"]
                 .as_f64()
                 .expect("tol_ink_max_cell");
-            let worst_mean = grid_worst_diff(&mean, &page_entry["grid_mean"]);
-            let worst_ink = grid_worst_diff(&ink, &page_entry["grid_ink"]);
+            let worst_mean = grid_worst_diff(&mean, &ref_mean);
+            let worst_ink = grid_worst_diff(&ink, &ref_ink);
             assert!(
                 worst_mean <= tol_mean + 1e-3,
                 "{name} p{page} mean 网格越差：最大逐格差 {worst_mean:.4} > 容差 {tol_mean}\
-                 （对照 poppler 参照——抗锯齿级差异应在校准余量内）"
+                 （对照独立参照——抗锯齿级差异应在校准余量内）"
             );
             assert!(
                 worst_ink <= tol_ink + RESAMPLE_INK_ALLOWANCE + 1e-3,
                 "{name} p{page} ink 网格越差：最大逐格差 {worst_ink:.4} > 容差 {tol_ink}+{RESAMPLE_INK_ALLOWANCE}\
-                 （对照 poppler 参照——内容/几何级差异才会越出）"
+                 （对照独立参照——内容/几何级差异才会越出）"
             );
-            eprintln!(
-                "#634 对照 ✓ {name} p{page}：几何 {}×{}pt | mean {worst_mean:.4}/{tol_mean:.3} ink {worst_ink:.4}/{:.3}",
-                exp_w,
-                exp_h,
-                tol_ink + RESAMPLE_INK_ALLOWANCE
-            );
+            if parity {
+                // D1 记录面：NCC / IoU / 静态网格漂移（跨平台字体栈差异
+                // 的量化——Windows/poppler 26.09 上 rotated_90 实测漂移
+                // 0.2569 的根因即在字体栈，活参照消解后漂移应归零量级）。
+                let ncc = grid_ncc(&mean, &ref_mean);
+                let iou = ink_iou_px(&rows, live_fit.as_ref().expect("活参照行阵"));
+                let static_drift_mean =
+                    grid_worst_diff(&mean, &grid_from_manifest(&page_entry["grid_mean"]));
+                let static_drift_ink =
+                    grid_worst_diff(&ink, &grid_from_manifest(&page_entry["grid_ink"]));
+                eprintln!(
+                    "#634 D1 活参照 ✓ {name} p{page}：mean {worst_mean:.4}/{tol_mean:.3} \
+                     ink {worst_ink:.4}/{:.3} | NCC {ncc:.4} | IoU {iou:.4} | \
+                     静态漂移 mean {static_drift_mean:.4} / ink {static_drift_ink:.4} \
+                     （活 poppler {} vs 静态 {}）",
+                    tol_ink + RESAMPLE_INK_ALLOWANCE,
+                    live_ver.as_deref().unwrap_or("?"),
+                    manifest["poppler_version"],
+                );
+                min_ncc = min_ncc.min(ncc);
+                min_iou = min_iou.min(iou);
+                max_static_drift = max_static_drift.max(static_drift_mean);
+            } else {
+                eprintln!(
+                    "#634 对照 ✓ {name} p{page}：几何 {}×{}pt | mean {worst_mean:.4}/{tol_mean:.3} ink {worst_ink:.4}/{:.3}",
+                    exp_w,
+                    exp_h,
+                    tol_ink + RESAMPLE_INK_ALLOWANCE
+                );
+            }
             checked_pages += 1;
         }
         checked_files += 1;
@@ -394,10 +728,20 @@ fn engine_content_matches_poppler_reference() {
         checked_files >= 13 && checked_pages >= 25,
         "矩阵覆盖面坍缩（{checked_files} 文件 / {checked_pages} 页——清单不得静默缩水）"
     );
-    eprintln!(
-        "#634 矩阵核验 ✓ {checked_files} 文件 × {checked_pages} 探针页（poppler {} vs pdfium，分页容差=观测×1.3）",
-        manifest["poppler_version"]
-    );
+    if parity {
+        eprintln!(
+            "#634 D1 矩阵核验 ✓ {checked_files} 文件 × {checked_pages} 探针页（活参照 pdftoppm {}：\
+             阈值不放宽）| 跨文档汇总：min NCC {min_ncc:.4} / min IoU {min_iou:.4} / \
+             max 静态漂移 {max_static_drift:.4}（静态源 poppler {}）",
+            live_ver.as_deref().unwrap_or("?"),
+            manifest["poppler_version"],
+        );
+    } else {
+        eprintln!(
+            "#634 矩阵核验 ✓ {checked_files} 文件 × {checked_pages} 探针页（poppler {} vs pdfium，分页容差=观测×1.3）",
+            manifest["poppler_version"]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +795,7 @@ fn view_chain_first_screen_scroll_zoom_close_reopen(cx: &mut gpui::TestAppContex
     let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
     if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
         if is_missing_library_error(&err) {
-            skip_banner(&err, "视图链核验");
+            missing_guard(&err, "视图链核验");
             return;
         }
         panic!("百页长文档（完好文件）打开失败：{err}");
@@ -532,6 +876,258 @@ fn view_chain_first_screen_scroll_zoom_close_reopen(cx: &mut gpui::TestAppContex
 }
 
 // ---------------------------------------------------------------------------
+// 测试 2b：#51 D2 尾巴——混合尺寸文档的变高槽视图链（每页几何槽高 +
+// 页空间锚点跳页 + 缩放不跳页）
+// ---------------------------------------------------------------------------
+
+/// 异尺寸合成件（3 页：宽扁 400×200 / 高瘦 200×300 / 正方 300×300）
+/// 的**变高槽**端到端：真窗口布局给出各页各高的页面槽、跳页读回、
+/// 缩放换档后顶部页号稳定（页空间锚——「缩放/旋转不跳页」的混合
+/// 尺寸档行为面）。
+#[gpui::test]
+fn view_chain_mixed_geometry_slots_and_zoom_anchor(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = crate::pdf_pages::mixed_size_pdf_bytes_for_tests();
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "混合尺寸视图链");
+            return;
+        }
+        panic!("异尺寸合成件打开失败：{err}");
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.page_count()), 3, "三页夹具");
+
+    // ① 首屏：600×480 视口 → fit_w=576；页 0 槽高 288（宽扁）、页 1
+    //    槽高 864（高瘦）——**两页同屏可见**（288 + 864 > 480）。
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "混合首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    let b0 = visual
+        .debug_bounds("pdf-visible-page-0")
+        .expect("混合档页 0 槽真实渲染");
+    let b1 = visual
+        .debug_bounds("pdf-visible-page-1")
+        .expect("混合档页 1 槽真实渲染（864 高槽与 288 高槽同屏——变高虚拟化的直接证据）");
+    assert!(
+        b0.size.height > gpui::px(250.) && b0.size.height < gpui::px(330.),
+        "页 0 槽高 ≈288（400×200 宽扁 @576 适宽），实得 {:?}",
+        b0.size.height
+    );
+    assert!(
+        b1.size.height > gpui::px(800.) && b1.size.height < gpui::px(930.),
+        "页 1 槽高 ≈864（200×300 高瘦），实得 {:?}",
+        b1.size.height
+    );
+    assert!(
+        b1.size.height > b0.size.height * 2.5,
+        "异尺寸档两页槽高显著不同（等高槽时代两槽相等——本断言即 D2 尾巴行为面）"
+    );
+    eprintln!(
+        "#51 D2 尾巴 ✓ 变高槽：页0 {:?} / 页1 {:?}（各页各高）",
+        b0.size.height, b1.size.height
+    );
+
+    // ② 跳页 2（正方 300×300 → 槽高 576）：页空间锚读回。
+    cx.update(|app| view.update(app, |v, _| v.scroll_to_page(2)));
+    pump_ready(cx, &mut visual, &view, 30, "混合跳页读回", |v| {
+        v.top_visible_page() == 2
+    });
+    pump_ready(cx, &mut visual, &view, 30, "混合跳页位图", |v| {
+        v.page_ready_for_test(2)
+    });
+    let b2 = visual
+        .debug_bounds("pdf-visible-page-2")
+        .expect("混合档页 2 槽真实渲染");
+    assert!(
+        b2.size.height > gpui::px(550.) && b2.size.height < gpui::px(600.),
+        "页 2 槽高 ≈576（正方 @576），实得 {:?}",
+        b2.size.height
+    );
+    eprintln!(
+        "#51 D2 尾巴 ✓ 跳页 2：top_visible_page=2 + 槽高 {:?}（页空间锚）",
+        b2.size.height
+    );
+
+    // ③ 缩放不跳页：Ctrl+= 步进放大（页空间锚——顶部页号稳定 2）。
+    let before_w = view.read_with(&visual, |v, _| v.raster_width_for_test());
+    let consumed =
+        cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+    assert!(consumed, "Ctrl+= 必须被 pdf 键域消费");
+    let after_w = view.read_with(&visual, |v, _| v.raster_width_for_test());
+    assert_ne!(
+        before_w, after_w,
+        "步进缩放必须换光栅宽档（{before_w} → ?）"
+    );
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.top_visible_page()),
+        2,
+        "缩放后顶部页号稳定（页空间锚——异尺寸档不跳页）"
+    );
+    pump_ready(cx, &mut visual, &view, 30, "混合换档重渲", |v| {
+        v.page_ready_for_test(2)
+    });
+    eprintln!("#51 D2 尾巴 ✓ 缩放不跳页：{before_w}px → {after_w}px 后 top_visible_page=2");
+
+    // ④ 回跳首页（锚点往返——变高树上来回移动不卡页号读数）。
+    cx.update(|app| view.update(app, |v, _| v.scroll_to_page(0)));
+    pump_ready(cx, &mut visual, &view, 30, "混合回跳", |v| {
+        v.top_visible_page() == 0
+    });
+    eprintln!("#51 D2 尾巴 ✓ 回跳页 0：变高树锚点往返");
+}
+
+// ---------------------------------------------------------------------------
+// 测试 2c：#51 D3——渲染与缓存生命周期（快速缩放陈旧取消 + 预算/
+// 队列/响应实测）
+// ---------------------------------------------------------------------------
+
+/// #51 D3 首批：**快速缩放的陈旧在飞取消**——换档后旧宽作业从在飞
+/// 登记摘除（pending 只含当前宽键——worker FIFO 不为死键排队，旧宽
+/// 迟到 Done 走机械丢弃不落缓存）；**取消 ≠ 失败**（缩回旧档时同宽
+/// 页面自然重派单就绪）；预算不变量全程成立。
+#[gpui::test]
+fn render_lifecycle_fast_zoom_stale_cancel(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = fixture_bytes("long_doc_120p.pdf");
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "快速缩放生命周期");
+            return;
+        }
+        panic!("百页夹具打开失败：{err}");
+    }
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "D3 基线首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+
+    // ① 缩放风暴（步进 ×3，档间一帧——每档都有真实在飞作业产生）：
+    //    每次换档后 pending 必须只剩当前宽键（旧宽被取消摘除——
+    //    取消面接线的直接断言；worker FIFO 不再为死键排队）。
+    for step in 1..=3u32 {
+        cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+        visual.update(|window, app| window.draw(app).clear(app));
+        let want = view.read_with(&visual, |v, _| v.device_raster_width_for_test());
+        let widths = view.read_with(&visual, |v, _| v.pending_widths_for_test());
+        assert!(
+            widths.iter().all(|w| *w == want),
+            "第 {step} 档缩放后 pending 宽度族 {widths:?} 必须只剩当前宽 {want}\
+             （陈旧在飞作业取消——旧宽不再排队/落键）"
+        );
+        assert!(
+            widths.len() <= 6,
+            "在飞作业数合理（可见窗 + 过扫描，非无界膨胀）：{:?}",
+            widths.len()
+        );
+        eprintln!("#51 D3 ✓ 第 {step} 档：pending {widths:?} 全为当前宽 {want}（陈旧取消）");
+    }
+
+    // ② 收敛：末档可见页就绪 + 预算不变量。
+    let final_w = view.read_with(&visual, |v, _| v.device_raster_width_for_test());
+    pump_ready(cx, &mut visual, &view, 30, "末档就绪", |v| {
+        v.page_ready_for_test(0)
+    });
+    let (used, entries) = view.read_with(&visual, |v, _| v.cache_stats_for_test());
+    assert!(
+        used <= crate::pdf_pages::CACHE_BUDGET_BYTES,
+        "快速缩放后缓存 {used}B 越预算"
+    );
+    eprintln!(
+        "#51 D3 ✓ 末档 {final_w}px 就绪：预算 {used}B / {}B（{entries} 条）",
+        crate::pdf_pages::CACHE_BUDGET_BYTES
+    );
+
+    // ③ 取消 ≠ 失败：缩回一档，同宽页面自然重派单就绪（Cancelled
+    //    回执未进 failed 永久标记——陈旧取消面不污染重试语义）。
+    cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("-", true, false, cx)));
+    pump_ready(cx, &mut visual, &view, 30, "缩回档重派单", |v| {
+        v.page_ready_for_test(0)
+    });
+    eprintln!("#51 D3 ✓ 缩回档重派单就绪（取消不落 failed——回访可重渲）");
+}
+
+/// #51 D3 首批：**大多页档的预算/队列/响应实测**——120 页逐档跳页
+/// （10 → 40 → 80 → 100 → 0），每站记录缓存字节/条目/就绪耗时，
+/// 断言预算不变量 + 工作集有界（全档不整体常驻）+ 顶部页读回。
+#[gpui::test]
+fn render_lifecycle_many_pages_budget_queue_response(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = fixture_bytes("long_doc_120p.pdf");
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "大多页生命周期");
+            return;
+        }
+        panic!("百页夹具打开失败：{err}");
+    }
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "大多页首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+
+    let mut worst_bytes = 0usize;
+    for target in [10usize, 40, 80, 100, 0] {
+        let started = std::time::Instant::now();
+        cx.update(|app| view.update(app, |v, _| v.scroll_to_page(target)));
+        pump_ready(cx, &mut visual, &view, 30, "跳页就绪", |v| {
+            v.top_visible_page() == target && v.page_ready_for_test(target)
+        });
+        let (used, entries) = view.read_with(&visual, |v, _| v.cache_stats_for_test());
+        worst_bytes = worst_bytes.max(used);
+        assert!(
+            used <= crate::pdf_pages::CACHE_BUDGET_BYTES,
+            "第 {target} 站缓存 {used}B 越预算"
+        );
+        assert!(
+            entries < 120,
+            "工作集应有界（受限预算逐出非全档常驻），实得 {entries} 条"
+        );
+        eprintln!(
+            "#51 D3 ✓ 大多页跳 {target}：{:?} 就绪 / 缓存 {used}B·{entries} 条（预算 {}B）",
+            started.elapsed(),
+            crate::pdf_pages::CACHE_BUDGET_BYTES
+        );
+    }
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.top_visible_page()),
+        0,
+        "回跳首页读回"
+    );
+    eprintln!(
+        "#51 D3 ✓ 大多页全链：预算峰值 {worst_bytes}B ≤ {}B，响应全部 ≤30s 门",
+        crate::pdf_pages::CACHE_BUDGET_BYTES
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 测试 3：健壮性（坏文件 / 超常尺寸 / 多标签并存切换）
 // ---------------------------------------------------------------------------
 
@@ -542,12 +1138,13 @@ fn robustness_damaged_oversized_multi_tab(cx: &mut gpui::TestAppContext) {
         theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
     });
 
-    // 环境门先行（缺库 → 全测 SKIP；坏文件视图态不该空转在库错误上）。
+    // 环境门先行（缺库：PARITY=1 → fail；否则 SKIP——坏文件视图态
+    // 不该空转在库错误上）。
     let probe =
         cx.update(|app| app.new(|cx| PdfPagesView::new(fixture_bytes("zh_embedded_font.pdf"), cx)));
     if let Some(err) = probe.read_with(cx, |v, _| v.error_for_test()) {
         if is_missing_library_error(&err) {
-            skip_banner(&err, "健壮性核验");
+            missing_guard(&err, "健壮性核验");
             return;
         }
         panic!("完好探针文件视图打开失败（真缺陷）：{err}");
