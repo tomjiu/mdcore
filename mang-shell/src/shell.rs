@@ -5124,6 +5124,138 @@ mod tab_workflow_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #47 A2：md 保存失败协调（xlsx/docx 已有同款，md 缺席——A2
+    /// 「保存失败及退出协调正确」的 md 面收口）：删夹具目录（写盘
+    /// ENOENT——root 也拦不住的真实 IO 失败）→ 关闭确认「保存」→ 失败
+    /// **不关标签**（脏保留可重试）→ 恢复后重试 → 保存成功关标签。
+    #[gpui::test]
+    fn md_save_failure_keeps_dirty_then_recovers(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("md-fail");
+        let a = write_md(&dir, "a.md", "L0\n");
+
+        let (shell, window) = shell_window(cx);
+        window.update(cx, |_host, _window, cx| {
+            open(&shell, cx, a.clone());
+            shell.update(cx, |shell, cx| {
+                shell.tab_editor(0).unwrap().update(cx, |ed, cx| {
+                    ed.insert_text_at(0, 2, "X", cx);
+                });
+                assert!(shell.tab_is_modified(0, cx).unwrap(), "置脏前置");
+            });
+        });
+
+        // 造真实 IO 失败：删夹具目录（fs::write ENOENT）。
+        std::fs::remove_dir_all(&dir).expect("删目录");
+
+        // 确认「保存」→ 保存失败不关标签（脏保留）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_active_tab(window, cx);
+                assert!(shell.confirm.is_some(), "脏标签关闭弹确认");
+                shell.resolve_confirm(0, window, cx);
+                assert_eq!(
+                    shell.tab_count(),
+                    1,
+                    "md 保存失败不关标签（脏态保留不静默丢）"
+                );
+                assert!(
+                    shell.tab_is_modified(0, cx).unwrap(),
+                    "失败后仍脏（可重试）"
+                );
+            });
+        });
+
+        // 恢复目录 + 夹具 → 重试 → 保存成功关标签 + 盘上 = 编辑后内容。
+        std::fs::create_dir_all(&dir).expect("恢复目录");
+        std::fs::write(&a, "L0\n").expect("恢复夹具");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_active_tab(window, cx);
+                shell.resolve_confirm(0, window, cx);
+                assert_eq!(shell.tab_count(), 0, "恢复后保存成功关标签");
+            });
+        });
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "L0X\n",
+            "重试保存落盘 = 编辑后内容"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #47 A2：md 退出保存失败保留确认框（重试语义——xlsx 有同款，md
+    /// 缺席）：真实关闭钮链 + 删目录真 IO 失败 → Quit 确认「保存」→
+    /// 失败 → **确认框保留**（不静默退出丢编辑）。
+    #[gpui::test]
+    fn md_quit_write_failure_keeps_retry_confirmation(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("md-quit-fail");
+        let a = write_md(&dir, "a.md", "Q0\n");
+
+        let (shell, window) = shell_window(cx);
+        window.update(cx, |_host, _window, cx| {
+            open(&shell, cx, a.clone());
+            shell.update(cx, |shell, cx| {
+                shell.tab_editor(0).unwrap().update(cx, |ed, cx| {
+                    ed.insert_text_at(0, 2, "Y", cx);
+                });
+                assert!(shell.tab_is_modified(0, cx).unwrap(), "置脏前置");
+            });
+        });
+
+        // 真实关闭钮回调链：脏 → 拦截 + 退出确认。
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let closed = vcx.simulate_close();
+        assert!(!closed, "脏 md → should-close 返回 false（退出被拦）");
+        vcx.update(|_window, cx| {
+            shell.update(cx, |shell, cx| {
+                assert!(
+                    matches!(
+                        shell.confirm.as_ref().map(|c| &c.action),
+                        Some(ConfirmAction::Quit)
+                    ),
+                    "前置：退出确认在场"
+                );
+            });
+        });
+
+        // 删目录造真 IO 失败 → 「保存」→ 失败 → 确认框保留（重试语义）。
+        std::fs::remove_dir_all(&dir).expect("删目录");
+        vcx.update(|_window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.resolve_confirm(0, _window, cx);
+                assert_eq!(shell.tab_count(), 1, "失败不关标签");
+                assert!(
+                    shell.confirm.is_some(),
+                    "退出保存失败 → 确认框保留（不静默退出丢编辑——重试语义）"
+                );
+                assert!(
+                    matches!(
+                        shell.confirm.as_ref().map(|c| &c.action),
+                        Some(ConfirmAction::Quit)
+                    ),
+                    "保留的确认动作仍是 Quit（重试同一决策面）"
+                );
+            });
+        });
+
+        // 恢复 → 重试「保存」→ 落盘 + 退出链走通（quit 无操作，盘上为断言面）。
+        std::fs::create_dir_all(&dir).expect("恢复目录");
+        std::fs::write(&a, "Q0\n").expect("恢复夹具");
+        vcx.update(|_window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.resolve_confirm(0, _window, cx);
+            });
+        });
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "Q0Y\n",
+            "重试退出保存落盘 = 编辑后内容"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #219 边界：循环切换在空态/单标签为 no-op；越界激活安全不改
     /// 状态（标签点击竞态/程序化调用的防御面）。
     #[gpui::test]
