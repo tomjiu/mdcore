@@ -5488,6 +5488,149 @@ mod pdf_search_wiring_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// WiringHost 整树 + md 标签窗口（#47 A4 查找框焦点链——md 面）。
+    fn md_wiring_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<ShellApp>, gpui::WindowHandle<WiringHost>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mdc-a4-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("a.md");
+        std::fs::write(&md, "L0\n").unwrap();
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(md.clone(), window, cx);
+            });
+        });
+        (shell, window, dir)
+    }
+
+    /// 真实键击派发（update_window + dispatch_event——main.rs 烟雾同构；
+    /// 预绘一帧保证派发树在位）。
+    fn dispatch_key_real(
+        window: &gpui::WindowHandle<WiringHost>,
+        cx: &mut gpui::TestAppContext,
+        key: &str,
+        key_char: Option<&str>,
+        ctrl: bool,
+    ) {
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            control: ctrl,
+                            ..Default::default()
+                        },
+                        key: key.into(),
+                        key_char: key_char.map(str::to_string),
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("键击派发");
+    }
+
+    /// #47 A4：md 查找框真实键链与焦点恢复——Ctrl+F 开（焦点落查找条，
+    /// 键入进查询框不进正文）→ Esc 关（焦点回编辑区）→ 键入恢复进正文
+    /// （焦点恢复的**行为**证据，非仅句柄断言）。
+    #[gpui::test]
+    fn md_ctrl_f_find_bar_esc_focus_chain(cx: &mut gpui::TestAppContext) {
+        let (shell, window, dir) = md_wiring_window(cx);
+
+        // 前置：焦点在编辑器（open_document 落焦链）。
+        let ed_focus = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.tab_editor(0).unwrap().read(cx).focus_handle().clone()
+                })
+            })
+            .expect("取编辑器焦点句柄");
+        window
+            .update(cx, |_host, window, cx| {
+                assert!(
+                    ed_focus.contains_focused(window, cx),
+                    "前置：焦点在编辑器"
+                );
+            })
+            .expect("前置断言");
+
+        // ① Ctrl+F（真实派发）→ 查找条开：焦点离开编辑器（落查找条输入框）。
+        dispatch_key_real(&window, cx, "f", Some("f"), true);
+        window
+            .update(cx, |_host, window, cx| {
+                assert!(
+                    !ed_focus.contains_focused(window, cx),
+                    "Ctrl+F 后焦点落查找条输入框（编辑器让焦）"
+                );
+            })
+            .expect("① 断言");
+
+        // ② 查找条聚焦期键入：进查询框，不进正文（焦点去向的行为证据）。
+        dispatch_key_real(&window, cx, "z", Some("z"), false);
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    let ed = shell.tab_editor(0).unwrap().clone();
+                    assert_eq!(
+                        ed.read(cx).buffer_line(0),
+                        "L0",
+                        "查找条聚焦期键入不进正文（进查询框）"
+                    );
+                });
+            })
+            .expect("② 断言");
+
+        // ③ Esc（真实派发）→ 查找条关：焦点回编辑区。
+        dispatch_key_real(&window, cx, "escape", None, false);
+        window
+            .update(cx, |_host, window, cx| {
+                assert!(
+                    ed_focus.contains_focused(window, cx),
+                    "Esc 后焦点回编辑区（close_find 归焦）"
+                );
+            })
+            .expect("③ 断言");
+
+        // ④ 键入恢复进正文（焦点恢复的行为证据——键事件真到达编辑器）。
+        // 光标在 (0,0)（无选区开查找条 + 零命中查询不动光标）——插入在
+        // 行首（"xL0"）；键入真到达编辑器即焦点恢复的行为面。
+        dispatch_key_real(&window, cx, "x", Some("x"), false);
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    let ed = shell.tab_editor(0).unwrap().clone();
+                    assert_eq!(
+                        ed.read(cx).buffer_line(0),
+                        "xL0",
+                        "Esc 后键入恢复进正文（光标处插入——焦点恢复的行为面）"
+                    );
+                });
+            })
+            .expect("④ 断言");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7803,3 +7946,4 @@ mod xlsx_save_close_tests {
             .unwrap();
     }
 }
+
