@@ -77,6 +77,20 @@ pub fn build_context_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<UiContextMenu> {
+    // #47 批次 8（A4）：右键菜单打开证据行——两个 open_* 共用单点
+    // （--smoke-context-menu 消费，context_menu_check.py 双通道断言）。
+    eprintln!(
+        "context-menu: open（{} 项，首项 {:?}）",
+        items.len(),
+        items
+            .first()
+            .and_then(|i| match i {
+                MenuItem::Action { label, .. } => Some(label.clone()),
+                MenuItem::Submenu { label, .. } => Some(label.clone()),
+                MenuItem::Separator => None,
+            })
+            .unwrap_or_default()
+    );
     UiContextMenu::build(window, cx, |menu, _window, _cx| {
         let mut menu = menu;
         for item in items {

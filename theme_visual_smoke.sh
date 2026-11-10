@@ -69,7 +69,7 @@ W=1600; H=1000
 FIXTURE="mang-shell/tests/fixtures/smoke.md"
 [ -f "$FIXTURE" ] || { echo "缺夹具 $FIXTURE" >&2; exit 69; }
 
-echo "[1/7] 构建 mang-shell（debug）"
+echo "[1/9] 构建 mang-shell（debug）"
 cargo build --manifest-path mang-shell/Cargo.toml
 BIN="mang-shell/target/debug/mang-shell"
 
@@ -82,7 +82,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[2/7] 启动 Xvfb :$DISPLAY_NUM（${W}x${H}x24）"
+echo "[2/9] 启动 Xvfb :$DISPLAY_NUM（${W}x${H}x24）"
 Xvfb ":$DISPLAY_NUM" -screen 0 "${W}x${H}x24" >/tmp/theme-smoke-xvfb.log 2>&1 &
 XVFB_PID=$!
 export DISPLAY=":$DISPLAY_NUM"
@@ -112,7 +112,7 @@ run_one() { # $1 = light|dark
   echo "  [$mode] $(grep '^theme:' "$log" | tail -1) + quit reached ✓"
 }
 
-echo "[3/7] 双态截帧"
+echo "[3/9] 双态截帧"
 run_one light
 run_one dark
 
@@ -166,7 +166,7 @@ run_hover_state() { # $1 = light|dark
   echo "  [hover-$mode] 三帧采集 ✓ $(grep 'hover-state-smoke' "$log" | tail -1 | sed 's/^hover-state-smoke: //')"
 }
 
-echo "[4/7] hover/选中态三帧采集（双主题）"
+echo "[4/9] hover/选中态三帧采集（双主题）"
 run_hover_state light
 run_hover_state dark
 
@@ -217,7 +217,7 @@ run_disabled_state() { # $1 = disabled|control  $2 = light|dark
   echo "  [ds-$face] 三帧采集 ✓"
 }
 
-echo "[5/7] 禁用态双面采集（disabled / control）"
+echo "[5/9] 禁用态双面采集（disabled / control）"
 run_disabled_state disabled light
 run_disabled_state control light
 
@@ -229,16 +229,16 @@ run_menu() { # $1 = light|dark
   local home="/tmp/theme-smoke-home-menu-$mode"
   local log="$OUT/menu-$mode.log"
   rm -rf "$home"; mkdir -p "$home"
-  echo "  [menu-$mode] 启动（--smoke-menu $mode --smoke-sec 11）"
-  HOME="$home" "$BIN" --smoke-menu "$mode" --smoke-sec 11 "$FIXTURE" >"$log" 2>&1 &
+  echo "  [menu-$mode] 启动（--smoke-menu $mode --smoke-sec 13）"
+  HOME="$home" "$BIN" --smoke-menu "$mode" --smoke-sec 13 "$FIXTURE" >"$log" 2>&1 &
   local app_pid=$!
   sleep 5.8
   ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
     -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/menu-$mode-a.ppm" -y
-  sleep 1.8
+  sleep 2.6
   ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
     -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/menu-$mode-b.ppm" -y
-  sleep 1.8
+  sleep 2.8
   ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
     -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/menu-$mode-c.ppm" -y
   ffmpeg -hide_banner -loglevel error -i "$OUT/menu-$mode-c.ppm" "$OUT/menu-$mode.png" -y
@@ -250,26 +250,106 @@ run_menu() { # $1 = light|dark
   echo "  [menu-$mode] 三帧采集 ✓"
 }
 
-echo "[6/7] 菜单开/关三帧采集（A4）"
+echo "[6/9] 菜单开/关三帧采集（A4）"
 run_menu light
 
-echo "[7/7] PPM 像素断言（E-1 + E-2 hover/禁用 + A4 菜单）"
-python3 mang-shell/tests/theme_visual_check.py \
-  "$OUT/theme-light.ppm" "$OUT/theme-dark.ppm" | tee "$OUT/evidence.txt"
+# 批次 8（A4 右键菜单）：--smoke-context-menu 三帧（A=5.8s / B=7.6s
+#（右键 6.7s 墙钟 + 0.9s）/ C=9.4s（点外 8.65s + 0.75s））。
+run_context_menu() { # $1 = light|dark
+  local mode="$1"
+  local home="/tmp/theme-smoke-home-cm-$mode"
+  local log="$OUT/cm-$mode.log"
+  rm -rf "$home"; mkdir -p "$home"
+  echo "  [cm-$mode] 启动（--smoke-context-menu $mode --smoke-sec 13）"
+  HOME="$home" "$BIN" --smoke-context-menu "$mode" --smoke-sec 13 "$FIXTURE" >"$log" 2>&1 &
+  local app_pid=$!
+  sleep 5.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/cm-$mode-a.ppm" -y
+  sleep 2.6
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/cm-$mode-b.ppm" -y
+  sleep 2.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/cm-$mode-c.ppm" -y
+  ffmpeg -hide_banner -loglevel error -i "$OUT/cm-$mode-c.ppm" "$OUT/cm-$mode.png" -y
+  wait "$app_pid" || { echo "  [cm-$mode] 应用退出码非 0" >&2; return 1; }
+  grep -q "context-menu-smoke: script done" "$log" \
+    || { echo "  [cm-$mode] 缺 context-menu-smoke 证据行" >&2; return 1; }
+  grep -q "smoke: quit reached" "$log" \
+    || { echo "  [cm-$mode] 缺 smoke: quit reached" >&2; return 1; }
+  echo "  [cm-$mode] 三帧采集 ✓"
+}
+
+echo "[7/9] 右键菜单开/关三帧采集（A4）"
+run_context_menu light
+
+# 批次 9（A4 命令面板）：--smoke-palette 三帧（A=5.8s / B=7.6s
+#（Ctrl+Shift+P 6.7s 墙钟 + 0.9s）/ C=9.4s（Esc 8.65s + 0.75s））。
+run_palette() { # $1 = light|dark
+  local mode="$1"
+  local home="/tmp/theme-smoke-home-pal-$mode"
+  local log="$OUT/pal-$mode.log"
+  rm -rf "$home"; mkdir -p "$home"
+  echo "  [pal-$mode] 启动（--smoke-palette $mode --smoke-sec 13）"
+  HOME="$home" "$BIN" --smoke-palette "$mode" --smoke-sec 13 "$FIXTURE" >"$log" 2>&1 &
+  local app_pid=$!
+  sleep 5.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/pal-$mode-a.ppm" -y
+  sleep 2.6
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/pal-$mode-b.ppm" -y
+  sleep 2.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/pal-$mode-c.ppm" -y
+  ffmpeg -hide_banner -loglevel error -i "$OUT/pal-$mode-c.ppm" "$OUT/pal-$mode.png" -y
+  wait "$app_pid" || { echo "  [pal-$mode] 应用退出码非 0" >&2; return 1; }
+  grep -q "palette-smoke: script done" "$log" \
+    || { echo "  [pal-$mode] 缺 palette-smoke 证据行" >&2; return 1; }
+  grep -q "smoke: quit reached" "$log" \
+    || { echo "  [pal-$mode] 缺 smoke: quit reached" >&2; return 1; }
+  echo "  [pal-$mode] 三帧采集 ✓"
+}
+
+echo "[8/9] 命令面板开/关三帧采集（A4）"
+run_palette light
+
+echo "[9/9] PPM 像素断言（E-1 + E-2 + A4 菜单/右键/面板）"
+# 断言链容错：单项失败记录到 FAILURES 不中止——全部跑完统一判定
+#（set -o pipefail 下 tee 管道会传递检查脚本退出码）。
+run_check() { # $@ = 检查脚本 + 参数
+  if ! "$@" | tee -a "$OUT/evidence.txt"; then
+    echo "CHECK-FAILED: $*" >> "$OUT/evidence.txt"
+    CHECK_FAILED=1
+  fi
+}
+: > "$OUT/evidence.txt"
+run_check python3 mang-shell/tests/theme_visual_check.py \
+  "$OUT/theme-light.ppm" "$OUT/theme-dark.ppm"
 for mode in light dark; do
-  python3 mang-shell/tests/hover_state_check.py \
-    "$OUT/hover-$mode-a.ppm" "$OUT/hover-$mode-b.ppm" "$OUT/hover-$mode-c.ppm" \
-    | tee -a "$OUT/evidence.txt"
+  run_check python3 mang-shell/tests/hover_state_check.py \
+    "$OUT/hover-$mode-a.ppm" "$OUT/hover-$mode-b.ppm" "$OUT/hover-$mode-c.ppm"
 done
 for face in disabled control; do
-  python3 mang-shell/tests/disabled_state_check.py "$face" \
-    "$OUT/ds-$face-a.ppm" "$OUT/ds-$face-b.ppm" "$OUT/ds-$face-c.ppm" "$OUT/ds-$face.log" \
-    | tee -a "$OUT/evidence.txt"
+  run_check python3 mang-shell/tests/disabled_state_check.py "$face" \
+    "$OUT/ds-$face-a.ppm" "$OUT/ds-$face-b.ppm" "$OUT/ds-$face-c.ppm" "$OUT/ds-$face.log"
 done
 for mode in light; do
-  python3 mang-shell/tests/menu_check.py \
-    "$OUT/menu-$mode-a.ppm" "$OUT/menu-$mode-b.ppm" "$OUT/menu-$mode-c.ppm" "$OUT/menu-$mode.log" \
-    | tee -a "$OUT/evidence.txt"
+  run_check python3 mang-shell/tests/menu_check.py \
+    "$OUT/menu-$mode-a.ppm" "$OUT/menu-$mode-b.ppm" "$OUT/menu-$mode-c.ppm" "$OUT/menu-$mode.log"
+done
+for mode in light; do
+  run_check python3 mang-shell/tests/context_menu_check.py \
+    "$OUT/cm-$mode-a.ppm" "$OUT/cm-$mode-b.ppm" "$OUT/cm-$mode-c.ppm" "$OUT/cm-$mode.log"
+done
+for mode in light; do
+  run_check python3 mang-shell/tests/palette_check.py \
+    "$OUT/pal-$mode-a.ppm" "$OUT/pal-$mode-b.ppm" "$OUT/pal-$mode-c.ppm"
 done
 
-echo "OK: 主题两态 + hover/选中态 + 禁用态 + 菜单开/关视觉证据 → $OUT"
+if [ "${CHECK_FAILED:-0}" = "1" ]; then
+  echo "存在失败断言（详见 $OUT/evidence.txt 的 CHECK-FAILED 行）" >&2
+  exit 1
+fi
+echo "OK: 主题两态 + hover/选中态 + 禁用态 + 菜单/右键菜单/命令面板开/关视觉证据 → $OUT"

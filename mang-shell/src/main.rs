@@ -23,6 +23,11 @@
 //! mang-shell --smoke-menu <mode>    #47 A4 菜单开/关：点击「文件」开下拉
 //!                               → 再点击 toggle 关（menu: open/close 证据行
 //!                               + 三帧像素断言；Esc 链归头单测）
+//! mang-shell --smoke-context-menu <mode>  #47 A4 右键菜单：右键编辑区开
+//!                               浮层（context-menu: open 证据行）→ 点外关
+//!                               （占比断言——右键留插入符）
+//! mang-shell --smoke-palette <mode>     #47 A4 命令面板：Ctrl+Shift+P 开
+//!                               → Esc 关（完整键派发链 + 面板区像素双态）
 //! mang-shell --check-pdfium  pdfium 部署自检（#68 方向一）：定位序逐层
 //!                               探针 + 绑定走查 + 修复指引；纯 CLI 不开窗，
 //!                               退出码 0=已绑定 / 3=未绑定
@@ -274,6 +279,37 @@ fn main() {
     // （menu: close 证据行）。menu_check.py 断言：B 帧下拉区像素变化
     // （浮层+菜单项）/ C 帧与 A 帧逐字节相等（真关净）+ 开/关证据行在档。
     // Esc 关闭链已由头单测（menu_bar_lifecycle_tests）覆盖。
+    // 接线登记批次 9（#47 A4/按钮六问⑥命令面板面）：--smoke-palette
+    // <light|dark>——Ctrl+Shift+P 完整键派发链开命令面板（PaletteToggle
+    // → editor.toggle_command_palette）→ Esc 关（编辑器内联键处理分支
+    // editor/mod.rs:1590——无焦点注入依赖，无头可达）。palette_check.py
+    // 断言：B 帧面板区像素变化 / C 帧恢复（插入符闪烁容差）+ 三帧原点。
+    // 证据行为像素双态（palette 开关是内联状态翻转，无独立日志面——
+    // 诚实口径）。
+    let smoke_palette: Option<&'static str> = args
+        .iter()
+        .position(|a| a == "--smoke-palette")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| match v.as_str() {
+            theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
+            theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
+            _ => None,
+        });
+    // 接线登记批次 8（#47 A4/按钮六问⑥右键面）：--smoke-context-menu
+    // <light|dark>——右键（MouseButton::Right）编辑区 → spawn_context_menu
+    // 完整链开浮层（context-menu: open 证据行）→ 点外关闭
+    // （on_mouse_down_out → DismissEvent）。context_menu_check.py 断言：
+    // B 帧菜单区像素变化 / C 帧菜单区变化占比 ≤ 阈值（关净——右键移
+    // 留插入符故用占比而非逐字节）+ 证据行在档。
+    let smoke_context_menu: Option<&'static str> = args
+        .iter()
+        .position(|a| a == "--smoke-context-menu")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| match v.as_str() {
+            theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
+            theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
+            _ => None,
+        });
     let smoke_menu: Option<&'static str> = args
         .iter()
         .position(|a| a == "--smoke-menu")
@@ -417,6 +453,10 @@ fn main() {
                 "--smoke-sec",
                 "--smoke-theme",
                 "--smoke-hover-state",
+                "--smoke-menu",
+                "--smoke-context-menu",
+                "--smoke-disabled-state",
+                "--smoke-palette",
                 "--smoke-open",
                 "--smoke-workspace",
                 "--smoke-save-as",
@@ -681,6 +721,25 @@ fn main() {
                             shell.set_theme_mode(mode, cx);
                         })
                     });
+                })
+                .detach();
+            }
+
+            // 接线登记批次 9（#47 A4）：Ctrl+Shift+P 开命令面板 → Esc 关。
+            if let Some(mode) = smoke_palette {
+                let handle = window_handle.clone();
+                cx.spawn(async move |cx| {
+                    run_palette_script(&handle, cx, mode).await;
+                })
+                .detach();
+            }
+
+            // 接线登记批次 8（#47 A4）：右键开右键菜单 → 点外关（时间线
+            // 见旗标注释）。
+            if let Some(mode) = smoke_context_menu {
+                let handle = window_handle.clone();
+                cx.spawn(async move |cx| {
+                    run_context_menu_script(&handle, cx, mode).await;
                 })
                 .detach();
             }
@@ -1592,9 +1651,177 @@ async fn run_menu_script(
     step(window, cx, 3600, park(900., 300.), true).await; // script 4.6s
     step(window, cx, 1400, down(36., 18.), false).await; // script 6.0s：开
     step(window, cx, 150, up(36., 18.), false).await; // script 6.15s
-    step(window, cx, 1850, down(36., 18.), false).await; // script 8.0s：toggle 关
-    step(window, cx, 150, up(36., 18.), false).await; // script 8.15s
+    step(window, cx, 3450, down(36., 18.), false).await; // script 9.6s：toggle 关（B 帧后宽窗）
+    step(window, cx, 150, up(36., 18.), false).await; // script 9.75s
     eprintln!("menu-smoke: script done (theme {mode} → park → click 文件 open → click close)");
+}
+
+// ---------------------------------------------------------------------------
+// 接线登记批次 8（#47 A4）：--smoke-context-menu 脚本（右键菜单开/关）
+// ---------------------------------------------------------------------------
+
+/// A4 右键菜单烟雾：右键（MouseButton::Right）编辑区 (600,300) →
+/// MenuOpener → spawn_context_menu 完整链开浮层（context-menu: open
+/// 证据行）→ 点外 (900,500) 左键关闭（on_mouse_down_out → DismissEvent
+/// → close_context_menu）。外层 A@5.8s / B@7.6s / C@9.4s 截帧，
+/// context_menu_check.py 断言菜单区变化占比（开 ≥ 下限 / 关 ≤ 上限）。
+///
+/// 关净断言用变化占比而非逐字节：右键在编辑器会留插入符/可能移动焦点
+/// ——关菜单后菜单区恢复底面 + 文本，插入符少量像素为正常残留（阈值
+/// 实测标定，见检查脚本）。
+async fn run_context_menu_script(
+    window: &gpui::WindowHandle<shell::ShellApp>,
+    cx: &mut gpui::AsyncApp,
+    mode: &'static str,
+) {
+    use gpui::{
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
+        px,
+    };
+
+    let park = |x: f32, y: f32| {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(x), px(y)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        })
+    };
+    let down = |x: f32, y: f32| {
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        })
+    };
+    let down_right = |x: f32, y: f32| {
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Right,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        })
+    };
+    let up = |x: f32, y: f32| {
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        })
+    };
+    let up_right = |x: f32, y: f32| {
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Right,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        })
+    };
+
+    async fn step(
+        window: &gpui::WindowHandle<shell::ShellApp>,
+        cx: &mut gpui::AsyncApp,
+        at_ms: u64,
+        ev: PlatformInput,
+        refresh: bool,
+    ) {
+        cx.background_executor()
+            .timer(Duration::from_millis(at_ms))
+            .await;
+        let any_handle: gpui::AnyWindowHandle = (*window).into();
+        let _ = cx.update_window(any_handle, |_, window, cx| {
+            window.dispatch_event(ev, cx);
+            if refresh {
+                window.refresh();
+            }
+        });
+    }
+
+    // 相对时间线：1.0s 切主题 → 4.6s 停驻 → 6.0/6.15s 右键编辑区
+    // (600,300) 开菜单 → 8.0/8.15s 左键点外 (900,500) 关闭。
+    cx.background_executor()
+        .timer(Duration::from_millis(1000))
+        .await;
+    let _ = cx.update(|cx| {
+        window.update(cx, |shell, _window, cx| {
+            shell.set_theme_mode(mode, cx);
+        })
+    });
+    step(window, cx, 3600, park(900., 300.), true).await; // script 4.6s
+    step(window, cx, 1400, down_right(600., 300.), false).await; // script 6.0s：右键开
+    step(window, cx, 150, up_right(600., 300.), false).await; // script 6.15s
+    step(window, cx, 3450, down(900., 500.), false).await; // script 9.6s：点外关（B 帧宽窗后）
+    step(window, cx, 150, up(900., 500.), false).await; // script 9.75s
+    eprintln!("context-menu-smoke: script done (theme {mode} → park → 右键开 → 点外关)");
+}
+
+// ---------------------------------------------------------------------------
+// 接线登记批次 9（#47 A4）：--smoke-palette 脚本（命令面板开/关）
+// ---------------------------------------------------------------------------
+
+/// A4 命令面板烟雾：Ctrl+Shift+P（完整键派发链——keymap E0 表项
+/// PaletteToggle）开面板 → Esc 关（editor/mod.rs:1590 内联分支——
+/// 编辑器持焦即达，无 deferred 焦点注入依赖）。外层 A@5.8s / B@7.6s /
+/// C@9.4s 截帧，palette_check.py 断言面板区像素双态。
+async fn run_palette_script(
+    window: &gpui::WindowHandle<shell::ShellApp>,
+    cx: &mut gpui::AsyncApp,
+    mode: &'static str,
+) {
+    use gpui::{
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
+        px,
+    };
+
+    let park = |x: f32, y: f32| {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(x), px(y)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        })
+    };
+
+    async fn park_step(
+        window: &gpui::WindowHandle<shell::ShellApp>,
+        cx: &mut gpui::AsyncApp,
+        at_ms: u64,
+        x: f32,
+        y: f32,
+    ) {
+        cx.background_executor()
+            .timer(Duration::from_millis(at_ms))
+            .await;
+        let any_handle: gpui::AnyWindowHandle = (*window).into();
+        let _ = cx.update_window(any_handle, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(x), px(y)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            );
+            window.refresh();
+        });
+    }
+
+    // 相对时间线：1.0s 切主题 → 4.6s 停驻 → 6.0s Ctrl+Shift+P 开面板 →
+    // 8.0s Esc 关（dispatch_key 自带相对 timer）。
+    cx.background_executor()
+        .timer(Duration::from_millis(1000))
+        .await;
+    let _ = cx.update(|cx| {
+        window.update(cx, |shell, _window, cx| {
+            shell.set_theme_mode(mode, cx);
+        })
+    });
+    park_step(window, cx, 3600, 900., 300.).await; // script 4.6s
+    dispatch_key(window, cx, 1400, "p", true, true, None).await; // script 6.0s：Ctrl+Shift+P 开
+    dispatch_key(window, cx, 3600, "escape", false, false, None).await; // script 9.6s：Esc 关（B 帧宽窗后）
+    eprintln!("palette-smoke: script done (theme {mode} → park → Ctrl+Shift+P 开 → Esc 关)");
 }
 
 // ---------------------------------------------------------------------------
