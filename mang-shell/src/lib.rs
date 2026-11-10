@@ -114,6 +114,12 @@ pub mod pdf_pages;
 #[path = "docx_pages.rs"]
 pub mod docx_pages;
 
+/// #50 C2：DOCX 页面几何单源（twips↔px 换算/缩放档/条带几何/内核
+/// 失效区间映射——全纯函数零 gpui 依赖；docx_pages 与
+/// editor::docx_lok_session 双消费，单测锚点独立成树）。
+#[path = "docx_geom.rs"]
+pub mod docx_geom;
+
 /// #420：PDF 页面缩略图侧栏（低 dpi 光栅化 → uniform_list 虚拟化懒加载
 /// ——≤60 页首批全量、>60 页只染可见窗；点击跳页 + 主视图滚动高亮
 /// 联动经壳注入钩子，与 pdf_pages 零写面耦合）。

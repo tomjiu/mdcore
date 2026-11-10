@@ -3274,6 +3274,27 @@ impl Render for ShellApp {
                     }
                 }
 
+                // #50 C2：docx 页面视图键域——缩放命令（pdf #421 分支同构
+                // 先例：视口命令在 keymap 表之前分流，消费即 return 防
+                // Ctrl+0/=/- 落 keymap 字号键二次响应）。键位：Ctrl+0
+                // 适应宽度 / Ctrl+1 实际大小 / Ctrl+= · Ctrl+- 步进缩放
+                //（连续画布无「适应页面」档——页边界依赖 B 线页面几何
+                // op，#49 已登记；Ctrl+滚轮在视图内 capture 期拦截，
+                // docx_pages 探针注册，不经本分支）。非 docx 页面态/文本
+                // 视图不进本分支，键位行为零变化。
+                if this.docx_view_mode && this.active_is_docx(cx) {
+                    if let Some((_, entity)) = &this.docx_pages {
+                        let mut zoom_consumed = false;
+                        entity.update(cx, |view, cx| {
+                            zoom_consumed =
+                                view.dispatch_zoom_key(&key, ctrl, ks.modifiers.shift, cx);
+                        });
+                        if zoom_consumed {
+                            return;
+                        }
+                    }
+                }
+
                 // #217：shell 键位改查 keymap 表（默认表 = 下方原分支的
                 // 精确镜像，行为零变化；用户换绑后跟随）。模态守卫（菜单
                 // /右键菜单/确认框）在表之前——模态语义不入表。
