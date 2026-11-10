@@ -2503,8 +2503,13 @@ impl Editor {
                 // 可打印字符（无修饰或仅 shift）：插入。
                 // key_char 为平台布局产生的实际字符（IME 未接管时的直输路径；
                 // 控制字符（含 \n/\r/tab）已被上方分支截获，此处双保险过滤）。
+                // #47 A4：IME 预编辑期（marked 在场）组合输入归输入法所有——
+                // 直插会破坏预编辑区间（marked 偏移与 buffer 内容脱钩，提交
+                // 时替换错段）。「不互相吞」：组合期键入零直插（IME 经
+                // replace_and_mark 更新预编辑），提交后直输路径恢复。
                 if !ctrl
                     && !ks.modifiers.alt
+                    && self.marked.is_none()
                     && let Some(c) = &ks.key_char
                     && !c.is_empty()
                     && c.chars().all(|ch| !ch.is_control())
@@ -5903,6 +5908,184 @@ mod save_outcome_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #47 A4：中文 IME 组合生命周期（EntityInputHandler 真接口面——预编辑
+// 起 → 预编辑更新 → 提交/取消；与键分发的「不互相吞」卫）。此前四接口
+// （replace_and_mark / replace_text / unmark / marked_text_range）零
+// 运行时覆盖——本模块经真实 `Window` 调 trait 方法（与 GPUI 输入框架
+// 同一入口），键面经 `dispatch_key` 真分发。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod ime_composition_tests {
+    use super::*;
+    use gpui::EntityInputHandler;
+
+    /// 测试宿主（PalHost 同款——trait 方法需要真实 `&mut Window`）。
+    struct ImeHost {
+        _ed: gpui::Entity<Editor>,
+    }
+
+    impl gpui::Render for ImeHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    fn ime_window(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+    ) -> (gpui::Entity<Editor>, gpui::WindowHandle<ImeHost>) {
+        let ed =
+            cx.update(|cx| cx.new(|cx| Editor::new(Some("ime.md".into()), text.to_string(), cx)));
+        let ed_for_host = ed.clone();
+        let window = cx.add_window(move |_window, _cx| ImeHost {
+            _ed: ed_for_host.clone(),
+        });
+        (ed, window)
+    }
+
+    fn plain_key(key: &str, key_char: Option<&str>) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: key.into(),
+                key_char: key_char.map(str::to_string),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// 预编辑全链：起（ni）→ 更新（你好，带选中）→ 提交（unmark 保文）
+    /// ——marked 区间（UTF16）逐态断言 + 提交后脏。
+    #[gpui::test]
+    fn ime_preedit_update_commit_lifecycle(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "AB\n");
+        window.update(cx, |_host, window, cx| {
+            // 组合起：光标处预编辑 "ni"。
+            ed.update(cx, |ed, cx| {
+                ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+            });
+            ed.update(cx, |ed, cx| {
+                assert_eq!(
+                    ed.marked_text_range(window, cx),
+                    Some(0..2),
+                    "预编辑起：marked = ni 的 UTF16 区间"
+                );
+                assert_eq!(ed.buffer_line(0), "niAB", "预编辑文本入 buffer");
+            });
+
+            // 组合更新：替换旧预编辑段为 "你好"（IME 候选确认的标准流），
+            // 带段内选中（new_selected_range——候选栏高亮语义）。
+            ed.update(cx, |ed, cx| {
+                ed.replace_and_mark_text_in_range(None, "你好", Some(0..2), window, cx);
+            });
+            ed.update(cx, |ed, cx| {
+                assert_eq!(
+                    ed.marked_text_range(window, cx),
+                    Some(0..2),
+                    "更新后 marked = 你好（2 字 × 1 UTF16）"
+                );
+                assert_eq!(ed.buffer_line(0), "你好AB", "预编辑段整体替换（不叠字）");
+                assert_eq!(
+                    ed.selection_points(),
+                    Some((Point::new(0, 0), Point::new(0, 2))),
+                    "new_selected_range 段内选中"
+                );
+            });
+
+            // 提交：unmark（保文提交——平台提交流之一）。
+            ed.update(cx, |ed, cx| {
+                ed.unmark_text(window, cx);
+                assert_eq!(ed.marked_text_range(window, cx), None, "提交清 marked");
+                assert_eq!(ed.buffer_line(0), "你好AB", "提交保文");
+                assert!(ed.is_modified(), "组合提交计入脏");
+            });
+        });
+    }
+
+    /// 提交第二流：replace_text_in_range（终文本替换预编辑段）——
+    /// marked 清 + 段替换正确（"zh" 预编辑 → "中" 提交）。
+    #[gpui::test]
+    fn ime_commit_via_replace_text_swaps_preedit(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "X\n");
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
+            });
+            ed.update(cx, |ed, cx| {
+                assert_eq!(ed.marked_text_range(window, cx), Some(0..2));
+            });
+            ed.update(cx, |ed, cx| {
+                // IME 终选提交通道：替换 0..2（预编辑段）为终文本。
+                ed.replace_text_in_range(Some(0..2), "中", window, cx);
+                assert_eq!(ed.marked_text_range(window, cx), None, "提交清 marked");
+                assert_eq!(ed.buffer_line(0), "中X", "终文本替换预编辑段");
+            });
+        });
+    }
+
+    /// 只读门禁（IME 双通道）：只读文档不接预编辑/替换——buffer 与
+    /// marked 均零变化。
+    #[gpui::test]
+    fn ime_readonly_rejects_both_channels(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| {
+            cx.new(|cx| Editor::new_readonly(Some("ro.md".into()), "RO\n".to_string(), cx))
+        });
+        let ed_for_host = ed.clone();
+        let window =
+            cx.add_window(move |_window, _cx| ImeHost { _ed: ed_for_host.clone() });
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.replace_and_mark_text_in_range(None, "拼", None, window, cx);
+                assert_eq!(ed.marked_text_range(window, cx), None, "只读不接预编辑");
+                assert_eq!(ed.buffer_line(0), "RO", "buffer 零变化");
+                ed.replace_text_in_range(None, "写", window, cx);
+                assert_eq!(ed.buffer_line(0), "RO", "只读拒替换");
+            });
+        });
+    }
+
+    /// 「不互相吞」卫（#47 A4 修复面）：预编辑期真实键分发（key_char
+    /// 直输路径）零插入——组合输入归输入法所有（直插会破坏 marked 区
+    /// 间与 buffer 的对应，提交时替换错段）；提交后直输路径恢复。
+    #[gpui::test]
+    fn ime_composition_guards_printable_keys(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "AB\n");
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+            });
+            // 预编辑期：真实键分发（'h'，无修饰）——不得直插。
+            ed.update(cx, |ed, cx| {
+                ed.dispatch_key(&plain_key("h", Some("h")), window, cx);
+                assert_eq!(
+                    ed.buffer_line(0),
+                    "niAB",
+                    "组合期 key_char 零直插（IME 所有）"
+                );
+                assert_eq!(
+                    ed.marked_text_range(window, cx),
+                    Some(0..2),
+                    "marked 区间不被键入破坏"
+                );
+            });
+            // 提交后：同一键分发——直输路径恢复（正常键入生效）。
+            ed.update(cx, |ed, cx| {
+                ed.unmark_text(window, cx);
+                ed.dispatch_key(&plain_key("h", Some("h")), window, cx);
+                assert_eq!(
+                    ed.buffer_line(0),
+                    // 光标在预编辑段尾（replace_range 后 = (0,2)）——
+                    // 提交后直输在 "ni" 与 "AB" 之间。
+                    "nihAB",
+                    "提交后直输恢复"
+                );
+            });
+        });
     }
 }
 
