@@ -230,8 +230,9 @@ mod tests {
         // install_path 契约：hook_2 收到的是 program 目录（sofficerc 所在）
         assert!(
             rt.program_dir.join("sofficerc").is_file()
-                || rt.program_dir.join("soffice.rc").is_file(),
-            "program 目录必须有 sofficerc（LO bootstrap 入口）：{:?}",
+                || rt.program_dir.join("soffice.rc").is_file()
+                || rt.program_dir.join("soffice.ini").is_file(),
+            "program 目录必须有平台对应的 soffice bootstrap 入口：{:?}",
             rt.program_dir
         );
     }
@@ -243,12 +244,24 @@ mod tests {
         std::fs::create_dir_all(tmp.join("program")).unwrap();
         let fake = tmp.join("program").join("libmergedlo.so");
         std::fs::write(&fake, b"x").unwrap();
+        // 隔离调用者的实际安装根，测试显式库路径分支；不改变生产发现优先级。
+        let previous_home = std::env::var_os(LOK_HOME_ENV);
+        let previous_lib = std::env::var_os(LOK_LIB_ENV);
+        unsafe { std::env::remove_var(LOK_HOME_ENV) };
         unsafe { std::env::set_var(LOK_LIB_ENV, &fake) };
         let rt = discover().expect("env 指定应直接采用");
         assert_eq!(rt.kernel_lib, fake);
         assert_eq!(rt.program_dir, tmp.join("program"));
         assert_eq!(rt.kernel_sha256.len(), 64);
-        unsafe { std::env::remove_var(LOK_LIB_ENV) };
+        unsafe {
+            match previous_lib {
+                Some(value) => std::env::set_var(LOK_LIB_ENV, value),
+                None => std::env::remove_var(LOK_LIB_ENV),
+            }
+            if let Some(value) = previous_home {
+                std::env::set_var(LOK_HOME_ENV, value);
+            }
+        };
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
