@@ -10,6 +10,9 @@ serde_json.workspace = true
 # 版本直依赖——pdfium-render/lopdf 传递引入已编译，零新编译单元，
 # 循 mdc-pdf sha2 先例）。
 flate2 = "1.1.10"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+url = "2.5"
+same-file = "1.0"
 
 
 [[bin]]

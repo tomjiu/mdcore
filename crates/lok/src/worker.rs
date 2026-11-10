@@ -76,6 +76,7 @@ pub struct WorkerState {
     profile: SessionProfile,
     session_dir: PathBuf,
     tile_counter: u64,
+    loaded_url: String,
 }
 
 unsafe impl Send for WorkerState {}
@@ -330,6 +331,7 @@ fn bind_kernel(
         profile,
         session_dir: boot.session_dir.clone(),
         tile_counter: 0,
+        loaded_url: String::new(),
     };
 
     // nSize 成员守卫（issue「nSize/member 检查」）：绑定面全量检查
@@ -486,6 +488,7 @@ impl WorkerState {
             }
             self.doc = doc;
             self.doc_class = (*doc).p_class;
+            self.loaded_url = url.to_owned();
         }
         // 加载即注册 doc 级回调（失效/搜索结果/UNO 结果事件持续透传）
         unsafe {
@@ -752,6 +755,8 @@ impl WorkerState {
     ) -> DispatchResult {
         unsafe {
             self.doc_guard(abi::doc_offsets::SAVE_AS, "saveAs")?;
+            crate::save_guard::check(&self.loaded_url, url)
+                .map_err(|message| (codes::SAVE, message))?;
             let f = (*self.doc_class)
                 .save_as
                 .ok_or((codes::MEMBER, "缺 saveAs".to_string()))?;
@@ -1094,6 +1099,7 @@ fn no_kernel_loop(
 /// 协议自测分发（无 LOK；client 集成测试恒跑用）。
 fn fake_dispatch_loop(mode: &str, tx: &Sender<ToWriter>, protocol_fd: std::fs::File) -> ! {
     let mut reader = BufReader::new(protocol_fd);
+    let mut edits = 0;
     loop {
         let frame = match protocol::read_frame(&mut reader) {
             Ok(Some(f)) => f,
@@ -1111,6 +1117,15 @@ fn fake_dispatch_loop(mode: &str, tx: &Sender<ToWriter>, protocol_fd: std::fs::F
         let op = protocol::req_str(&v, "op").unwrap_or_default();
         let answer: Value = match (mode, op.as_str()) {
             (_, "ping") => protocol::ok_frame(id, json!({"pong": true})),
+            ("edit-fails-after-first", "post_key") => {
+                edits += 1;
+                if edits == 1 {
+                    protocol::ok_frame(id, json!({"edited": true}))
+                } else {
+                    protocol::err_frame(id, codes::BAD_REQUEST, "injected second edit failure")
+                }
+            }
+            ("edit-fails-after-first", _) => protocol::ok_frame(id, json!({})),
             ("echo", _) => protocol::ok_frame(id, json!({"echo": op})),
             ("hang", "slow") => {
                 // 永不回答（宿主超时看门狗测试；stdin 保活）
