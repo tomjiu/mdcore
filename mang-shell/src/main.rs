@@ -8,6 +8,10 @@
 //! mang-shell --smoke-sec N     烟雾模式：开窗 N 秒后自动退出（exit 0 +
 //!                               stdout 末行 "smoke: quit reached"——Xvfb
 //!                               无头验证通道）
+//! mang-shell --smoke-theme <mode>  #47 E-1 主题两态视觉验收：1.0s 经
+//!                               set_theme_mode 真实动作链切 light/dark
+//!                               （与设置面板三态钮同链）；配合 --smoke-sec
+//!                               供 theme_visual_smoke.sh 截帧断言
 //! mang-shell --check-pdfium  pdfium 部署自检（#68 方向一）：定位序逐层
 //!                               探针 + 绑定走查 + 修复指引；纯 CLI 不开窗，
 //!                               退出码 0=已绑定 / 3=未绑定
@@ -237,6 +241,22 @@ fn main() {
     // F6：主题循环烟雾（--smoke-theme-cycle——3.5s 合成 Ctrl+T；
     // 断言 theme: 证据行 + settings.json theme 键 + 全窗重绘不崩）。
     let smoke_theme_cycle = args.iter().any(|a| a == "--smoke-theme-cycle");
+    // 接线登记批次 4（#47 E-1）：主题两态视觉验收旗标（--smoke-theme
+    // <light|dark>——1.0s 经 set_theme_mode 真实动作链切目标模式；与
+    // 设置面板三态钮 / Ctrl+T 同一生效链，theme_switch 主题逻辑零触碰。
+    // theme_visual_smoke.sh 消费：Xvfb 双态启动 → 稳定后 ffmpeg x11grab
+    // 截帧 → tests/theme_visual_check.py 纯 stdlib PPM 像素断言（两态底色
+    // 分向 / 主题切换真实生效 / 侧栏图标可见性的像素级证据）。非法 mode
+    // 值静默忽略（脚本层负责报参数错）。
+    let smoke_theme: Option<&'static str> = args
+        .iter()
+        .position(|a| a == "--smoke-theme")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| match v.as_str() {
+            theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
+            theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
+            _ => None,
+        });
     // F6：字号烟雾（--smoke-zoom N——3.5s 设字号 N[8-32]；断言
     // font-size: 证据行 + settings.json font_size 键）。
     let smoke_zoom = args
@@ -582,6 +602,25 @@ fn main() {
                 let handle = window_handle.clone();
                 cx.spawn(async move |cx| {
                     dispatch_key(&handle, cx, 3500, "t", true, false, None).await;
+                })
+                .detach();
+            }
+
+            // 接线登记批次 4（#47 E-1）：主题两态视觉验收——1.0s 经
+            // set_theme_mode 真实动作链切目标模式（与设置面板三态钮同一
+            // 生效链；theme_switch 逻辑零触碰）。启动态为 system/dark，
+            // 切 light 与切 dark 都是真实应用动作（evidence 行 theme: …）。
+            if let Some(mode) = smoke_theme {
+                let handle = window_handle.clone();
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(1000))
+                        .await;
+                    let _ = cx.update(|cx| {
+                        handle.update(cx, |shell, _window, cx| {
+                            shell.set_theme_mode(mode, cx);
+                        })
+                    });
                 })
                 .detach();
             }

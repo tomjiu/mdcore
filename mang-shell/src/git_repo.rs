@@ -695,9 +695,12 @@ mod whitespace_path_regression {
     use super::*;
     #[test]
     fn leading_space_workspace_keeps_its_real_git_prefix() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join(format!("pr610-space-{}", std::process::id()));
+        // 夹具卫生（#47 批次 4 随批修复）：原实现用 current_dir() 在仓内
+        // 建 pr610-space-* 且零清理——旧会话实测残留 7 枚，有误提交入仓
+        // 风险（同 PR#65 修的另两枚同源缺陷）。迁 temp_dir + 首尾自清，
+        // 与 mdc-598-unit-* 同范式。
+        let root = std::env::temp_dir().join(format!("pr610-space-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let workspace = root.join(" leading");
         std::fs::create_dir_all(&workspace).unwrap();
         let file = workspace.join("tracked.txt");
@@ -739,5 +742,6 @@ mod whitespace_path_regression {
                 .unwrap()
                 .contains("+after")
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
