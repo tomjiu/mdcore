@@ -199,12 +199,7 @@ pub fn center_twips(offset_y_px: f64, viewport_h_px: f64, doc_w_tw: i64, rw: u32
 
 /// 中心 twips → 新光栅宽下的滚动偏移（换档回写：`center_twips -
 /// vh/2`——与取锚同式互逆，量化舍入差 ≤ 半像素级）。
-pub fn offset_for_center_twips(
-    center_tw: f64,
-    viewport_h_px: f64,
-    doc_w_tw: i64,
-    rw: u32,
-) -> f64 {
+pub fn offset_for_center_twips(center_tw: f64, viewport_h_px: f64, doc_w_tw: i64, rw: u32) -> f64 {
     let px_per_tw = raster_scale(doc_w_tw, rw) / TWIPS_PER_PX as f64;
     (center_tw * px_per_tw - viewport_h_px.max(0.) / 2.).max(0.)
 }
@@ -308,7 +303,10 @@ mod tests {
     /// FitWidth 档 = v1 适宽（量化视口宽）——零行为变化门。
     #[test]
     fn zoom_raster_width_fit_width_matches_v1() {
-        assert_eq!(zoom_raster_width(ZoomMode::FitWidth, A4.0, 800.), quantize_width(800));
+        assert_eq!(
+            zoom_raster_width(ZoomMode::FitWidth, A4.0, 800.),
+            quantize_width(800)
+        );
         assert_eq!(zoom_raster_width(ZoomMode::FitWidth, A4.0, 79.), WIDTH_MIN);
     }
 
@@ -325,7 +323,10 @@ mod tests {
     #[test]
     fn zoom_raster_width_custom_scales_and_clamps() {
         let half = zoom_raster_width(ZoomMode::Custom(0.5), A4.0, 800.);
-        assert_eq!(half, quantize_width((A4.0 as f32 * 0.5 / TWIPS_PER_PX as f32) as u32));
+        assert_eq!(
+            half,
+            quantize_width((A4.0 as f32 * 0.5 / TWIPS_PER_PX as f32) as u32)
+        );
         let tiny = zoom_raster_width(ZoomMode::Custom(DOCX_ZOOM_MIN), A4.0, 800.);
         assert_eq!(tiny, WIDTH_MIN, "下限档必须钳到光栅下限");
         let big = zoom_raster_width(ZoomMode::Custom(DOCX_ZOOM_MAX), A4.0, 800.);
@@ -394,7 +395,10 @@ mod tests {
         // 文档 3000tw 宽（200px 名义）、6000tw 高（400px 名义）。
         let rw = 1024u32; // s = 1024/200 = 5.12
         let total = content_height_px(3000, 6000, rw);
-        assert!((total - 2048.).abs() < 1., "两轴同缩放：400*5.12≈{total:.0}");
+        assert!(
+            (total - 2048.).abs() < 1.,
+            "两轴同缩放：400*5.12≈{total:.0}"
+        );
         let count = band_count(3000, 6000, rw);
         assert!((count as f64 * BAND_PX as f64) >= total);
         assert!(total > BAND_PX as f64);
@@ -420,16 +424,31 @@ mod tests {
     fn parse_invalidate_standard_forms() {
         assert_eq!(
             parse_invalidate_payload("0, 0, 11906, 16838, 0, 0"),
-            InvalScope::Rect { x: 0, y: 0, w: 11906, h: 16838 }
+            InvalScope::Rect {
+                x: 0,
+                y: 0,
+                w: 11906,
+                h: 16838
+            }
         );
         assert_eq!(
             parse_invalidate_payload("100,200,300,400"),
-            InvalScope::Rect { x: 100, y: 200, w: 300, h: 400 }
+            InvalScope::Rect {
+                x: 100,
+                y: 200,
+                w: 300,
+                h: 400
+            }
         );
         // 负坐标合法（LO 可发部分越界矩形）。
         assert_eq!(
             parse_invalidate_payload("-50, -60, 100, 200, 1, 2"),
-            InvalScope::Rect { x: -50, y: -60, w: 100, h: 200 }
+            InvalScope::Rect {
+                x: -50,
+                y: -60,
+                w: 100,
+                h: 200
+            }
         );
     }
 
@@ -438,7 +457,10 @@ mod tests {
     #[test]
     fn parse_invalidate_full_scope_forms() {
         assert_eq!(parse_invalidate_payload("-1, -1, 0, 0"), InvalScope::Full);
-        assert_eq!(parse_invalidate_payload("EMPTY, EMPTY, 0, 0, 0, 0"), InvalScope::Full);
+        assert_eq!(
+            parse_invalidate_payload("EMPTY, EMPTY, 0, 0, 0, 0"),
+            InvalScope::Full
+        );
         assert_eq!(parse_invalidate_payload(""), InvalScope::Full);
         assert_eq!(parse_invalidate_payload("garbage"), InvalScope::Full);
         assert_eq!(parse_invalidate_payload("1,2,3"), InvalScope::Full); // 缺字段
@@ -452,15 +474,7 @@ mod tests {
         assert!(count >= 3, "夹具前提：≥3 条带（实际 {count}）");
         let bounds = band_boundaries(A4.0, A4.1, 1024);
         // 第 1 条带内部小矩形 → 恰命中条带 0。
-        let r0 = bands_in_rect(
-            A4.0,
-            A4.1,
-            1024,
-            0,
-            bounds[1] - 10,
-            A4.0,
-            10,
-        );
+        let r0 = bands_in_rect(A4.0, A4.1, 1024, 0, bounds[1] - 10, A4.0, 10);
         assert_eq!(r0, 0..1, "条带 0 内矩形");
         // 跨第 2-3 条带的纵向长矩形 → 区间 [1,3)。
         let span = bands_in_rect(

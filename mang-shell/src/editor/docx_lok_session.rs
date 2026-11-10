@@ -152,10 +152,7 @@ pub enum SessionReply {
     Callback { name: String, payload: String },
     /// 文档几何重查回执（`SessionCmd::Size`——DOCUMENT_SIZE_CHANGED
     /// 时机重查；twips 单一真源 = `DocSession::size`）。
-    Size {
-        width_twips: i64,
-        height_twips: i64,
-    },
+    Size { width_twips: i64, height_twips: i64 },
     /// worker 死亡（回执侧终态——宿主转错误态并停轮询）。
     Died { detail: String },
 }
@@ -709,21 +706,22 @@ mod tests {
         let src = std::env::var_os("MDC_LOK_WORKER_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../target/debug/mdc-lok-worker")
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mdc-lok-worker")
             });
         if !src.is_file() {
-            eprintln!(
-                "SKIP（worker 构建产物不在 {src:?}——先 `cargo build -p mdc-lok`，真链未跑）"
-            );
+            eprintln!("SKIP（worker 构建产物不在 {src:?}——先 `cargo build -p mdc-lok`，真链未跑）");
             return;
         }
-        if staged != src && (!staged.is_file() || std::fs::metadata(&staged).ok().map(|m| m.len()) != std::fs::metadata(&src).ok().map(|m| m.len())) {
+        if staged != src
+            && (!staged.is_file()
+                || std::fs::metadata(&staged).ok().map(|m| m.len())
+                    != std::fs::metadata(&src).ok().map(|m| m.len()))
+        {
             std::fs::copy(&src, &staged)
                 .unwrap_or_else(|e| panic!("worker 预部署拷贝失败（{src:?} → {staged:?}）：{e}"));
         }
-        let mut session = DocxLokSession::open_blocking(&work)
-            .expect("打开链必须成功（运行时在场）");
+        let mut session =
+            DocxLokSession::open_blocking(&work).expect("打开链必须成功（运行时在场）");
         // 打开链回执必须先于任何 tile；Failed/Died 快速失败——不白等
         // 180s（C1 遗留缺陷：失败回执被吞导致超时 panic 丢真实原因）。
         let mut ready = None;

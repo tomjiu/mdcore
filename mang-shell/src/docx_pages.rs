@@ -50,8 +50,8 @@ use ui::prelude::*;
 use crate::canvas_view::WHEEL_LINE_PX;
 use crate::docx_geom::{
     BAND_PX, DOCX_ZOOM_MAX, DOCX_ZOOM_MIN, DOCX_ZOOM_STEP, InvalScope, ZoomMode, band_count,
-    band_region, center_twips, content_height_px, offset_for_center_twips, parse_invalidate_payload,
-    quantize_width, zoom_percent, zoom_raster_width,
+    band_region, center_twips, content_height_px, offset_for_center_twips,
+    parse_invalidate_payload, quantize_width, zoom_percent, zoom_raster_width,
 };
 use crate::editor::docx_lok_session::{DocxLokSession, SessionError, SessionReply};
 
@@ -558,7 +558,8 @@ impl DocxPagesView {
                     n += hit as usize;
                     !hit
                 });
-                self.cache_costs.retain(|(band, _), _| !range.contains(band));
+                self.cache_costs
+                    .retain(|(band, _), _| !range.contains(band));
                 self.cache_order.retain(|(band, _)| !range.contains(band));
                 self.cache_bytes = self.cache_costs.values().sum();
                 self.failed.retain(|(band, _)| !range.contains(band));
@@ -825,7 +826,9 @@ impl DocxPagesView {
                 let label = *label;
                 let shortcut = *shortcut;
                 div()
-                    .id(gpui::SharedString::from(format!("docx-zoom-preset-{label}")))
+                    .id(gpui::SharedString::from(format!(
+                        "docx-zoom-preset-{label}"
+                    )))
                     .w_full()
                     .flex()
                     .items_center()
@@ -863,10 +866,13 @@ impl DocxPagesView {
                 .size_full()
                 .top_0()
                 .left_0()
-                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.zoom_menu_open = false;
-                    cx.notify();
-                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.zoom_menu_open = false;
+                        cx.notify();
+                    }),
+                )
                 .child(
                     v_flex()
                         .id("docx-zoom-menu")
@@ -1029,8 +1035,11 @@ impl Render for DocxPagesView {
             // 本批改根级口径）+ Ctrl+滚轮 capture 期拦截（缩放——
             // 止冒泡防列表滚动，pdf #421 同款）。
             .child(
-                div().id("docx-viewport-probe").absolute().size_full().child(
-                    gpui::canvas(
+                div()
+                    .id("docx-viewport-probe")
+                    .absolute()
+                    .size_full()
+                    .child(gpui::canvas(
                         move |bounds, _window, _cx| bounds,
                         move |bounds: gpui::Bounds<gpui::Pixels>,
                               _t,
@@ -1052,18 +1061,14 @@ impl Render for DocxPagesView {
                                     if phase != DispatchPhase::Capture {
                                         return;
                                     }
-                                    if !(event.modifiers.control
-                                        || event.modifiers.platform)
-                                    {
+                                    if !(event.modifiers.control || event.modifiers.platform) {
                                         return;
                                     }
                                     if !bounds.contains(&event.position) {
                                         return;
                                     }
                                     let (dx, dy) = match event.delta {
-                                        ScrollDelta::Pixels(p) => {
-                                            (p.x.as_f32(), p.y.as_f32())
-                                        }
+                                        ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
                                         ScrollDelta::Lines(l) => {
                                             (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
                                         }
@@ -1079,8 +1084,7 @@ impl Render for DocxPagesView {
                                 },
                             );
                         },
-                    ),
-                ),
+                    )),
             )
             .into_any_element()
     }
@@ -1227,7 +1231,11 @@ mod tests {
             assert!(v.dispatch_zoom_key("1", true, false, cx), "Ctrl+1 消费");
             assert_eq!(v.zoom_mode_for_test(), ZoomMode::ActualSize);
             let rw_actual = v.raster_width(800.);
-            assert_eq!(rw_actual, quantize_width((11906 / 15) as u32), "实际大小光栅宽");
+            assert_eq!(
+                rw_actual,
+                quantize_width((11906 / 15) as u32),
+                "实际大小光栅宽"
+            );
             // Ctrl+= 步进 → Custom 档起算 = 当前生效倍率（不跳档）。
             assert!(v.dispatch_zoom_key("=", true, false, cx));
             assert!(rw_actual < v.raster_width(800.), "步进放大必须增光栅宽");
@@ -1263,11 +1271,7 @@ mod tests {
             v.viewport_size = (1024., 600.);
         });
         // 注入缓存/失败/在途登记（两档光栅宽 × 三条带）。
-        let img = || {
-            Arc::new(
-                bgra_to_image(&[0u8; 16], 2, 2).expect("2x2 载荷必须可成像"),
-            )
-        };
+        let img = || Arc::new(bgra_to_image(&[0u8; 16], 2, 2).expect("2x2 载荷必须可成像"));
         view.update(cx, |v, _| {
             for band in [0u32, 1, 2] {
                 v.cache_insert((band, 1024), img(), 16);
@@ -1278,18 +1282,20 @@ mod tests {
         });
         // 条带 1 区域的 twips 矩形（1024px 档 A4：条带 0 ≈ [0, 5907)）。
         view.update(cx, |v, cx| {
-            v.handle_callback(
-                "INVALIDATE_TILES",
-                "0, 6000, 11906, 100, 0, 0",
-                cx,
-            );
+            v.handle_callback("INVALIDATE_TILES", "0, 6000, 11906, 100, 0, 0", cx);
         });
         view.read_with(cx, |v, _| {
             assert!(!v.cache.contains_key(&(1, 1024)), "命中条带 1024 档逐出");
-            assert!(!v.cache.contains_key(&(1, 512)), "命中条带 512 档同逐（跨档）");
+            assert!(
+                !v.cache.contains_key(&(1, 512)),
+                "命中条带 512 档同逐（跨档）"
+            );
             assert!(v.cache.contains_key(&(0, 1024)), "未命中条带保留");
             assert!(v.cache.contains_key(&(2, 1024)), "未命中条带保留");
-            assert!(!v.failed.contains(&(1, 1024)), "失败登记随失效清除（可重试）");
+            assert!(
+                !v.failed.contains(&(1, 1024)),
+                "失败登记随失效清除（可重试）"
+            );
             assert!(
                 v.pending.values().any(|k| *k == (2, 1024)),
                 "条带 2 不在矩形内——在途保留"
@@ -1320,7 +1326,11 @@ mod tests {
             v.doc_size = Some((11906, 16838));
             v.boot = Boot::Ready;
             v.viewport_size = (1024., 600.);
-            v.cache_insert((0, 1024), Arc::new(bgra_to_image(&[0u8; 16], 2, 2).unwrap()), 16);
+            v.cache_insert(
+                (0, 1024),
+                Arc::new(bgra_to_image(&[0u8; 16], 2, 2).unwrap()),
+                16,
+            );
         });
         // 无会话：回调不得 panic（request_size 空转）。
         view.update(cx, |v, cx| {
