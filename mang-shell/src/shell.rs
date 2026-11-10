@@ -4782,6 +4782,178 @@ mod tab_workflow_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// docx 标签置脏的共用前奏：开 → 切文本态 → 锚点段插入标记 →
+    /// 断言脏（返回锚点行号——落盘断言复用）。
+    fn docx_dirty_tab(
+        cx: &mut gpui::TestAppContext,
+        shell: &Entity<ShellApp>,
+        window: &gpui::WindowHandle<ShellHost>,
+        docx: &Path,
+        marker: &str,
+    ) -> usize {
+        window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document_tab(docx.to_path_buf(), cx);
+                });
+            })
+            .expect("开 docx 标签");
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.toggle_docx_view_mode(window, cx);
+                    let ed = shell.tab_editor(0).unwrap().clone();
+                    let target = (0..ed.read(cx).line_count())
+                        .find(|&i| {
+                            ed.read(cx)
+                                .buffer_line(i)
+                                .starts_with("平台采用云原生微服务架构")
+                        })
+                        .expect("锚点段在场（smoke.docx 夹具）");
+                    ed.update(cx, |ed, cx| {
+                        ed.insert_text_at(target, 2, marker, cx);
+                    });
+                    assert!(shell.tab_is_modified(0, cx).unwrap(), "置脏前置");
+                    target
+                })
+            })
+            .expect("置脏")
+    }
+
+    /// #47 A2：docx 退出协调——脏 docx 文本编辑 → 真实关闭钮回调链
+    /// （simulate_close）→ 拦截 + 退出确认（Quit）→「保存」逐标签落盘
+    /// = **合法 docx 字节**（PK zip + 锚点段带标记），不是行模型文本
+    /// 覆写。测试平台 quit() 无操作——盘上字节为本断言面。
+    #[gpui::test]
+    fn docx_dirty_quit_confirm_saves_docx_bytes(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("docx-quit");
+        let docx = write_docx_fixture(&dir, "quit.docx");
+
+        let (shell, window) = shell_window(cx);
+        let target = docx_dirty_tab(cx, &shell, &window, &docx, "【退】");
+        cx.run_until_parked();
+
+        // 真实关闭钮回调链：脏 → 拦截 + 退出确认。
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let closed = vcx.simulate_close();
+        assert!(!closed, "脏 docx → should-close 返回 false（退出被拦）");
+        vcx.update(|_window, cx| {
+            shell.update(cx, |shell, cx| {
+                let confirm = shell.confirm.as_ref().expect("退出前确认弹出");
+                assert!(
+                    matches!(confirm.action, ConfirmAction::Quit),
+                    "确认动作 = Quit（得 {:?}）",
+                    confirm.action
+                );
+                assert!(
+                    confirm.message.contains('1'),
+                    "文案含未保存计数（得 {:?}）",
+                    confirm.message
+                );
+                assert_eq!(shell.tab_count(), 1, "被拦 = 标签还在");
+            });
+        });
+
+        // 「保存」（choice 0）→ Quit 分支逐标签 save_tab → docx 字节落盘。
+        vcx.update(|_window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.resolve_confirm(0, _window, cx);
+            });
+        });
+        let bytes = std::fs::read(&docx).expect("退出保存后文件在场");
+        assert!(
+            bytes.starts_with(b"PK\x03\x04"),
+            "退出保存 = docx 容器（PK zip 头），不是行模型文本"
+        );
+        assert!(
+            zip_entry_names(&bytes)
+                .iter()
+                .any(|n| n == "word/document.xml"),
+            "zip 条目含 word/document.xml"
+        );
+        // 落盘内容含锚点段标记（docx_doc 装载回读——与打开链同一函数）。
+        let reloaded = crate::editor::docx_doc::load_editable(&docx)
+            .expect("退出保存产物可重开")
+            .payload;
+        let line = reloaded
+            .text
+            .split('\n')
+            .nth(target)
+            .expect("锚点行在场");
+        assert!(
+            line.contains("【退】"),
+            "退出保存落盘锚点段带标记（得 {line}）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #47 A2：docx 保存失败协调——删夹具目录（写盘临时文件 ENOENT
+    /// ——root 也拦不住的真实 IO 失败）→ 关闭确认「保存」→ 保存失败
+    /// **不关标签**（脏态保留不静默丢）→ 恢复目录后重试 → 保存成功关
+    /// 标签 + 盘上 = 合法 docx 字节（PK zip）带标记。
+    #[gpui::test]
+    fn docx_save_failure_keeps_dirty_then_recovers(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("docx-fail");
+        let docx = write_docx_fixture(&dir, "fail.docx");
+
+        let (shell, window) = shell_window(cx);
+        docx_dirty_tab(cx, &shell, &window, &docx, "【败】");
+
+        // 造真实 IO 失败：删夹具目录（save_docx 的临时文件写 ENOENT）。
+        std::fs::remove_dir_all(&dir).expect("删目录");
+
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.close_active_tab(window, cx);
+                    assert!(
+                        shell.confirm.is_some(),
+                        "脏标签关闭弹确认（保存失败前置）"
+                    );
+                    shell.resolve_confirm(0, window, cx);
+                    assert_eq!(
+                        shell.tab_count(),
+                        1,
+                        "保存失败不关标签（脏态保留不静默丢）"
+                    );
+                    assert!(
+                        shell.tab_is_modified(0, cx).unwrap(),
+                        "失败后仍脏（可重试）"
+                    );
+                });
+            })
+            .expect("失败拒关");
+
+        // 恢复目录 + 夹具字节 → 重试关闭 → 保存成功关标签 + PK 字节。
+        std::fs::create_dir_all(&dir).expect("恢复目录");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.docx");
+        std::fs::copy(&src, &docx).expect("恢复夹具");
+        window
+            .update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.close_active_tab(window, cx);
+                    shell.resolve_confirm(0, window, cx);
+                    assert_eq!(shell.tab_count(), 0, "恢复后保存成功关标签");
+                });
+            })
+            .expect("恢复后关闭");
+        let bytes = std::fs::read(&docx).expect("恢复保存后文件在场");
+        assert!(
+            bytes.starts_with(b"PK\x03\x04"),
+            "重试保存 = docx 容器（PK zip 头）"
+        );
+        let reloaded = crate::editor::docx_doc::load_editable(&docx)
+            .expect("重试保存产物可重开")
+            .payload;
+        assert!(
+            reloaded.text.contains("【败】"),
+            "重试保存落盘锚点段带标记"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #219 边界：循环切换在空态/单标签为 no-op；越界激活安全不改
     /// 状态（标签点击竞态/程序化调用的防御面）。
     #[gpui::test]
