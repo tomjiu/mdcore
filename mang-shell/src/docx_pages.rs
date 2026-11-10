@@ -164,7 +164,7 @@ impl DocxPagesView {
             .name("docx-lok-open".into())
             .spawn(move || {
                 // 会话层自带线程跑打开链——本线程只等句柄回传（秒内）。
-                let _ = open_tx.send(DocxLokSession::open_blocking(&thread_path, None));
+                let _ = open_tx.send(DocxLokSession::open_blocking(&thread_path));
             })
             .expect("打开线程");
         let view = Self {
@@ -440,12 +440,11 @@ impl DocxPagesView {
                     width_twips,
                     height_twips,
                     kernel_sha256,
-                    version_info,
                     elapsed_ms,
                 } => {
                     eprintln!(
                         "docx-pages: ready size={width_twips}x{height_twips}tw \
-                         kernel={kernel_sha256} version={version_info} open_ms={elapsed_ms}"
+                         kernel={kernel_sha256} open_ms={elapsed_ms}"
                     );
                     self.doc_size = Some((width_twips, height_twips));
                     self.boot = Boot::Ready;
@@ -502,9 +501,6 @@ impl DocxPagesView {
                 }
                 SessionReply::Callback { name, payload } => {
                     self.handle_callback(&name, &payload, cx);
-                }
-                SessionReply::Pong { rtt_ms } => {
-                    eprintln!("docx-pages: pong rtt_ms={rtt_ms}");
                 }
             }
         }

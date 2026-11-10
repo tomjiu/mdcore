@@ -34,18 +34,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use mdc_lok::client::{DocHandle, Event, WorkerClient};
-use mdc_lok::profile::{self, SessionProfile};
+use mdc_lok::client::{DocSession, Event, LokError};
+use mdc_lok::profile;
 use mdc_lok::runtime;
-use serde_json::json;
 
 // twips↔px 换算常量 `TWIPS_PER_PX`：C2 起单源于 `crate::docx_geom`
 //（消费方 docx_pages 直连导入；本模块不再 re-export——零剩余消费面）。
 
-/// worker boot 等待（ready 事件；180s 同 smoke.rs `wait_ready` 预算）。
-const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
-/// 单 op 超时（paint 尺寸随视口浮动，60s 上限宽裕且不挂死 UI 轮询）。
-const OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// worker boot 等待（DocSession 契约：load 请求内含就绪等待，
+/// DEFAULT_TIMEOUT=120s 内置——本层不再独立等 boot 事件）。
 /// 会话线程命令等待切片（期间顺带 drain 事件）。
 const CMD_TICK: Duration = Duration::from_millis(100);
 
@@ -54,6 +51,17 @@ fn session_root_for(seq: u64) -> PathBuf {
     std::env::temp_dir()
         .join("mdc-docx-lok")
         .join(format!("{}-{seq}", std::process::id()))
+}
+
+/// `LokError` → 会话阶段名（打开链口径：spawn / load 两段；discover
+/// 由本层先行、died 由事件流上报——`boot` 段随 DocSession 契约
+///（load 请求内含就绪等待，超时 120s 内置）不再独立出现）。
+fn stage_of_open_error(e: &LokError) -> &'static str {
+    match e {
+        LokError::WorkerDied { .. } => "spawn",
+        LokError::Protocol(m) if m.contains("spawn") || m.contains("可执行") => "spawn",
+        _ => "load",
+    }
 }
 
 /// 打开/运行期错误。`NoRuntime` 是「内核缺失」判据（宿主回落文本
@@ -114,12 +122,13 @@ pub struct TileStats {
 /// 会话线程 → 宿主回执（16ms drain；一次一条）。
 #[derive(Debug)]
 pub enum SessionReply {
-    /// 打开链完成：文档几何（twips）+ 内核版本/指纹 + 全链耗时。
+    /// 打开链完成：文档几何（twips）+ 内核指纹 + 全链耗时。
+    /// （C2 迁移 DocSession 契约后无 version 暴露面——版本证据以内核
+    /// SHA256 为准，B 线运行时文档另有 version_info 记录。)
     Ready {
         width_twips: i64,
         height_twips: i64,
         kernel_sha256: String,
-        version_info: String,
         elapsed_ms: u128,
     },
     /// 打开链失败（`stage` 见 [`SessionError::stage`]）。
@@ -142,13 +151,11 @@ pub enum SessionReply {
     /// 登记；C3 接命令状态面）。
     Callback { name: String, payload: String },
     /// 文档几何重查回执（`SessionCmd::Size`——DOCUMENT_SIZE_CHANGED
-    /// 时机重查；twips 单一真源 = worker `size` op）。
+    /// 时机重查；twips 单一真源 = `DocSession::size`）。
     Size {
         width_twips: i64,
         height_twips: i64,
     },
-    /// ping 回执（会话活性探针——测试/诊断用）。
-    Pong { rtt_ms: u128 },
     /// worker 死亡（回执侧终态——宿主转错误态并停轮询）。
     Died { detail: String },
 }
@@ -156,7 +163,7 @@ pub enum SessionReply {
 /// 宿主 → 会话线程命令。
 enum SessionCmd {
     /// tile 渲染：`(canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h)`
-    ///（画布 px + 区域 twips——worker `paint` 契约）。
+    ///（画布 px + 区域 twips——`DocSession::paint` 契约）。
     Paint {
         seq: u64,
         canvas_w: usize,
@@ -168,7 +175,6 @@ enum SessionCmd {
     },
     /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机——C2 缓存换尺寸链）。
     Size,
-    Ping,
     Close,
 }
 
@@ -199,16 +205,14 @@ impl std::fmt::Debug for DocxLokSession {
 
 impl DocxLokSession {
     /// 阻塞打开（**只许在非 UI 线程调用**——打开链含 worker boot 可达
-    /// 数十秒）。`worker_bin`：worker 可执行（None = exe 同目录约定，
-    /// 或 `MDC_LOK_WORKER_BIN` 环境注入——开发/测试面）。
-    pub fn open_blocking(path: &Path, worker_bin: Option<&Path>) -> Result<Self, SessionError> {
+    /// 数十秒）。worker 可执行定位交 `DocSession::open` 契约（同目录
+    /// `mdc-lok-worker`——部署布局；测试经预部署仿真，见
+    /// [`Self::open_blocking`] 测试注释）。
+    pub fn open_blocking(path: &Path) -> Result<Self, SessionError> {
         let path = std::fs::canonicalize(path)
             .map_err(|e| SessionError::Load(format!("文档路径无效（{}）：{e}", path.display())))?;
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let session_dir = session_root_for(seq);
-        let worker_bin = worker_bin
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("MDC_LOK_WORKER_BIN").map(PathBuf::from));
 
         let (cmd_tx, cmd_rx) = channel::<SessionCmd>();
         let (reply_tx, reply_rx) = channel::<SessionReply>();
@@ -217,7 +221,7 @@ impl DocxLokSession {
         std::thread::Builder::new()
             .name(format!("docx-lok-session-{seq}"))
             .spawn(move || {
-                session_main(thread_path, thread_dir, worker_bin, cmd_rx, reply_tx);
+                session_main(thread_path, thread_dir, cmd_rx, reply_tx);
             })
             .map_err(|e| SessionError::Spawn(format!("会话线程启动失败：{e}")))?;
 
@@ -271,11 +275,6 @@ impl DocxLokSession {
         let _ = self.cmd_tx.send(SessionCmd::Size);
     }
 
-    /// 活性探针（回执 [`SessionReply::Pong`]）。
-    pub fn ping(&self) {
-        let _ = self.cmd_tx.send(SessionCmd::Ping);
-    }
-
     /// 非阻塞收回执（宿主 16ms 轮询 drain）。
     pub fn try_recv(&self) -> Option<SessionReply> {
         match self.reply_rx.try_recv() {
@@ -302,10 +301,15 @@ impl Drop for DocxLokSession {
 }
 
 /// 会话线程主体（一次生命周期；全链错误走 `Failed` 回执后退出）。
+///
+/// **C2 契约迁移**：打开链 = 本层 `runtime::discover`（NoRuntime 分类
+/// + 内核指纹）→ `DocSession::open`（spawn + load + init_rendering——
+/// profile worker 侧自建；boot 等待内含于 load 请求，超时 120s 内置）
+/// → `size`。服务循环按 [`SessionCmd`] 消费 `DocSession` 同步方法
+///（paint/size/close——B2 契约 §2/§4；dirty/revision C3/C4 接管）。
 fn session_main(
     path: PathBuf,
     session_dir: PathBuf,
-    worker_bin: Option<PathBuf>,
     cmd_rx: Receiver<SessionCmd>,
     reply_tx: Sender<SessionReply>,
 ) {
@@ -314,84 +318,39 @@ fn session_main(
     };
     let started = Instant::now();
 
-    // ---- 0. 运行时发现（NoRuntime → 宿主回落文本视图判据）----
+    // ---- 0. 运行时发现（NoRuntime → 宿主回落文本视图判据；内核
+    // SHA256 = 就绪回执的来源指纹——B3 版本钉定验收口径）。
     let rt = match runtime::discover() {
         Ok(rt) => rt,
         Err(e) => return fail("discover", e),
     };
 
-    // ---- 1. 独立 profile（会话隔离——见 profile.rs 模块头）----
-    let _profile = match SessionProfile::new(&session_dir) {
-        Ok(p) => p,
-        Err(e) => return fail("spawn", format!("会话 profile 创建失败：{e}")),
-    };
-
-    // ---- 2. worker spawn + ready（smoke.rs 同款序列）----
-    let client = match WorkerClient::spawn(Some(&rt), &session_dir, worker_bin.as_deref(), None) {
-        Ok(c) => c,
-        Err(e) => return fail("spawn", e.to_string()),
-    };
-    let events = client.take_events();
-    let boot_deadline = Instant::now() + BOOT_TIMEOUT;
-    loop {
-        let Some(ev_rx) = events.as_ref() else { break };
-        // 就绪等待（smoke.rs 同款预算；超时/断连同径失败——不留哨兵态）。
-        let wait = boot_deadline.saturating_duration_since(Instant::now());
-        let ev = match ev_rx.recv_timeout(wait) {
-            Ok(ev) => ev,
-            Err(_) => return fail("boot", "180s 内未见 ready 事件".into()),
-        };
-        match ev {
-            Event::Life { kind, detail } => {
-                if kind == "ready" {
-                    break;
-                }
-                if kind == "boot-failed" {
-                    return fail("boot", format!("内核 boot 失败：{detail}"));
-                }
-                // hello 等其他生命事件：忽略。
-            }
-            Event::Callback { .. } => {} // boot 前不应有文档回调
-        }
-        if Instant::now() > boot_deadline {
-            return fail("boot", "180s 内未见 ready 事件".into());
-        }
-    }
-
-    // ---- 3. 版本指纹（来源可追溯——#49 B 验收口径）----
-    let version_info = client
-        .request("version", json!({}))
-        .ok()
-        .and_then(|v| {
-            v.get("version_info")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
-
-    // ---- 4. 打开文档（load 一次性；此后句柄即弃——见模块头所有权说明）----
+    // ---- 1. DocSession::open（spawn → load → init_rendering——B2 契约
+    // 产品会话形态；C 线不再触碰借用式 DocHandle）。
     let url = profile::file_url_of(&path);
-    let open_started = Instant::now();
-    let opened = DocHandle::load(&client, &url, Some("DeviceFormFactor=desktop"));
-    let doc = match opened {
-        Ok(doc) => doc,
-        Err(e) => return fail("load", e.to_string()),
+    let opened = DocSession::open(
+        Some(&rt),
+        &session_dir,
+        &url,
+        Some("DeviceFormFactor=desktop"),
+    );
+    let session = match opened {
+        Ok(s) => s,
+        Err(e) => return fail(stage_of_open_error(&e), e.to_string()),
     };
-    if let Err(e) = doc.init_rendering(None) {
-        return fail("load", format!("init_rendering 失败：{e}"));
-    }
-    let (w_tw, h_tw) = match doc.size() {
+    let events = session.take_events();
+
+    // ---- 2. 文档几何（就绪门：尺寸非零）。
+    let (w_tw, h_tw) = match session.size() {
         Ok(size) => size,
         Err(e) => return fail("load", format!("文档尺寸获取失败：{e}")),
     };
-    drop(doc); // 文档仍在 worker 进程内（close 前有效）；句柄弃——宿主走原始 op。
 
     if reply_tx
         .send(SessionReply::Ready {
             width_twips: w_tw,
             height_twips: h_tw,
             kernel_sha256: rt.kernel_sha256.clone(),
-            version_info,
             elapsed_ms: started.elapsed().as_millis(),
         })
         .is_err()
@@ -399,8 +358,8 @@ fn session_main(
         return; // 宿主已走（视图被 drop）——直接收尾。
     }
     eprintln!(
-        "docx-lok: ready url={url} size={w_tw}x{h_tw}tw load={}ms total={}ms",
-        open_started.elapsed().as_millis(),
+        "docx-lok: ready url={url} size={w_tw}x{h_tw}tw pid={} total={}ms",
+        session.pid(),
         started.elapsed().as_millis(),
     );
 
@@ -417,18 +376,7 @@ fn session_main(
                 tile_h,
             }) => {
                 let paint_started = Instant::now();
-                let result = client.request_with_timeout(
-                    "paint",
-                    json!({
-                        "canvas_w": canvas_w,
-                        "canvas_h": canvas_h,
-                        "tile_x": tile_x,
-                        "tile_y": tile_y,
-                        "tile_w": tile_w,
-                        "tile_h": tile_h,
-                    }),
-                    OP_TIMEOUT,
-                );
+                let result = session.paint(canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h);
                 match result {
                     Ok(v) => match tile_reply(&v, &session_dir) {
                         Ok(Some((bgra, width, height, sha256, stats))) => {
@@ -456,7 +404,7 @@ fn session_main(
                         }
                     },
                     Err(e) => {
-                        let dead = client.is_dead();
+                        let dead = session.is_dead();
                         let message = if dead {
                             format!("worker 死亡：{e}")
                         } else {
@@ -468,7 +416,7 @@ fn session_main(
                         });
                         if dead {
                             let _ = reply_tx.send(SessionReply::Died {
-                                detail: client.death_detail(),
+                                detail: session.death_detail(),
                             });
                             return;
                         }
@@ -476,24 +424,13 @@ fn session_main(
                 }
             }
             Ok(SessionCmd::Size) => {
-                // worker `size` op（与打开链 `DocHandle::size` 同 wire 面——
-                // 就绪后文档仍在 worker 进程，原始 op 直查）。
-                let result = client.request("size", json!({}));
-                match result {
-                    Ok(v) => {
-                        let w = v.get("width_twips").and_then(serde_json::Value::as_i64);
-                        let h = v.get("height_twips").and_then(serde_json::Value::as_i64);
-                        if let (Some(w), Some(h)) = (w, h) {
-                            let _ = reply_tx.send(SessionReply::Size {
-                                width_twips: w,
-                                height_twips: h,
-                            });
-                        } else {
-                            let _ = reply_tx.send(SessionReply::Failed {
-                                stage: "size",
-                                message: "size 回执缺几何字段".into(),
-                            });
-                        }
+                // `DocSession::size`（B2 契约 §4——geometry 单一真源）。
+                match session.size() {
+                    Ok((w, h)) => {
+                        let _ = reply_tx.send(SessionReply::Size {
+                            width_twips: w,
+                            height_twips: h,
+                        });
                     }
                     Err(e) => {
                         let _ = reply_tx.send(SessionReply::Failed {
@@ -503,30 +440,14 @@ fn session_main(
                     }
                 }
             }
-            Ok(SessionCmd::Ping) => {
-                let started = Instant::now();
-                match client.request("ping", json!({})) {
-                    Ok(_) => {
-                        let _ = reply_tx.send(SessionReply::Pong {
-                            rtt_ms: started.elapsed().as_millis(),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = reply_tx.send(SessionReply::Failed {
-                            stage: "ping",
-                            message: e.to_string(),
-                        });
-                    }
-                }
-            }
             Ok(SessionCmd::Close) => {
-                let _ = client.shutdown();
+                session.shutdown();
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {} // 切片到点 → 顺带 drain 事件
             Err(RecvTimeoutError::Disconnected) => {
                 // 宿主已走（视图 drop）——关 worker 收尾。
-                let _ = client.shutdown();
+                session.shutdown();
                 return;
             }
         }
@@ -549,9 +470,9 @@ fn session_main(
                 }
             }
         }
-        if client.is_dead() {
+        if session.is_dead() {
             let _ = reply_tx.send(SessionReply::Died {
-                detail: client.death_detail(),
+                detail: session.death_detail(),
             });
             return;
         }
@@ -743,12 +664,16 @@ mod tests {
 
     /// **真实运行时链（有内核才跑；无内核 SKIP 横幅——不假绿）**：
     /// open_blocking → Ready（尺寸非零 + 内核指纹）→ request_tile →
-    /// Tile（像素非空 + stats 达冒烟口径）→ close。
+    /// Tile（像素非空 + stats 达冒烟口径）→ request_size（DocSession 契约
+    /// 重查）→ close。
     ///
-    /// 运行方式（Linux 真实证据）：
+    /// worker 预部署仿真（DocSession::open 契约 = 同目录 `mdc-lok-worker`，
+    /// 不暴露注入参——测试把构建产物拷到本测试二进制同目录，与部署
+    /// 布局一致；`MDC_LOK_WORKER_BIN` 仅作拷贝源提示，不给产品路径）。
+    ///
+    /// 运行方式（Linux 真实证据，工作区根）：
     /// ```text
     /// cargo build -p mdc-lok            # 先出 worker 二进制
-    /// MDC_LOK_WORKER_BIN=target/debug/mdc-lok-worker \
     /// cargo test -p mang-shell --lib docx_lok_session -- --nocapture --test-threads=1
     /// ```
     #[test]
@@ -773,22 +698,31 @@ mod tests {
             rt.kernel_lib.display(),
             rt.kernel_sha256
         );
-        let worker_bin = std::env::var_os("MDC_LOK_WORKER_BIN").map(PathBuf::from);
-        if worker_bin.is_none() {
-            eprintln!("SKIP（MDC_LOK_WORKER_BIN 未注入——测试进程目录无 mdc-lok-worker，真链未跑）");
+        // worker 预部署：拷到本测试二进制同目录（DocSession::open 同目录
+        // 契约）。`MDC_LOK_WORKER_BIN` = 拷贝源（工作区根 target/debug）；
+        // 未设则拷工作区根 target/debug/mdc-lok-worker（cargo 标准布局）。
+        let test_exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .expect("定位测试二进制目录失败");
+        let staged = test_exe_dir.join("mdc-lok-worker");
+        let src = std::env::var_os("MDC_LOK_WORKER_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/debug/mdc-lok-worker")
+            });
+        if !src.is_file() {
+            eprintln!(
+                "SKIP（worker 构建产物不在 {src:?}——先 `cargo build -p mdc-lok`，真链未跑）"
+            );
             return;
         }
-        // worker 可执行预检：相对路径随 cargo 测试 cwd 浮动（工作区根
-        // vs 包根）——不存在即 FAIL 并打印 cwd，不进 180s 白等。
-        if let Some(bin) = &worker_bin {
-            assert!(
-                bin.is_file(),
-                "worker 可执行不存在：{:?}（cwd={:?}——相对路径请给工作区根 target/debug 全量）",
-                bin,
-                std::env::current_dir().unwrap_or_default()
-            );
+        if staged != src && (!staged.is_file() || std::fs::metadata(&staged).ok().map(|m| m.len()) != std::fs::metadata(&src).ok().map(|m| m.len())) {
+            std::fs::copy(&src, &staged)
+                .unwrap_or_else(|e| panic!("worker 预部署拷贝失败（{src:?} → {staged:?}）：{e}"));
         }
-        let mut session = DocxLokSession::open_blocking(&work, worker_bin.as_deref())
+        let mut session = DocxLokSession::open_blocking(&work)
             .expect("打开链必须成功（运行时在场）");
         // 打开链回执必须先于任何 tile；Failed/Died 快速失败——不白等
         // 180s（C1 遗留缺陷：失败回执被吞导致超时 panic 丢真实原因）。
@@ -800,7 +734,6 @@ mod tests {
                 width_twips,
                 height_twips,
                 kernel_sha256,
-                version_info,
                 elapsed_ms,
             }) = session.try_recv()
             {
@@ -808,7 +741,7 @@ mod tests {
                 assert!(!kernel_sha256.is_empty(), "内核指纹必须留痕");
                 eprintln!(
                     "ready: {width_twips}x{height_twips}tw kernel={kernel_sha256} \
-                     version={version_info} open_ms={elapsed_ms}"
+                     open_ms={elapsed_ms}"
                 );
                 ready = Some((width_twips, height_twips));
             }
