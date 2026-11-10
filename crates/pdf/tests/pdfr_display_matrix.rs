@@ -25,6 +25,10 @@
 //! 6. [`tiny_extreme_widths_render_stability`]——40×720 极窄页
 //!    （aspect 18）：1px / 96px / 2048px 三档宽渲染稳定（含总像素
 //!    预算收缩路径），纵横比全程保持。
+//! 7. [`lopdf_runtime_independent_geometry_contract`]——#51 D1 落地
+//!    面：**运行时** lopdf 独立解析对照（MediaBox/CropBox//Rotate 含
+//!    页树继承，与面 1 的 pypdf manifest **生成期**对照互补——不
+//!    依赖 python 前置步骤、不用 pdfium 自证的第三独立面）；
 //!
 //! ## 环境门
 //!
@@ -861,6 +865,209 @@ fn tiny_extreme_widths_render_stability() {
             "fixture": "tiny_note.pdf（40×720pt，aspect 18）",
             "widths_px": [1, 96, 2048],
             "note": "2048px 档触发 S3-L2 总像素预算等比收缩（收缩后纵横比保持）",
+        }),
+    );
+}
+
+// ---------------------------------------------------------------- 测试面 7
+
+/// lopdf `Object` → f64（Integer/Real 双格式；其他形态 = None——
+/// 对照器不做猜测）。
+fn lopdf_obj_as_f64(obj: &lopdf::Object) -> Option<f64> {
+    match obj {
+        lopdf::Object::Integer(v) => Some(*v as f64),
+        lopdf::Object::Real(v) => Some(f64::from(*v)),
+        _ => None,
+    }
+}
+
+/// 间接引用解到实对象（Reference → `get_object`；其余原样）。
+fn lopdf_derefed<'a>(
+    doc: &'a lopdf::Document,
+    obj: &'a lopdf::Object,
+) -> Option<&'a lopdf::Object> {
+    match obj {
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok(),
+        other => Some(other),
+    }
+}
+
+/// 矩形 Object → (x0,y0,x1,y1)。
+fn lopdf_obj_as_rect(obj: &lopdf::Object) -> Option<(f64, f64, f64, f64)> {
+    let arr = obj.as_array().ok()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    Some((
+        lopdf_obj_as_f64(&arr[0])?,
+        lopdf_obj_as_f64(&arr[1])?,
+        lopdf_obj_as_f64(&arr[2])?,
+        lopdf_obj_as_f64(&arr[3])?,
+    ))
+}
+
+/// 页字典键沿 /Parent 链继承查找（spec 7.7.3.3：MediaBox/CropBox/
+/// Rotate 可继承）。
+fn lopdf_inherited<'a>(
+    doc: &'a lopdf::Document,
+    dict: &'a lopdf::Dictionary,
+    key: &[u8],
+) -> Option<&'a lopdf::Object> {
+    let mut cur = dict;
+    loop {
+        // lopdf 0.46：`Dictionary::get` → Result<&Object, Error>。
+        if let Ok(found) = cur.get(key) {
+            return lopdf_derefed(doc, found);
+        }
+        let parent_id = cur.get(b"Parent").ok()?;
+        let parent = lopdf_derefed(doc, parent_id)?;
+        cur = parent.as_dict().ok()?;
+    }
+}
+
+/// 矩形四元组（lopdf 独立解析的返回形态——type 别名化避免签名
+/// clippy::type_complexity）。
+type Rect4 = (f64, f64, f64, f64);
+
+/// lopdf 独立解析单页几何三元组（media/crop/rotate——渲染显示域由
+/// 调用方按 90/270 交换换算；与面 1 的 pypdf manifest 对照互补）。
+fn lopdf_page_rects(bytes: &[u8], page0: u32) -> Option<(Rect4, Option<Rect4>, i64)> {
+    let doc = lopdf::Document::load_mem(bytes).ok()?;
+    let page_id = doc.get_pages().get(&(page0 + 1))?.to_owned();
+    let page = doc.get_object(page_id).ok()?;
+    let dict = page.as_dict().ok()?;
+    let media = lopdf_inherited(&doc, dict, b"MediaBox")
+        .and_then(lopdf_obj_as_rect)
+        .unwrap_or((0., 0., 612., 792.)); // spec 缺省 Letter——仅回退口径
+    let crop = lopdf_inherited(&doc, dict, b"CropBox")
+        .and_then(lopdf_obj_as_rect)
+        .filter(|c| {
+            // 恒等形态（crop ≡ media，容差 0.5pt）归 None——与引擎
+            // `engine_pdfium.rs` 的归档语义同款（「真裁剪」vs「缺省」）。
+            (c.0 - media.0).abs() > 0.5
+                || (c.1 - media.1).abs() > 0.5
+                || (c.2 - media.2).abs() > 0.5
+                || (c.3 - media.3).abs() > 0.5
+        });
+    let rotate = lopdf_inherited(&doc, dict, b"Rotate")
+        .and_then(|o| match o {
+            lopdf::Object::Integer(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Some((media, crop, rotate))
+}
+
+/// **面 7 · lopdf 运行时独立几何对照**（#51 D1 落地面——与面 1 的
+/// pypdf manifest 互补）：面 1 的断言基准是**生成期**对照（pypdf 在
+/// 语料构建时解析、冻结进 manifest——改文件后基准不跟随）；本面在
+/// **运行时**用 lopdf（与 pdfium 互不相干的 PDF 对象语义实现）直接
+/// 解析夹具字节，覆盖十类夹具逐页 MediaBox/CropBox（含继承与真裁剪
+/// 归档语义）//Rotate 枚举与渲染显示域换算——不用 pdfium 自证、
+/// 不依赖 python 前置步骤（门禁环境可复现的第三独立面）。
+#[test]
+fn lopdf_runtime_independent_geometry_contract() {
+    let fixtures = manifest_fixtures();
+    assert!(fixtures.len() >= 10, "十类显示矩阵夹具在位");
+    let mut checked = 0usize;
+    for fx in &fixtures {
+        let file = fx["file"].as_str().unwrap();
+        let bytes = fixture_bytes(file);
+        let engine = open_engine(file);
+        for i in 0..engine.page_count() {
+            let Some((media, crop, rotate)) = lopdf_page_rects(&bytes, i) else {
+                panic!(
+                    "{file} 页 {}：lopdf 独立解析失败（完好夹具必须可解析）",
+                    i + 1
+                );
+            };
+            let geo = engine
+                .page_geometry(PageIndex(i))
+                .unwrap_or_else(|e| panic!("{file} 页 {}: 几何查询失败 {e:?}", i + 1));
+
+            // MediaBox 四值（±0.6pt——数值格式差在亚像素级）。
+            let got_media = [
+                geo.media_box.x0,
+                geo.media_box.y0,
+                geo.media_box.x1,
+                geo.media_box.y1,
+            ];
+            let want_media = [media.0, media.1, media.2, media.3];
+            for (g, w) in got_media.iter().zip(want_media) {
+                assert!(
+                    (g - w as f32).abs() <= GEOM_EPS_PT,
+                    "{file} 页 {} MediaBox：pdfium {g} vs lopdf {w}",
+                    i + 1
+                );
+            }
+
+            // CropBox（None 语义同面 1：真裁剪 vs 缺省必须同形）。
+            match (geo.crop_box, crop) {
+                (None, None) => {}
+                (Some(c), Some(w)) => {
+                    let got = [c.x0, c.y0, c.x1, c.y1];
+                    for (g, w) in got.iter().zip([w.0, w.1, w.2, w.3]) {
+                        assert!(
+                            (g - w as f32).abs() <= GEOM_EPS_PT,
+                            "{file} 页 {} CropBox：pdfium {got:?} vs lopdf {w:?}",
+                            i + 1
+                        );
+                    }
+                }
+                (a, b) => panic!(
+                    "{file} 页 {} CropBox 形态不符：pdfium {a:?} vs lopdf {b:?}",
+                    i + 1
+                ),
+            }
+
+            // /Rotate 枚举。
+            let got_rot: u32 = match geo.rotation {
+                Rotation::Deg0 => 0,
+                Rotation::Deg90 => 90,
+                Rotation::Deg180 => 180,
+                Rotation::Deg270 => 270,
+            };
+            assert_eq!(
+                got_rot,
+                rotate as u32,
+                "{file} 页 {} /Rotate：pdfium {got_rot} vs lopdf {rotate}",
+                i + 1
+            );
+
+            // 渲染显示域（CropBox 优先 + 90/270 交换——与面 1 的
+            // display_size 同义）。
+            let disp = crop.unwrap_or(media);
+            let (rw, rh) = (disp.2 - disp.0, disp.3 - disp.1);
+            let (want_w, want_h) = if rotate % 180 == 90 {
+                (rh, rw)
+            } else {
+                (rw, rh)
+            };
+            let t = PageTransform::from_geometry(&geo)
+                .unwrap_or_else(|e| panic!("{file} 页 {}: 变换构造失败 {e:?}", i + 1));
+            let ds = t.display_size();
+            let (got_w, got_h) = (ds.width, ds.height);
+            assert!(
+                (got_w - want_w as f32).abs() <= GEOM_EPS_PT
+                    && (got_h - want_h as f32).abs() <= GEOM_EPS_PT,
+                "{file} 页 {} 显示域：pdfium {got_w}×{got_h} vs lopdf {want_w}×{want_h}",
+                i + 1
+            );
+            checked += 1;
+        }
+        eprintln!(
+            "#634 面7 lopdf 独立对照 ✓ {file}（{} 页）",
+            engine.page_count()
+        );
+    }
+    assert!(checked >= 10, "lopdf 对照覆盖面坍缩（{checked} 页）");
+    write_report(
+        "report-lopdf-face.json",
+        json!({
+            "face": "lopdf_runtime_independent_geometry_contract",
+            "head": runtime_head(None),
+            "pages_checked": checked,
+            "note": "运行时 lopdf 独立解析（与 pypdf manifest 生成期对照互补——无 python 依赖的第三独立面）",
         }),
     );
 }

@@ -86,10 +86,12 @@ pub struct PdfThumbnailsView {
     aspect: f32,
     /// 低 dpi 渲染工人（独立线程 + 看门狗换代；error 态为 None）。
     worker: Option<RenderWorker<PdfiumEngine>>,
-    /// 缩略缓存（页号键控——预算 LRU）。
-    cache: mdc_pdf::cache::PageCache<u32, Arc<RenderImage>>,
-    /// 在途作业：job_id → 页号（回执对账）。
-    pending: HashMap<u64, u32>,
+    /// 缩略缓存（（页号, 设备像素宽）键控——#643 sf 换档自然 miss
+    /// 重光栅；预算 LRU）。
+    cache: mdc_pdf::cache::PageCache<(u32, u32), Arc<RenderImage>>,
+    /// 在途作业：job_id →（页号, 设备像素宽）（回执对账——#643 sf
+    /// 换档期间在途回执按发起时宽度落键）。
+    pending: HashMap<u64, (u32, u32)>,
     /// 失败页（敌意页一次性登记，不无限重试）。
     failed: HashSet<u32>,
     hooks: PdfThumbsHooks,
@@ -103,6 +105,9 @@ pub struct PdfThumbnailsView {
     scroll: UniformListScrollHandle,
     /// 引擎面错误（构造期 open 失败——面板明示，不白屏）。
     error: Option<String>,
+    /// #643：窗口缩放因子（render 期每帧同步——HiDPI 侧栏缩略不发
+    /// 虚；1.0 = 单倍屏零行为变化）。
+    scale_factor: f32,
 }
 
 impl PdfThumbnailsView {
@@ -146,6 +151,7 @@ impl PdfThumbnailsView {
             polling: false,
             scroll: UniformListScrollHandle::new(),
             error: None,
+            scale_factor: 1.0,
         }
     }
 
@@ -164,6 +170,7 @@ impl PdfThumbnailsView {
             polling: false,
             scroll: UniformListScrollHandle::new(),
             error: Some(message),
+            scale_factor: 1.0,
         }
     }
 
@@ -178,9 +185,17 @@ impl PdfThumbnailsView {
         THUMB_WIDTH as f32 * aspect + CAPTION_H + ROW_GAP
     }
 
+    /// #643：设备像素请求宽——THUMB_WIDTH（逻辑显示宽）× 窗口缩放
+    /// 因子。防御域 [1.0, 4.0]（低于 1 不降密度；上限由 sf 域钳）。
+    /// 显示尺寸恒 THUMB_WIDTH 逻辑 px（位图密度与显示尺寸解耦）。
+    fn thumb_request_width(&self) -> u32 {
+        (THUMB_WIDTH as f32 * self.scale_factor.clamp(1.0, 4.0)) as u32
+    }
+
     /// 就绪判定（懒加载断言读面——测试与 shell 同源）。
     pub fn thumb_ready(&self, page: usize) -> bool {
-        self.cache.contains(&(page as u32))
+        self.cache
+            .contains(&(page as u32, self.thumb_request_width()))
     }
 
     /// 当前高亮行（联动断言读面）。
@@ -190,20 +205,23 @@ impl PdfThumbnailsView {
 
     /// 提交一页缩略光栅（已缓存/在途/失败幂等跳过）。
     fn submit_thumb(&mut self, page: u32, cx: &mut gpui::Context<Self>) {
+        // #643：请求密度 = 设备像素宽（HiDPI 侧栏不发虚）；显示恒
+        // THUMB_WIDTH 逻辑 px。worker 可变借用前先行解析（键口径单点）。
+        let width = self.thumb_request_width();
         let Some(worker) = self.worker.as_mut() else {
             return;
         };
-        if self.cache.contains(&page) || self.failed.contains(&page) {
+        if self.cache.contains(&(page, width)) || self.failed.contains(&page) {
             return;
         }
-        if self.pending.values().any(|&p| p == page) {
+        if self.pending.values().any(|&p| p.0 == page) {
             return;
         }
         let id = worker.submit(RenderRequest {
             page: PageIndex(page),
-            width_px: THUMB_WIDTH,
+            width_px: width,
         });
-        self.pending.insert(id, page);
+        self.pending.insert(id, (page, width));
         if !self.polling {
             self.polling = true;
             Self::spawn_poll_loop(cx);
@@ -245,14 +263,14 @@ impl PdfThumbnailsView {
         while let Some(reply) = worker.try_recv() {
             match reply {
                 WorkerReply::Done { id, result } => {
-                    let Some(page) = self.pending.remove(&id) else {
+                    let Some((page, width)) = self.pending.remove(&id) else {
                         continue; // 迟到回执（换代竞态）——机械丢弃。
                     };
                     match result {
                         Ok(rendered) => {
                             if let Some(image) = rendered_page_to_image(&rendered) {
                                 let cost = rendered.bgra.len();
-                                let _evicted = self.cache.put(page, Arc::new(image), cost);
+                                let _evicted = self.cache.put((page, width), Arc::new(image), cost);
                                 cx.notify();
                             } else {
                                 self.failed.insert(page);
@@ -266,7 +284,7 @@ impl PdfThumbnailsView {
                     }
                 }
                 WorkerReply::Cancelled { id } | WorkerReply::Timeout { id } => {
-                    if let Some(page) = self.pending.remove(&id) {
+                    if let Some((page, _width)) = self.pending.remove(&id) {
                         self.failed.insert(page);
                         cx.notify();
                     }
@@ -291,7 +309,7 @@ impl PdfThumbnailsView {
         // 三态：Ready（缓存位图）/ Failed（敌意页）/ Pending（占位）。
         let thumb: gpui::AnyElement = if self.failed.contains(&(idx as u32)) {
             failed_slot(idx, colors.border, img_h)
-        } else if let Some(image) = self.cache.get(&(idx as u32)) {
+        } else if let Some(image) = self.cache.get(&(idx as u32, self.thumb_request_width())) {
             gpui::img(ImageSource::Render(image.clone()))
                 .id(gpui::ElementId::NamedInteger(
                     "pdf-thumb-img".into(),
@@ -374,6 +392,9 @@ fn failed_slot(idx: usize, border: gpui::Hsla, img_h: f32) -> AnyElement {
 
 impl Render for PdfThumbnailsView {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // #643：窗口缩放因子捕获（每帧同步——懒提交点 read 同字段，
+        // 键口径恒一致）。
+        self.scale_factor = _window.scale_factor();
         let colors = cx.theme().colors().clone();
         // error 态：明示面板（不白屏；壳据主视图态不挂侧栏，此面为
         // 独立持有实体时的防御呈现）。
@@ -465,6 +486,35 @@ mod tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
+
+    /// #643：HiDPI 请求密度——sf 升档请求宽翻倍（键口径同步，sf 换档
+    /// 自然 miss 重光栅）；单倍屏与 v1 同值；异常低报不降密度。
+    #[gpui::test]
+    fn hidpi_thumb_request_density_scales(cx: &mut gpui::TestAppContext) {
+        let hooks = PdfThumbsHooks {
+            jump_to_page: Arc::new(|_, _, _| {}),
+            current_page: Arc::new(|_| 0),
+        };
+        let view = cx.update(|app| {
+            app.new(|_| {
+                PdfThumbnailsView::error_state(
+                    1.414,
+                    hooks,
+                    "测试态：引擎缺席（密度口径面）".into(),
+                )
+            })
+        });
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                assert_eq!(v.thumb_request_width(), THUMB_WIDTH);
+                v.scale_factor = 2.0;
+                assert_eq!(v.thumb_request_width(), THUMB_WIDTH * 2);
+                // sf 域防御：<1 不降密度（THUMB_WIDTH 即保底）。
+                v.scale_factor = 0.5;
+                assert_eq!(v.thumb_request_width(), THUMB_WIDTH);
+            })
+        });
+    }
 
     fn fixture_bytes(name: &str) -> Vec<u8> {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

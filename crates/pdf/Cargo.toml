@@ -56,3 +56,11 @@ engine-lopdf = ["dep:lopdf", "dep:sha2"]
 [[example]]
 name = "q31_acceptance"
 required-features = ["engine-lopdf"]
+
+# #634 D1（#51 工作线 D）：显示矩阵测试面（tests/pdfr_display_matrix.rs）
+# 的**独立解析对照器**——lopdf 不经 pdfium 自证几何（三方对照的引擎内
+# 第三方）。版本/feature 与主依赖同源（=0.46.0 / default-features 同关，
+# 与 mang-shell dev-deps 先例一致——Cargo.lock 既有条目，零新三方）；
+# dev 依赖不进 shipped 依赖图。
+[dev-dependencies]
+lopdf = { version = "=0.46.0", default-features = false }
