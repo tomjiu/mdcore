@@ -68,7 +68,7 @@
 |---|---|---|
 | E-1 | 明 / 暗主题两态 | 侧栏无透明按钮；主题色 / 尺寸 / 圆角 / 焦点环统一。**Linux 侧自动化背书（#47 批次 4）**：`theme_visual_smoke.sh` → `theme_visual_check.py` 11 项像素断言（双态底色分向 / 切换真实生效 / 侧栏随主题 / 活动条墨迹可见性），证据 PNG `theme-light.png` / `theme-dark.png`；「无透明按钮」人工观感与四态统一仍属真机验收 |
 | E-2 | hover / 选中 / 焦点 / 禁用态 | 四态可见且一致。**Linux 侧自动化背书（#47 批次 5+6，hover/选中/禁用三面）**：`--smoke-hover-state` 真实鼠标事件管线三帧断言（hover 底色 light Δ-14.2/dark Δ+24.5、选中图标蓝度 +19.5、文件树取消选中 -10.5、视图切换 3.6% 变化像素）+ `--smoke-disabled-state` 双面断言（**产品行为：git 面板「刷新」钮在不可用态改禁用渲染**——无 hover/无监听/Color::Disabled；禁用面悬停+点击零响应逐字节验证，对照面 hover/点击生效+`git: ` 证据行增量），证据 `hover-light/dark.png`、`ds-disabled/control.png`；**焦点环暂无确定性夹具**（渲染依赖键盘 focus_visible 语义）——待后续功能批补夹具，完整四态人工观感归 #48 真机 |
-| 按钮六问 | （用户原话逐条） | ① 各面板按钮点击有响应（含 hover）②「打开文件」按钮→选择器→成功 ③ 侧栏无透明按钮（明暗两态）④ 菜单栏贴左与 zed/vscode 同款位 ⑤ 左右栏布局合理 ⑥ 迁移组件真机行为：右键菜单 / 菜单栏 / 命令面板 / Ctrl+G 跳行 / tab 条 / settings 模态 / panels·file_tree·git_panel 列表 |
+| 按钮六问 | （用户原话逐条） | ① 各面板按钮点击有响应（含 hover）②「打开文件」按钮→选择器→成功 ③ 侧栏无透明按钮（明暗两态）④ 菜单栏贴左与 zed/vscode 同款位 ⑤ 左右栏布局合理 ⑥ 迁移组件真机行为：右键菜单 / 菜单栏 / 命令面板 / Ctrl+G 跳行 / tab 条 / settings 模态 / panels·file_tree·git_panel 列表。**⑥ 菜单栏 GUI 级背书（#47 批次 7）**：`--smoke-menu` 点击「文件」开下拉（B 帧下拉区 54.45% 像素变化——浮层+菜单项真实渲染）→ 再点击 toggle 关（C 帧与 A 帧逐字节相等 + `menu: open/close` 双证据行），证据 `menu-light.png`；Esc 关闭链与菜单项执行派发归头单测（menu_bar_lifecycle_tests / ui_wiring_faces） |
 
 ## 六、Linux 侧启动证据（2026-11-10，本批实测）
 

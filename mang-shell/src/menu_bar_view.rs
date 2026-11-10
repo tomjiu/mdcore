@@ -57,6 +57,8 @@ pub fn menu_titles(
         .gap(px(crate::menu_bar::TITLES_GAP))
         .children(menus.iter().enumerate().map(|(idx, menu)| {
             let is_open = open_idx == Some(idx);
+            // #47 批次 7：证据行标签（listener move 捕获需要 owned）。
+            let trigger_label = menu.label.clone();
             div()
                 .id(SharedString::from(format!("menu-title-{}", menu.id)))
                 .h_full()
@@ -79,8 +81,12 @@ pub fn menu_titles(
                     cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                         let x = f32::from(event.position.x);
                         if this.is_menu_bar_open_at(idx) {
+                            // #47 批次 7（A4）：菜单开/关 GUI 级证据行——
+                            // --smoke-menu 消费（menu_check.py 双通道断言）。
+                            eprintln!("menu: close（标题点击 toggle）");
                             this.close_menu_bar(window, cx);
                         } else {
+                            eprintln!("menu: open {trigger_label} @x≈{x:.0}");
                             this.open_menu_bar(idx, x, window, cx);
                         }
                     }),

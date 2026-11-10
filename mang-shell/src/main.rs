@@ -20,6 +20,9 @@
 //!                               下切 git 视图 → 悬停/点击禁用的「刷新」钮
 //!                               （git_panel 不可用态禁用渲染）；外层双跑
 //!                               （禁用面/带工作区对照面）三帧+日志断言
+//! mang-shell --smoke-menu <mode>    #47 A4 菜单开/关：点击「文件」开下拉
+//!                               → 再点击 toggle 关（menu: open/close 证据行
+//!                               + 三帧像素断言；Esc 链归头单测）
 //! mang-shell --check-pdfium  pdfium 部署自检（#68 方向一）：定位序逐层
 //!                               探针 + 绑定走查 + 修复指引；纯 CLI 不开窗，
 //!                               退出码 0=已绑定 / 3=未绑定
@@ -259,6 +262,21 @@ fn main() {
     let smoke_theme: Option<&'static str> = args
         .iter()
         .position(|a| a == "--smoke-theme")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| match v.as_str() {
+            theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
+            theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
+            _ => None,
+        });
+    // 接线登记批次 7（#47 A4/按钮六问⑥）：--smoke-menu <light|dark>——
+    // 点击「文件」标题触发器（36,18）真实打开菜单下拉（open_menu_bar
+    // 完整链 + menu: open 证据行）→ 再次点击同触发器 toggle 关闭
+    // （menu: close 证据行）。menu_check.py 断言：B 帧下拉区像素变化
+    // （浮层+菜单项）/ C 帧与 A 帧逐字节相等（真关净）+ 开/关证据行在档。
+    // Esc 关闭链已由头单测（menu_bar_lifecycle_tests）覆盖。
+    let smoke_menu: Option<&'static str> = args
+        .iter()
+        .position(|a| a == "--smoke-menu")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| match v.as_str() {
             theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
@@ -663,6 +681,16 @@ fn main() {
                             shell.set_theme_mode(mode, cx);
                         })
                     });
+                })
+                .detach();
+            }
+
+            // 接线登记批次 7（#47 A4）：点击开菜单 → Esc 关（时间线见
+            // 旗标注释）。
+            if let Some(mode) = smoke_menu {
+                let handle = window_handle.clone();
+                cx.spawn(async move |cx| {
+                    run_menu_script(&handle, cx, mode).await;
                 })
                 .detach();
             }
@@ -1478,6 +1506,95 @@ async fn run_disabled_state_script(
     eprintln!(
         "disabled-state-smoke: script done (theme {mode} → act-git → park → hover refresh → click)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 接线登记批次 7（#47 A4）：--smoke-menu 脚本（菜单开/关 GUI 证据）
+// ---------------------------------------------------------------------------
+
+/// A4 菜单烟雾脚本：点击「文件」标题触发器真实打开下拉（open_menu_bar
+/// 完整链——触发器 listener 带 `menu: open` 证据行）→ Esc 经完整键派发
+/// 管线关菜单（menu::Cancel → DismissEvent → close_menu_bar）。
+/// 外层 A@5.8s（基态）/ B@7.6s（开菜单）/ C@9.4s（Esc 后）截帧，
+/// `menu_check.py` 断言下拉区像素变化 / 关净逐字节相等 / 证据行在档。
+///
+/// 坐标（窗口内容系）：「文件」触发器 (36,18)——标题栏 36px 高，菜单行
+/// 自 x≈8 起（批次 4/5 帧实测）。
+async fn run_menu_script(
+    window: &gpui::WindowHandle<shell::ShellApp>,
+    cx: &mut gpui::AsyncApp,
+    mode: &'static str,
+) {
+    use gpui::{
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
+        px,
+    };
+
+    let park = |x: f32, y: f32| {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(x), px(y)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        })
+    };
+    let down = |x: f32, y: f32| {
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        })
+    };
+    let up = |x: f32, y: f32| {
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        })
+    };
+
+    async fn step(
+        window: &gpui::WindowHandle<shell::ShellApp>,
+        cx: &mut gpui::AsyncApp,
+        at_ms: u64,
+        ev: PlatformInput,
+        refresh: bool,
+    ) {
+        cx.background_executor()
+            .timer(Duration::from_millis(at_ms))
+            .await;
+        let any_handle: gpui::AnyWindowHandle = (*window).into();
+        let _ = cx.update_window(any_handle, |_, window, cx| {
+            window.dispatch_event(ev, cx);
+            if refresh {
+                window.refresh();
+            }
+        });
+    }
+
+    // 相对时间线：1.0s 切主题 → 4.6s 停驻编辑区中性位 → 6.0/6.15s 点击
+    // 「文件」触发器（开菜单 + menu: open 证据行）→ 8.0/8.15s 再次点击同
+    // 触发器（**toggle 关闭**——menu_bar_view 同一监听器的关闭分支 +
+    // menu: close 证据行）。Esc 关闭链（menu::Cancel → DismissEvent）
+    // 依赖 open_menu_bar 的两层 on_next_frame 焦点注入，无头烟雾无输入
+    // 事件泵帧时不可达（生产环境靠常驻重绘泵帧）——该面已由头单测
+    // （menu_bar_lifecycle_tests）覆盖，本脚本走点击 toggle 关闭。
+    cx.background_executor()
+        .timer(Duration::from_millis(1000))
+        .await;
+    let _ = cx.update(|cx| {
+        window.update(cx, |shell, _window, cx| {
+            shell.set_theme_mode(mode, cx);
+        })
+    });
+    step(window, cx, 3600, park(900., 300.), true).await; // script 4.6s
+    step(window, cx, 1400, down(36., 18.), false).await; // script 6.0s：开
+    step(window, cx, 150, up(36., 18.), false).await; // script 6.15s
+    step(window, cx, 1850, down(36., 18.), false).await; // script 8.0s：toggle 关
+    step(window, cx, 150, up(36., 18.), false).await; // script 8.15s
+    eprintln!("menu-smoke: script done (theme {mode} → park → click 文件 open → click close)");
 }
 
 // ---------------------------------------------------------------------------
