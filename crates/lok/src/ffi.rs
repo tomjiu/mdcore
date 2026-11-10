@@ -99,6 +99,7 @@ mod imp {
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryExA(lpLibFileName: LPCSTR, hFile: *mut c_void, dwFlags: DWORD) -> HMODULE;
+        fn SetDllDirectoryA(lpPathName: LPCSTR) -> BOOL;
         fn GetProcAddress(hModule: HMODULE, lpProcName: LPCSTR) -> *mut c_void;
         fn FreeLibrary(hModule: HMODULE) -> BOOL;
         fn GetLastError() -> DWORD;
@@ -109,18 +110,32 @@ mod imp {
     pub fn open(path: &std::path::Path) -> Result<RawLib, String> {
         // LO 的 DLL 全在 program/ 同目录：LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
         // 让依赖 DLL 解析落在同目录（ElyOffice 同参数）。
+        //
+        // #69 Windows 实测补充：仅 DLL_LOAD_DIR 不够——mergedlo.dll 的依赖
+        // 解析报 GetLastError=126（ERROR_MOD_NOT_FOUND）。原因是 LO 26.x 的
+        // 内核还会延迟加载同目录的其他组件 DLL，而标准搜索路径不含 program/。
+        // 修复：加载前 SetDllDirectoryA(program 目录)（加入搜索序），
+        // 加载后还原空（不污染进程级搜索路径）。SetDllDirectory 同时隐式
+        // 启用 LOAD_LIBRARY_SEARCH_USER_DIRS 语义，双保险。
+        let dir = path.parent().unwrap_or(path);
+        let dir_c = std::ffi::CString::new(dir.to_string_lossy().as_bytes())
+            .map_err(|e| format!("目录路径含 NUL: {e}"))?;
         let c = std::ffi::CString::new(path.to_string_lossy().as_bytes())
             .map_err(|e| format!("路径含 NUL: {e}"))?;
         unsafe {
+            SetDllDirectoryA(dir_c.as_ptr().cast());
             let h = LoadLibraryExA(
                 c.as_ptr().cast(),
                 std::ptr::null_mut(),
                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
             );
+            // 还原搜索路径（NULL = 恢复默认），失败也继续用句柄
+            SetDllDirectoryA(std::ptr::null());
             if h.is_null() {
                 return Err(format!(
-                    "LoadLibraryExA 失败：GetLastError={}",
-                    GetLastError()
+                    "LoadLibraryExA 失败：GetLastError={}（dir={:?}）",
+                    GetLastError(),
+                    dir
                 ));
             }
             Ok(RawLib(h))
