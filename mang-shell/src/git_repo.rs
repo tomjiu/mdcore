@@ -693,14 +693,37 @@ mod tests {
 #[cfg(test)]
 mod whitespace_path_regression {
     use super::*;
+    /// #65 同款夹具卫生（本面 2026-11-10 实测再泄漏：pr610-space-<pid> 在
+    /// cwd 残留，`git add -A` 纪律下有嵌套仓误提交风险）：temp_dir + Drop
+    /// 首尾自清——断言失败也回收，实测零再生。
+    struct TempRoot(std::path::PathBuf);
+    impl TempRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "pr610-space-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     #[test]
     fn leading_space_workspace_keeps_its_real_git_prefix() {
-        // 夹具卫生（#47 批次 4 随批修复）：原实现用 current_dir() 在仓内
-        // 建 pr610-space-* 且零清理——旧会话实测残留 7 枚，有误提交入仓
-        // 风险（同 PR#65 修的另两枚同源缺陷）。迁 temp_dir + 首尾自清，
-        // 与 mdc-598-unit-* 同范式。
-        let root = std::env::temp_dir().join(format!("pr610-space-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // 夹具卫生（#47 批次 4 与 #83 898ea80 双路同源修复，整合取
+        // main 的 TempRoot RAII 范式）：原实现用 current_dir() 在仓内
+        // 建 pr610-space-* 且零清理——旧会话实测残留 7 枚，有误提交
+        // 入仓风险（同 PR#65 修的另两枚同源缺陷）。
+        let guard = TempRoot::new();
+        let root = guard.0.clone();
         let workspace = root.join(" leading");
         std::fs::create_dir_all(&workspace).unwrap();
         let file = workspace.join("tracked.txt");

@@ -57,6 +57,9 @@ pub mod docx_edit_bridge; // #115：docx 可编辑化——Buffer ↔ DocxEditor
 // #50 C1：DOCX LOK 会话层（宿主侧异步包装——线程演员 + mpsc 回执；
 // GPUI 零依赖，零 crates/lok 私有域触碰）。
 pub mod docx_lok_session;
+// #629：docx 保存/查找替换 UI 链（测试姿势面）。
+#[cfg(test)]
+mod docx_save_ui_tests;
 pub mod fence; // #205：fence 缓存重建（纯逻辑：FenceCursor 推进 + 增量/全量）
 pub mod find_bar;
 pub mod highlight;
@@ -954,37 +957,6 @@ impl Editor {
             .as_ref()
             .map(|edit| Box::new(edit.clone()) as Box<dyn crate::editor::buffer::UndoHook>);
         self.buffer.set_undo_hook(undo);
-    }
-
-    /// #115：**并行增删行**后的行归属平移（单点插入/整行删除之外的
-    /// 手势：缩进批的逐行插入、查找替换批的多点替换）。
-    ///
-    /// 单点编辑的行归属重排由 Buffer 钩子在 `replace_range` 内完成；批量
-    /// 手势逐行走 `replace_range` 时每次行数变化都会被重映射一次，等价于
-    /// 这里再按净变化补一次——`delta == 0` 时零操作。
-    /// #115：**批量手势**（缩进批 / 查找替换批）后的行归属兜底重排。
-    ///
-    /// 单点编辑的行归属重排由 Buffer 钩子在 `replace_range` 内完成（含
-    /// 派生入口）；批量手势里钩子被临时摘除（不逐点问门禁），故在收尾时
-    /// 按「行数净变化」补一次——**数量保真**的兜底（精确归属由下一帧
-    /// 保存时的正文比对承担：正文拿不对的段落按原文写回，绝不误改）。
-    fn remap_docx_rows_after_batch(&mut self) {
-        let Some(edit) = self.docx_edit.as_ref() else {
-            return;
-        };
-        let want = self.buffer.line_count();
-        let mut e = edit.borrow_mut();
-        let rows = e.bridge.rows_mut();
-        while rows.len() < want {
-            let last = rows
-                .last()
-                .copied()
-                .unwrap_or(LineBlock::User { join: true });
-            rows.push(last);
-        }
-        while rows.len() > want {
-            rows.pop();
-        }
     }
 
     /// #115：把 Buffer 现状重新落进 docx 引擎待落账层（幂等）。
@@ -2805,9 +2777,9 @@ impl Editor {
     /// - 每光标独立判定：有选区 → 覆盖行段入缩进集；裸光标 Tab →
     ///   光标处插单位（多光标走 `insert_all` 既有批语义）；裸光标
     ///   Shift+Tab → 当前行入缩进集。
-    /// - 行缩进/反缩进：全行去重后**一次手势批应用**（文档序尾→头
-    ///   逐行 `replace_range` + `add_undo_batch` 登记——Ctrl+Z 一键
-    ///   连撤整批）；与裸光标插入路径同手势时批点数累加。
+    /// - 行缩进/反缩进：全行去重后一次 `replace_batch`，逐点预检保护
+    ///   范围并保存精确历史；Ctrl+Z 一键撤整批。与裸光标插入路径同
+    ///   手势时撤销条目数累加。
     /// - 光标/选区列按各行的编辑位移平移（缩进 +n / 反缩进 -k，
     ///   列下限 0）。
     fn indent_key(&mut self, shift: bool) {
@@ -2863,17 +2835,12 @@ impl Editor {
                 edits.push((start, end, text));
             }
             if !edits.is_empty() {
-                // #115：一手势多行批——与查找替换同口径（派生编辑：不逐行
-                // 问门禁，收尾按行数保真补映射；缩进只动行首空白，改不坏
-                // 段落文本）。
-                let hook = self.buffer.take_edit_hook();
-                for (start, end, text) in &edits {
-                    self.buffer.replace_range(*start, *end, text);
+                // 保护域/单元格也必须预检，不能摘掉 DOCX 钩子后猜测行身份。
+                if self.buffer.replace_batch(edits.clone()) == 0 {
+                    return;
                 }
-                self.buffer.set_edit_hook(hook);
-                self.remap_docx_rows_after_batch();
-                // 一手势批登记（含 ② 的插入条数——add_undo_batch 累加）。
-                self.cursors.add_undo_batch(edits.len());
+                // replace_batch 创建一条历史记录，而不是每行一条。
+                self.cursors.add_undo_batch(1);
                 // 光标/选区列按行位移平移。
                 self.cursors
                     .shift_cols_by_line(|line| deltas.get(&line).copied().unwrap_or(0));
@@ -3221,6 +3188,20 @@ impl Editor {
     }
 
     /// 查找条按键分发（`find_focus` 聚焦时）。
+    fn replace_find(&mut self, all: bool) {
+        // 查找替换也是正文编辑；沿用保护检查和精确批/撤销通知。
+        if let Some(find) = self.find.as_mut() {
+            if all {
+                let n = find.replace_all(&mut self.buffer);
+                eprintln!("find-replace: replace-all {n} matches");
+            } else {
+                find.replace_current(&mut self.buffer);
+            }
+        }
+        self.sync_cursors_from_buffer();
+        self.after_edit();
+    }
+
     fn dispatch_find_key(
         &mut self,
         event: &KeyDownEvent,
@@ -3249,31 +3230,11 @@ impl Editor {
             }
             // G1：替换当前（替换行 Enter）——单点替换，一次 undo。
             FindKeyOutcome::ReplaceCurrent => {
-                // #115：查找替换是**派生编辑**（替换文本是查找条给的，不是
-                // 用户往正文里敲的）——不向 docx 桥问「这一行能否改」（否则
-                // 表格/锁定行全文会整体命中不了），安全面由随后的回写闸门
-                // （只回写可编辑段）承担。
-                let hook = self.buffer.take_edit_hook();
-                if let Some(f) = self.find.as_mut() {
-                    f.replace_current(&mut self.buffer);
-                }
-                self.buffer.set_edit_hook(hook);
-                self.remap_docx_rows_after_batch();
-                self.sync_cursors_from_buffer();
-                self.after_edit();
+                self.replace_find(false);
             }
             // G1：全部替换——一次批量编辑，一条 undo 记录。
             FindKeyOutcome::ReplaceAll => {
-                // #115：同 ReplaceCurrent——整批一次派生（一条 undo）。
-                let hook = self.buffer.take_edit_hook();
-                if let Some(f) = self.find.as_mut() {
-                    let n = f.replace_all(&mut self.buffer);
-                    eprintln!("find-replace: replace-all {n} matches");
-                }
-                self.buffer.set_edit_hook(hook);
-                self.remap_docx_rows_after_batch();
-                self.sync_cursors_from_buffer();
-                self.after_edit();
+                self.replace_find(true);
             }
             // G1：选项/输入行切换——纯 UI 态，重绘即可。
             FindKeyOutcome::OptionsChanged => {}

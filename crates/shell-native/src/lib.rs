@@ -56,76 +56,47 @@ window.__inject_chunk = (chunk, first) => {
 /// ```
 pub const BLUEPRINT_NOTE: &str = "see module docs; enable deps in Cargo.toml on a native host";
 
-/// s5a-env：依赖实体化后的最小原生实现面（tao + wry + GTK3/Linux）。
+/// 跨平台纯逻辑面（#71 后续：--all-targets Windows 门）。
 ///
-/// 范围纪律：仅为实机连通性服务（cargo check + Xvfb 冒烟）——对接点
-/// 清单 1–5 的完整壳功能不在 s5a-env 范围。三个构件：
-/// 1. [`native::WryHost`]：`mdshell::Host` 在 wry WebView 上的最小实现
-///    （evaluate_script 面，对接点 2 的宿主侧）；
-/// 2. [`native::ShellConfig`] / [`native::run_smoke`]：tao 事件循环 +
-///    wry WebView 的可退出冒烟运行器（examples/xvfb_smoke.rs 消费）；
-/// 3. `escape_js_string`：注入脚本的 JSON 字符串转义（无三方 serde 依赖）。
-#[cfg(target_os = "linux")]
-pub mod native {
-    use std::cell::Cell;
-    use std::rc::Rc;
-    use std::time::{Duration, Instant};
-
-    use tao::event::{Event, StartCause, WindowEvent};
-    use tao::event_loop::{ControlFlow, EventLoop};
-    use tao::window::WindowBuilder;
-
-    /// 冒烟/最小壳运行配置。
-    pub struct ShellConfig {
-        /// 初始 URL（`about:blank`、`data:` 或 `file://…/dist/index.html`）。
-        pub url: String,
-        pub title: String,
-        /// 逻辑尺寸（width, height）。
-        pub size: (u32, u32),
-        /// 存活看门狗：到时自动退出（None = 常驻直至窗口关闭）。
-        pub quit_after: Option<Duration>,
-        /// 探针发出后的回传等待窗（默认 700ms；异步探针/轮询式探针可加大）。
-        pub flush_millis: u64,
-        /// s5a-env 增强：看门狗到时执行的可选探针 JS（默认仅响应探测）。
-        ///
-        /// wry 0.46 `evaluate_script` 无返回值——探针结果经导航拦截通道回传：
-        /// 探针 JS 自行触发 `location.assign("probe://r/" + encodeURIComponent(...))`，
-        /// 宿主截获解码后打印 `smoke: probe: <payload>` 并记为证据（取消导航）。
-        pub probe_js: Option<String>,
-        /// mdapp:// 本地 bundle 根（指向 dist/）。设置后注册 mdapp:// scheme
-        /// serve 该目录，初始 URL 改为 mdapp://localhost/。
-        ///
-        /// 为什么不用 file://：WebKit file:// 下 wasm fetch/ESM 被安全策略拦
-        /// （Xvfb 实证：页面 title 出现但全部探针空、轮询 12 次不初始化；
-        /// 同 bundle http:// 下全绿）——dist 自包含声明在 file:// 不成立。
-        /// mdapp:// 是桌面壳加载本地 bundle 的产品级形态。
-        pub dist_root: Option<String>,
-    }
-
-    /// wry WebView 宿主面（对接点 2 宿主侧的最小实现）。
+/// 这些函数无 tao/wry/GTK 依赖，是壳的通用工具面；从 Linux-only 的
+/// [`native`] 拆出后，其单元测试在 Windows 目标同样编译并运行（此前
+/// 测试钉在 `super::native` 上，`cargo check --all-targets --target
+/// x86_64-pc-windows-msvc` 编译红——与 #71 同型的「单平台验证」缺陷）。
+///
+/// 构件：
+/// 1. [`webutil::escape_js_string`]：注入脚本的 JSON 字符串转义（无三方 serde 依赖）；
+/// 2. [`webutil::percent_decode`]：probe:// 导航 payload 还原；
+/// 3. [`webutil::serve_dist`]：mdapp:// 静态文件映射（含穿越防护），
+///    返回平台无关的 [`webutil::DistResponse`]——wry `http::Response`
+/// 的转换留在 Linux [`native`] 的协议回调里做。
+pub mod webutil {
+    /// `serve_dist` 的平台无关产物（status/mime/body）。
     ///
-    /// `surface_load_markdown` = 先装注入脚本（INJECT_SNIPPET）再调
-    /// `window.__inject(md)`；错误透传 wry evaluate_script。
-    pub struct WryHost<'a> {
-        view: &'a wry::WebView,
+    /// GUI 栈（wry）只在 Linux 目标可用，但路径映射/穿越防护/mime
+    /// 判定是纯逻辑——本结构使其可在任意目标测试（Windows 亦覆盖
+    /// 「穿越四形全 404」这类安全面断言）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DistResponse {
+        pub status: u16,
+        pub content_type: &'static str,
+        pub body: Vec<u8>,
     }
 
-    impl<'a> WryHost<'a> {
-        pub fn new(view: &'a wry::WebView) -> Self {
-            Self { view }
+    impl DistResponse {
+        fn ok(content_type: &'static str, body: Vec<u8>) -> Self {
+            Self {
+                status: 200,
+                content_type,
+                body,
+            }
         }
     }
 
-    impl mdshell::Host for WryHost<'_> {
-        fn surface_load_markdown(&mut self, markdown: &str) -> Result<(), String> {
-            let js = format!(
-                "{}\nwindow.__inject && window.__inject({});",
-                crate::INJECT_SNIPPET,
-                escape_js_string(markdown)
-            );
-            self.view
-                .evaluate_script(&js)
-                .map_err(|e| format!("wry evaluate_script: {e:?}"))
+    fn not_found() -> DistResponse {
+        DistResponse {
+            status: 404,
+            content_type: "text/plain; charset=utf-8",
+            body: b"not found".to_vec(),
         }
     }
 
@@ -186,12 +157,7 @@ pub mod native {
     /// 职责：path → dist 下文件（/ 或空 → index.html）→ 200 + mime；
     /// 目录穿越（../ 或逃逸 root）→ 404；读失败 → 404。无缓存（每请求读盘，
     /// 冒烟/开发态优先简单；未来需要时再加）。
-    pub fn serve_dist(
-        root: &std::path::Path,
-        raw_path: &str,
-    ) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
-        use std::borrow::Cow;
-
+    pub fn serve_dist(root: &std::path::Path, raw_path: &str) -> DistResponse {
         let decoded = percent_decode(raw_path);
         let rel = decoded.trim_start_matches('/');
         let rel = if rel.is_empty() { "index.html" } else { rel };
@@ -202,23 +168,9 @@ pub mod native {
         }
         let full = root.join(rel);
         match std::fs::read(&full) {
-            Ok(bytes) => {
-                let mime = mime_of(rel);
-                wry::http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", mime)
-                    .body(Cow::Owned(bytes))
-                    .unwrap_or_else(|_| not_found())
-            }
+            Ok(bytes) => DistResponse::ok(mime_of(rel), bytes),
             Err(_) => not_found(),
         }
-    }
-
-    fn not_found() -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
-        wry::http::Response::builder()
-            .status(404)
-            .body(std::borrow::Cow::Borrowed(&b"not found"[..]))
-            .unwrap()
     }
 
     fn mime_of(path: &str) -> &'static str {
@@ -238,6 +190,83 @@ pub mod native {
             "woff2" => "font/woff2",
             "ttf" => "font/ttf",
             _ => "application/octet-stream",
+        }
+    }
+}
+
+/// s5a-env：依赖实体化后的最小原生实现面（tao + wry + GTK3/Linux）。
+///
+/// 范围纪律：仅为实机连通性服务（cargo check + Xvfb 冒烟）——对接点
+/// 清单 1–5 的完整壳功能不在 s5a-env 范围。构件：
+/// 1. [`native::WryHost`]：`mdshell::Host` 在 wry WebView 上的最小实现
+///    （evaluate_script 面，对接点 2 的宿主侧）；
+/// 2. [`native::ShellConfig`] / [`native::run_smoke`]：tao 事件循环 +
+///    wry WebView 的可退出冒烟运行器（examples/xvfb_smoke.rs 消费）；
+/// 3. 纯逻辑工具（escape/percent_decode/serve_dist）在跨平台的
+///    [`webutil`]（见该模块文档）。
+#[cfg(target_os = "linux")]
+pub mod native {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use tao::event::{Event, StartCause, WindowEvent};
+    use tao::event_loop::{ControlFlow, EventLoop};
+    use tao::window::WindowBuilder;
+
+    use super::webutil::{escape_js_string, percent_decode};
+
+    /// 冒烟/最小壳运行配置。
+    pub struct ShellConfig {
+        /// 初始 URL（`about:blank`、`data:` 或 `file://…/dist/index.html`）。
+        pub url: String,
+        pub title: String,
+        /// 逻辑尺寸（width, height）。
+        pub size: (u32, u32),
+        /// 存活看门狗：到时自动退出（None = 常驻直至窗口关闭）。
+        pub quit_after: Option<Duration>,
+        /// 探针发出后的回传等待窗（默认 700ms；异步探针/轮询式探针可加大）。
+        pub flush_millis: u64,
+        /// s5a-env 增强：看门狗到时执行的可选探针 JS（默认仅响应探测）。
+        ///
+        /// wry 0.46 `evaluate_script` 无返回值——探针结果经导航拦截通道回传：
+        /// 探针 JS 自行触发 `location.assign("probe://r/" + encodeURIComponent(...))`，
+        /// 宿主截获解码后打印 `smoke: probe: <payload>` 并记为证据（取消导航）。
+        pub probe_js: Option<String>,
+        /// mdapp:// 本地 bundle 根（指向 dist/）。设置后注册 mdapp:// scheme
+        /// serve 该目录，初始 URL 改为 mdapp://localhost/。
+        ///
+        /// 为什么不用 file://：WebKit file:// 下 wasm fetch/ESM 被安全策略拦
+        /// （Xvfb 实证：页面 title 出现但全部探针空、轮询 12 次不初始化；
+        /// 同 bundle http:// 下全绿）——dist 自包含声明在 file:// 不成立。
+        /// mdapp:// 是桌面壳加载本地 bundle 的产品级形态。
+        pub dist_root: Option<String>,
+    }
+
+    /// wry WebView 宿主面（对接点 2 宿主侧的最小实现）。
+    ///
+    /// `surface_load_markdown` = 先装注入脚本（INJECT_SNIPPET）再调
+    /// `window.__inject(md)`；错误透传 wry evaluate_script。
+    pub struct WryHost<'a> {
+        view: &'a wry::WebView,
+    }
+
+    impl<'a> WryHost<'a> {
+        pub fn new(view: &'a wry::WebView) -> Self {
+            Self { view }
+        }
+    }
+
+    impl mdshell::Host for WryHost<'_> {
+        fn surface_load_markdown(&mut self, markdown: &str) -> Result<(), String> {
+            let js = format!(
+                "{}\nwindow.__inject && window.__inject({});",
+                crate::INJECT_SNIPPET,
+                escape_js_string(markdown)
+            );
+            self.view
+                .evaluate_script(&js)
+                .map_err(|e| format!("wry evaluate_script: {e:?}"))
         }
     }
 
@@ -271,7 +300,22 @@ pub mod native {
         let mut url = cfg.url.clone();
         if let Some(root) = cfg.dist_root.clone() {
             builder = builder.with_custom_protocol("mdapp".to_string(), move |_id, request| {
-                serve_dist(std::path::Path::new(&root), request.uri().path())
+                // 路径映射/穿越防护在跨平台 webutil；此处只做 wry Response
+                // 形态转换（Linux GUI 面）。
+                let r =
+                    super::webutil::serve_dist(std::path::Path::new(&root), request.uri().path());
+                wry::http::Response::builder()
+                    .status(r.status)
+                    .header("Content-Type", r.content_type)
+                    .body(std::borrow::Cow::Owned(r.body))
+                    .unwrap_or_else(|e| {
+                        // builder 仅因非法 header/status 失败—— DistResponse
+                        // 产物面受控，理论不可达；仍保进不可 panic 面。
+                        wry::http::Response::builder()
+                            .status(404)
+                            .body(std::borrow::Cow::Borrowed(&b"not found"[..]))
+                            .unwrap_or_else(|_| panic!("wry response build: {e}"))
+                    })
             });
             url = "mdapp://localhost/".to_string();
         }
@@ -376,19 +420,21 @@ mod tests {
     }
 
     /// s5a-env：JS 字符串转义面（无三方依赖路径的自锁）。
+    /// #71 后续：纯逻辑测试钉在跨平台 [`webutil`] 上——Windows 目标
+    /// 同样编译运行（不再随 Linux-only `native` 一起被 cfg 掉）。
     #[test]
     fn js_escape_roundtrip_samples() {
-        let e = super::native::escape_js_string("a\"b\\c\nd\te\u{1}");
+        let e = super::webutil::escape_js_string("a\"b\\c\nd\te\u{1}");
         assert_eq!(e, "\"a\\\"b\\\\c\\nd\\te\\u0001\"");
         // 空串与 unicode 边界
-        assert_eq!(super::native::escape_js_string(""), "\"\"");
-        assert_eq!(super::native::escape_js_string("中文"), "\"中文\"");
+        assert_eq!(super::webutil::escape_js_string(""), "\"\"");
+        assert_eq!(super::webutil::escape_js_string("中文"), "\"中文\"");
     }
 
     /// s5a-env：percent_decode 面（合法/非法转义/中文/孤立 %）。
     #[test]
     fn percent_decode_samples() {
-        use super::native::percent_decode;
+        use super::webutil::percent_decode;
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("%E4%B8%AD%E6%96%87"), "中文");
@@ -405,9 +451,11 @@ mod tests {
 
     /// s5a-env：mdapp serve_dist 面（默认页/200+mime/穿越拒绝/404）。
     /// 用临时目录构造最小 bundle，不依赖 web/dist（测试自包含）。
+    /// #71 后续：产物改为平台无关 [`webutil::DistResponse`]——穿越防护
+    /// 断言在 Windows 目标同样生效。
     #[test]
     fn serve_dist_mapping_and_traversal() {
-        use super::native::serve_dist;
+        use super::webutil::serve_dist;
         use std::fs;
 
         let tmp = std::env::temp_dir().join(format!("mdshell_native_test_{}", std::process::id()));
@@ -418,15 +466,12 @@ mod tests {
 
         // / → index.html；路径形 → 文件；mime 面
         let r = serve_dist(&tmp, "/");
-        assert_eq!(r.status(), 200);
-        assert_eq!(
-            r.headers().get("Content-Type").unwrap(),
-            "text/html; charset=utf-8"
-        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type, "text/html; charset=utf-8");
         let r = serve_dist(&tmp, "/pkg/a.wasm");
-        assert_eq!(r.status(), 200);
-        assert_eq!(r.headers().get("Content-Type").unwrap(), "application/wasm");
-        assert_eq!(r.body().as_ref(), b"\0asm-payload");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type, "application/wasm");
+        assert_eq!(r.body.as_slice(), b"\0asm-payload");
 
         // 目录穿越四形（含 percent 编码形）——全 404
         for p in [
@@ -436,11 +481,11 @@ mod tests {
             "/a/..",
         ] {
             let r = serve_dist(&tmp, p);
-            assert_eq!(r.status(), 404, "path {p} must 404");
+            assert_eq!(r.status, 404, "path {p} must 404");
         }
 
         // 不存在文件 → 404
-        assert_eq!(serve_dist(&tmp, "/nope.js").status(), 404);
+        assert_eq!(serve_dist(&tmp, "/nope.js").status, 404);
 
         let _ = fs::remove_dir_all(&tmp);
     }

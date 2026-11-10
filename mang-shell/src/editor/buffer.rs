@@ -118,6 +118,7 @@ impl IndentUnit {
 ///   重算）替换回 `old_text`——undo 不读 `end_del`。
 #[derive(Clone, Debug)]
 struct Edit {
+    history_id: u64,
     start: Point,
     end_del: Point,
     old_text: String,
@@ -129,6 +130,7 @@ struct Edit {
 /// [`Buffer::replace_batch`] 时一次算定）。
 #[derive(Clone, Debug)]
 struct BatchEdit {
+    history_id: u64,
     /// 原始文档坐标起点（批首光标/汇报用——撤销后文档即原始态，
     /// 该 Point 恒有效）。
     start: Point,
@@ -152,6 +154,13 @@ enum Undoable {
 }
 
 impl Undoable {
+    fn history_id(&self) -> u64 {
+        match self {
+            Self::Single(edit) => edit.history_id,
+            Self::Batch(edits) => edits.first().expect("history batch is nonempty").history_id,
+        }
+    }
+
     /// 批量条目的子编辑数（单点为 1）。
     fn edit_count(&self) -> usize {
         match self {
@@ -302,6 +311,10 @@ pub struct EditIntent {
 /// 变更结果摘要（钩子侧据此重映射块表）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditSummary {
+    /// 同一 undo 条目的稳定身份；undo/redo 回放保持该 ID。
+    pub history_id: u64,
+    /// 变更前被替换区间的终点，不能用变更后 cursor 推算。
+    pub before_end: Point,
     /// 变更起点。
     pub start: Point,
     /// 变更后插入文本末尾（纯删除时等同起点）。
@@ -325,6 +338,15 @@ pub trait UndoHook {
     /// 撤销/重做前（`redo = false` = 撤销）：行数变化量，宿主据此先
     /// 调整映射行数（返回 `Err` 不拦——撤销不可拦，仅作诊断）。
     fn before_history(&mut self, redo: bool, delta_lines: i64) -> Result<(), String>;
+    /// 精确历史身份（旧实现默认转发，通用 DOCX 桥据 ID 恢复对应映射）。
+    fn before_history_at(
+        &mut self,
+        redo: bool,
+        delta_lines: i64,
+        _history_id: u64,
+    ) -> Result<(), String> {
+        self.before_history(redo, delta_lines)
+    }
     /// 撤销/重做后实际行数（宿主对齐映射行数）。
     fn after_history(&mut self, redo: bool, lines: usize);
 }
@@ -335,6 +357,11 @@ pub trait EditHook {
     fn before_edit(&mut self, intent: &EditIntent) -> Result<(), String>;
     /// 变更**之后**：宿主据摘要重映射（块表/映射状态）。
     fn after_edit(&mut self, summary: &EditSummary);
+    /// 批内子编辑按原始坐标逆序排列；同 ID 为一个撤销单元。
+    /// 旧钩子仍接收原有汇总，精确映射钩子覆盖此方法消费子编辑。
+    fn after_batch(&mut self, _edits: &[EditSummary], aggregate: &EditSummary) {
+        self.after_edit(aggregate);
+    }
 }
 
 /// #205：fence 增量重建的脏行记账（Buffer 侧记账，Editor 侧
@@ -616,6 +643,16 @@ impl Buffer {
     /// #115：变更前问钩子（拒 → 零变更返回 false），变更后通报摘要。
     /// 返回是否实际变更。
     pub fn replace_range(&mut self, start: Point, end: Point, text: &str) -> bool {
+        self.replace_range_with_intent(start, end, text, true)
+    }
+
+    fn replace_range_with_intent(
+        &mut self,
+        start: Point,
+        end: Point,
+        text: &str,
+        user_intent: bool,
+    ) -> bool {
         let Range { start, end } = self.ordered_range(start..end);
         // no-op 短路（#111）：空域 + 空文本 = 无内容变化——不落 undo
         // 记录、不计版本、不发事件（防无意义事件流 + undo 栈噪音）。
@@ -625,7 +662,6 @@ impl Buffer {
         let old_text = self.range_text(&(start..end));
         let text_lines = text.matches('\n').count();
         let newline_removed = old_text.contains('\n');
-        let user_intent = true;
         let intent = EditIntent {
             start,
             end,
@@ -635,7 +671,8 @@ impl Buffer {
             // 行首换行被删：起点在行尾且删到了下一行首。
             joins_prev: old_text.starts_with('\n'),
         };
-        if let Some(hook) = self.edit_hook.as_mut()
+        if user_intent
+            && let Some(hook) = self.edit_hook.as_mut()
             && let Err(reason) = hook.before_edit(&intent)
         {
             eprintln!("edit-guard: 拒绝编辑（{reason}）");
@@ -661,6 +698,7 @@ impl Buffer {
         ));
         self.revision += 1;
         self.undo_stack.push(Undoable::Single(Edit {
+            history_id: self.revision,
             start,
             end_del: end,
             old_text,
@@ -674,6 +712,8 @@ impl Buffer {
         let line_count = self.line_count();
         if let Some(hook) = self.edit_hook.as_mut() {
             hook.after_edit(&EditSummary {
+                history_id: self.revision,
+                before_end: end,
                 start,
                 end: cursor,
                 lines: line_count,
@@ -714,12 +754,6 @@ impl Buffer {
         // 构建避免二次迭代（一次事务版本只 +1 在事务尾）。
         for (start, end, new_text) in ordered {
             let old_text = self.range_text(&(start..end));
-            self.note_change(crate::doc_events::ChangeRecord::precise(
-                "replace",
-                start,
-                end,
-                new_text.clone(),
-            ));
             let z_start = self.point_to_zoffset(start);
             let z_end_del = self.point_to_zoffset(end);
             let applied_start = (z_start as i64 + shift) as usize;
@@ -733,6 +767,7 @@ impl Buffer {
             );
             rope_edits.push((z_start..z_end_del, new_text.clone()));
             records.push(BatchEdit {
+                history_id: self.revision + 1,
                 start,
                 z_del: (z_start, z_end_del),
                 z_applied: (applied_start, applied_end),
@@ -743,45 +778,65 @@ impl Buffer {
         let mut newline_removed_batch = false;
         // #115：变更前逐条问钩子（锁定行/跨行合并的防线；整批原子——任何
         // 一条被拒 = 整批拒，Buffer 零变更）。
-        // 坐标域：records 的 start 是**原始文档坐标**（应用前换算基准），
-        // 钩子需要的是「应用当时」坐标——按前序净位移累进。
+        // 预检时文本与映射尚未变更，所有意图都使用原始删除区间。
+        // 成功后精确结果按原始坐标逆序通知，前项不会被后项行差影响。
         // 快速路径：无钩子（md 文本面）且整批都不含换行——省去逐条意图
         // 装箱（千处替换的计时门禁在毫秒级，装箱开销会压线）。
         let need_hook = self.edit_hook.is_some()
             || records
                 .iter()
                 .any(|r| r.old_text.contains('\n') || r.new_text.contains('\n'));
-        let mut line_shift: i64 = 0;
         for r in records.iter().filter(|_| need_hook) {
-            let at = Point::new(
-                (r.start.line as i64 + line_shift).max(0) as usize,
-                r.start.col,
-            );
-            if r.old_text.contains('\n') {
-                newline_removed_batch = true;
-            }
-            let old_lines = r.old_text.matches('\n').count();
-            let new_lines = r.new_text.matches('\n').count();
+            newline_removed_batch |= r.old_text.contains('\n');
+            let before_end = self.end_after_insert(&r.start, &r.old_text);
             let intent = EditIntent {
-                start: at,
-                end: at,
-                inserted_lines: new_lines,
-                joins_next: r.new_text.is_empty() && r.old_text.starts_with('\n'),
-                joins_prev: false,
+                start: r.start,
+                end: before_end,
+                inserted_lines: r.new_text.matches('\n').count(),
+                joins_next: before_end.line > r.start.line && r.start.col > 0,
+                joins_prev: r.old_text.starts_with('\n'),
             };
             if let Some(hook) = self.edit_hook.as_mut()
                 && let Err(reason) = hook.before_edit(&intent)
             {
                 eprintln!("edit-guard: 拒绝批量替换（{reason}）");
-                // #178：拒改落账（GUI 反馈面——批量整批原子拒，行取被拒
-                // 首条起点；stderr 保留）。
                 self.last_reject = Some(RejectNotice {
                     reason,
-                    line: at.line,
+                    line: r.start.line,
                 });
                 return 0;
             }
-            line_shift += new_lines as i64 - old_lines as i64;
+        }
+        let before_lines = self.line_count();
+        let before_end = records
+            .last()
+            .map(|r| self.end_after_insert(&r.start, &r.old_text))
+            .expect("nonempty batch");
+        let mut summaries = Vec::new();
+        if self.edit_hook.is_some() {
+            let mut mapped_lines = before_lines;
+            for r in records.iter().rev() {
+                let inserted = r.new_text.matches('\n').count();
+                mapped_lines = mapped_lines - r.old_text.matches('\n').count() + inserted;
+                summaries.push(EditSummary {
+                    history_id: r.history_id,
+                    start: r.start,
+                    before_end: self.end_after_insert(&r.start, &r.old_text),
+                    end: self.end_after_insert(&r.start, &r.new_text),
+                    lines: mapped_lines,
+                    newline_removed: r.old_text.contains('\n'),
+                    user_intent: true,
+                    inserted_lines: inserted,
+                });
+            }
+        }
+        for r in &records {
+            self.note_change(crate::doc_events::ChangeRecord::precise(
+                "replace",
+                r.start,
+                self.end_after_insert(&r.start, &r.old_text),
+                r.new_text.clone(),
+            ));
         }
         // #205：批量多区间——几何不可靠，回退全量（钩子已放行、变更
         // 必然发生）。
@@ -808,28 +863,29 @@ impl Buffer {
         let cursor_now = self.cursor;
         let line_count = self.line_count();
         if let Some(hook) = self.edit_hook.as_mut() {
-            hook.after_edit(&EditSummary {
-                start: first_start,
-                end: cursor_now,
-                lines: line_count,
-                inserted_lines,
-                newline_removed: newline_removed_batch,
-                user_intent: true,
-            });
+            hook.after_batch(
+                &summaries,
+                &EditSummary {
+                    history_id: self.revision,
+                    before_end,
+                    start: first_start,
+                    end: cursor_now,
+                    lines: line_count,
+                    inserted_lines,
+                    newline_removed: newline_removed_batch,
+                    user_intent: true,
+                },
+            );
         }
         n
     }
 
     /// #115：**派生编辑**（非用户意图的内部二次变更：查找替换的重复项剥离）。
     ///
-    /// 与 [`Buffer::replace_range`] 同一变更语义，但**不询问不通报**编辑
-    /// 钩子——这类变更发生在`replace_batch`（已经问过钩子）之后的同一手势
-    /// 里，再问一次会误伤「批量替换恰好覆盖锁定行」的场景。
+    /// 与 [`Buffer::replace_range`] 同一变更语义，只跳过意图裁决；仍通报
+    /// 准确结果与历史身份，防止行归属与撤销栈悄然失同步。
     pub fn replace_range_derived(&mut self, start: Point, end: Point, text: &str) -> bool {
-        let hook = self.edit_hook.take();
-        let ok = self.replace_range(start, end, text);
-        self.edit_hook = hook;
-        ok
+        self.replace_range_with_intent(start, end, text, false)
     }
 
     /// 在光标处插入文本（有选区则先被替换）。
@@ -909,7 +965,7 @@ impl Buffer {
         // #115：撤销前告知宿主（行数变化量——宿主调整映射行数）。
         let delta = history_delta_lines(&entry, false);
         if let Some(h) = self.undo_hook.as_mut() {
-            let _ = h.before_history(false, delta);
+            let _ = h.before_history_at(false, delta, entry.history_id());
         }
         match entry {
             Undoable::Single(edit) => {
@@ -928,6 +984,7 @@ impl Buffer {
                 self.apply_core(edit.start, end_new, &edit.old_text);
                 // redo 方向的 Edit：old_text 恢复后的占位范围即 end_del。
                 self.redo_stack.push(Undoable::Single(Edit {
+                    history_id: edit.history_id,
                     start: edit.start,
                     end_del: self.end_after_insert(&edit.start, &edit.old_text),
                     old_text: edit.old_text,
@@ -973,7 +1030,7 @@ impl Buffer {
         // #111：版本递增挪到 note 之后（同 undo 的基线语义）。
         let delta = history_delta_lines(&entry, true);
         if let Some(h) = self.undo_hook.as_mut() {
-            let _ = h.before_history(true, delta);
+            let _ = h.before_history_at(true, delta, entry.history_id());
         }
         match entry {
             Undoable::Single(edit) => {

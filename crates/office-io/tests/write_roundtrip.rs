@@ -701,3 +701,79 @@ fn save_to_vec_bytes_are_reopenable() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+// ---------------------------------------------------------------------------
+// #496：冻结窗格写面（XML 级 roundtrip——calamine 读面无冻结承载，
+// 断言锚在 sheetN.xml 的 <pane> 元素：state/xSplit/ySplit/topLeftCell）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn freeze_panes_row_and_column_roundtrip() {
+    // ① 冻结首行（1, 0）：ySplit=1 + topLeftCell=A2（滚动锚在冻结区
+    //    下方）。
+    let mut w = mdc_office_io::write::WorkbookWriter::new();
+    {
+        let mut s = w.add_sheet("FrozenRow").unwrap();
+        s.write_row(0, &[mdc_office_io::write::CellValue::Text("表头".into())])
+            .unwrap();
+        s.write_row(1, &[mdc_office_io::write::CellValue::Text("数据".into())])
+            .unwrap();
+        s.set_freeze_panes(1, 0).unwrap();
+    }
+    let p = tmp("freeze_row");
+    w.save_to_path(&p).unwrap();
+    let sheet = zip_entry(&p, "xl/worksheets/sheet1.xml");
+    assert!(
+        sheet.contains(
+            r#"<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>"#
+        ) || (sheet.contains("ySplit=\"1\"")
+            && sheet.contains("state=\"frozen\"")
+            && sheet.contains("topLeftCell=\"A2\"")),
+        "冻结首行 pane 元素：{sheet}"
+    );
+    // 数据面不回归（冻结是表级设置）。
+    let book = read_book(&p).unwrap();
+    let non_empty: usize = book.sheets[0]
+        .values
+        .rows()
+        .map(|r| {
+            r.iter()
+                .filter(|c| !matches!(c, calamine::Data::Empty))
+                .count()
+        })
+        .sum();
+    assert_eq!(non_empty, 2, "两行数据在场（冻结不吞数据）");
+    let _ = std::fs::remove_file(&p);
+
+    // ② 冻结前两列（0, 2）：xSplit=2 + topLeftCell=C1。
+    let mut w = mdc_office_io::write::WorkbookWriter::new();
+    {
+        let mut s = w.add_sheet("FrozenCol").unwrap();
+        s.write_row(0, &[mdc_office_io::write::CellValue::Text("A".into())])
+            .unwrap();
+        s.set_freeze_panes(0, 2).unwrap();
+    }
+    let p = tmp("freeze_col");
+    w.save_to_path(&p).unwrap();
+    let sheet = zip_entry(&p, "xl/worksheets/sheet1.xml");
+    assert!(
+        sheet.contains("xSplit=\"2\"") && sheet.contains("state=\"frozen\""),
+        "冻结前两列 pane 元素：{sheet}"
+    );
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn freeze_panes_out_of_range_typed_reject() {
+    // 越界 typed 拒（InvalidInput——不触引擎；与 write/write_row 同族）。
+    let mut w = mdc_office_io::write::WorkbookWriter::new();
+    let mut s = w.add_sheet("OOB").unwrap();
+    assert!(matches!(
+        s.set_freeze_panes(mdc_office_io::write::MAX_ROW + 1, 0),
+        Err(mdc_office_io::write::WriteError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        s.set_freeze_panes(0, mdc_office_io::write::MAX_COL + 1),
+        Err(mdc_office_io::write::WriteError::InvalidInput(_))
+    ));
+}

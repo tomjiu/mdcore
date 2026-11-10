@@ -27,7 +27,15 @@ cargo test --workspace --exclude mdshell-native
 ```
 
 GUI 壳自身的 4 个纯逻辑测试（blueprint/js_escape/percent_decode/
-serve_dist）需 GTK 环境：`cargo test -p mdshell-native`。
+serve_dist）在 Linux 上仍需 GTK 环境（crate 的 Linux 目标依赖面）：
+`cargo test -p mdshell-native`。
+
+#71 后续（跨平台测试面收口）：js_escape/percent_decode/serve_dist 三测
+已钉在平台无关的 `webutil` 模块——GUI 栈（tao/wry/GTK）仍是
+Linux-only，但这些纯逻辑在 Windows 目标同样编译运行（穿越防护等安全
+面断言不再只覆盖单平台）。示例 `xvfb_smoke` 与 `bin/mdcore` 同步补齐
+非 Linux 保编译 stub——`cargo check --all-targets --target
+x86_64-pc-windows-msvc` 全绿（此前示例 E0432 编译红）。
 
 ## Linux 系统库清单（Debian/Ubuntu 系）
 

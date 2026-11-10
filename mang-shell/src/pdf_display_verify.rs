@@ -876,6 +876,258 @@ fn view_chain_first_screen_scroll_zoom_close_reopen(cx: &mut gpui::TestAppContex
 }
 
 // ---------------------------------------------------------------------------
+// 测试 2b：#51 D2 尾巴——混合尺寸文档的变高槽视图链（每页几何槽高 +
+// 页空间锚点跳页 + 缩放不跳页）
+// ---------------------------------------------------------------------------
+
+/// 异尺寸合成件（3 页：宽扁 400×200 / 高瘦 200×300 / 正方 300×300）
+/// 的**变高槽**端到端：真窗口布局给出各页各高的页面槽、跳页读回、
+/// 缩放换档后顶部页号稳定（页空间锚——「缩放/旋转不跳页」的混合
+/// 尺寸档行为面）。
+#[gpui::test]
+fn view_chain_mixed_geometry_slots_and_zoom_anchor(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = crate::pdf_pages::mixed_size_pdf_bytes_for_tests();
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "混合尺寸视图链");
+            return;
+        }
+        panic!("异尺寸合成件打开失败：{err}");
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.page_count()), 3, "三页夹具");
+
+    // ① 首屏：600×480 视口 → fit_w=576；页 0 槽高 288（宽扁）、页 1
+    //    槽高 864（高瘦）——**两页同屏可见**（288 + 864 > 480）。
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "混合首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    let b0 = visual
+        .debug_bounds("pdf-visible-page-0")
+        .expect("混合档页 0 槽真实渲染");
+    let b1 = visual
+        .debug_bounds("pdf-visible-page-1")
+        .expect("混合档页 1 槽真实渲染（864 高槽与 288 高槽同屏——变高虚拟化的直接证据）");
+    assert!(
+        b0.size.height > gpui::px(250.) && b0.size.height < gpui::px(330.),
+        "页 0 槽高 ≈288（400×200 宽扁 @576 适宽），实得 {:?}",
+        b0.size.height
+    );
+    assert!(
+        b1.size.height > gpui::px(800.) && b1.size.height < gpui::px(930.),
+        "页 1 槽高 ≈864（200×300 高瘦），实得 {:?}",
+        b1.size.height
+    );
+    assert!(
+        b1.size.height > b0.size.height * 2.5,
+        "异尺寸档两页槽高显著不同（等高槽时代两槽相等——本断言即 D2 尾巴行为面）"
+    );
+    eprintln!(
+        "#51 D2 尾巴 ✓ 变高槽：页0 {:?} / 页1 {:?}（各页各高）",
+        b0.size.height, b1.size.height
+    );
+
+    // ② 跳页 2（正方 300×300 → 槽高 576）：页空间锚读回。
+    cx.update(|app| view.update(app, |v, _| v.scroll_to_page(2)));
+    pump_ready(cx, &mut visual, &view, 30, "混合跳页读回", |v| {
+        v.top_visible_page() == 2
+    });
+    pump_ready(cx, &mut visual, &view, 30, "混合跳页位图", |v| {
+        v.page_ready_for_test(2)
+    });
+    let b2 = visual
+        .debug_bounds("pdf-visible-page-2")
+        .expect("混合档页 2 槽真实渲染");
+    assert!(
+        b2.size.height > gpui::px(550.) && b2.size.height < gpui::px(600.),
+        "页 2 槽高 ≈576（正方 @576），实得 {:?}",
+        b2.size.height
+    );
+    eprintln!(
+        "#51 D2 尾巴 ✓ 跳页 2：top_visible_page=2 + 槽高 {:?}（页空间锚）",
+        b2.size.height
+    );
+
+    // ③ 缩放不跳页：Ctrl+= 步进放大（页空间锚——顶部页号稳定 2）。
+    let before_w = view.read_with(&visual, |v, _| v.raster_width_for_test());
+    let consumed =
+        cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+    assert!(consumed, "Ctrl+= 必须被 pdf 键域消费");
+    let after_w = view.read_with(&visual, |v, _| v.raster_width_for_test());
+    assert_ne!(
+        before_w, after_w,
+        "步进缩放必须换光栅宽档（{before_w} → ?）"
+    );
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.top_visible_page()),
+        2,
+        "缩放后顶部页号稳定（页空间锚——异尺寸档不跳页）"
+    );
+    pump_ready(cx, &mut visual, &view, 30, "混合换档重渲", |v| {
+        v.page_ready_for_test(2)
+    });
+    eprintln!("#51 D2 尾巴 ✓ 缩放不跳页：{before_w}px → {after_w}px 后 top_visible_page=2");
+
+    // ④ 回跳首页（锚点往返——变高树上来回移动不卡页号读数）。
+    cx.update(|app| view.update(app, |v, _| v.scroll_to_page(0)));
+    pump_ready(cx, &mut visual, &view, 30, "混合回跳", |v| {
+        v.top_visible_page() == 0
+    });
+    eprintln!("#51 D2 尾巴 ✓ 回跳页 0：变高树锚点往返");
+}
+
+// ---------------------------------------------------------------------------
+// 测试 2c：#51 D3——渲染与缓存生命周期（快速缩放陈旧取消 + 预算/
+// 队列/响应实测）
+// ---------------------------------------------------------------------------
+
+/// #51 D3 首批：**快速缩放的陈旧在飞取消**——换档后旧宽作业从在飞
+/// 登记摘除（pending 只含当前宽键——worker FIFO 不为死键排队，旧宽
+/// 迟到 Done 走机械丢弃不落缓存）；**取消 ≠ 失败**（缩回旧档时同宽
+/// 页面自然重派单就绪）；预算不变量全程成立。
+#[gpui::test]
+fn render_lifecycle_fast_zoom_stale_cancel(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = fixture_bytes("long_doc_120p.pdf");
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "快速缩放生命周期");
+            return;
+        }
+        panic!("百页夹具打开失败：{err}");
+    }
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "D3 基线首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+
+    // ① 缩放风暴（步进 ×3，档间一帧——每档都有真实在飞作业产生）：
+    //    每次换档后 pending 必须只剩当前宽键（旧宽被取消摘除——
+    //    取消面接线的直接断言；worker FIFO 不再为死键排队）。
+    for step in 1..=3u32 {
+        cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+        visual.update(|window, app| window.draw(app).clear(app));
+        let want = view.read_with(&visual, |v, _| v.device_raster_width_for_test());
+        let widths = view.read_with(&visual, |v, _| v.pending_widths_for_test());
+        assert!(
+            widths.iter().all(|w| *w == want),
+            "第 {step} 档缩放后 pending 宽度族 {widths:?} 必须只剩当前宽 {want}\
+             （陈旧在飞作业取消——旧宽不再排队/落键）"
+        );
+        assert!(
+            widths.len() <= 6,
+            "在飞作业数合理（可见窗 + 过扫描，非无界膨胀）：{:?}",
+            widths.len()
+        );
+        eprintln!("#51 D3 ✓ 第 {step} 档：pending {widths:?} 全为当前宽 {want}（陈旧取消）");
+    }
+
+    // ② 收敛：末档可见页就绪 + 预算不变量。
+    let final_w = view.read_with(&visual, |v, _| v.device_raster_width_for_test());
+    pump_ready(cx, &mut visual, &view, 30, "末档就绪", |v| {
+        v.page_ready_for_test(0)
+    });
+    let (used, entries) = view.read_with(&visual, |v, _| v.cache_stats_for_test());
+    assert!(
+        used <= crate::pdf_pages::CACHE_BUDGET_BYTES,
+        "快速缩放后缓存 {used}B 越预算"
+    );
+    eprintln!(
+        "#51 D3 ✓ 末档 {final_w}px 就绪：预算 {used}B / {}B（{entries} 条）",
+        crate::pdf_pages::CACHE_BUDGET_BYTES
+    );
+
+    // ③ 取消 ≠ 失败：缩回一档，同宽页面自然重派单就绪（Cancelled
+    //    回执未进 failed 永久标记——陈旧取消面不污染重试语义）。
+    cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("-", true, false, cx)));
+    pump_ready(cx, &mut visual, &view, 30, "缩回档重派单", |v| {
+        v.page_ready_for_test(0)
+    });
+    eprintln!("#51 D3 ✓ 缩回档重派单就绪（取消不落 failed——回访可重渲）");
+}
+
+/// #51 D3 首批：**大多页档的预算/队列/响应实测**——120 页逐档跳页
+/// （10 → 40 → 80 → 100 → 0），每站记录缓存字节/条目/就绪耗时，
+/// 断言预算不变量 + 工作集有界（全档不整体常驻）+ 顶部页读回。
+#[gpui::test]
+fn render_lifecycle_many_pages_budget_queue_response(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = fixture_bytes("long_doc_120p.pdf");
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "大多页生命周期");
+            return;
+        }
+        panic!("百页夹具打开失败：{err}");
+    }
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "大多页首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+
+    let mut worst_bytes = 0usize;
+    for target in [10usize, 40, 80, 100, 0] {
+        let started = std::time::Instant::now();
+        cx.update(|app| view.update(app, |v, _| v.scroll_to_page(target)));
+        pump_ready(cx, &mut visual, &view, 30, "跳页就绪", |v| {
+            v.top_visible_page() == target && v.page_ready_for_test(target)
+        });
+        let (used, entries) = view.read_with(&visual, |v, _| v.cache_stats_for_test());
+        worst_bytes = worst_bytes.max(used);
+        assert!(
+            used <= crate::pdf_pages::CACHE_BUDGET_BYTES,
+            "第 {target} 站缓存 {used}B 越预算"
+        );
+        assert!(
+            entries < 120,
+            "工作集应有界（受限预算逐出非全档常驻），实得 {entries} 条"
+        );
+        eprintln!(
+            "#51 D3 ✓ 大多页跳 {target}：{:?} 就绪 / 缓存 {used}B·{entries} 条（预算 {}B）",
+            started.elapsed(),
+            crate::pdf_pages::CACHE_BUDGET_BYTES
+        );
+    }
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.top_visible_page()),
+        0,
+        "回跳首页读回"
+    );
+    eprintln!(
+        "#51 D3 ✓ 大多页全链：预算峰值 {worst_bytes}B ≤ {}B，响应全部 ≤30s 门",
+        crate::pdf_pages::CACHE_BUDGET_BYTES
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 测试 3：健壮性（坏文件 / 超常尺寸 / 多标签并存切换）
 // ---------------------------------------------------------------------------
 
