@@ -412,7 +412,12 @@ fn undo_restores_original_text_semantically() {
         let opts = io::ReadOptions { compat: true };
         let doc =
             mdc_office_io::docx::read_docx_from_bytes_with_options(&src, &opts).expect("原档宽面");
-        let p = mang_shell::editor::docx_doc::convert(&doc);
+        // #629 收尾：撤销等价回写须用「可编辑行模型」的原文——与编辑器
+        // undo 到底后的行模型同源。只读 convert 视图不含 Locked 辅助行
+        // （行数 < 桥的行模型），compute 的映射漂移防线会整体拒绝（零
+        // set、改坏内容滞留盘面）——旧断言 sets2==1 在该形态下假失败。
+        let port = mang_shell::editor::docx_doc::DocxEnginePort::open(&src).expect("原档窄面");
+        let p = mang_shell::editor::docx_doc::convert_editable(&doc, &port);
         p.text.split('\n').map(|s| s.to_string()).collect()
     });
     assert_eq!(sets2, 1, "从改坏的内容回到原文 = 一次正常回写");
