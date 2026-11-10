@@ -207,6 +207,14 @@ const WIRED_MODULES: &[(&str, &str, &[&str])] = &[
         "shell.rs",
         &["DocxPagesView"],
     ),
+    // #50 C2：docx 页面几何单源（twips↔px/缩放档/条带几何/失效区间
+    // 映射）——docx_pages（条带派单/缩放/失效）与 editor/docx_lok_
+    // session（TWIPS_PER_PX re-export）双消费。
+    (
+        "docx_geom.rs（docx 页面几何单源）",
+        "docx_pages.rs",
+        &["docx_geom::"],
+    ),
     (
         "editor/xlsx_doc.rs（xlsx 读面）",
         "document.rs",

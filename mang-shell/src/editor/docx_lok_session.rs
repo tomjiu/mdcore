@@ -39,9 +39,8 @@ use mdc_lok::profile::{self, SessionProfile};
 use mdc_lok::runtime;
 use serde_json::json;
 
-/// twips → 像素换算（96 DPI 口径，与 crates/lok/src/smoke.rs
-/// `TWIPS_PER_PX` 同源；worker 渲染面 DPI 无关，宿主侧换算单源）。
-pub const TWIPS_PER_PX: i64 = 15;
+// twips↔px 换算常量 `TWIPS_PER_PX`：C2 起单源于 `crate::docx_geom`
+//（消费方 docx_pages 直连导入；本模块不再 re-export——零剩余消费面）。
 
 /// worker boot 等待（ready 事件；180s 同 smoke.rs `wait_ready` 预算）。
 const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -138,9 +137,16 @@ pub enum SessionReply {
         stats: TileStats,
         elapsed_ms: u128,
     },
-    /// 内核回调转发（C1 只登记：INVALIDATE_TILES / DOCUMENT_SIZE_CHANGED
-    /// / STATE_CHANGED 等名称 + 载荷原文；C2/C3 接缓存失效/命令状态面）。
+    /// 内核回调转发（INVALIDATE_TILES / DOCUMENT_SIZE_CHANGED /
+    /// STATE_CHANGED 等——C2 起视图层按名消费缓存失效/换尺寸，其余
+    /// 登记；C3 接命令状态面）。
     Callback { name: String, payload: String },
+    /// 文档几何重查回执（`SessionCmd::Size`——DOCUMENT_SIZE_CHANGED
+    /// 时机重查；twips 单一真源 = worker `size` op）。
+    Size {
+        width_twips: i64,
+        height_twips: i64,
+    },
     /// ping 回执（会话活性探针——测试/诊断用）。
     Pong { rtt_ms: u128 },
     /// worker 死亡（回执侧终态——宿主转错误态并停轮询）。
@@ -160,6 +166,8 @@ enum SessionCmd {
         tile_w: i32,
         tile_h: i32,
     },
+    /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机——C2 缓存换尺寸链）。
+    Size,
     Ping,
     Close,
 }
@@ -255,6 +263,12 @@ impl DocxLokSession {
             tile_h,
         });
         seq
+    }
+
+    /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机；回执
+    /// [`SessionReply::Size`]——twips 单一真源）。
+    pub fn request_size(&self) {
+        let _ = self.cmd_tx.send(SessionCmd::Size);
     }
 
     /// 活性探针（回执 [`SessionReply::Pong`]）。
@@ -458,6 +472,34 @@ fn session_main(
                             });
                             return;
                         }
+                    }
+                }
+            }
+            Ok(SessionCmd::Size) => {
+                // worker `size` op（与打开链 `DocHandle::size` 同 wire 面——
+                // 就绪后文档仍在 worker 进程，原始 op 直查）。
+                let result = client.request("size", json!({}));
+                match result {
+                    Ok(v) => {
+                        let w = v.get("width_twips").and_then(serde_json::Value::as_i64);
+                        let h = v.get("height_twips").and_then(serde_json::Value::as_i64);
+                        if let (Some(w), Some(h)) = (w, h) {
+                            let _ = reply_tx.send(SessionReply::Size {
+                                width_twips: w,
+                                height_twips: h,
+                            });
+                        } else {
+                            let _ = reply_tx.send(SessionReply::Failed {
+                                stage: "size",
+                                message: "size 回执缺几何字段".into(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply_tx.send(SessionReply::Failed {
+                            stage: "size",
+                            message: e.to_string(),
+                        });
                     }
                 }
             }
@@ -736,12 +778,24 @@ mod tests {
             eprintln!("SKIP（MDC_LOK_WORKER_BIN 未注入——测试进程目录无 mdc-lok-worker，真链未跑）");
             return;
         }
+        // worker 可执行预检：相对路径随 cargo 测试 cwd 浮动（工作区根
+        // vs 包根）——不存在即 FAIL 并打印 cwd，不进 180s 白等。
+        if let Some(bin) = &worker_bin {
+            assert!(
+                bin.is_file(),
+                "worker 可执行不存在：{:?}（cwd={:?}——相对路径请给工作区根 target/debug 全量）",
+                bin,
+                std::env::current_dir().unwrap_or_default()
+            );
+        }
         let mut session = DocxLokSession::open_blocking(&work, worker_bin.as_deref())
             .expect("打开链必须成功（运行时在场）");
-        // 打开链回执必须先于任何 tile。
+        // 打开链回执必须先于任何 tile；Failed/Died 快速失败——不白等
+        // 180s（C1 遗留缺陷：失败回执被吞导致超时 panic 丢真实原因）。
         let mut ready = None;
+        let mut open_error: Option<(String, String)> = None;
         let deadline = Instant::now() + Duration::from_secs(180);
-        while ready.is_none() && Instant::now() < deadline {
+        while ready.is_none() && open_error.is_none() && Instant::now() < deadline {
             if let Some(SessionReply::Ready {
                 width_twips,
                 height_twips,
@@ -758,7 +812,16 @@ mod tests {
                 );
                 ready = Some((width_twips, height_twips));
             }
+            if let Some(SessionReply::Failed { stage, message }) = session.try_recv() {
+                open_error = Some((stage.to_string(), message));
+            }
+            if let Some(SessionReply::Died { detail }) = session.try_recv() {
+                open_error = Some(("died".into(), detail));
+            }
             std::thread::sleep(Duration::from_millis(16));
+        }
+        if let Some((stage, message)) = open_error {
+            panic!("打开链失败（{stage}）：{message}");
         }
         let (w_tw, h_tw) = ready.expect("180s 内必须 Ready");
         // 首块 tile：整页缩放进 512px 画布（smoke.rs 同款口径断言）。
@@ -794,6 +857,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(16));
         }
         assert!(tile.is_some(), "60s 内必须收到 tile 回执");
+        // ---- C2：文档几何重查（DOCUMENT_SIZE_CHANGED 时机同款 wire 面）----
+        session.request_size();
+        let mut size_reply = None;
+        let mut seen_callbacks: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while size_reply.is_none() && Instant::now() < deadline {
+            match session.try_recv() {
+                Some(SessionReply::Size {
+                    width_twips,
+                    height_twips,
+                }) => {
+                    assert_eq!(
+                        (width_twips, height_twips),
+                        (w_tw, h_tw),
+                        "只读打开后 size 重查必须与 Ready 几何一致"
+                    );
+                    size_reply = Some((width_twips, height_twips));
+                }
+                Some(SessionReply::Callback { name, payload }) => {
+                    // 证据登记（打印原文）——只读打开是否有自发回调
+                    //（INVALIDATE_TILES/DOCUMENT_SIZE_CHANGED）属内核行为面，
+                    // 不作硬断言；C2 视图层消费链在单测面锁定。
+                    eprintln!("real-chain callback: name={name} payload={payload}");
+                    if !seen_callbacks.contains(&name) {
+                        seen_callbacks.push(name);
+                    }
+                }
+                Some(SessionReply::Failed { stage, message }) => {
+                    panic!("size 重查失败（{stage}）：{message}");
+                }
+                Some(SessionReply::Died { detail }) => panic!("worker 死亡：{detail}"),
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(size_reply.is_some(), "10s 内必须收到 Size 回执");
+        eprintln!("real-chain size re-query ok: {seen_callbacks:?}");
         session.request_close();
         // 工作副本清理（含 LO 文档锁残留——落 tmp 不落夹具目录）。
         let _ = std::fs::remove_file(&work);

@@ -113,6 +113,9 @@ mod pdf_pages;
 // #50 C1：DOCX LOK 页面视图（bin 根声明——shell.rs 壳接线消费；与
 // lib.rs 双根同文件复用，缺此声明 bin 面 E0432——#420 同源病灶）。
 mod docx_pages;
+// #50 C2：DOCX 页面几何单源（bin 根声明——docx_pages/docx_lok_session
+// 双消费；与 lib.rs 双根同文件复用）。
+mod docx_geom;
 // #420：PDF 页面缩略图侧栏（bin 根声明——shell.rs 壳接线消费；与
 // lib.rs 双根同文件复用，缺此声明 bin 面 E0432）。
 mod pdf_thumbs;
