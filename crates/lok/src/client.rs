@@ -131,9 +131,10 @@ impl WorkerClient {
             // resources/ 布局；集成测试经此注入 cargo 构建产物）。
             .or_else(|| std::env::var_os("MDC_LOK_WORKER_BIN").map(PathBuf::from))
             .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("mdc-lok-worker")))
+                std::env::current_exe().ok().and_then(|p| {
+                    p.parent()
+                        .map(|d| d.join(format!("mdc-lok-worker{}", std::env::consts::EXE_SUFFIX)))
+                })
             })
             .ok_or_else(|| LokError::Protocol("无法定位 mdc-lok-worker 可执行文件".into()))?;
         if !exe.is_file() {
