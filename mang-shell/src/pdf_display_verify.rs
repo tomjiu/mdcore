@@ -876,6 +876,117 @@ fn view_chain_first_screen_scroll_zoom_close_reopen(cx: &mut gpui::TestAppContex
 }
 
 // ---------------------------------------------------------------------------
+// 测试 2b：#51 D2 尾巴——混合尺寸文档的变高槽视图链（每页几何槽高 +
+// 页空间锚点跳页 + 缩放不跳页）
+// ---------------------------------------------------------------------------
+
+/// 异尺寸合成件（3 页：宽扁 400×200 / 高瘦 200×300 / 正方 300×300）
+/// 的**变高槽**端到端：真窗口布局给出各页各高的页面槽、跳页读回、
+/// 缩放换档后顶部页号稳定（页空间锚——「缩放/旋转不跳页」的混合
+/// 尺寸档行为面）。
+#[gpui::test]
+fn view_chain_mixed_geometry_slots_and_zoom_anchor(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = crate::pdf_pages::mixed_size_pdf_bytes_for_tests();
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "混合尺寸视图链");
+            return;
+        }
+        panic!("异尺寸合成件打开失败：{err}");
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.page_count()), 3, "三页夹具");
+
+    // ① 首屏：600×480 视口 → fit_w=576；页 0 槽高 288（宽扁）、页 1
+    //    槽高 864（高瘦）——**两页同屏可见**（288 + 864 > 480）。
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "混合首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    let b0 = visual
+        .debug_bounds("pdf-visible-page-0")
+        .expect("混合档页 0 槽真实渲染");
+    let b1 = visual
+        .debug_bounds("pdf-visible-page-1")
+        .expect("混合档页 1 槽真实渲染（864 高槽与 288 高槽同屏——变高虚拟化的直接证据）");
+    assert!(
+        b0.size.height > gpui::px(250.) && b0.size.height < gpui::px(330.),
+        "页 0 槽高 ≈288（400×200 宽扁 @576 适宽），实得 {:?}",
+        b0.size.height
+    );
+    assert!(
+        b1.size.height > gpui::px(800.) && b1.size.height < gpui::px(930.),
+        "页 1 槽高 ≈864（200×300 高瘦），实得 {:?}",
+        b1.size.height
+    );
+    assert!(
+        b1.size.height > b0.size.height * 2.5,
+        "异尺寸档两页槽高显著不同（等高槽时代两槽相等——本断言即 D2 尾巴行为面）"
+    );
+    eprintln!(
+        "#51 D2 尾巴 ✓ 变高槽：页0 {:?} / 页1 {:?}（各页各高）",
+        b0.size.height, b1.size.height
+    );
+
+    // ② 跳页 2（正方 300×300 → 槽高 576）：页空间锚读回。
+    cx.update(|app| view.update(app, |v, _| v.scroll_to_page(2)));
+    pump_ready(cx, &mut visual, &view, 30, "混合跳页读回", |v| {
+        v.top_visible_page() == 2
+    });
+    pump_ready(cx, &mut visual, &view, 30, "混合跳页位图", |v| {
+        v.page_ready_for_test(2)
+    });
+    let b2 = visual
+        .debug_bounds("pdf-visible-page-2")
+        .expect("混合档页 2 槽真实渲染");
+    assert!(
+        b2.size.height > gpui::px(550.) && b2.size.height < gpui::px(600.),
+        "页 2 槽高 ≈576（正方 @576），实得 {:?}",
+        b2.size.height
+    );
+    eprintln!(
+        "#51 D2 尾巴 ✓ 跳页 2：top_visible_page=2 + 槽高 {:?}（页空间锚）",
+        b2.size.height
+    );
+
+    // ③ 缩放不跳页：Ctrl+= 步进放大（页空间锚——顶部页号稳定 2）。
+    let before_w = view.read_with(&visual, |v, _| v.raster_width_for_test());
+    let consumed =
+        cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+    assert!(consumed, "Ctrl+= 必须被 pdf 键域消费");
+    let after_w = view.read_with(&visual, |v, _| v.raster_width_for_test());
+    assert_ne!(
+        before_w, after_w,
+        "步进缩放必须换光栅宽档（{before_w} → ?）"
+    );
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.top_visible_page()),
+        2,
+        "缩放后顶部页号稳定（页空间锚——异尺寸档不跳页）"
+    );
+    pump_ready(cx, &mut visual, &view, 30, "混合换档重渲", |v| {
+        v.page_ready_for_test(2)
+    });
+    eprintln!("#51 D2 尾巴 ✓ 缩放不跳页：{before_w}px → {after_w}px 后 top_visible_page=2");
+
+    // ④ 回跳首页（锚点往返——变高树上来回移动不卡页号读数）。
+    cx.update(|app| view.update(app, |v, _| v.scroll_to_page(0)));
+    pump_ready(cx, &mut visual, &view, 30, "混合回跳", |v| {
+        v.top_visible_page() == 0
+    });
+    eprintln!("#51 D2 尾巴 ✓ 回跳页 0：变高树锚点往返");
+}
+
+// ---------------------------------------------------------------------------
 // 测试 3：健壮性（坏文件 / 超常尺寸 / 多标签并存切换）
 // ---------------------------------------------------------------------------
 
