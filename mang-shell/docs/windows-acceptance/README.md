@@ -32,7 +32,7 @@
 | A-5 | 标签条 | 编辑区上沿 | 标签只在编辑区上沿（起 x 与编辑区同列） | 同上（1280 / 900 两宽断言） |
 | A-6 | 右 dock | 右缘 | 导航与文档信息分离生命周期；关信息不关导航 | `right_dock_navigation_and_document_information_have_separate_lifetimes` |
 | A-7 | 状态栏 | 底部 | 真实文案：文件名 + 修改标记 + 行列字数 + 工作区 + 选区 + git 分支 + 编码 + 换行 + 页码 | `ui_wiring_faces::face5_status_bar_binds_data_sources` |
-| A-8 | 窗口宽高变化 | 拖拽边缘 1280→900、最大化 / 还原 | 布局不错位、编辑区保可用宽度 | 1280/900 已自动化；更窄 / 最大化 / 还原手工（Windows 待验） |
+| A-8 | 窗口宽高变化 | 拖拽边缘 1280→760（最小窗宽）、最大化 / 还原 | 布局不错位、编辑区保 ≥240px 可用宽（**右 dock 在窗宽 <900px 时渲染期让位，不改写用户开关态，宽度恢复后回归**） | 1280/900/760×480 已自动化（`right_dock_yields_below_critical_width_and_returns_when_restored` / `layout_holds_at_enforced_minimum_window_size`）；最大化 / 还原手工（Windows 待验） |
 | A-9 | 高 DPI | 150% / 200% 显示缩放 | 布局不错位（全壳物理 px 自绘，源内零 rem 混用） | 无——#48 真机专有 |
 
 ## 三、B. 文档生命周期（阶段 A2）
