@@ -174,6 +174,10 @@ impl WorkerClient {
         // 环境卫生（worker 启动时也会自设；双侧幂等）
         cmd.env("SAL_NOLOCK_PROFILE", "1");
         cmd.env("SAL_DISABLE_OPENCL", "1");
+        // B1 unipoll 主循环契约（worker.rs 模块头「为什么 unipoll」）：
+        // 必须在 hook_2 之前生效；只设 env 不进 runLoop 会 SIGSEGV——
+        // worker 侧必配套 runLoop（unipoll_loop）。
+        cmd.env("SAL_LOK_OPTIONS", "unipoll");
         if cfg!(windows) {
             cmd.env("SAL_SKIA", "raster");
         } else {
