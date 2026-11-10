@@ -5631,6 +5631,129 @@ mod pdf_search_wiring_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// WiringHost 整树 + **空态** shell 窗口（无文档——工作区测试用；
+    /// md_wiring_window 的无打开文档变体）。
+    fn md_wiring_window_root(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<ShellApp>, gpui::WindowHandle<WiringHost>) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        (slot.expect("宿主构造即置"), window)
+    }
+
+    /// 单击派发（MouseDown + MouseUp 同点——statusbar click_at 同构；
+    /// WiringHost 版）。
+    fn click_wiring_at(
+        window: &gpui::WindowHandle<WiringHost>,
+        cx: &mut gpui::TestAppContext,
+        x: f32,
+        y: f32,
+    ) {
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        let down = gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: gpui::point(gpui::px(x), gpui::px(y)),
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        let up = gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: gpui::point(gpui::px(x), gpui::px(y)),
+            modifiers: Default::default(),
+            click_count: 1,
+        });
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(down, cx);
+            window.dispatch_event(up, cx);
+        })
+        .expect("单击派发");
+    }
+
+    /// #47 A3：打开文件夹全链——open_workspace（真实临时目录）→ 文件
+    /// 树 + git 面板就位 → **真实点击**文件树文件行 → open_file 钩子 →
+    /// 标签打开（路径 = 工作区文件）。扫描从下往上（先中 a.md 文件行
+    /// ——唯一文件行；root 折叠行在最上，自下而上永不先触）。
+    #[gpui::test]
+    fn open_workspace_click_tree_opens_tab(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("mdc-a3-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("a.md");
+        std::fs::write(&md, "W0\n").unwrap();
+
+        let (shell, window) = md_wiring_window_root(cx);
+        window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_workspace(dir.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // ① 工作区就位：文件树（根 = 工作区目录）+ git 面板（非 git
+        //    目录同样就位——#183 提示态不崩溃不拦截）。
+        window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                let tree = shell.workspace.as_ref().expect("文件树实体在场");
+                assert_eq!(tree.read(cx).root(), dir.as_path(), "树根 = 工作区目录");
+                assert!(
+                    shell.git_panel.is_some(),
+                    "git 面板就位（非 git 目录提示态）"
+                );
+            });
+        });
+
+        // ② 自下而上扫描左栏文件树（x = 活动条 52 + 左栏中部）——空树区
+        //    点击零副作用；首个交互行 = a.md 文件行（唯一文件，root 折叠
+        //    行在其上方——扫描方向保证不先触）→ open_file 钩子 → 标签开。
+        let mut opened: Option<f32> = None;
+        let mut y = 170.0f32;
+        while y > 50.0 {
+            click_wiring_at(&window, cx, 150.0, y);
+            let tabs = window
+                .update(cx, |_host, _window, cx| {
+                    shell.update(cx, |shell, cx| shell.tab_count())
+                })
+                .expect("读标签数");
+            if tabs > 0 {
+                opened = Some(y);
+                break;
+            }
+            y -= 4.0;
+        }
+        let hit_y = opened.unwrap_or_else(|| panic!("扫描未命中文件行（y 170→50 未开标签）"));
+
+        // ③ 标签 = 工作区文件（路径 + 内容），激活即聚焦。
+        window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                assert_eq!(shell.tab_count(), 1, "点击文件行开一标签");
+                let path = shell.tab_path(0).unwrap();
+                assert_eq!(
+                    path,
+                    std::path::absolute(&md).unwrap_or(md.clone()),
+                    "标签路径 = 工作区文件（open_file 钩子链）"
+                );
+                let ed = shell.tab_editor(0).unwrap().clone();
+                assert_eq!(ed.read(cx).buffer_line(0), "W0", "标签内容 = 文件内容");
+                eprintln!("ws-click: 命中 y={hit_y}（自下而上扫描首个交互行）");
+            });
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
