@@ -2032,6 +2032,18 @@ impl ShellApp {
                     window.focus(&focus, cx);
                     return;
                 }
+                // #50 C1 / #47 A4：docx 页面态——焦点落 LOK 页视图（编辑
+                // 器不在树内，其句柄游离则键事件死在合成根——#422 同款
+                // 病灶；toggle 切页面态/关标签落 docx/菜单面板关闭归焦
+                // 全经本函数，此前漏 docx 分支一律落游离句柄）。
+                if self.docx_view_mode
+                    && tab.editor.read(cx).doc_kind() == "docx"
+                    && let Some((_, view)) = self.docx_pages.as_ref()
+                {
+                    let focus = view.read(cx).focus_handle(cx).clone();
+                    window.focus(&focus, cx);
+                    return;
+                }
                 let focus = tab.editor.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
             }
@@ -5038,6 +5050,73 @@ mod tab_workflow_tests {
                 assert!(
                     shell.outline.is_none(),
                     "末标签关闭 → 大纲空态清（右栏不挂游离编辑器）"
+                );
+            });
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #47 A4：切换标签/关标签/切显示模式后焦点恢复——docx 页面态主
+    /// 显示面是 LOK 页视图，`focus_active` 必须落页视图句柄（编辑器
+    /// 不在树内，游离句柄 = 键事件死在合成根——#422 同款病灶；本批
+    /// 修复面：关标签落 docx / toggle 切回页面态两条路径）。
+    #[gpui::test]
+    fn focus_restore_lands_on_docx_page_view(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("docx-focus");
+        let docx = write_docx_fixture(&dir, "focus.docx");
+        let md = write_md(&dir, "m.md", "M\n");
+
+        let (shell, window) = shell_window(cx);
+        window.update(cx, |_host, _window, cx| {
+            open(&shell, cx, docx.clone());
+            open(&shell, cx, md.clone());
+        });
+
+        // ① 关活动 md（干净）→ docx 成活动标签（页面态）→ 焦点落
+        //    LOK 页视图（修复前：落游离编辑器句柄——键事件死）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_active_tab(window, cx);
+                assert_eq!(shell.tab_count(), 1, "关 md 后剩 docx");
+                let (_, view) = shell
+                    .docx_pages
+                    .as_ref()
+                    .expect("docx 页视图在场（页面态缺省）")
+                    .clone();
+                let view_focus = view.read(cx).focus_handle(cx);
+                assert!(
+                    view_focus.contains_focused(window, cx),
+                    "关 md 落 docx → 焦点落 LOK 页视图（focus_active 修复面）"
+                );
+                let ed_focus = shell.tab_editor(0).unwrap().read(cx).focus_handle().clone();
+                assert!(
+                    !ed_focus.contains_focused(window, cx),
+                    "游离编辑器句柄不承担焦点（页面态编辑器不在树内）"
+                );
+            });
+        });
+
+        // ② 切文本态（焦点落编辑器）→ 切回页面态（ensure 重建页视图）
+        //    → 焦点落重建的页视图（toggle 路径同修复）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.toggle_docx_view_mode(window, cx);
+                let ed_focus = shell.tab_editor(0).unwrap().read(cx).focus_handle().clone();
+                assert!(
+                    ed_focus.contains_focused(window, cx),
+                    "文本态焦点落编辑器（文本投影在树内）"
+                );
+                shell.toggle_docx_view_mode(window, cx);
+                let (_, view) = shell
+                    .docx_pages
+                    .as_ref()
+                    .expect("页视图重建（切回页面态）")
+                    .clone();
+                let view_focus = view.read(cx).focus_handle(cx);
+                assert!(
+                    view_focus.contains_focused(window, cx),
+                    "切回页面态 → 焦点落重建的 LOK 页视图（toggle 路径修复面）"
                 );
             });
         });
