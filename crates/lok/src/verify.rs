@@ -1,22 +1,13 @@
-//! 保存产物校验（B4 · #49 工作线 B）——原型级最小 zip 读取器。
-//!
-//! 用途：`save_as` 落盘的临时 DOCX 在「决定替换源文件」前做结构
-//! 与内容断言（zip 合法、document.xml 在场、期望文本已变、图片条目
-//! 仍在）。**这是 B 线给 C 线（#50）的「保存完成」独立判据**——不经
-//! LO 重开，宿主可单方面确认产物。**不是通用 zip 实现**：只支持 zip
-//! 恒定面（EOCD → 中央目录 → local header；stored + deflate 条目），
-//! 防御性解析、拒绝畸形输入；通用容器操作继续用 mdc-office-io
-//! （本 crate 不跨域依赖）。
-//!
-//! 错误为人话 String（宿主侧校验器，不掺协议错误码——消费面是测试
-//! 与 C 线保存链）。deflate 解压经 flate2（Cargo.lock 现解析版本直
-//! 依赖，零新编译单元，见 Cargo.toml 注释）。
+//! 保存产物独立校验：复用 zip 解析、CRC 与存储/deflate 支持。
+//! 所有条目有解压总量限制，document.xml 单独限制大小；损坏输入返回错误。
+//! 校验完成后再由宿主决定目标替换，不在此覆盖源文件。
 
 use std::io::Read;
 use std::path::Path;
 
-const EOCD_SIGN: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
+#[cfg(test)]
 const CD_SIGN: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
+#[cfg(test)]
 const LFH_SIGN: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
 
 /// 一次校验的期望断言集。
@@ -62,56 +53,78 @@ impl VerifySpec {
 
 /// 校验保存产物。任一断言失败 → `VerifyFailed`（信息指明哪条）。
 pub fn verify_saved_docx(path: &Path, spec: &VerifySpec) -> Result<VerifyReport, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("读取保存产物失败 {path:?}：{e}"))?;
-    if bytes.len() < 4 || bytes[0..2] != *b"PK" {
-        return Err(format!("{path:?} 不是 zip（保存产物损坏或为空）"));
+    const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+    const MAX_XML_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+    let file = std::fs::File::open(path).map_err(|e| format!("读取保存产物失败 {path:?}：{e}"))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_ARCHIVE_BYTES {
+        return Err("保存产物超过容器大小限制".into());
     }
-    let eocd = find_eocd(&bytes).ok_or_else(|| "zip 缺 EOCD（中央目录尾）".to_string())?;
-    let count = u16le(&bytes[eocd + 10..]) as usize;
-    let cd_offset = u32le(&bytes[eocd + 16..]) as usize;
-
-    // 解析中央目录条目。
-    // （name, local_offset, csize, usize, method）
-    let mut entries: Vec<(String, usize, usize, usize, u16)> = Vec::new();
-    let mut p = cd_offset;
-    for _ in 0..count {
-        if p + 46 > bytes.len() || bytes[p..p + 4] != CD_SIGN {
-            return Err("中央目录记录签名错位".to_string());
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("{path:?} 不是 zip 或容器损坏：{e}"))?;
+    if archive.len() > 100_000 {
+        return Err("保存产物条目过多".into());
+    }
+    let mut names = Vec::with_capacity(archive.len());
+    let mut document = None;
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("保存产物条目读取失败：{e}"))?;
+        let name = entry.name().to_owned();
+        names.push(name.clone());
+        if entry.is_dir() {
+            continue;
         }
-        let method = u16le(&bytes[p + 10..]);
-        let csize = u32le(&bytes[p + 20..]) as usize;
-        let usize_ = u32le(&bytes[p + 24..]) as usize;
-        let name_len = u16le(&bytes[p + 28..]) as usize;
-        let extra_len = u16le(&bytes[p + 30..]) as usize;
-        let comment_len = u16le(&bytes[p + 32..]) as usize;
-        let local_off = u32le(&bytes[p + 42..]) as usize;
-        let name = String::from_utf8_lossy(&bytes[p + 46..p + 46 + name_len]).into_owned();
-        entries.push((name, local_off, csize, usize_, method));
-        p += 46 + name_len + extra_len + comment_len;
+        let declared = entry.size();
+        let limit = if name == "word/document.xml" {
+            MAX_XML_BYTES
+        } else {
+            MAX_TOTAL_BYTES
+        };
+        if declared > limit
+            || total
+                .checked_add(declared)
+                .is_none_or(|n| n > MAX_TOTAL_BYTES)
+        {
+            return Err(format!("保存产物解压大小超限：{name}"));
+        }
+        let actual = if name == "word/document.xml" {
+            let mut bytes = Vec::new();
+            entry
+                .by_ref()
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("document.xml 解压/CRC校验失败：{e}"))?;
+            let len = bytes.len() as u64;
+            if len > limit {
+                return Err("document.xml 解压大小超限".into());
+            }
+            document = Some(bytes);
+            len
+        } else {
+            std::io::copy(&mut entry.by_ref().take(limit + 1), &mut std::io::sink())
+                .map_err(|e| format!("保存产物条目解压/CRC校验失败 {name}：{e}"))?
+        };
+        if actual != declared {
+            return Err(format!("保存产物条目长度不符：{name}"));
+        }
+        total = total
+            .checked_add(actual)
+            .filter(|n| *n <= MAX_TOTAL_BYTES)
+            .ok_or_else(|| "保存产物解压总大小超限".to_string())?;
     }
-
-    let names: Vec<String> = entries.iter().map(|(n, ..)| n.clone()).collect();
     for want in &spec.must_have_entries {
-        if !names.iter().any(|n| n == want) {
+        if !names.contains(want) {
             return Err(format!(
                 "保存产物缺条目 {want}（现有：{}）",
                 names.join(", ")
             ));
         }
     }
-
-    // 提取 word/document.xml 文本。
-    let doc_xml = entries
-        .iter()
-        .find(|(n, ..)| n == "word/document.xml")
-        .map(|(_, off, csize, usize_, method)| {
-            extract_entry(&bytes, *off, *csize, *usize_, *method)
-        })
-        .transpose()
-        .map_err(|e: std::io::Error| format!("document.xml 解压失败：{e}"))?
-        .ok_or_else(|| "保存产物缺 word/document.xml".to_string())?;
-    let text = String::from_utf8_lossy(&doc_xml).into_owned();
-
+    let bytes = document.ok_or_else(|| "保存产物缺 word/document.xml".to_string())?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| format!("document.xml 编码无效：{e}"))?;
     let mut passed = spec.must_have_entries.len();
     for want in &spec.must_contain {
         if !text.contains(want.as_str()) {
@@ -129,87 +142,66 @@ pub fn verify_saved_docx(path: &Path, spec: &VerifySpec) -> Result<VerifyReport,
         }
         passed += 1;
     }
-
     Ok(VerifyReport {
-        entry_count: entries.len(),
+        entry_count: names.len(),
         entries: names,
-        document_xml_len: doc_xml.len(),
+        document_xml_len: bytes.len(),
         checks_passed: passed,
     })
-}
-
-fn find_eocd(bytes: &[u8]) -> Option<usize> {
-    // EOCD 在尾部 64KB 内（zip 注释段上限）。
-    let start = bytes.len().saturating_sub(66_000);
-    let mut i = bytes.len() - 4;
-    loop {
-        if bytes[i..i + 4] == EOCD_SIGN {
-            return Some(i);
-        }
-        if i == start {
-            return None;
-        }
-        i -= 1;
-    }
-}
-
-fn u16le(b: &[u8]) -> u16 {
-    u16::from_le_bytes([b[0], b[1]])
-}
-
-fn u32le(b: &[u8]) -> u32 {
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-/// 从 local file header 起提取条目数据：stored 直拷 csize 字节；
-/// deflate 切 csize 字节后解压（usize 仅作长度合理性对照）。
-fn extract_entry(
-    bytes: &[u8],
-    lfh_offset: usize,
-    csize: usize,
-    usize_: usize,
-    method: u16,
-) -> std::io::Result<Vec<u8>> {
-    if lfh_offset + 4 > bytes.len() || bytes[lfh_offset..lfh_offset + 4] != LFH_SIGN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "local header 签名错位",
-        ));
-    }
-    let name_len = u16le(&bytes[lfh_offset + 26..]) as usize;
-    let extra_len = u16le(&bytes[lfh_offset + 28..]) as usize;
-    let data_start = lfh_offset + 30 + name_len + extra_len;
-    let data_end = data_start + csize;
-    if data_end > bytes.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "条目数据越界",
-        ));
-    }
-    let data = &bytes[data_start..data_end];
-    match method {
-        0 => Ok(data.to_vec()),
-        8 => {
-            let mut out = Vec::with_capacity(usize_.min(64 * 1024 * 1024));
-            flate2::read::DeflateDecoder::new(data).read_to_end(&mut out)?;
-            if usize_ != 0 && out.len() != usize_ {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("解压长度不符：{} != {usize_}", out.len()),
-                ));
-            }
-            Ok(out)
-        }
-        m => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!("不支持的压缩方法 {m}"),
-        )),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_bad_container_is_error_without_panic(tag: &str, bytes: &[u8]) {
+        let dir =
+            std::env::temp_dir().join(format!("mdc-lok-bad-zip-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.docx");
+        std::fs::write(&path, bytes).unwrap();
+        let result = std::panic::catch_unwind(|| verify_saved_docx(&path, &VerifySpec::new()));
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            result.is_ok(),
+            "malformed ZIP must return an error, not panic"
+        );
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn short_eocd_returns_error_without_panic() {
+        assert_bad_container_is_error_without_panic("eocd", b"PK\x05\x06");
+    }
+
+    #[test]
+    fn oversized_directory_name_returns_error_without_panic() {
+        let mut bytes = stored_zip(&[("word/document.xml", b"text".to_vec())]);
+        let cd = bytes.windows(4).position(|w| w == CD_SIGN).unwrap();
+        bytes[cd + 28..cd + 30].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_bad_container_is_error_without_panic("name", &bytes);
+    }
+
+    #[test]
+    fn truncated_local_header_returns_error_without_panic() {
+        let mut bytes = stored_zip(&[("word/document.xml", b"text".to_vec())]);
+        let cd = bytes.windows(4).position(|w| w == CD_SIGN).unwrap();
+        let off = bytes.len() as u32;
+        bytes[cd + 42..cd + 46].copy_from_slice(&off.to_le_bytes());
+        bytes.extend_from_slice(&LFH_SIGN);
+        assert_bad_container_is_error_without_panic("local", &bytes);
+    }
+
+    #[test]
+    fn corrupt_payload_crc_is_rejected() {
+        let mut bytes = stored_zip(&[("word/document.xml", b"CRC_SENTINEL".to_vec())]);
+        let payload = bytes
+            .windows(12)
+            .position(|w| w == b"CRC_SENTINEL")
+            .unwrap();
+        bytes[payload] = b'X';
+        assert_bad_container_is_error_without_panic("crc", &bytes);
+    }
 
     #[test]
     fn rejects_non_zip() {
@@ -222,58 +214,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 手造最小 stored zip（一个 document.xml 条目）。
+    fn zip_bytes(entries: &[(&str, Vec<u8>)], method: zip::CompressionMethod) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut writer, bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
     fn stored_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut offsets = Vec::new();
-        for (name, data) in entries {
-            offsets.push(out.len() as u32);
-            out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
-            out.extend_from_slice(&20u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes()); // method=stored
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(data);
-        }
-        let cd_off = out.len() as u32;
-        let mut cd_size = 0u32;
-        for (i, (name, data)) in entries.iter().enumerate() {
-            let start = out.len();
-            out.extend_from_slice(&[0x50, 0x4B, 0x01, 0x02]);
-            out.extend_from_slice(&20u16.to_le_bytes());
-            out.extend_from_slice(&20u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes()); // method=stored
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&offsets[i].to_le_bytes());
-            out.extend_from_slice(name.as_bytes());
-            cd_size += (out.len() - start) as u32;
-        }
-        // EOCD
-        out.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0]);
-        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-        out.extend_from_slice(&cd_size.to_le_bytes());
-        out.extend_from_slice(&cd_off.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out
+        zip_bytes(entries, zip::CompressionMethod::Stored)
     }
 
     #[test]
@@ -304,53 +256,10 @@ mod tests {
         // deflate 条目（真实 LO saveAs 的压缩形态）：手造。
         let raw =
             "<w:document><w:body><w:p>丁戊己 REPLACEME</w:p></w:body></w:document>".as_bytes();
-        let mut enc =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut enc, raw).unwrap();
-        let deflated = enc.finish().unwrap();
-        let mut out: Vec<u8> = Vec::new();
-        // LFH（method=8）
-        out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&8u16.to_le_bytes()); // method=deflate
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(deflated.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        out.extend_from_slice(&17u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(b"word/document.xml");
-        out.extend_from_slice(&deflated);
-        let cd_off = out.len();
-        // CD
-        out.extend_from_slice(&[0x50, 0x4B, 0x01, 0x02]);
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&8u16.to_le_bytes()); // method=deflate
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(deflated.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        out.extend_from_slice(&17u16.to_le_bytes()); // nlen @28
-        out.extend_from_slice(&0u16.to_le_bytes()); // extra @30
-        out.extend_from_slice(&0u16.to_le_bytes()); // comment @32
-        out.extend_from_slice(&0u16.to_le_bytes()); // disk @34
-        out.extend_from_slice(&0u16.to_le_bytes()); // iattr @36
-        out.extend_from_slice(&0u32.to_le_bytes()); // eattr @38
-        out.extend_from_slice(&0u32.to_le_bytes()); // offset @42
-        out.extend_from_slice(b"word/document.xml");
-        let cd_size = (out.len() - cd_off) as u32;
-        // EOCD
-        out.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0]);
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&cd_size.to_le_bytes());
-        out.extend_from_slice(&(cd_off as u32).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        let out = zip_bytes(
+            &[("word/document.xml", raw.to_vec())],
+            zip::CompressionMethod::Deflated,
+        );
         let p2 = dir.join("deflated.docx");
         std::fs::write(&p2, &out).unwrap();
         let report = verify_saved_docx(
