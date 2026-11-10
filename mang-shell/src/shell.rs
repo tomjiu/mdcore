@@ -6090,6 +6090,126 @@ mod statusbar_view_toggle_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 整树宿主 + **显尺寸窗口**（A5 布局敏感面——`cx.open_window` 布局
+    /// 控制口径，add_window 是最大化尺寸不可控）。
+    fn host_window_sized(
+        cx: &mut gpui::TestAppContext,
+        w: f32,
+        h: f32,
+    ) -> (Entity<ShellApp>, gpui::WindowHandle<StatusHost>) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.open_window(gpui::size(px(w), px(h)), |window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            StatusHost(shell)
+        });
+        (slot.expect("宿主构造即置"), window)
+    }
+
+    /// 仅 MouseDown（命中探针——down 侧监听器即置 `panel_drag` 态；
+    /// up 免发：拖拽会话由测试直接清态，不经持久化路径）。
+    fn mouse_down_at(
+        window: &gpui::WindowHandle<StatusHost>,
+        cx: &mut gpui::TestAppContext,
+        x: f32,
+        y: f32,
+    ) {
+        let any: AnyWindowHandle = window.clone().into();
+        let down = PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.update_window(any, |_, window, cx| window.dispatch_event(down, cx))
+            .expect("MouseDown 派发");
+    }
+
+    /// 右栏拖拽热区 x（右缘锚定：dock 条 52 + 右栏宽 right_width——
+    /// 热区 4px 在右栏左缘，取中点 2px）。探针断言依据：**热区元素
+    /// 只在 `right_open_effective` 臂内渲染**（GPUI `when(false, f)` 不
+    /// 应用 f——元素/命中盒不存在），MouseDown 命中与否即让位证据。
+    fn right_hotzone_x(right_width: f32, w: f32) -> f32 {
+        w - 52. - right_width - 2.
+    }
+
+    /// A5（#47 批次 13）：**实际窗口宽变化**下的右 dock 渲染期让位与
+    /// 恢复——真实尺寸事件（`simulate_window_resize`）+ 真实 MouseDown
+    /// 命中管线（拖拽热区探针）：
+    /// - 宽窗（1000px ≥ 900px 临界）：热区在场 → MouseDown 置
+    ///   `panel_drag`（Some(Right)）——右栏体真实渲染；
+    /// - 窄窗（760px < 900px 临界）：右栏让位 → 热区**不渲染** →
+    ///   MouseDown 零命中（`panel_drag` 保持 None），且 `right_open`
+    ///   用户开关态**不被改写**（让位是渲染期判定）；
+    /// - 恢复宽窗：热区回归 → 命中恢复（按原开关态自动回归）。
+    #[gpui::test]
+    fn narrow_window_right_dock_yields_and_restores(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = host_window_sized(cx, 1000., 600.);
+
+        // ① 宽窗：右栏在场（right_open 缺省开 + 1000 ≥ 900 临界）。
+        redraw(&window, cx);
+        let (right_open0, right_width0) = shell.read_with(cx, |s, _| {
+            (s.right_open, f32::from(s.right_width))
+        });
+        assert!(right_open0, "前置：right_open 用户态开（缺省）");
+        assert!(
+            right_width0 > 0. && right_width0 < 900.,
+            "右栏宽在位（实得 {right_width0}px）"
+        );
+        let hot_x = right_hotzone_x(right_width0, 1000.);
+        mouse_down_at(&window, cx, hot_x, 300.);
+        let drag0 = shell.read_with(cx, |s, _| {
+            s.panel_drag
+                .as_ref()
+                .map(|d| (d.side, d.last_x))
+        });
+        assert!(
+            matches!(drag0, Some((PanelSide::Right, _))),
+            "宽窗热区命中 → panel_drag = Some(Right)（实得 {drag0:?}）"
+        );
+        // 探针复位（不经 finish——零持久化副作用）。
+        shell.update(cx, |s, _| {
+            s.panel_drag = None;
+        });
+
+        // ② 窄窗（760px < 900px 临界）：右栏让位——热区不渲染，MouseDown
+        //    零命中；right_open 用户态不被改写。
+        let any: AnyWindowHandle = window.clone().into();
+        cx.simulate_window_resize(any, gpui::size(px(760.), px(600.)));
+        redraw(&window, cx);
+        let viewport_w = window
+            .update(cx, |_, window, _| f32::from(window.viewport_size().width))
+            .expect("视口宽");
+        assert_eq!(viewport_w, 760., "尺寸事件生效（viewport 760px）");
+        let hot_x_narrow = right_hotzone_x(right_width0, 760.);
+        mouse_down_at(&window, cx, hot_x_narrow, 300.);
+        let (drag1, right_open1) =
+            shell.read_with(cx, |s, _| (s.panel_drag.clone(), s.right_open));
+        assert!(
+            drag1.is_none(),
+            "窄窗让位 → 热区不渲染 → MouseDown 零命中（panel_drag 仍 None）"
+        );
+        assert!(
+            right_open1,
+            "让位不改写用户开关态（right_open 保持 true——宽度恢复后按原态回归）"
+        );
+
+        // ③ 恢复宽窗：热区回归 → 命中恢复（同 x 同 y）。
+        cx.simulate_window_resize(any, gpui::size(px(1000.), px(600.)));
+        redraw(&window, cx);
+        mouse_down_at(&window, cx, hot_x, 300.);
+        let drag2 = shell.read_with(cx, |s, _| s.panel_drag.clone());
+        assert!(
+            matches!(drag2, Some(PanelDragState { side: PanelSide::Right, .. })),
+            "恢复宽窗 → 热区回归 → 命中恢复（panel_drag = Some(Right)）"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
