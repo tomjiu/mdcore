@@ -53,10 +53,13 @@
 //! - **状态**：[`ZoomMode`]——FitWidth（v1 现状适宽，默认零变化）/
 //!   FitPage（整页可见）/ ActualSize（1pt:1px，百分比基准）/ Custom
 //!   （相对实际大小的倍率——滚轮/键盘步进/预设档落此态）；
-//! - **口径单点**：[`PdfPagesView::raster_width`] 是光栅宽的唯一解析点
-//!   ——submit_visible（可见区间）/ render_page_slot（槽宽）/ commit_
+//! - **口径单点**：[`PdfPagesView::raster_width`] 是逻辑光栅宽的唯一
+//!   解析点——submit_visible（可见区间）/ render_page_slot（槽宽）/ commit_
 //!   annotation（DPI）三消费点同源调用：**缩放后批注坐标正确性的
 //!   关键**（issue 验收 3——#304 坐标变换的 DPI 基准随缩放同步）；
+//!   #643：请求密度口径 = [`PdfPagesView::device_raster_width`]（逻辑宽
+//!   × 窗口缩放因子——HiDPI 不发虚），位图密度与显示尺寸解耦，
+//!   显示几何/坐标换算全部保持逻辑域；
 //! - **渲染关联**：RenderKey 键含（页, 宽）——缩放即宽变即新键，旧位
 //!   图自然 miss 重光栅（无需改键结构；缓存预算不变 LRU 回收）；
 //! - **交互**：Ctrl+滚轮（capture 期窗口级拦截——止冒泡防列表随缩
@@ -142,6 +145,10 @@ pub const WIDTH_QUANTUM: u32 = 64;
 pub const WIDTH_MIN: u32 = 256;
 /// 光栅宽上限（px）——4K 屏适宽 + 余量；引擎侧 S3-L2 仍有独立钳制。
 pub const WIDTH_MAX: u32 = 4096;
+/// #643：设备像素光栅宽上限（px）——引擎 S3-L2 单边钳制同值（8192）。
+/// HiDPI 倍率后的请求再高也必被引擎截断——壳侧先钳，键与产物不
+/// 失控。逻辑宽 [`WIDTH_MAX`]（4096）× 常见最高倍率 2.0 恰达此界。
+pub const WIDTH_MAX_DEVICE: u32 = 8192;
 /// 页面缓存字节预算（192MB——A4 适宽 BGRA ≈ 1.4MB/页，可容百页级
 /// 工作集；超预算 LRU 逐出，回滚再光栅）。
 pub const CACHE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
@@ -281,6 +288,9 @@ pub struct PdfPagesView {
     /// 视口尺寸回写通道（覆盖 canvas paint 回调持有同款 Rc——零实体
     /// 更新零重入；不注册命中区，不挡列表滚轮）。
     viewport: Rc<Cell<Option<(f32, f32)>>>,
+    /// #643：窗口缩放因子（render 期从 `Window::scale_factor` 每帧
+    /// 同步——跨显示器拖拽换档自然生效；1.0 = 单倍屏零行为变化）。
+    scale_factor: f32,
     /// 引擎面错误（构造期 open 失败——面板明示，不白屏）。
     error: Option<String>,
     /// #422：页内查找态（None = 查找条未开；开条期间常驻——层索引
@@ -530,6 +540,7 @@ impl PdfPagesView {
             focus_handle,
             viewport_size: (0., 0.),
             viewport: Rc::new(Cell::new(None)),
+            scale_factor: 1.0,
             error: None,
             search: None,
             search_focus: cx.focus_handle(),
@@ -570,6 +581,7 @@ impl PdfPagesView {
             focus_handle,
             viewport_size: (0., 0.),
             viewport: Rc::new(Cell::new(None)),
+            scale_factor: 1.0,
             error: Some(message),
             search: None,
             search_focus,
@@ -670,7 +682,8 @@ impl PdfPagesView {
     #[cfg(test)]
     pub fn page_ready_for_test(&self, page: usize) -> bool {
         let (vw, vh) = self.viewport_size;
-        let fit_w = self.raster_width(vw, vh);
+        // #643：键口径 = 设备像素宽（与 submit_visible 同源）。
+        let fit_w = self.device_raster_width(vw, vh);
         self.render_key(&(page as u32, fit_w))
             .is_some_and(|k| self.cache.contains(&k))
     }
@@ -680,6 +693,12 @@ impl PdfPagesView {
     pub fn raster_width_for_test(&self) -> u32 {
         let (vw, vh) = self.viewport_size;
         self.raster_width(vw, vh)
+    }
+
+    /// #643 测试写面：窗口缩放因子注入（无真窗口环境的唯一样本点）。
+    #[cfg(test)]
+    pub fn set_scale_factor_for_test(&mut self, sf: f32) {
+        self.scale_factor = sf;
     }
 
     /// #634 测试读数：缓存（已用字节, 条目数）——预算受限不变量断言
@@ -705,6 +724,23 @@ impl PdfPagesView {
     /// 关键（issue 验收 3：#304 坐标变换的 DPI 基准随缩放同步）。
     fn raster_width(&self, vw: f32, vh: f32) -> u32 {
         zoom_raster_width(self.zoom_mode, self.aspect, self.page_pt_w, vw, vh)
+    }
+
+    /// #643：窗口缩放因子（防御域 [1.0, 4.0]——低于 1 不降密度
+    /// （逻辑宽即保底清晰度），高于 4 由 [`WIDTH_MAX_DEVICE`] 钳制
+    /// 同效）。异常报告值（0/负）同样落回 1.0。
+    fn sf_clamped(&self) -> f32 {
+        self.scale_factor.clamp(1.0, 4.0)
+    }
+
+    /// #643：设备像素光栅宽——[`Self::raster_width`]（逻辑）× 缩放
+    /// 因子，独立量化钳制。**PageKey / RenderRequest 的口径**（位图
+    /// 请求密度）；显示几何（槽高 / contain_box / 高亮 / 批注 DPI）
+    /// 仍走逻辑宽——位图密度与显示尺寸解耦（等比内接按位图自身
+    /// 纵横比），密度提升零坐标换算影响。单倍屏（sf = 1.0）与 v1
+    /// 完全同值（缓存键零迁移）。
+    fn device_raster_width(&self, vw: f32, vh: f32) -> u32 {
+        device_quantize_width((self.raster_width(vw, vh) as f32 * self.sf_clamped()) as u32)
     }
 
     /// #421：当前缩放百分比（相对实际大小——chip 显示与菜单基准）。
@@ -845,7 +881,10 @@ impl PdfPagesView {
             return; // 首帧视口未记录——覆盖 canvas 本帧落位，下一帧起算。
         }
         // #421：光栅宽单点口径（缩放模式解析——FitWidth 与 v1 同值）。
+        // #643：请求密度走设备像素宽（HiDPI 不发虚）——键与请求同
+        // 口径；显示几何（槽高）仍按逻辑宽。
         let fit_w = self.raster_width(vw, vh);
+        let dev_w = self.device_raster_width(vw, vh);
         let slot_h = Self::slot_height(fit_w, self.aspect).max(1.);
         // 滚动偏移（内容坐标）。gpui 滚动句柄为**负向约定**（下滚 =
         // 负 y——uniform_list 自身以 `-offset` 推可见行，见其
@@ -861,7 +900,7 @@ impl PdfPagesView {
         let last = (first + visible_rows).min(self.page_count as u32);
         let mut submitted = false;
         for page in first..last {
-            let key = (page, fit_w);
+            let key = (page, dev_w);
             if self
                 .render_key(&key)
                 .is_some_and(|k| self.cache.contains(&k))
@@ -986,7 +1025,10 @@ impl PdfPagesView {
         // #421：光栅宽单点口径（首帧视口未记录时各模式均落 WIDTH_MIN
         // ——与 v1 兜底同值；ActualSize/Custom 档不依赖视口，首帧即准）。
         let fit_w = self.raster_width(vw, vh);
-        let key = (idx as u32, fit_w);
+        // #643：缓存键口径 = 设备像素宽（与 submit_visible 同源——sf
+        // 换档自然 miss 重光栅）；显示几何（槽高/内容盒/高亮）仍用
+        // 逻辑宽。
+        let key = (idx as u32, self.device_raster_width(vw, vh));
         let slot_h = Self::slot_height(fit_w, self.aspect);
         let page_no = idx + 1;
         let image = self
@@ -1034,7 +1076,7 @@ impl PdfPagesView {
                 } else {
                     let keys: Vec<RenderKey> =
                         self.cache.entries().into_iter().map(|(k, _)| k).collect();
-                    Self::nearest_fallback_key(&keys, idx as u32, fit_w)
+                    Self::nearest_fallback_key(&keys, idx as u32, key.1)
                         .and_then(|k| self.cache.get(&k).cloned())
                 };
                 if let Some(image) = stale {
@@ -1723,6 +1765,8 @@ impl Focusable for PdfPagesView {
 
 impl Render for PdfPagesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // #643：窗口缩放因子捕获（每帧同步——派单前，首帧即新口径）。
+        self.scale_factor = _window.scale_factor();
         // 派单（render 期直接改 self——uniform_list 回调期只读，无重入面）。
         self.submit_visible(cx);
         let colors = cx.theme().colors().clone();
@@ -2350,12 +2394,71 @@ pub fn quantize_width(w: u32) -> u32 {
     (clamped.div_ceil(WIDTH_QUANTUM) * WIDTH_QUANTUM).min(WIDTH_MAX)
 }
 
+/// #643：设备像素光栅宽量子化 + 域钳制（纯函数——单测锚点）。下限
+/// 同 [`WIDTH_MIN`]（更窄无读面）；上限 [`WIDTH_MAX_DEVICE`]（= 引擎
+/// S3-L2 单边钳制值——更高请求必被引擎截断，键与产物失配白费预算）。
+/// 量子化步长沿用 [`WIDTH_QUANTUM`]（sf 换档低频，键稳定性重于重
+/// 光栅频率）。
+pub fn device_quantize_width(w: u32) -> u32 {
+    let clamped = w.clamp(WIDTH_MIN, WIDTH_MAX_DEVICE);
+    (clamped.div_ceil(WIDTH_QUANTUM) * WIDTH_QUANTUM).min(WIDTH_MAX_DEVICE)
+}
+
 // ─── 纯函数面单测（零引擎依赖——CI 无 libpdfium 同样真跑） ──────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// #643：设备宽量化护栏（上限 = 引擎 S3-L2 钳制值）。
+    #[test]
+    fn device_quantize_width_clamps_and_rounds_up() {
+        assert_eq!(device_quantize_width(256), 256);
+        // 64 步长向上对齐（与逻辑宽同款量子化护栏思想）。
+        assert_eq!(device_quantize_width(300), 320);
+        // 上限 = 引擎单边钳制值；更高请求壳侧先钳（键不失控）。
+        assert_eq!(device_quantize_width(u32::MAX), WIDTH_MAX_DEVICE);
+        assert_eq!(device_quantize_width(0), WIDTH_MIN);
+    }
+
+    /// #643：HiDPI 密度接线不变量——请求密度随 sf 升档，显示几何
+    /// （槽高）保持逻辑域；单倍屏与 v1 完全同值（缓存键零迁移）。
+    #[gpui::test]
+    fn hidpi_device_width_scales_display_stays_logical(cx: &mut gpui::TestAppContext) {
+        let view = cx.update(|app| {
+            app.new(|cx| {
+                PdfPagesView::error_state(
+                    Arc::new(Vec::new()),
+                    cx.focus_handle(),
+                    cx.focus_handle(),
+                    "测试态：引擎缺席（几何口径面不依赖 worker）".into(),
+                )
+            })
+        });
+        cx.update(|app| {
+            view.update(app, |v, _| {
+                v.viewport_size = (1000., 800.);
+                let logical = v.raster_width(1000., 800.);
+                // 单倍屏：设备宽 = 逻辑宽——v1 行为与缓存键完全兼容。
+                assert_eq!(v.device_raster_width(1000., 800.), logical);
+                // 2x 屏：请求密度翻倍（64 步长量化对齐）。
+                v.set_scale_factor_for_test(2.0);
+                assert_eq!(
+                    v.device_raster_width(1000., 800.),
+                    device_quantize_width(logical * 2)
+                );
+                // 显示几何不随 sf 变：槽高仍按逻辑宽（uniform_list
+                // 行高稳定——HiDPI 换档不重排）。
+                let slot_h = PdfPagesView::slot_height(logical, v.aspect);
+                v.set_scale_factor_for_test(1.0);
+                assert_eq!(slot_h, PdfPagesView::slot_height(logical, v.aspect));
+                // sf 域防御：异常低报不降密度（逻辑宽即保底清晰度）。
+                v.set_scale_factor_for_test(0.5);
+                assert_eq!(v.device_raster_width(1000., 800.), logical);
+            })
+        });
+    }
 
     #[test]
     fn quantize_width_clamps_and_rounds_up() {
@@ -2377,9 +2480,16 @@ mod tests {
         // 640 × 1.415 = 905.6 → #634 0.5px 量子化保持 905.5。
         assert!((PdfPagesView::slot_height(640, 1.415) - 905.5).abs() < 0.01);
         // #634：量子化语义——解析值对齐半像素网格（Taffy 行高测量
-        // 同网格；uniform_list 测量与滚动换算单源一致）。
-        assert_eq!(PdfPagesView::slot_height(576, 1.41421), 814.5);
-        assert_eq!(PdfPagesView::slot_height(577, 1.41421), 816.0);
+        // 同网格；uniform_list 测量与滚动换算单源一致）。aspect 用
+        // √2 常量（字面近似值触发 clippy::approx_constant）。
+        assert_eq!(
+            PdfPagesView::slot_height(576, std::f32::consts::SQRT_2),
+            814.5
+        );
+        assert_eq!(
+            PdfPagesView::slot_height(577, std::f32::consts::SQRT_2),
+            816.0
+        );
     }
 
     #[test]
@@ -2638,7 +2748,8 @@ mod tests {
             cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(2));
             if view.read_with(&visual, |v, _| {
-                let width = v.raster_width(v.viewport_size.0, v.viewport_size.1);
+                // #643：键口径 = 设备像素宽（与 submit_visible 同源）。
+                let width = v.device_raster_width(v.viewport_size.0, v.viewport_size.1);
                 v.render_key(&(0, width))
                     .is_some_and(|key| v.cache.contains(&key))
             }) {
