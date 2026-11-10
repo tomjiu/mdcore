@@ -271,3 +271,90 @@ fn tab_close_button_closes_document_and_honors_dirty_cancel(cx: &mut TestAppCont
         "last tab closes back to empty state"
     );
 }
+
+/// A5（#47 批次 20）：**高 DPI 缩放因子**下布局保持——`simulate_scale_
+/// factor_change`（真实缩放事件——跨显示器拖拽换档的同源管线）：
+/// 2.0 档（HiDPI 双倍屏）下核心布局不变量逐项复核（标题/菜单/活动条
+/// 在场、标签在编辑区上沿、左栏完整、编辑区可用宽、右栏按开关态在
+/// 位）；回落 1.0 档布局与基线逐项一致（换档不残留）。
+#[gpui::test]
+fn layout_holds_at_hidpi_scale_factor_and_returns(cx: &mut TestAppContext) {
+    let (_shell, mut visual) = host(cx);
+    // 基线（1.0 档）边界快照。
+    visual.update(|window, app| window.draw(app).clear(app));
+    let baseline = (
+        visual.debug_bounds("title-bar").unwrap(),
+        visual.debug_bounds("menu-bar-titles").unwrap(),
+        visual.debug_bounds("act-git").unwrap(),
+        visual.debug_bounds("left-panel").unwrap(),
+        visual.debug_bounds("editor-tabs").unwrap(),
+        visual.debug_bounds("editor-content").unwrap(),
+        visual.debug_bounds("right-panel").unwrap(),
+    );
+
+    // 2.0 档（HiDPI 双倍屏）：缩放事件 + 重绘 → 不变量逐项复核。
+    visual.simulate_scale_factor_change(2.0);
+    visual.update(|window, app| window.draw(app).clear(app));
+    assert!(
+        visual.debug_bounds("title-bar").is_some(),
+        "HiDPI 档标题栏在场"
+    );
+    assert!(
+        visual.debug_bounds("menu-bar-titles").is_some(),
+        "HiDPI 档菜单入口在场（可达性）"
+    );
+    assert!(
+        visual.debug_bounds("act-git").is_some(),
+        "HiDPI 档 Git 入口在场（可达性）"
+    );
+    let left = visual.debug_bounds("left-panel").expect("HiDPI 档左栏完整");
+    let tabs = visual.debug_bounds("editor-tabs").expect("HiDPI 档标签栏在场");
+    let editor = visual
+        .debug_bounds("editor-content")
+        .expect("HiDPI 档编辑区在场");
+    assert_eq!(
+        tabs.origin.x, editor.origin.x,
+        "HiDPI 档标签仍只在编辑区上沿（列归属不变）"
+    );
+    assert!(
+        tabs.origin.x >= left.origin.x + left.size.width,
+        "HiDPI 档标签不越左栏"
+    );
+    assert!(
+        editor.size.width >= px(240.),
+        "HiDPI 档编辑区保可用宽：{:?}",
+        editor.size.width
+    );
+    assert!(
+        visual.debug_bounds("right-panel").is_some(),
+        "HiDPI 档右栏按开关态在位（right_open 缺省开）"
+    );
+
+    // 回落 1.0 档：布局与基线逐项一致（换档不残留）。
+    visual.simulate_scale_factor_change(1.0);
+    visual.update(|window, app| window.draw(app).clear(app));
+    let restored = (
+        visual.debug_bounds("title-bar").unwrap(),
+        visual.debug_bounds("menu-bar-titles").unwrap(),
+        visual.debug_bounds("act-git").unwrap(),
+        visual.debug_bounds("left-panel").unwrap(),
+        visual.debug_bounds("editor-tabs").unwrap(),
+        visual.debug_bounds("editor-content").unwrap(),
+        visual.debug_bounds("right-panel").unwrap(),
+    );
+    let same = |name: &str, a: &gpui::Bounds<gpui::Pixels>, b: &gpui::Bounds<gpui::Pixels>| {
+        assert_eq!(a.origin, b.origin, "{name} 原点回落一致");
+        assert_eq!(a.size, b.size, "{name} 尺寸回落一致");
+    };
+    let (
+        (t0, m0, g0, l0, tb0, e0, r0),
+        (t1, m1, g1, l1, tb1, e1, r1),
+    ) = (baseline, restored);
+    same("title-bar", &t0, &t1);
+    same("menu-bar-titles", &m0, &m1);
+    same("act-git", &g0, &g1);
+    same("left-panel", &l0, &l1);
+    same("editor-tabs", &tb0, &tb1);
+    same("editor-content", &e0, &e1);
+    same("right-panel", &r0, &r1);
+}
