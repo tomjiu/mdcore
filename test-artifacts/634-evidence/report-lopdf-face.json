@@ -1,8 +1,13 @@
 {
   "face": "lopdf_runtime_independent_geometry_contract",
   "head": {
-    "mdc_pdfium_lib_env": "/home/z/pdfium-bin/libpdfium.so",
-    "pdfium_lib": null,
+    "mdc_pdfium_lib_env": null,
+    "pdfium_lib": {
+      "path": "/home/z/my-project/wt51d2t/crates/pdf/../../bin/lib/libpdfium.so",
+      "provenance": "chromium/8086（CI ci-deps-v1 同轨铆定）",
+      "role": "产品仓 bin/lib（开发取件位）",
+      "sha256": "e995a89f11d48605a79a0e44f101ca3a621e5c3ef9ee311a1405e03b44dc5b19"
+    },
     "poppler": null
   },
   "note": "运行时 lopdf 独立解析（与 pypdf manifest 生成期对照互补——无 python 依赖的第三独立面）",
