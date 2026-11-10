@@ -235,6 +235,38 @@ fn layout_holds_at_enforced_minimum_window_size(cx: &mut TestAppContext) {
     );
 }
 
+/// A1/A2（#47 批次 3）：最小窗宽下标签关闭钮可达可点——760×480 时标签
+/// 条仅 ~108px，钉住关闭钮仍在标签条几何内，且点击真实关闭（干净标签
+/// 直关，无确认框；回到空态）。
+#[gpui::test]
+fn tab_close_button_remains_reachable_at_minimum_width(cx: &mut TestAppContext) {
+    let (shell, mut visual) = host(cx);
+    visual.simulate_resize(size(px(760.), px(480.)));
+    visual.update(|window, app| window.draw(app).clear(app));
+    let tabs = visual
+        .debug_bounds("editor-tabs")
+        .expect("tabs are rendered at the minimum width");
+    let close = visual
+        .debug_bounds("tab-close-0")
+        .expect("the close button is rendered at the minimum width");
+    assert!(
+        close.origin.x >= tabs.origin.x
+            && close.origin.x + close.size.width <= tabs.origin.x + tabs.size.width,
+        "close button stays inside the tab strip: close={close:?} tabs={tabs:?}"
+    );
+    visual.simulate_click(close.center(), Default::default());
+    assert_eq!(
+        shell.read_with(&visual, |shell, _| shell.tab_count()),
+        0,
+        "a clean tab closes directly at the minimum width"
+    );
+    visual.update(|window, app| window.draw(app).clear(app));
+    assert!(
+        visual.debug_bounds("editor-tabs").is_none(),
+        "last tab closes back to the empty state at the minimum width"
+    );
+}
+
 #[gpui::test]
 fn tab_close_button_closes_document_and_honors_dirty_cancel(cx: &mut TestAppContext) {
     let (shell, mut visual) = host(cx);

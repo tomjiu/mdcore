@@ -695,9 +695,14 @@ mod whitespace_path_regression {
     use super::*;
     #[test]
     fn leading_space_workspace_keeps_its_real_git_prefix() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join(format!("pr610-space-{}", std::process::id()));
+        // #47 批次 3（测试卫生）：夹具从 CWD（= cargo test 运行目录，即仓内
+        // mang-shell/）迁 temp_dir——原实现既无首尾自清也无 .gitignore 登记
+        // （对照 shell.rs 同文件重开测试的 mdc-tab-rel-* 纪律：注释 + 忽略 +
+        // 首尾自清），在 `git add -A` 提交纪律下实测残留（mang-shell/
+        // pr610-space-<pid>/）有误提交入仓风险。本测试无相对路径需求，
+        // temp_dir 语义等价；首尾自清对齐同款纪律。
+        let root = std::env::temp_dir().join(format!("pr610-space-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let workspace = root.join(" leading");
         std::fs::create_dir_all(&workspace).unwrap();
         let file = workspace.join("tracked.txt");
@@ -739,5 +744,6 @@ mod whitespace_path_regression {
                 .unwrap()
                 .contains("+after")
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
