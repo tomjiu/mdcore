@@ -3234,6 +3234,7 @@ dependencies = [
  "image",
  "lopdf",
  "mdc-canvas",
+ "mdc-lok",
  "mdc-office-io",
  "mdc-pdf",
  "menu",
@@ -3306,6 +3307,13 @@ name = "mdc-formula"
 version = "0.1.0"
 dependencies = [
  "ironcalc_base",
+]
+
+[[package]]
+name = "mdc-lok"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

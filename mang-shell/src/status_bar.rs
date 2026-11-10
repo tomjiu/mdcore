@@ -36,12 +36,15 @@ pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
 /// `workspace`：工作区根（F2——`None` = 未打开）；`pdf_view_mode`：
 /// #289-④ pdf 页面视图开关态（仅 pdf 标签活跃时消费——切换钮挂
 /// 右侧信息区）；`xlsx_grid_view_mode`：#389 阶段 1 xlsx 网格视图
-/// 开关态（仅 xlsx 标签活跃时消费——网格/文本切换钮，pdf 先例同构）。
+/// 开关态（仅 xlsx 标签活跃时消费——网格/文本切换钮，pdf 先例同构）；
+/// `docx_view_mode`：#50 C1 docx LOK 页面视图开关态（仅 docx 标签活
+/// 跃时消费——页面/文本切换钮）。
 pub fn status_bar(
     editor: Option<&Entity<Editor>>,
     workspace: Option<std::path::PathBuf>,
     pdf_view_mode: bool,
     xlsx_grid_view_mode: bool,
+    docx_view_mode: bool,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -152,6 +155,10 @@ pub fn status_bar(
     // 非 xlsx 态不占位；#585 残余①同源收口）。
     let is_xlsx = editor.is_some_and(|ed| ed.read(cx).doc_kind() == "xlsx");
     let xlsx_toggle_label = status_info::xlsx_toggle_label(xlsx_grid_view_mode);
+    // #50 C1：docx 标签 → 页面/文本视图切换钮（pdf/xlsx 先例同构——
+    // 非 docx 态不占位；#585 零内联字面量纪律同源）。
+    let is_docx = editor.is_some_and(|ed| ed.read(cx).doc_kind() == "docx");
+    let docx_toggle_label = status_info::docx_toggle_label(docx_view_mode);
     let hover = colors.element_hover;
 
     h_flex()
@@ -216,6 +223,27 @@ pub fn status_bar(
                             ))
                             .child(
                                 Label::new(xlsx_toggle_label)
+                                    .size(LabelSize::XSmall)
+                                    .color(ui::Color::Muted),
+                            ),
+                    )
+                })
+                // #50 C1：docx 页面/文本视图切换（LOK 内核页视图 ↔ 行投
+                // 影；非 docx 标签不占位）。
+                .when(is_docx, |el| {
+                    el.child(
+                        div()
+                            .id("docx-view-toggle")
+                            .px_2()
+                            .rounded_sm()
+                            .hover(move |el| el.bg(hover))
+                            .on_click(cx.listener(
+                                |this, _ev: &ClickEvent, window: &mut Window, cx| {
+                                    this.toggle_docx_view_mode(window, cx);
+                                },
+                            ))
+                            .child(
+                                Label::new(docx_toggle_label)
                                     .size(LabelSize::XSmall)
                                     .color(ui::Color::Muted),
                             ),
