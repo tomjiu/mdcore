@@ -16,6 +16,10 @@
 //!                               切主题 → 3.6s 停驻中性位 → 4.2s 悬停
 //!                               活动 git 钮 → 5.6s 点击切 git 视图（完整
 //!                               鼠标事件管线）；A/B/C 三帧断言三态
+//! mang-shell --smoke-disabled-state <mode>  #47 E-2 禁用态夹具：无工作区
+//!                               下切 git 视图 → 悬停/点击禁用的「刷新」钮
+//!                               （git_panel 不可用态禁用渲染）；外层双跑
+//!                               （禁用面/带工作区对照面）三帧+日志断言
 //! mang-shell --check-pdfium  pdfium 部署自检（#68 方向一）：定位序逐层
 //!                               探针 + 绑定走查 + 修复指引；纯 CLI 不开窗，
 //!                               退出码 0=已绑定 / 3=未绑定
@@ -255,6 +259,22 @@ fn main() {
     let smoke_theme: Option<&'static str> = args
         .iter()
         .position(|a| a == "--smoke-theme")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| match v.as_str() {
+            theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
+            theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
+            _ => None,
+        });
+    // 接线登记批次 6（#47 E-2 禁用态夹具）：--smoke-disabled-state
+    // <light|dark>——无工作区（git 面板不可用）下点击 act-git 切 git
+    // 视图 → 悬停/点击禁用的「刷新」钮；外层双跑本旗标（无工作区 = 禁用
+    // 面 / 带 --smoke-workspace = 对照面），disabled_state_check.py 断言
+    // 禁用无 hover/无点击响应 + 对照面 hover/点击真实生效（git: 证据行
+    // 计数）。git_panel.rs 刷新钮不可用态改禁用渲染（无 hover/无监听/
+    // Color::Disabled）——本旗标是该产品行为的验收夹具。
+    let smoke_disabled_state: Option<&'static str> = args
+        .iter()
+        .position(|a| a == "--smoke-disabled-state")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| match v.as_str() {
             theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
@@ -643,6 +663,16 @@ fn main() {
                             shell.set_theme_mode(mode, cx);
                         })
                     });
+                })
+                .detach();
+            }
+
+            // 接线登记批次 6（#47 E-2 禁用态）：无工作区下点击 act-git 切
+            // git 视图 → 悬停/点击禁用刷新钮（时间线见旗标注释）。
+            if let Some(mode) = smoke_disabled_state {
+                let handle = window_handle.clone();
+                cx.spawn(async move |cx| {
+                    run_disabled_state_script(&handle, cx, mode).await;
                 })
                 .detach();
             }
@@ -1357,6 +1387,97 @@ async fn run_hover_state_script(
     step(window, cx, 2200, down(26., 102.), false).await; // 相对：script 7.4s（B 帧后）
     step(window, cx, 150, up(26., 102.), false).await; // 相对：script 7.55s
     eprintln!("hover-state-smoke: script done (theme {mode} → park → hover act-git → click)");
+}
+
+// ---------------------------------------------------------------------------
+// 接线登记批次 6（#47 E-2 禁用态）：--smoke-disabled-state 脚本
+// ---------------------------------------------------------------------------
+
+/// E-2 禁用态烟雾脚本：无工作区（git 面板不可用）下切 git 视图 → 悬停 →
+/// 点击**禁用的「刷新」钮**。禁用渲染（git_panel.rs）：无 hover 反馈、
+/// 无点击监听、Label Color::Disabled。外层双跑本旗标：
+/// 无 --smoke-workspace = 禁用面；带 = 对照面（刷新钮可用）。
+/// `disabled_state_check.py` 断言：禁用面 hover/点击零响应（帧逐字节
+/// 相等）+ 对照面 hover 底色响应 + 点击产生 `git: ` 证据行增量。
+///
+/// 坐标（窗口内容系）：act-git 钮 (26,102)（批次 5 同源）；「刷新」钮
+/// (265,93)（git 面板头部右侧——260px 面板宽 + flex_1 推右，批次 5 实测
+/// 标签盒 x∈[249,281] y∈[91,96]）。
+async fn run_disabled_state_script(
+    window: &gpui::WindowHandle<shell::ShellApp>,
+    cx: &mut gpui::AsyncApp,
+    mode: &'static str,
+) {
+    use gpui::{
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
+        px,
+    };
+
+    let park = |x: f32, y: f32| {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(px(x), px(y)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        })
+    };
+    let down = |x: f32, y: f32| {
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        })
+    };
+    let up = |x: f32, y: f32| {
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        })
+    };
+
+    async fn step(
+        window: &gpui::WindowHandle<shell::ShellApp>,
+        cx: &mut gpui::AsyncApp,
+        at_ms: u64,
+        ev: PlatformInput,
+        refresh: bool,
+    ) {
+        cx.background_executor()
+            .timer(Duration::from_millis(at_ms))
+            .await;
+        let any_handle: gpui::AnyWindowHandle = (*window).into();
+        let _ = cx.update_window(any_handle, |_, window, cx| {
+            window.dispatch_event(ev, cx);
+            // 落帧机制同批次 5（纯 hover 依赖 draw 期命中解析）。
+            if refresh {
+                window.refresh();
+            }
+        });
+    }
+
+    // 相对时间线：1.0s 切主题 → 3.0/3.15s 点击 act-git 切 git 视图 →
+    // 4.6s 停驻中性位 → 6.2s 悬停刷新钮 → 8.0/8.15s 点击刷新钮
+    //（外层 A@5.8s / B@8.2s / C@10.0s 截帧）。
+    cx.background_executor()
+        .timer(Duration::from_millis(1000))
+        .await;
+    let _ = cx.update(|cx| {
+        window.update(cx, |shell, _window, cx| {
+            shell.set_theme_mode(mode, cx);
+        })
+    });
+    step(window, cx, 2000, down(26., 102.), false).await; // script 3.0s
+    step(window, cx, 150, up(26., 102.), false).await; // script 3.15s
+    step(window, cx, 1450, park(900., 400.), true).await; // script 4.6s
+    step(window, cx, 1600, park(265., 93.), true).await; // script 6.2s
+    step(window, cx, 1800, down(265., 93.), false).await; // script 8.0s
+    step(window, cx, 150, up(265., 93.), false).await; // script 8.15s
+    eprintln!(
+        "disabled-state-smoke: script done (theme {mode} → act-git → park → hover refresh → click)"
+    );
 }
 
 // ---------------------------------------------------------------------------
