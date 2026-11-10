@@ -69,7 +69,7 @@ W=1600; H=1000
 FIXTURE="mang-shell/tests/fixtures/smoke.md"
 [ -f "$FIXTURE" ] || { echo "缺夹具 $FIXTURE" >&2; exit 69; }
 
-echo "[1/5] 构建 mang-shell（debug）"
+echo "[1/6] 构建 mang-shell（debug）"
 cargo build --manifest-path mang-shell/Cargo.toml
 BIN="mang-shell/target/debug/mang-shell"
 
@@ -82,7 +82,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[2/5] 启动 Xvfb :$DISPLAY_NUM（${W}x${H}x24）"
+echo "[2/6] 启动 Xvfb :$DISPLAY_NUM（${W}x${H}x24）"
 Xvfb ":$DISPLAY_NUM" -screen 0 "${W}x${H}x24" >/tmp/theme-smoke-xvfb.log 2>&1 &
 XVFB_PID=$!
 export DISPLAY=":$DISPLAY_NUM"
@@ -112,7 +112,7 @@ run_one() { # $1 = light|dark
   echo "  [$mode] $(grep '^theme:' "$log" | tail -1) + quit reached ✓"
 }
 
-echo "[3/5] 双态截帧"
+echo "[3/6] 双态截帧"
 run_one light
 run_one dark
 
@@ -166,11 +166,62 @@ run_hover_state() { # $1 = light|dark
   echo "  [hover-$mode] 三帧采集 ✓ $(grep 'hover-state-smoke' "$log" | tail -1 | sed 's/^hover-state-smoke: //')"
 }
 
-echo "[4/5] hover/选中态三帧采集（双主题）"
+echo "[4/6] hover/选中态三帧采集（双主题）"
 run_hover_state light
 run_hover_state dark
 
-echo "[5/5] PPM 像素断言（E-1 双态 + E-2 hover/选中态）"
+# 批次 6（E-2 禁用态）：--smoke-disabled-state 双面跑——禁用面（非 git
+# 工作区：面板构造但不可用→刷新钮禁用）/ 对照面（git 工作区）。
+# 外层 A@5.8s / B@8.2s / C@10.0s。
+run_disabled_state() { # $1 = disabled|control  $2 = light|dark
+  local face="$1" mode="$2"
+  local home="/tmp/theme-smoke-home-ds-$face"
+  local log="$OUT/ds-$face.log"
+  rm -rf "$home"; mkdir -p "$home"
+  local ws_args=()
+  command -v git >/dev/null || { echo "缺 git（工作区夹具）" >&2; return 1; }
+  if [ "$face" = "control" ]; then
+    local ws="/tmp/theme-smoke-ws-ds-$mode"
+    make_hover_workspace "$ws"
+    ws_args=(--smoke-workspace "$ws")
+  else
+    # 禁用面：非 git 工作区目录——GitPanel 随工作区构造（shell.rs
+    # open_workspace「工作区打开即建」），root 非 git 仓 → 不可用态 →
+    # 刷新钮禁用。无工作区时面板不构造，测不到禁用面。
+    local ws="/tmp/theme-smoke-ws-plain-$mode"
+    rm -rf "$ws"; mkdir -p "$ws/子目录"
+    echo "# 非 git 工作区" > "$ws/普通文档.md"
+    ws_args=(--smoke-workspace "$ws")
+  fi
+  echo "  [ds-$face] 启动（--smoke-disabled-state $mode --smoke-sec 12 ${ws_args[*]:+工作区}）"
+  HOME="$home" "$BIN" --smoke-disabled-state "$mode" --smoke-sec 12 \
+    "${ws_args[@]}" >"$log" 2>&1 &
+  local app_pid=$!
+  # A=5.8s（act-git 点击 3.5s 墙钟后 + 渲染窗，park 5.1s 后）
+  # / B=8.2s（hover 6.7s 墙钟 + 1.5s）/ C=10.0s（up 8.65s 墙钟 + 1.35s）。
+  sleep 5.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/ds-$face-a.ppm" -y
+  sleep 2.4
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/ds-$face-b.ppm" -y
+  sleep 1.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/ds-$face-c.ppm" -y
+  ffmpeg -hide_banner -loglevel error -i "$OUT/ds-$face-c.ppm" "$OUT/ds-$face.png" -y
+  wait "$app_pid" || { echo "  [ds-$face] 应用退出码非 0" >&2; return 1; }
+  grep -q "disabled-state-smoke: script done" "$log" \
+    || { echo "  [ds-$face] 缺 disabled-state-smoke 证据行" >&2; return 1; }
+  grep -q "smoke: quit reached" "$log" \
+    || { echo "  [ds-$face] 缺 smoke: quit reached" >&2; return 1; }
+  echo "  [ds-$face] 三帧采集 ✓"
+}
+
+echo "[5/6] 禁用态双面采集（disabled / control）"
+run_disabled_state disabled light
+run_disabled_state control light
+
+echo "[6/6] PPM 像素断言（E-1 双态 + E-2 hover/选中 + E-2 禁用/对照）"
 python3 mang-shell/tests/theme_visual_check.py \
   "$OUT/theme-light.ppm" "$OUT/theme-dark.ppm" | tee "$OUT/evidence.txt"
 for mode in light dark; do
@@ -178,5 +229,10 @@ for mode in light dark; do
     "$OUT/hover-$mode-a.ppm" "$OUT/hover-$mode-b.ppm" "$OUT/hover-$mode-c.ppm" \
     | tee -a "$OUT/evidence.txt"
 done
+for face in disabled control; do
+  python3 mang-shell/tests/disabled_state_check.py "$face" \
+    "$OUT/ds-$face-a.ppm" "$OUT/ds-$face-b.ppm" "$OUT/ds-$face-c.ppm" "$OUT/ds-$face.log" \
+    | tee -a "$OUT/evidence.txt"
+done
 
-echo "OK: 主题两态 + hover/选中态视觉证据 → $OUT"
+echo "OK: 主题两态 + hover/选中态 + 禁用态视觉证据 → $OUT"

@@ -193,7 +193,11 @@ impl Render for GitPanel {
         let hover = colors.element_hover;
         let selected = colors.element_selected;
 
-        // 头部：视图切换（改动/历史）+ 刷新。
+        // 头部：视图切换（改动/历史）+ 刷新。刷新钮在不可用态（非 git
+        // 目录 / 缺 git）进入**禁用态**（#47 E-2 禁用态夹具——按钮六问①
+        // 「点击有响应」的反面：无动作可执行时如实禁用，不再伪装可点）：
+        // 无 hover 反馈、无点击监听、Label 用 ui::Color::Disabled。
+        let refresh_disabled = self.unavailable.is_some();
         let view = self.view;
         let changes_count = self.changes.len();
         let header = h_flex()
@@ -249,26 +253,34 @@ impl Render for GitPanel {
                     .child(Label::new("历史").size(LabelSize::Small)),
             )
             .child(div().flex_1())
-            .child(
-                h_flex()
-                    .id("git-refresh")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .hover(move |el| el.bg(hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.refresh();
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        Label::new("刷新")
-                            .size(LabelSize::Small)
-                            .color(ui::Color::Muted),
-                    ),
-            );
+            .child({
+                let btn =
+                    h_flex()
+                        .id("git-refresh")
+                        // #47 E-2 禁用态批：测试定位锚（shell.rs editor-tabs
+                        // 同款 id+debug_selector 配对——debug_bounds 需显式选择器）。
+                        .debug_selector(|| "git-refresh".into())
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .when(!refresh_disabled, |el| {
+                            el.hover(move |el| el.bg(hover)).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.refresh();
+                                    cx.notify();
+                                }),
+                            )
+                        })
+                        .child(Label::new("刷新").size(LabelSize::Small).color(
+                            if refresh_disabled {
+                                ui::Color::Disabled
+                            } else {
+                                ui::Color::Muted
+                            },
+                        ));
+                btn
+            });
 
         // 体：不可用提示 / 对应视图列表。
         let body: gpui::AnyElement = if let Some(reason) = &self.unavailable {
@@ -906,5 +918,123 @@ mod keyboard_tests {
                 "存续行句柄身份不变（刷新后焦点稳定）"
             );
         });
+    }
+
+    // --------------------------------------------------------------
+    // #47 批次 6（E-2 禁用态）：刷新钮禁用行为——不可用态点击冒泡零
+    // 状态变化；可用态点击真实拉取磁盘新改动。GUI 像素面由
+    // --smoke-disabled-state 双面断言（theme_visual_smoke.sh），本组为
+    // 头无单测面（debug_bounds 锚 + simulate_click 全事件管线）。
+    // --------------------------------------------------------------
+
+    /// 构造指定根的 GitPanel 并在测试窗口中渲染；返回 (visual, panel,
+    /// 刷新钮 bounds)。夹具卫生：temp_dir + 首尾自清（#47 批次 4 范式）。
+    fn refresh_host(
+        cx: &mut gpui::TestAppContext,
+        root: std::path::PathBuf,
+    ) -> (
+        gpui::VisualTestContext,
+        gpui::Entity<GitPanel>,
+        gpui::Bounds<gpui::Pixels>,
+    ) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let opened_focus = cx.update(|app| app.focus_handle());
+        let panel = cx.update(|app| {
+            app.new(|cx| {
+                GitPanel::new(
+                    root,
+                    GitPanelHooks {
+                        open_readonly: Arc::new(|_, _, _, _| {}),
+                        escape: Arc::new(|_, _| {}),
+                    },
+                    cx,
+                )
+            })
+        });
+        let window = cx.open_window(gpui::size(gpui::px(260.), gpui::px(400.)), {
+            let panel = panel.clone();
+            let opened_focus = opened_focus.clone();
+            move |_, _| ClickHost {
+                panel,
+                opened_focus,
+            }
+        });
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual
+            .debug_bounds("git-refresh")
+            .expect("刷新钮渲染在场（debug_selector 锚）");
+        (visual, panel, bounds)
+    }
+
+    #[gpui::test]
+    fn refresh_click_is_inert_when_root_not_a_git_repo(cx: &mut gpui::TestAppContext) {
+        // 非 git 根（夹具卫生：temp_dir + 自清）。
+        let dir =
+            std::env::temp_dir().join(format!("mang-git-refresh-disabled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("普通.md"), "非 git 根\n").unwrap();
+
+        let (mut visual, panel, bounds) = refresh_host(cx, dir.clone());
+        panel.read_with(&visual, |p, _| {
+            let reason = p.unavailable.as_ref().expect("非 git 根 → 不可用态");
+            assert!(reason.contains("非 git"), "不可用文案语义: {reason}");
+        });
+        // 禁用钮点击：冒泡到无监听元素——状态零变化。
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        panel.read_with(&visual, |p, _| {
+            let reason = p.unavailable.as_ref().expect("点击后仍不可用态");
+            assert!(reason.contains("非 git"), "禁用点击不改文案: {reason}");
+            assert!(p.changes.is_empty(), "禁用点击不产生改动");
+            assert!(p.commits.is_empty(), "禁用点击不产生提交");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn refresh_click_pulls_disk_changes_when_available(cx: &mut gpui::TestAppContext) {
+        assert!(git_available(), "真 Git 刷新回归需要 git");
+        let dir =
+            std::env::temp_dir().join(format!("mang-git-refresh-enabled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("probe.txt"), "original\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git 进程");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "refresh-test@example.invalid"]);
+        git(&["config", "user.name", "Refresh test"]);
+        git(&["add", "probe.txt"]);
+        git(&["commit", "-qm", "Initial"]);
+
+        let (mut visual, panel, bounds) = refresh_host(cx, dir.clone());
+        panel.read_with(&visual, |p, _| {
+            assert!(p.unavailable.is_none(), "git 根可用");
+            assert!(p.changes.is_empty(), "构造期干净");
+        });
+        // 磁盘弄脏 → 点击刷新 → 真实拉取（点击冒泡 + refresh 同步）。
+        std::fs::write(dir.join("probe.txt"), "changed\n").unwrap();
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        panel.read_with(&visual, |p, _| {
+            assert!(p.unavailable.is_none());
+            assert_eq!(p.changes.len(), 1, "刷新拉到磁盘新改动");
+            assert_eq!(p.changes[0].path, "probe.txt");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
