@@ -693,11 +693,33 @@ mod tests {
 #[cfg(test)]
 mod whitespace_path_regression {
     use super::*;
+    /// #65 同款夹具卫生（本面 2026-11-10 实测再泄漏：pr610-space-<pid> 在
+    /// cwd 残留，`git add -A` 纪律下有嵌套仓误提交风险）：temp_dir + Drop
+    /// 首尾自清——断言失败也回收，实测零再生。
+    struct TempRoot(std::path::PathBuf);
+    impl TempRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "pr610-space-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     #[test]
     fn leading_space_workspace_keeps_its_real_git_prefix() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join(format!("pr610-space-{}", std::process::id()));
+        let guard = TempRoot::new();
+        let root = guard.0.clone();
         let workspace = root.join(" leading");
         std::fs::create_dir_all(&workspace).unwrap();
         let file = workspace.join("tracked.txt");
