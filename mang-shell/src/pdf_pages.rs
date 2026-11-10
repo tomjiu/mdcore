@@ -774,6 +774,14 @@ impl PdfPagesView {
         self.raster_width(vw, vh)
     }
 
+    /// #51 D3 测试读数：当前**设备像素**光栅宽（pending 键宽同口径——
+    /// HiDPI 测试窗口 sf≠1 时与逻辑宽不同域，断言面必用本读数）。
+    #[cfg(test)]
+    pub fn device_raster_width_for_test(&self) -> u32 {
+        let (vw, vh) = self.viewport_size;
+        self.device_raster_width(vw, vh)
+    }
+
     /// #643 测试写面：窗口缩放因子注入（无真窗口环境的唯一样本点）。
     #[cfg(test)]
     pub fn set_scale_factor_for_test(&mut self, sf: f32) {
@@ -785,6 +793,25 @@ impl PdfPagesView {
     #[cfg(test)]
     pub fn cache_stats_for_test(&self) -> (usize, usize) {
         (self.cache.bytes(), self.cache.len())
+    }
+
+    /// #51 D3 测试读数：在飞作业键宽族——陈旧取消面断言（缩放风暴后
+    /// pending 只应含当前设备宽键；empty = 无在飞）。
+    #[cfg(test)]
+    pub fn pending_widths_for_test(&self) -> Vec<u32> {
+        self.pending.values().map(|k| k.1).collect()
+    }
+
+    /// #51 D3 测试读数：缓存条目的宽度族——旧宽残留观测（陈旧取消只
+    /// 截停在飞面，已落缓存条目交 LRU 自然逐出——本读数断言「旧宽
+    /// 不新增」的基线差分）。
+    #[cfg(test)]
+    pub fn cache_widths_for_test(&self) -> Vec<u32> {
+        self.cache
+            .entries()
+            .into_iter()
+            .map(|(k, _)| k.width_px)
+            .collect()
     }
 
     /// #634 测试读数：引擎面错误（坏文件视图态断言——面板明示面同源）。
@@ -980,8 +1007,33 @@ impl PdfPagesView {
             filled += self.page_slot_height(fit_w, last);
         }
         let last = (last + 2).min(self.page_count) as u32; // exclusive + 1 页过扫描
+        // #51 D3：陈旧在飞作业取消——缩放/HiDPI 换档使 dev_w 变化时，
+        // 旧宽在飞作业若放行完成会落**旧键**（LRU 最近位挤占当前键——
+        // 快速缩放抖动收口）。取消 = 排队面令牌 + 在飞登记摘除：已
+        // 开跑作业的迟到 Done 走「机械丢弃」既有路径（pending miss，
+        // 不落缓存）；Cancelled 回执同理（取消 ≠ 失败——同宽回访时
+        // 自然重新派单，不进 failed 永久标记）。
+        let stale_ids: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, k)| k.1 != dev_w)
+            .map(|(id, _)| *id)
+            .collect();
+        if !stale_ids.is_empty() {
+            let worker = self
+                .worker
+                .as_mut()
+                .expect("submit_visible 头部已过 None 门（worker 必在）");
+            for id in stale_ids {
+                worker.cancel(id);
+                self.pending.remove(&id);
+            }
+        }
+        // #51 D3：可见页优先——顶部可见页先入队（worker FIFO），过
+        // 扫描邻居（idx-1）殿后：跳页/滚动后的用户感知延迟 = 首屏
+        // 页一跳渲染即回（旧行为先渲 idx-1 再渲顶部页）。
         let mut submitted = false;
-        for page in first..last {
+        for page in idx as u32..last {
             let key = (page, dev_w);
             if self
                 .render_key(&key)
@@ -997,6 +1049,22 @@ impl PdfPagesView {
             });
             self.pending.insert(id, key);
             submitted = true;
+        }
+        if first < idx as u32 {
+            let key = (first, dev_w);
+            if !(self
+                .render_key(&key)
+                .is_some_and(|k| self.cache.contains(&k))
+                || self.failed.contains(&key)
+                || self.pending.values().any(|k| *k == key))
+            {
+                let id = self.worker.as_mut().unwrap().submit(RenderRequest {
+                    page: PageIndex(key.0),
+                    width_px: key.1,
+                });
+                self.pending.insert(id, key);
+                submitted = true;
+            }
         }
         if submitted && !self.polling {
             self.polling = true;
