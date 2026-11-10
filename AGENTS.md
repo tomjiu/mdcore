@@ -5,6 +5,136 @@
 
 ---
 
+# 负一、当前协作平台（2026-11-10 起，最高优先）
+
+> **GitHub 已停用**（`mmqz` 账号被 suspended，不可恢复）。所有代码提交走**自部署 Git 服务**。
+
+## -1.1 唯一提交入口
+
+```
+地址：https://git.mingjiu.store
+账号：sandbox-agent
+令牌：见任务派发时下发的 TOKEN（不入库、不写文件）
+```
+
+**六个仓库都在 `sandbox` 组织下**：
+
+| 仓库 | 说明 |
+|---|---|
+| `sandbox/mdcore` | 文档引擎（PDF/DOCX/XLSX/Canvas/mang-shell GPUI） |
+| `sandbox/ai-bid-research` | 标书应用（bid-mcp/bid-domain/mang-app） |
+| `sandbox/kokoa` | Kokoa 浏览器 |
+| `sandbox/mang-research-archive` | 研究仓 |
+| `sandbox/agents-hub` | Agent 中心 |
+| `sandbox/cpa-multi-plugins` | CPA 插件集 |
+
+## -1.2 提交方式：HTTPS + Token，不用 SSH
+
+```bash
+# 克隆
+git clone https://sandbox-agent:<TOKEN>@git.mingjiu.store/sandbox/mdcore.git
+cd mdcore
+
+# 开分支（必须带身份前缀，防撞车）
+git checkout -b <你的身份>/<issue号>-<简短描述>
+# 例：git checkout -b agent-x7m2/601-extract
+
+# 改代码 → 提交
+git add -A
+git commit -m "feat(#601): 一句话说清"
+
+# 推分支
+git push origin <你的身份>/<issue号>-<简短描述>
+```
+
+**为什么不用 SSH**：
+
+```
+· 服务器 22 端口有 fail2ban，容易被封
+· HTTPS + token 全程走 443，不受影响
+· 证书是 Let's Encrypt，不需要 http.sslVerify=false
+```
+
+## -1.3 开 PR
+
+**方式 A：网页**（推荐）
+
+```
+https://git.mingjiu.store/sandbox/<仓库>/pulls
+点 New Pull Request，选你的分支 → base 选 main
+```
+
+**方式 B：API**
+
+```bash
+curl -X POST "https://git.mingjiu.store/api/v1/repos/sandbox/mdcore/pulls" \
+  -H "Authorization: token <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"feat(#601): xxx","head":"<你的分支>","base":"main"}'
+```
+
+## -1.4 不跑 CI
+
+**本平台不配置、不触发任何 CI。**
+
+```
+· Forgejo 未启用 Actions
+· 提交不会触发任何流水线
+· 代码正确性由你自己本地验证
+```
+
+**必须在 PR 描述里写明你跑了什么**：
+
+```markdown
+## 本地验证
+- cargo check --workspace → 0 error
+- cargo test -p mdcore → 123 passed
+- 或 python -m pytest → 305 passed
+```
+
+## -1.5 main 自动同步到云托管
+
+```
+你的 push → git.mingjiu.store
+              ↓ 服务器每 2 分钟自动同步
+         Codeberg（公开）+ CNB（私有）
+```
+
+**你只需要往 `git.mingjiu.store` 推。不要直接推 Codeberg / CNB——会被覆盖。**
+
+| 云托管 | 同步范围 | 说明 |
+|---|---|---|
+| Codeberg | main only | 3 个文档引擎仓库，公开 |
+| CNB | main only | 5 个仓库，私有 |
+
+## -1.6 红线
+
+```
+❌ 不要 push 到 Codeberg / CNB（会被服务器自动同步覆盖）
+❌ 不要 push 到 GitHub（账号已封，不该再依赖）
+❌ 不要 push main 分支（走 PR，同 §0 规矩）
+❌ 不要在代码/提交里写 token
+❌ 不要期待 CI 反馈——没有 CI
+```
+
+## -1.7 与下文旧规则的关系
+
+```
+下文 §0 ~ §八 的流程规则（认领、PR 纪律、rebase、
+冲突处理、测试环境门等）全部继续有效。
+
+只有「用哪个平台」和「用什么命令」变了：
+  gh pr create        → 网页 / REST API
+  gh issue list       → 本平台无 issue 体系，任务由 Lead 派发
+  gh api repos/...    → https://git.mingjiu.store/api/v1/...
+  origin = github.com → origin = git.mingjiu.store
+```
+
+---
+
+
+---
+
 
 ---
 
