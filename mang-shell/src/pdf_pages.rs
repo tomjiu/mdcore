@@ -2378,8 +2378,12 @@ mod tests {
         assert!((PdfPagesView::slot_height(640, 1.415) - 905.5).abs() < 0.01);
         // #634：量子化语义——解析值对齐半像素网格（Taffy 行高测量
         // 同网格；uniform_list 测量与滚动换算单源一致）。
-        assert_eq!(PdfPagesView::slot_height(576, 1.41421), 814.5);
-        assert_eq!(PdfPagesView::slot_height(577, 1.41421), 816.0);
+        // （#58 合入的 1.41421 字面量触 clippy::approx_constant（1.99
+        // deny 默认）——改精确 `SQRT_2` 常量，断言结果不变：576×√2
+        // = 814.59 → 814.5；577×√2 = 815.93 → 816.0。随 C2 批修复
+        // main 门红——D 线知悉即可。）
+        assert_eq!(PdfPagesView::slot_height(576, std::f64::consts::SQRT_2 as f32), 814.5);
+        assert_eq!(PdfPagesView::slot_height(577, std::f64::consts::SQRT_2 as f32), 816.0);
     }
 
     #[test]
