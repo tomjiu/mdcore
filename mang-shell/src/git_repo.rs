@@ -718,6 +718,7 @@ mod whitespace_path_regression {
     }
     #[test]
     fn leading_space_workspace_keeps_its_real_git_prefix() {
+        // 夹具卫生：TempRoot::new()（#65 引入的标准件）——temp_dir + 首尾自清。
         let guard = TempRoot::new();
         let root = guard.0.clone();
         let workspace = root.join(" leading");
@@ -761,5 +762,6 @@ mod whitespace_path_regression {
                 .unwrap()
                 .contains("+after")
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

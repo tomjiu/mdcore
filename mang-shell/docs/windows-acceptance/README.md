@@ -66,13 +66,17 @@
 
 | # | 检查项 | 期望 |
 |---|---|---|
-| E-1 | 明 / 暗主题两态 | 侧栏无透明按钮；主题色 / 尺寸 / 圆角 / 焦点环统一 |
+| E-1 | 明 / 暗主题两态 | 侧栏无透明按钮；主题色 / 尺寸 / 圆角 / 焦点环统一。**Linux 侧自动化背书（#47 批次 4）**：`theme_visual_smoke.sh` → `theme_visual_check.py` 11 项像素断言（双态底色分向 / 切换真实生效 / 侧栏随主题 / 活动条墨迹可见性），证据 PNG `theme-light.png` / `theme-dark.png`；「无透明按钮」人工观感与四态统一仍属真机验收 |
 | E-2 | hover / 选中 / 焦点 / 禁用态 | 四态可见且一致 |
 | 按钮六问 | （用户原话逐条） | ① 各面板按钮点击有响应（含 hover）②「打开文件」按钮→选择器→成功 ③ 侧栏无透明按钮（明暗两态）④ 菜单栏贴左与 zed/vscode 同款位 ⑤ 左右栏布局合理 ⑥ 迁移组件真机行为：右键菜单 / 菜单栏 / 命令面板 / Ctrl+G 跳行 / tab 条 / settings 模态 / panels·file_tree·git_panel 列表 |
 
 ## 六、Linux 侧启动证据（2026-11-10，本批实测）
 
 - 基线：main `2e9d233`；工具链 rust 1.99.0（rust-toolchain.toml 钉住）。
+- 主题两态视觉面（#47 批次 4，E-1）：`./theme_visual_smoke.sh`（仓库根级）
+  Xvfb 1600×1000 + llvmpipe 双态截帧 → 11 项断言全过
+  （实测：light 全帧 244.6 / dark 37.4 / MAD 132.8 / 活动条墨迹 1.05%・0.95%），
+  证据 `theme-light.png` / `theme-dark.png`（本目录）。
 - 门禁（全部本地实跑）：`cargo check --all-targets` 0 error；
   `cargo test --lib` 582 passed / 0 failed / 5 ignored（ignored = 夹具生成器 + 1 性能面）；
   `cargo test --bin mang-shell` 679 passed / 0 failed；
