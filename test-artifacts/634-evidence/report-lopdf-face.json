@@ -1,0 +1,10 @@
+{
+  "face": "lopdf_runtime_independent_geometry_contract",
+  "head": {
+    "mdc_pdfium_lib_env": "/home/z/pdfium-bin/libpdfium.so",
+    "pdfium_lib": null,
+    "poppler": null
+  },
+  "note": "运行时 lopdf 独立解析（与 pypdf manifest 生成期对照互补——无 python 依赖的第三独立面）",
+  "pages_checked": 134
+}
