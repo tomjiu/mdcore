@@ -1,0 +1,21 @@
+# mdc-dock —— dock 体系（#119 批①：trait 化 + 面板注册 + 激活协议）
+#
+# 溯源与纪律见同目录 PROVENANCE.md（zed dock.rs 蓝本移植 + delta 三栏）。
+# 本 crate 是 mang-shell 独立 workspace 的成员（mang-shell/Cargo.toml
+# [workspace] members），主仓门禁不触达；自身门禁单独跑：
+#   cargo test -p mdc-dock
+# 依赖面 = third_party/zed 搬运闭包 gpui（源码零修改口径）。
+[package]
+name = "mdc-dock"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[dependencies]
+gpui = { path = "../../../third_party/zed/crates/gpui", default-features = false }
+
+[dev-dependencies]
+# 测试面（trait 契约 + 激活协议）与 mang-shell 同口径：test-support
+# 特性只进 dev-deps，产物面零携带。
+gpui = { path = "../../../third_party/zed/crates/gpui", default-features = false, features = ["test-support"] }

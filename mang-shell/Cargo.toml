@@ -29,7 +29,10 @@ path = "src/main.rs"
 name = "mang_shell"
 path = "src/lib.rs"
 
+#119：mdc-dock crate（dock 体系批①——trait 化+注册+激活协议；
+# 独立成员，主仓门禁不触达，自身门禁：cargo test -p mdc-dock）。
 [workspace]
+members = ["crates/mdc-dock"]
 
 [dependencies]
 anyhow = "1.0.86"
@@ -87,6 +90,11 @@ mdc-canvas = { path = "../crates/canvas" }
 # 公开 client API：WorkerClient/DocHandle/运行时发现/BMP 回读；零
 # FFI 触碰（B 线私有域）。serde_json 1.0 既有闭包（settings 同源）。
 mdc-lok = { path = "../crates/lok" }
+# #119（mdc-dock 批①）：dock 体系——Panel/PanelHandle trait + Dock 实体
+# + 激活协议 + 注册表。左栏文件树↔Git 面切换经此协议（git_view 布尔
+# 退役）。独立 workspace 成员（crates/mdc-dock），门禁单跑
+# `cargo test -p mdc-dock`。
+mdc-dock = { path = "crates/mdc-dock" }
 # #133 任务 1：canvas 位面通道的图像容器（image 的 Frame/ImageBuffer
 # 构造 RGBA 帧 + smallvec 帧容器——RenderImage::new 入参；R↔B 字节序
 # 交换见 canvas_view::rgba_to_bgra——RenderImage 是 BGRA 字节序）。均

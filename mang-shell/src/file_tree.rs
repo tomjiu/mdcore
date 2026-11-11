@@ -140,6 +140,10 @@ pub struct TreeRow {
 /// 深度上限（DFS 双保险——符号链接/异常环防御）。
 const MAX_DEPTH: usize = 24;
 
+/// #119（mdc-dock 批①）：文件树面板的 dock 身份键（左栏激活协议）。
+/// 发布后不可改（布局序列化依赖——蓝本 dock.rs:37 警告同款）。
+pub const FILE_TREE_PANEL_KEY: &str = "file-tree";
+
 /// 文件树纯状态机（单测面——无 gpui 依赖）。
 pub struct TreeState {
     root: PathBuf,
@@ -440,6 +444,44 @@ impl Render for FileTree {
                 .flex_1()
                 .min_h_0(),
             )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #119（mdc-dock 批①）：FileTree 作为 dock 面板（行为层）。
+//
+// 左栏文件树视图经 [`mdc_dock::Dock`] 激活协议接管（git_view 布尔退役）。
+// 激活焦点 = 树根句柄（蓝本 dock.rs:44 activation_focus_handle 缺省口径）。
+// ---------------------------------------------------------------------------
+
+impl gpui::EventEmitter<mdc_dock::PanelEvent> for FileTree {}
+
+impl gpui::Focusable for FileTree {
+    fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
+        self.tree_focus.clone()
+    }
+}
+
+impl mdc_dock::Panel for FileTree {
+    /// 布局序列化身份（发布后不可改——蓝本 dock.rs:37 警告同款）。
+    fn persistent_name() -> &'static str {
+        FILE_TREE_PANEL_KEY
+    }
+
+    fn panel_key() -> &'static str {
+        FILE_TREE_PANEL_KEY
+    }
+
+    fn position(&self) -> mdc_dock::DockPosition {
+        mdc_dock::DockPosition::Left
+    }
+
+    fn position_is_valid(&self, position: mdc_dock::DockPosition) -> bool {
+        position == mdc_dock::DockPosition::Left
+    }
+
+    fn starts_open(&self) -> bool {
+        true
     }
 }
 

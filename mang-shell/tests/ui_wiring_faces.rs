@@ -196,7 +196,9 @@ fn face3_panel_toggle_changes_state() {
         !bar.contains("act-toggle-right"),
         "【面 3：面板切换 → 状态变更】act-toggle-right 不应在左图标条（#289-⑤：右栏开关归右缘 dock 条）"
     );
-    // 状态变更体：字段翻转 + notify（渲染层可见的前提）。
+    // 状态变更体：字段翻转 + notify（渲染层可见的前提）。#119：
+    // git_view 布尔退役——左栏视图切换的形态断言改为 dock 激活协议
+    // 接线（activate_left_view 单点 + 预物化意图注释）。
     let shell = src("shell.rs");
     for (decl, flip, what) in [
         (
@@ -204,7 +206,11 @@ fn face3_panel_toggle_changes_state() {
             "left_open = !self.left_open",
             "左栏开合字段翻转",
         ),
-        ("fn toggle_git(", "git_view = true", "git 视图置位"),
+        (
+            "fn toggle_git(",
+            "activate_left_view(crate::git_panel::GIT_PANEL_KEY, cx)",
+            "git 视图经 dock 激活协议（#119）",
+        ),
         (
             "fn toggle_settings(",
             "settings_open = !self.settings_open",

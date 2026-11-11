@@ -3234,6 +3234,7 @@ dependencies = [
  "image",
  "lopdf",
  "mdc-canvas",
+ "mdc-dock",
  "mdc-lok",
  "mdc-office-io",
  "mdc-pdf",
@@ -3292,6 +3293,13 @@ dependencies = [
  "mdc-evidence",
  "serde_json",
  "yrs",
+]
+
+[[package]]
+name = "mdc-dock"
+version = "0.1.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]
