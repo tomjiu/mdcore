@@ -6036,8 +6036,9 @@ mod ime_composition_tests {
             cx.new(|cx| Editor::new_readonly(Some("ro.md".into()), "RO\n".to_string(), cx))
         });
         let ed_for_host = ed.clone();
-        let window =
-            cx.add_window(move |_window, _cx| ImeHost { _ed: ed_for_host.clone() });
+        let window = cx.add_window(move |_window, _cx| ImeHost {
+            _ed: ed_for_host.clone(),
+        });
         window.update(cx, |_host, window, cx| {
             ed.update(cx, |ed, cx| {
                 ed.replace_and_mark_text_in_range(None, "拼", None, window, cx);
