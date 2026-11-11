@@ -92,6 +92,13 @@
 - `save_as(&mut self, url, format)`：目标**不得等于源文件**（worker
   硬守卫 `E_INVALID_REQUEST`）；成功 dirty=false、revision+1；失败
   （拒写/非法目录）dirty 保留（smoke §save.denied_keeps_dirty）。
+- `export_pdf(&self, url, page_range, notes_in_margin, tracked_changes)`
+  （B 线 2026-11-11，暗标导出线 / #52 分发消费面）：LOK
+  `saveAs(url, "pdf", typed options)`——`page_range=Some((from,to))`
+  1 起含端（None=全文）、批注边栏、修订标记。**非变更类**：dirty/
+  revision 不动（产物是新文件）。源守卫与 save_as 同拍。真内核实测
+  （tests/export_pdf.rs）：三页夹具全文=3 页、范围 2-3=2 页、单页=1
+  （PDF 字典级 `/Type/Page` 计数）+ `%PDF` 魔数 + `%%EOF` 尾。
 - **安全链**（C 线职责）：saveAs 到临时产物 → `DocSession::open` 重开
   校验 → 决定替换原文件。worker 永不覆盖源。
 
