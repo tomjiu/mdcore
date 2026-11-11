@@ -12,6 +12,7 @@ use crate::dock::{ActiveTracker, Dock, DockPosition};
 use crate::handle::PanelId;
 use crate::panel::{Panel, PanelEvent};
 use crate::registry::PanelRegistry;
+use crate::state::{DOCK_LAYOUT_VERSION, DockAreaState, DockLayoutVersionMismatch, PanelState};
 
 // ---------------------------------------------------------------------------
 // 纯逻辑：ActiveTracker
@@ -460,8 +461,196 @@ fn panel_id_and_position_contract(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// 批②持久化面（#120 验收 1/2/3：round-trip 全等 / 版本迁移 / 坏值容错）
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn dump_restore_round_trips_all_fields(cx: &mut TestAppContext) {
+    let dock = left_dock(cx);
+    let tree_e = tree(cx);
+    let git_e = git(cx);
+    dock.update(cx, |d, cx| {
+        d.add_panel(&tree_e, cx);
+        d.add_panel(&git_e, cx);
+        d.activate_key("git", cx);
+        d.set_panel_size("file-tree", 312.5, cx);
+        d.set_panel_size("git", 268.0, cx);
+        d.set_open(false, cx);
+    });
+    // dump → serde 往返 → restore 到新 dock 实体——全等。
+    let state = dock.read_with(cx, |d, _| d.dump());
+    let json = serde_json::to_string(&state).expect("serde 序列化");
+    let parsed: DockAreaState = serde_json::from_str(&json).expect("serde 反序列化");
+    let dock2 = left_dock(cx);
+    let tree2 = tree(cx);
+    let git2 = git(cx);
+    dock2.update(cx, |d, cx| {
+        d.add_panel(&tree2, cx);
+        d.add_panel(&git2, cx);
+        d.restore(parsed, cx).expect("同版恢复");
+    });
+    let state2 = dock2.read_with(cx, |d, _| d.dump());
+    assert_eq!(state, state2, "round-trip：dump→restore→dump 全等");
+    assert_eq!(state.version, DOCK_LAYOUT_VERSION);
+    assert_eq!(state.active.as_deref(), Some("git"));
+    assert!(!state.open, "开合态随快照");
+    assert_eq!(
+        state.panels,
+        vec![
+            PanelState {
+                key: "file-tree".into(),
+                size: Some(312.5)
+            },
+            PanelState {
+                key: "git".into(),
+                size: Some(268.0)
+            },
+        ],
+        "面板集与尺寸逐条快照"
+    );
+}
+
+#[gpui::test]
+fn version_mismatch_discards_and_rebuilds_default(cx: &mut TestAppContext) {
+    let dock = left_dock(cx);
+    let tree = tree(cx);
+    dock.update(cx, |d, cx| {
+        d.add_panel(&tree, cx);
+        d.activate_key("file-tree", cx);
+        // 旧版本号（0）——升级迁移：整份丢弃。
+        let old = DockAreaState {
+            version: 0,
+            open: false,
+            active: Some("file-tree".into()),
+            panels: vec![PanelState {
+                key: "file-tree".into(),
+                size: Some(999.),
+            }],
+        };
+        let err = d.restore(old, cx).expect_err("版本不符应拒");
+        assert_eq!(
+            err,
+            DockLayoutVersionMismatch {
+                found: 0,
+                expected: DOCK_LAYOUT_VERSION
+            },
+            "诊断面携带实得/期望两值"
+        );
+    });
+    // 丢弃语义：旧面板尺寸/激活态不残留（重建默认——面板集在、
+    // 尺寸无、激活保持 restore 前状态）。
+    dock.update(cx, |d, cx| {
+        assert_eq!(d.panel_size("file-tree"), None, "旧尺寸未写入");
+        d.set_open(true, cx);
+    });
+    let fresh = dock.read_with(cx, |d, _| d.dump());
+    assert_eq!(
+        fresh,
+        DockAreaState {
+            version: DOCK_LAYOUT_VERSION,
+            open: true,
+            // 激活态不受被拒恢复影响（restore 在写入前已返回）。
+            active: Some("file-tree".into()),
+            panels: vec![PanelState {
+                key: "file-tree".into(),
+                size: None
+            }],
+        },
+        "丢弃语义：旧尺寸不残留，存量状态不被污染"
+    );
+}
+
+#[gpui::test]
+fn restore_tolerates_unknown_keys_and_missing_panels(cx: &mut TestAppContext) {
+    let dock = left_dock(cx);
+    let tree = tree(cx);
+    dock.update(cx, |d, cx| {
+        d.add_panel(&tree, cx);
+        // 未来面板键 + 未知键 + 未物化激活键——全静默、不崩。
+        d.restore(
+            DockAreaState {
+                version: DOCK_LAYOUT_VERSION,
+                open: true,
+                active: Some("future-panel".into()),
+                panels: vec![
+                    PanelState {
+                        key: "file-tree".into(),
+                        size: Some(301.),
+                    },
+                    PanelState {
+                        key: "no-such-panel".into(),
+                        size: Some(42.),
+                    },
+                ],
+            },
+            cx,
+        )
+        .expect("未知键不阻恢复");
+        assert_eq!(d.panel_size("file-tree"), Some(301.), "在列面板尺寸生效");
+        assert_eq!(d.panel_size("no-such-panel"), None, "未知键丢弃");
+        assert_eq!(d.active_index(), None, "未物化激活键静默丢弃（不灌意图）");
+    });
+}
+
+#[test]
+fn polluted_json_is_host_layer_default_bound() {
+    // 坏值容错的宿主层契约：截断/污染 JSON 在 serde_json 解析层即拒
+    //（宿主 settings 捕获后回默认——见 mang-shell settings.rs 测试面）。
+    // 本测锁结构形状：字段名冻结 + 坏结构拒绝。
+    let good = r#"{"version":1,"open":true,"active":null,"panels":[]}"#;
+    let parsed: Result<DockAreaState, _> = serde_json::from_str(good);
+    assert!(parsed.is_ok(), "合法结构应解");
+    for bad in [
+        "{",
+        "not json at all",
+        r#"{"version":1,"open":"yes","active":null,"panels":[]}"#,
+        r#"{"panels":[]}"#,
+    ] {
+        let bad_parsed: Result<DockAreaState, _> = serde_json::from_str(bad);
+        assert!(bad_parsed.is_err(), "坏值应拒：{bad}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 注册表（批② 布局恢复的消费契约）
 // ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn restore_pending_size_consumed_on_materialization(cx: &mut TestAppContext) {
+    let dock = left_dock(cx);
+    // 恢复时无任何面板——尺寸记入预物化意图（真实流：重启后
+    // 「打开文件夹」才建树）。
+    dock.update(cx, |d, cx| {
+        d.restore(
+            DockAreaState {
+                version: DOCK_LAYOUT_VERSION,
+                open: true,
+                active: None,
+                panels: vec![PanelState {
+                    key: "file-tree".into(),
+                    size: Some(298.),
+                }],
+            },
+            cx,
+        )
+        .expect("恢复");
+    });
+    // 物化树面板——意图兑现。
+    let tree_e = tree(cx);
+    dock.update(cx, |d, cx| {
+        d.add_panel(&tree_e, cx);
+    });
+    assert_eq!(
+        dock.read_with(cx, |d, _| d.panel_size("file-tree")),
+        Some(298.),
+        "预物化尺寸意图在面板注册时兑现"
+    );
+    assert_eq!(
+        dock.read_with(cx, |d, _| d.dump()).panels[0].size,
+        Some(298.),
+        "dump 出已兑现值（快照不依赖意图）"
+    );
+}
 
 #[gpui::test]
 fn registry_rebuilds_by_persistent_name(cx: &mut TestAppContext) {

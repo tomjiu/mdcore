@@ -33,6 +33,8 @@
 | `add_panel`（订阅/入列） | zed workspace crate（AddPanel 群） | `dock.rs` | 事件订阅（Activate→激活；Close→closable 门移除）+ pending 兑现 + 注册不自动激活（宿主显式） |
 | `PanelRegistry` | Q-IDE `app/dock.rs:95-121`；gpui-base `registry.rs:59` | `registry.rs` | persistent_name → 构造器全局注册表（批② 布局恢复消费面） |
 | `ActiveTracker` | gpui-base `active.rs:20` 设计 | `dock.rs` | 去重/去抖纯状态机（同目标零通知；去激-激成对产出） |
+| `DockAreaState`/版本迁移 | Q-IDE `layout.rs:20-22/:525-662/:518-521` | `state.rs` | #120 批②：serde 结构化快照（字段名冻结）+ `DOCK_LAYOUT_VERSION` + 不符整份丢弃；per-panel 尺寸参照 zed `dock.rs:998-1160`（单 dock 绝对像素宽——无分树份额缩放，delta） |
+| `dump`/`restore` | zed 序列化钩子 + Q-IDE `save_layout`/`restore_session` | `dock.rs` | #120 批②：快照/恢复协议；**预物化尺寸意图**（restore 时未注册面板记 pending，物化即兑现——与批① pending_activation 对称，重启后打开文件夹才建树的真实流） |
 
 ## 三、纪律说明
 

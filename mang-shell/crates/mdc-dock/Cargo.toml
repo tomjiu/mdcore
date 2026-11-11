@@ -14,8 +14,13 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 gpui = { path = "../../../third_party/zed/crates/gpui", default-features = false }
+# #120（mdc-dock 批②）：DockAreaState 结构化持久化（serde derive 面——
+# mang-shell 闭包内既有 1.0，零新增编译面）。
+serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 # 测试面（trait 契约 + 激活协议）与 mang-shell 同口径：test-support
 # 特性只进 dev-deps，产物面零携带。
 gpui = { path = "../../../third_party/zed/crates/gpui", default-features = false, features = ["test-support"] }
+# #120（批②）：round-trip/坏值测试的 serde 载体（闭包内既有 1.0）。
+serde_json = "1.0"

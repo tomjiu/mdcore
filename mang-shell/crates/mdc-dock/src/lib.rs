@@ -33,6 +33,7 @@ mod dock;
 mod handle;
 mod panel;
 mod registry;
+mod state;
 
 #[cfg(test)]
 mod tests;
@@ -41,3 +42,4 @@ pub use dock::{ActiveTracker, Dock, DockPosition, PanelEntry};
 pub use handle::{PanelHandle, PanelId};
 pub use panel::{Panel, PanelEvent};
 pub use registry::{PanelBuilder, PanelRegistry};
+pub use state::{DOCK_LAYOUT_VERSION, DockAreaState, DockLayoutVersionMismatch, PanelState};

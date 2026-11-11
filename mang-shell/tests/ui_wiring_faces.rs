@@ -203,8 +203,8 @@ fn face3_panel_toggle_changes_state() {
     for (decl, flip, what) in [
         (
             "fn toggle_left(",
-            "left_open = !self.left_open",
-            "左栏开合字段翻转",
+            "let next = !dock.is_open();",
+            "左栏开合经 dock 开合协议（#120 批②）",
         ),
         (
             "fn toggle_git(",

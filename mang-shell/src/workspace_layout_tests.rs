@@ -75,11 +75,12 @@ fn git_and_menu_controls_keep_visible_bounds_with_document_open(cx: &mut TestApp
         let git = visual.debug_bounds("act-git").unwrap();
         assert_eq!(git.size, size(px(36.), px(36.)));
         visual.simulate_click(git.center(), Default::default());
-        assert!(shell.read_with(&visual, |shell, cx| shell.git_active(cx) && shell.left_open));
+        assert!(shell.read_with(&visual, |shell, cx| shell.git_active(cx)
+            && shell.left_open(cx)));
         let file = visual.debug_bounds("act-file-tree").unwrap();
         visual.simulate_click(file.center(), Default::default());
         assert!(shell.read_with(&visual, |shell, cx| !shell.git_active(cx)
-            && shell.left_open));
+            && shell.left_open(cx)));
     }
 }
 
