@@ -30,6 +30,7 @@
 //! （mang-shell → mdc-dock），mang-shell 测试树不被反向传染。
 
 mod dock;
+mod drag;
 mod handle;
 mod panel;
 mod registry;
@@ -39,6 +40,10 @@ mod state;
 mod tests;
 
 pub use dock::{ActiveTracker, Dock, DockPosition, PanelEntry};
+pub use drag::{
+    drop_is_intended, drop_zone_at, placement_for, DockDropZone, DraggedPanel, PanelDetachment,
+    Placement,
+};
 pub use handle::{PanelHandle, PanelId};
 pub use panel::{Panel, PanelEvent};
 pub use registry::{PanelBuilder, PanelRegistry};

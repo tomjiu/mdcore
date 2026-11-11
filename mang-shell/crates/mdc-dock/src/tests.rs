@@ -681,3 +681,295 @@ fn registry_rebuilds_by_persistent_name(cx: &mut TestAppContext) {
     });
     assert_eq!(names, vec!["file-tree"]);
 }
+
+// ---------------------------------------------------------------------------
+// #121 批③a：拖拽停靠数据面（drop zone 几何 / 落位裁决 / take-receive
+// 协议 / 挤掉原槽位 / 记忆尺寸随行 / round-trip）
+// ---------------------------------------------------------------------------
+
+use crate::drag::{
+    drop_is_intended, drop_zone_at, placement_for, DockDropZone, DraggedPanel, Placement,
+};
+
+/// 可停靠三侧的面板（拖拽换侧的裁决面——区别于 Left-only 的
+/// TreePanel/GitPanel）。
+struct RoverPanel {
+    focus: gpui::FocusHandle,
+}
+
+impl RoverPanel {
+    const KEY: &'static str = "rover";
+}
+
+impl gpui::Render for RoverPanel {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        gpui::div()
+    }
+}
+impl gpui::EventEmitter<PanelEvent> for RoverPanel {}
+impl gpui::Focusable for RoverPanel {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus.clone()
+    }
+}
+impl Panel for RoverPanel {
+    fn persistent_name() -> &'static str {
+        RoverPanel::KEY
+    }
+    fn panel_key() -> &'static str {
+        RoverPanel::KEY
+    }
+    fn position(&self) -> DockPosition {
+        // 偏好左（「两侧占满时替换偏好侧」的裁决输入）。
+        DockPosition::Left
+    }
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(
+            position,
+            DockPosition::Left | DockPosition::Right | DockPosition::Bottom
+        )
+    }
+}
+
+fn rover(cx: &mut TestAppContext) -> gpui::Entity<RoverPanel> {
+    cx.update(|app| {
+        app.new(|cx| RoverPanel {
+            focus: cx.focus_handle(),
+        })
+    })
+}
+
+fn window_bounds() -> gpui::Bounds<gpui::Pixels> {
+    // 900×600 假想窗口（分区线：x 300/600，y 400）。
+    gpui::Bounds {
+        origin: gpui::point(gpui::px(0.), gpui::px(0.)),
+        size: gpui::size(gpui::px(900.), gpui::px(600.)),
+    }
+}
+
+#[test]
+fn drop_zone_geometry_covers_three_sides_and_center() {
+    let b = window_bounds();
+    // 左右条带（底条带之上的两翼）。
+    assert_eq!(
+        drop_zone_at(b, gpui::point(gpui::px(150.), gpui::px(100.))),
+        DockDropZone::Left
+    );
+    assert_eq!(
+        drop_zone_at(b, gpui::point(gpui::px(750.), gpui::px(100.))),
+        DockDropZone::Right
+    );
+    // 底条带全宽优先（左中右水平位置都落底）。
+    for x in [50., 450., 850.] {
+        assert_eq!(
+            drop_zone_at(b, gpui::point(gpui::px(x), gpui::px(500.))),
+            DockDropZone::Bottom,
+            "y > 2/3 全宽落底（x={x}）"
+        );
+    }
+    // 中心合并区（中三分之一 × 底条带之上）。
+    assert_eq!(
+        drop_zone_at(b, gpui::point(gpui::px(450.), gpui::px(100.))),
+        DockDropZone::Center
+    );
+    // 越界点 clamp 后判定（窗口外 drop 不发生，防御口径）。
+    assert_eq!(
+        drop_zone_at(b, gpui::point(gpui::px(-50.), gpui::px(-50.))),
+        DockDropZone::Left
+    );
+    assert_eq!(
+        drop_zone_at(b, gpui::point(gpui::px(9999.), gpui::px(0.))),
+        DockDropZone::Right
+    );
+}
+
+#[test]
+fn placement_respects_validity_and_preference() {
+    use DockPosition::{Bottom, Left, Right};
+    let all_valid = |_: DockPosition| true;
+    // 中心区 → 取消。
+    assert_eq!(
+        placement_for(DockDropZone::Center, Left, all_valid),
+        Placement::Cancel
+    );
+    // 边分区合法 → 落位该侧。
+    assert_eq!(
+        placement_for(DockDropZone::Right, Left, all_valid),
+        Placement::Dock(Right)
+    );
+    assert_eq!(
+        placement_for(DockDropZone::Bottom, Left, all_valid),
+        Placement::Dock(Bottom)
+    );
+    // 分区非法 → 回偏好位（Left-only 面板拖到右分区 → 回左）。
+    let left_only = |p: DockPosition| p == Left;
+    assert_eq!(
+        placement_for(DockDropZone::Right, Left, left_only),
+        Placement::Dock(Left)
+    );
+    // 分区与偏好位都非法 → 取消（面板声明自相矛盾的保守兜底）。
+    let nothing_valid = |_: DockPosition| false;
+    assert_eq!(
+        placement_for(DockDropZone::Right, Left, nothing_valid),
+        Placement::Cancel
+    );
+}
+
+#[test]
+fn drop_is_intended_rejects_same_side_drop() {
+    let a = gpui::EntityId::from(1u64);
+    let b = gpui::EntityId::from(2u64);
+    let dragged = DraggedPanel {
+        source_dock: a,
+        key: "rover",
+    };
+    assert!(drop_is_intended(dragged, b), "跨侧移动正常落位");
+    assert!(
+        !drop_is_intended(dragged, a),
+        "拖回源侧 = 取消语义（不落位）"
+    );
+}
+
+#[gpui::test]
+fn take_panel_activates_next_and_keeps_dock_open(cx: &mut TestAppContext) {
+    let dock = left_dock(cx);
+    let tree = tree(cx);
+    let git = git(cx);
+    dock.update(cx, |d, cx| {
+        d.add_panel(&tree, cx);
+        d.add_panel(&git, cx);
+        d.activate_key("git", cx);
+        d.set_panel_size("git", 240., cx);
+    });
+    // 拔出激活面板 git：tree 接管激活，dock 保持开（拖拽不是关栏——
+    // 与 remove_panel 收起语义的分界裁决）。
+    let detached = dock
+        .update(cx, |d, cx| d.take_panel("git", cx))
+        .expect("激活面板在列可拔");
+    assert_eq!(detached.panel.panel_key(), "git");
+    assert_eq!(detached.size, Some(240.), "记忆尺寸随面板走");
+    dock.read_with(cx, |d, _| {
+        assert_eq!(d.panels_len(), 1);
+        assert_eq!(d.active_key(), Some("file-tree"), "次面板接管激活");
+        assert!(d.is_open(), "拔出激活面板不收起 dock");
+    });
+    // 拔非激活面板：激活不变。
+    let tree_detached = dock
+        .update(cx, |d, cx| d.take_panel("file-tree", cx))
+        .expect("非激活面板在列可拔");
+    dock.read_with(cx, |d, _| {
+        assert_eq!(d.panels_len(), 0);
+        assert_eq!(d.active_key(), None);
+        assert!(d.is_open());
+    });
+    // 键不在列：None（拖起与落位间竞态防御）。
+    let missing = dock.update(cx, |d, cx| d.take_panel("git", cx));
+    assert!(missing.is_none());
+    std::mem::forget(tree_detached);
+}
+
+#[gpui::test]
+fn receive_panel_takes_the_slot_and_inherits_size(cx: &mut TestAppContext) {
+    // 右侧 dock 已有激活面板 rover（占槽）→ 接收左拖来的 git =
+    // 挤掉原槽位（git 落位即激活，rover 让位留列）。
+    let left = left_dock(cx);
+    let right = cx.update(|app| app.new(|cx| Dock::new(DockPosition::Right, cx)));
+    let rover = rover(cx);
+    let git = git(cx);
+    left.update(cx, |d, cx| {
+        d.add_panel(&git, cx);
+        d.activate_key("git", cx);
+        d.set_panel_size("git", 240., cx);
+    });
+    right.update(cx, |d, cx| {
+        d.add_panel(&rover, cx);
+        d.activate_key("rover", cx);
+    });
+    // 宿主 drop 收尾序列（批③b 渲染面照此接线）：
+    // 1) placement 裁决（右分区 × rover 合法性——此处 git 拖到右分区，
+    //    git 的 position_is_valid 由面板型声明，测试面板 GitPanel 是
+    //    Left-only → 裁决回偏好位左。**换 RoverPanel 做被拖面板**才
+    //    有跨侧合法性——本用例走 rover 拖到右已是右，改由 git 先
+    //    落到右 dock 的替代路径：直接协议面验证（take → receive），
+    //    几何/裁决由上面纯函数测试覆盖。
+    // 2) take（源）→ receive（目标）。
+    let detached = left
+        .update(cx, |d, cx| d.take_panel("git", cx))
+        .expect("git 在左 dock 在列");
+    right.update(cx, |d, cx| {
+        let ix = d.receive_panel(detached, cx);
+        assert_eq!(ix, 1, "追加在 rover 之后");
+        assert_eq!(d.active_key(), Some("git"), "落位即激活（挤掉原槽位）");
+        assert!(d.is_open(), "落位侧打开");
+    });
+    // 记忆尺寸继承：落位侧 dump 带原尺寸（round-trip 尺寸面）。
+    let snapshot = right.update(cx, |d, _| d.dump());
+    assert_eq!(
+        snapshot
+            .panels
+            .iter()
+            .find(|p| p.key == "git")
+            .and_then(|p| p.size),
+        Some(240.),
+        "面板记忆尺寸跨 dock 随行"
+    );
+    // 源侧快照不再含 git（双向一致性）。
+    let left_snapshot = left.update(cx, |d, _| d.dump());
+    assert!(
+        !left_snapshot.panels.iter().any(|p| p.key == "git"),
+        "拔出后源侧 dump 不再含该面板"
+    );
+}
+
+#[gpui::test]
+fn drag_round_trip_survives_dump_restore(cx: &mut TestAppContext) {
+    // 验收「拖拽后布局持久化 round-trip」：rover 从左 dock 拖到右
+    // dock（真实序列：placement 裁决 → take → receive → set_position
+    // 语义由宿主面板承担）后 dump → restore 进全新右 dock，激活
+    // 与尺寸无损。
+    let left = left_dock(cx);
+    let right = cx.update(|app| app.new(|cx| Dock::new(DockPosition::Right, cx)));
+    let rover_entity = rover(cx);
+    left.update(cx, |d, cx| {
+        d.add_panel(&rover_entity, cx);
+        d.activate_key("rover", cx);
+        d.set_panel_size("rover", 320., cx);
+    });
+    // 拖拽序列：裁决（右分区合法）→ take → receive。
+    let placement = placement_for(
+        DockDropZone::Right,
+        DockPosition::Left,
+        |p| p != DockPosition::Bottom,
+    );
+    assert_eq!(placement, Placement::Dock(DockPosition::Right));
+    let detached = left.update(cx, |d, cx| d.take_panel("rover", cx)).unwrap();
+    right.update(cx, |d, cx| {
+        d.receive_panel(detached, cx);
+    });
+    // round-trip：dump 右 → restore 进新右 dock。批② restore 语义
+    // 只兑现当下面板（未注册键静默丢弃）——fresh 里先物化 rover，
+    // dump 的激活/尺寸才能经 restore 无损兑现（真实流：重启后
+    // PanelRegistry 按键重建 → restore）。
+    let snapshot = right.update(cx, |d, _| d.dump());
+    let fresh = cx.update(|app| app.new(|cx| Dock::new(DockPosition::Right, cx)));
+    let rover_here = rover(cx);
+    fresh.update(cx, |d, cx| {
+        d.add_panel(&rover_here, cx);
+        d.restore(snapshot.clone(), cx).unwrap();
+        assert_eq!(
+            d.active_key(),
+            Some("rover"),
+            "restore 兑现拖拽后的激活面"
+        );
+        assert_eq!(
+            d.panel_size("rover"),
+            Some(320.),
+            "restore 兑现拖拽后的记忆尺寸"
+        );
+    });
+    assert_eq!(
+        snapshot.active.as_deref(),
+        Some("rover"),
+        "dump 携带拖拽后的激活键"
+    );
+}
