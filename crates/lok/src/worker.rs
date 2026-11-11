@@ -77,6 +77,10 @@ pub struct WorkerState {
     session_dir: PathBuf,
     tile_counter: u64,
     loaded_url: String,
+    // #69：getVersionInfo 首调结果缓存。LO 26.x 实测：getVersionInfo 返回
+    // 内部串指针，freeError 释放后二调返回 NULL 且内核状态受损（后续
+    // documentLoad 时 worker 静默死亡）。缓存 = 只调一次，规避二调。
+    version_cache: String,
 }
 
 unsafe impl Send for WorkerState {}
@@ -332,6 +336,7 @@ fn bind_kernel(
         session_dir: boot.session_dir.clone(),
         tile_counter: 0,
         loaded_url: String::new(),
+        version_cache: String::new(),
     };
 
     // nSize 成员守卫（issue「nSize/member 检查」）：绑定面全量检查
@@ -405,9 +410,12 @@ impl WorkerState {
         Some(s)
     }
 
-    /// getVersionInfo 原文（freeError 释放）。
+    /// getVersionInfo 原文（首调缓存；见 WorkerState.version_cache）。
     fn kit_version_info(&mut self) -> String {
-        unsafe {
+        if !self.version_cache.is_empty() {
+            return self.version_cache.clone();
+        }
+        let s = unsafe {
             let f = match (*self.kit_class).get_version_info {
                 Some(f) => f,
                 None => return String::new(),
@@ -421,7 +429,9 @@ impl WorkerState {
                 free(p);
             }
             s
-        }
+        };
+        self.version_cache = s;
+        self.version_cache.clone()
     }
 
     /// doc 成员守卫。
