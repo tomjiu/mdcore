@@ -28,6 +28,7 @@
 | #302 | PDF 消费倒挂——桌面标注接线（阶段 2·④） | [gates/302.md](gates/302.md) | 🔄 PR 中 |
 | #305 | 渲染缓存标注失效（RenderKey 键控 + 显式失效双轨） | [gates/305.md](gates/305.md) | 🔄 PR 中 |
 | #633 | LibreOfficeKit 隔离 worker 原型（B1 unipoll 主循环已落地，新站 #49） | [gates/633.md](gates/633.md) | 🔄 PR 中 |
+| #104 | LOK worker Windows 消息驱动——message-only window 替代 unipoll（#69 终局） | [gates/104.md](gates/104.md) | 🔄 PR 中 |
 
 
 

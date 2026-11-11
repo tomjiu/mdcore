@@ -1,6 +1,8 @@
 //! worker 侧运行时：LOK 内核绑定 + 请求分发 + 回调转发。
 //!
-//! ## 线程模型（B1：unipoll 主循环集成）
+//! ## 线程模型
+//!
+//! ### Linux：unipoll 主循环（B1）
 //!
 //! ```text
 //! 宿主 pipe ──stdin──▶ reader 线程（只读字节 → channel）
@@ -10,6 +12,28 @@
 //! LO 内核线程 ──回调──▶ 事件队列 ──▶ 写线程（独占 stdout：应答+事件同串行化）
 //! 宿主 pipe ◀──stdout── 写线程
 //! ```
+//!
+//! ### Windows：message-only window 消息驱动（#104，#69 终局）
+//!
+//! ```text
+//! 宿主 pipe ──stdin──▶ reader 线程（只读字节 → PostMessageW）
+//!                                          │ ASK(帧指针) / CLOSED(退出码)
+//! LO 内核 ──runLoop(空钩子)──▶ 主线程消息泵 ──▶ WndProc：ASK=handle_frame
+//!                        │
+//! LO 内核线程 ──回调──▶ 事件队列 ──▶ 写线程（独占 stdout：应答+事件同串行化）
+//! 宿主 pipe ◀──stdout── 写线程
+//! ```
+//!
+//! **为什么 Windows 换消息驱动**（#69 Windows 实测 + ElyOffice
+//! `worker/messages.rs` 实证）：LO Windows 版 `run_loop` 要求调用线程
+//! **先持有 message-only window**——无窗口时 runLoop 立即返回
+//! （`bye(run-loop-returned)`，worker 随即退出，请求帧无应答）；先
+//! `CreateWindowExW(HWND_MESSAGE)` 再进 runLoop，则 runLoop 阻塞运行
+//! 成为本线程的消息泵，`PostMessageW` 的请求经 `WndProc` 在主线程
+//! 同步分发——与 unipoll 的「所有 LOK 调用串行于主循环」同构。
+//! unipoll 契约（`SAL_LOK_OPTIONS=unipoll`）仍要求传 hooks，Windows
+//! 消息循环从不调用它们——空实现满足契约（ElyOffice 同款：
+//! "Unipoll needs hooks; the Windows loop never calls them"）。
 //!
 //! **为什么 unipoll**（异步事件黑洞实录，gates/633.md）：LO 的
 //! `postKeyEvent/postMouseEvent/postUnoCommand` 均为 `postKeyEventAsync`
@@ -152,7 +176,16 @@ pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
                     no_kernel_loop(protocol_fd, &tx, code, msg);
                 }
             };
-            unipoll_loop(state, &tx, protocol_fd)
+            // 平台路由（模块头「线程模型」两节）：Windows 走 message-only
+            // window 消息驱动（#104），其余平台走 unipoll 主循环（B1）。
+            #[cfg(windows)]
+            {
+                messages_loop(state, &tx, protocol_fd)
+            }
+            #[cfg(not(windows))]
+            {
+                unipoll_loop(state, &tx, protocol_fd)
+            }
         }
     }
 }
@@ -1045,9 +1078,11 @@ fn steal_stdin_fd() -> std::fs::File {
     }
 }
 
-/// 真实主循环（B1：unipoll 集成）：主线程进 LOK `runLoop`，宿主请求在
-/// poll 回调里同步分发（内核主循环上下文）；reader 线程只管 stdin→
-/// channel 并 wake（模块头「线程模型」与「为什么 unipoll」）。
+/// 真实主循环（B1：unipoll 集成，非 Windows 平台）：主线程进 LOK
+/// `runLoop`，宿主请求在 poll 回调里同步分发（内核主循环上下文）；
+/// reader 线程只管 stdin→ channel 并 wake（模块头「线程模型」与
+/// 「为什么 unipoll」）。Windows 见下方 [`messages_loop`]（#104）。
+#[cfg(not(windows))]
 fn unipoll_loop(state: WorkerState, tx: &Sender<ToWriter>, protocol_fd: std::fs::File) -> ! {
     WRITER_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
 
@@ -1102,6 +1137,9 @@ fn unipoll_loop(state: WorkerState, tx: &Sender<ToWriter>, protocol_fd: std::fs:
 }
 
 /// 主循环待办：宿主请求帧 / 内核唤醒 / 对端关闭（携退出码）。
+/// （unipoll 机件，非 Windows 平台——Windows 走 Win32 消息，见
+/// [`messages_loop`]。）
+#[cfg(not(windows))]
 enum Note {
     Ask(Vec<u8>),
     Woken,
@@ -1109,19 +1147,25 @@ enum Note {
     Closed(i32),
 }
 
-/// unipoll 上下文（进入 runLoop 后经 data 指针回到这里）。
+/// 主循环上下文：unipoll 经 runLoop `data` 指针回到这里；Windows
+/// messages_loop 经 [`WND_CTX`] 静态指针回到这里（两平台共用，
+/// `handle_frame`/`loop_exit` 的分发/收尾逻辑平台无关）。
 struct LoopCtx {
     state: WorkerState,
     tx: Sender<ToWriter>,
+    /// unipoll 的 reader 通道（非 Windows；Windows 用 PostMessageW）。
+    #[cfg(not(windows))]
     rx: Receiver<Note>,
 }
 
-/// wake 通道（内核任意线程 → 主循环 poll）。
+/// wake 通道（内核任意线程 → 主循环 poll；unipoll 机件，非 Windows）。
+#[cfg(not(windows))]
 static WAKE_TX: std::sync::OnceLock<std::sync::Mutex<Sender<Note>>> = std::sync::OnceLock::new();
 
-/// unipoll poll 回调：内核空闲时在此等待；请求到达即在本（主）线程同步
-/// 分发。timeout 语义（微秒，LO runLoop 契约）：0=非阻塞，负=无限等，
-/// 正=上限。返回非零 = 有事件已处理（LO 随后泵内部队列）。
+/// unipoll poll 回调（非 Windows）：内核空闲时在此等待；请求到达即在本
+/// （主）线程同步分发。timeout 语义（微秒，LO runLoop 契约）：0=非阻塞，
+/// 负=无限等，正=上限。返回非零 = 有事件已处理（LO 随后泵内部队列）。
+#[cfg(not(windows))]
 unsafe extern "C" fn unipoll_poll(data: *mut c_void, timeout_us: c_int) -> c_int {
     let ctx = &mut *data.cast::<LoopCtx>();
     let note = match timeout_us {
@@ -1155,10 +1199,351 @@ unsafe extern "C" fn unipoll_poll(data: *mut c_void, timeout_us: c_int) -> c_int
     }
 }
 
-/// unipoll wake 回调：内核其他线程要主循环干活时叫醒 poll。
+/// unipoll wake 回调（非 Windows）：内核其他线程要主循环干活时叫醒 poll。
+#[cfg(not(windows))]
 unsafe extern "C" fn unipoll_wake(_data: *mut c_void) {
     if let Some(tx) = WAKE_TX.get() {
         let _ = tx.lock().expect("wake 通道锁中毒").send(Note::Woken);
+    }
+}
+
+// ============================================================================
+// Windows：message-only window 消息驱动主循环（#104，#69 终局）
+// ============================================================================
+//
+// 架构与参照：ELY-Open-Source/ElyOffice `crates/ely-lok/src/worker/messages.rs`
+// （Apache-2.0；本仓按自身 FFI 风格手写零新依赖）。LO Windows 版
+// run_loop 的硬前提：调用线程先持有 message-only window（无窗口
+// runLoop 立即返回——#69 Windows 实测：worker ready 后请求帧无应答、
+// bye(run-loop-returned) 退出）。顺序：建窗口 → reader 线程
+// PostMessageW → runLoop(空钩子) 阻塞泵消息 → WndProc 在主线程同步
+// 分发（与 unipoll 同构：所有 LOK 调用串行于内核主循环上下文）。
+
+/// 请求帧到达（lparam = `Box<Vec<u8>>` 指针，WndProc 接管后回收）。
+#[cfg(windows)]
+const WM_ASK: u32 = 0x8000 + 1; // WM_APP + 1
+
+/// stdin 关闭/读失败（wparam = 退出码：0=EOF 干净，2=帧读失败）。
+#[cfg(windows)]
+const WM_CLOSED: u32 = 0x8000 + 2; // WM_APP + 2
+
+/// WndProc → 主循环上下文（单窗口单上下文；runLoop 泵消息前必已就位）。
+#[cfg(windows)]
+static WND_CTX: std::sync::atomic::AtomicPtr<LoopCtx> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Win32 `WNDCLASSW`（手写 repr(C)，对齐 x64 MSVC 布局；零新依赖）。
+#[cfg(windows)]
+#[repr(C)]
+struct WndClassW {
+    style: u32,
+    wnd_proc: Option<unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize>,
+    cls_extra: i32,
+    wnd_extra: i32,
+    instance: *mut c_void,
+    icon: *mut c_void,
+    cursor: *mut c_void,
+    background: *mut c_void,
+    menu_name: *const u16,
+    class_name: *const u16,
+}
+
+/// Windows 真实主循环（#104）：先建 message-only window，reader 线程把
+/// 帧投递成窗口消息，主线程 runLoop 泵消息，WndProc 里同步分发。
+#[cfg(windows)]
+fn messages_loop(state: WorkerState, tx: &Sender<ToWriter>, protocol_fd: std::fs::File) -> ! {
+    use std::sync::atomic::Ordering;
+
+    // WRITER_TX 注入（op_load 的 doc 回调注册面；与 unipoll_loop 同构）。
+    WRITER_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
+
+    // ① 先建窗口（LO Windows run_loop 硬前提——见本节模块注释）。
+    //    失败 = 无法进入内核主循环：bye 如实报因 + 硬退（码 3 = 窗口
+    //    创建失败，见模块头「退出纪律」的码表扩展）。
+    let hwnd = match window_create() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("mdc-lok-worker: message-only window 创建失败：{e}");
+            let _ = tx.send(ToWriter::Frame(protocol::life_event_frame(
+                "bye",
+                json!({"reason": "window-create-failed", "message": e}),
+            )));
+            let _ = tx.send(ToWriter::Quit);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            hard_exit(3);
+        }
+    };
+
+    // ② 主循环上下文就位（runLoop 泵消息前必已设置——消息只会在泵期
+    //    间分发，静态指针无竞态）。
+    let ctx = Box::into_raw(Box::new(LoopCtx {
+        state,
+        tx: tx.clone(),
+    }));
+    WND_CTX.store(ctx, Ordering::SeqCst);
+
+    // ③ reader 线程：协议流（私有化句柄）→ PostMessageW。帧指针经
+    //    lparam 移交 WndProc（Box 独占所有权，投递失败即回收防泄漏）。
+    //    HWND 以 usize 携带跨线程（句柄非解引用指针，整数语义安全）。
+    let hwnd_usize = hwnd as usize;
+    let reader = std::thread::Builder::new()
+        .name("lok-reader".into())
+        .spawn(move || {
+            let hwnd = hwnd_usize as *mut c_void;
+            let mut reader = BufReader::new(protocol_fd);
+            loop {
+                match protocol::read_frame(&mut reader) {
+                    Ok(Some(f)) => {
+                        let p = Box::into_raw(Box::new(f));
+                        if post_message(hwnd, WM_ASK, 0, p as isize) == 0 {
+                            // 窗口已不可达（进程退出竞态）：帧丢失，如实硬退。
+                            drop(unsafe { Box::from_raw(p) });
+                            eprintln!("mdc-lok-worker: 请求帧投递失败");
+                            hard_exit(2);
+                        }
+                    }
+                    Ok(None) => {
+                        // 宿主关了 stdin：干净关机（码 0；语义对齐
+                        // unipoll Note::Closed(0)）。
+                        let _ = post_message(hwnd, WM_CLOSED, 0, 0);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("mdc-lok-worker: 帧读取失败：{e}");
+                        let _ = post_message(hwnd, WM_CLOSED, 2, 0);
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn lok-reader");
+    let _ = reader;
+
+    // ④ runLoop（空钩子）：unipoll 契约（env 已设 SAL_LOK_OPTIONS=unipoll）
+    //    要求传 hooks，Windows 消息循环从不调用——空实现满足契约
+    //    （ElyOffice messages.rs 同款）。窗口就绪后 runLoop 阻塞泵消息
+    //    直到内核主循环退出。
+    let run_loop = unsafe { (*(*ctx).state.kit_class).run_loop }
+        .expect("runLoop 槽位（bind_kernel nSize 守卫已查）");
+    let kit = unsafe { (*ctx).state.kit };
+    unsafe {
+        run_loop(
+            kit,
+            Some(messages_poll),
+            Some(messages_wake),
+            std::ptr::null_mut(),
+        )
+    };
+
+    // ⑤ runLoop 返回 = 内核主循环正常退出：干净收尾（与 unipoll 同义）。
+    let ctx = WND_CTX.swap(std::ptr::null_mut(), Ordering::SeqCst);
+    loop_exit(unsafe { &mut *ctx }, 0, "run-loop-returned");
+}
+
+/// 建消息专用窗口：RegisterClassW + CreateWindowExW(HWND_MESSAGE)。
+/// 消息只进不显示（HWND_MESSAGE 父窗口），本进程唯一窗口、唯一读者。
+#[cfg(windows)]
+fn window_create() -> Result<*mut c_void, String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterClassW(class: *const WndClassW) -> u16;
+        fn CreateWindowExW(
+            ex_style: u32,
+            class_name: *const u16,
+            window_name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            parent: *mut c_void,
+            menu: *mut c_void,
+            instance: *mut c_void,
+            param: *mut c_void,
+        ) -> *mut c_void;
+    }
+    const HWND_MESSAGE: *mut c_void = -3isize as *mut c_void;
+    let name: Vec<u16> = "MdcLokWorker\0".encode_utf16().collect();
+    unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        if instance.is_null() {
+            return Err("GetModuleHandleW 返回 NULL".into());
+        }
+        let class = WndClassW {
+            style: 0,
+            wnd_proc: Some(messages_wndproc),
+            cls_extra: 0,
+            wnd_extra: 0,
+            instance,
+            icon: std::ptr::null_mut(),
+            cursor: std::ptr::null_mut(),
+            background: std::ptr::null_mut(),
+            menu_name: std::ptr::null(),
+            class_name: name.as_ptr(),
+        };
+        if RegisterClassW(&class) == 0 {
+            return Err(format!(
+                "RegisterClassW 失败：{}（GDI 原子 0）",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let made = CreateWindowExW(
+            0,
+            name.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null_mut(),
+        );
+        if made.is_null() {
+            return Err(format!(
+                "CreateWindowExW(HWND_MESSAGE) 失败：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(made)
+    }
+}
+
+/// PostMessageW 薄封装（reader 线程投递用）。
+#[cfg(windows)]
+fn post_message(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+    }
+    unsafe { PostMessageW(hwnd, msg, wparam, lparam) }
+}
+
+/// 窗口过程：ASK=取帧分发（主线程，内核主循环上下文）；CLOSED=收尾退出；
+/// 其余走 DefWindowProcW。分发复用 [`handle_frame`]（与 unipoll 同一条
+/// JSON 解析→dispatch→answer_or_oversize 链，平台零分叉）。
+#[cfg(windows)]
+unsafe extern "system" fn messages_wndproc(
+    hwnd: *mut c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn DefWindowProcW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    match msg {
+        WM_ASK => {
+            // 帧所有权移交完成：Box 独占，离开作用域即释放（无泄漏路径）。
+            let frame = unsafe { Box::from_raw(lparam as *mut Vec<u8>) };
+            let ctx = WND_CTX.load(std::sync::atomic::Ordering::SeqCst);
+            if !ctx.is_null() {
+                // 主线程同步分发（runLoop 泵消息期间 = 内核主循环上下文）。
+                handle_frame(unsafe { &mut *ctx }, *frame);
+            }
+            0
+        }
+        WM_CLOSED => {
+            let code = wparam as i32;
+            let ctx = WND_CTX.load(std::sync::atomic::Ordering::SeqCst);
+            if ctx.is_null() {
+                // 理论不可达（泵开始前 WND_CTX 已就位）；防御性硬退保活语义。
+                hard_exit(code);
+            }
+            loop_exit(
+                unsafe { &mut *ctx },
+                code,
+                if code == 0 { "stdin-eof" } else { "oversize" },
+            )
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// runLoop 空钩子（unipoll 契约要求非空；Windows 消息循环从不调用）。
+#[cfg(windows)]
+unsafe extern "C" fn messages_poll(_data: *mut c_void, _timeout_us: c_int) -> c_int {
+    0
+}
+
+/// runLoop 空 wake 钩子（同上）。
+#[cfg(windows)]
+unsafe extern "C" fn messages_wake(_data: *mut c_void) {}
+
+#[cfg(all(windows, test))]
+mod messages_tests {
+    use super::*;
+
+    /// Win32 `MSG`（泵用；尾部多留一个指针位兼容新 SDK 的 lPrivate）。
+    #[repr(C)]
+    struct Msg {
+        hwnd: *mut c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt_x: i32,
+        pt_y: i32,
+        spare: usize,
+    }
+
+    /// 窗口管线冒烟（Windows 实机跑；Linux 沙箱编译面可达但不执行）：
+    /// 建窗 → 投递 ASK（WND_CTX=null 安全跳过分发、帧所有权不漏）→
+    /// 投递无关消息（DefWindowProc 面）→ 手动泵消费 → 队列排空。
+    /// 覆盖 RegisterClassW / CreateWindowExW(HWND_MESSAGE) / PostMessageW /
+    /// WndProc 接线在无内核环境下的基本功——#104 实机门的前置冒烟。
+    #[test]
+    fn message_window_plumbing_smoke() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn PeekMessageW(
+                msg: *mut Msg,
+                hwnd: *mut c_void,
+                min: u32,
+                max: u32,
+                remove: u32,
+            ) -> i32;
+            fn DispatchMessageW(msg: *const Msg) -> isize;
+        }
+        const PM_REMOVE: u32 = 1;
+
+        let hwnd = window_create().expect("message-only window 创建");
+        assert!(!hwnd.is_null(), "HWND 非空");
+
+        // ASK：帧指针经 lparam 移交（WndProc 里 Box::from_raw 回收；
+        // WND_CTX 未设置 → 分发安全跳过，帧 drop 不泄漏）。
+        let frame = Box::into_raw(Box::new(vec![b'{', b'}']));
+        assert_ne!(post_message(hwnd, WM_ASK, 0, frame as isize), 0, "ASK 投递");
+        // 无关消息：走 DefWindowProcW 面。
+        assert_ne!(post_message(hwnd, 0x0400 + 7, 0, 0), 0, "WM_USER+7 投递");
+
+        // 手动泵（不依赖内核 runLoop——本测试只验窗口接线）。
+        let mut msg = Msg {
+            hwnd: std::ptr::null_mut(),
+            message: 0,
+            wparam: 0,
+            lparam: 0,
+            time: 0,
+            pt_x: 0,
+            pt_y: 0,
+            spare: 0,
+        };
+        let mut pumped = 0usize;
+        unsafe {
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                DispatchMessageW(&msg);
+                pumped += 1;
+                assert!(pumped < 16, "泵出消息数异常：{pumped}");
+            }
+        }
+        assert!(pumped >= 2, "至少消费 ASK + WM_USER+7 两帧，实得 {pumped}");
     }
 }
 

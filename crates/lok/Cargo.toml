@@ -2,7 +2,7 @@
 name = "mdc-lok"
 version.workspace = true
 edition = "2021"
-description = "LibreOfficeKit 隔离 worker 原型（#633）：LOK 内核动态加载（dlopen/dlsym libreofficekit_hook_2 + sofficeapp>1000B 回退，对齐官方 LibreOfficeKitInit.h 引导序）+ 单文档 worker 进程（JSON-lines stdio 协议：请求 ID 关联 / 帧长上限 / 超时看门狗 / 错误码化）+ 会话独立 user profile（SAL_NOLOCK_PROFILE，多会话不互锁）+ 真实运行时 smoke（documentLoad→initializeForRendering→getDocumentSize→paintTile 非空像素→postKeyEvent/postUnoCommand→回调脏态→saveAs→重开校验）。ABI 面 = LibreOfficeKit.h pin commit 0d51fdc，逐成员 nSize/offset 守卫（本机实测运行时 25.2.3.2 的 Doc 0-18 / Kit 0-12 布局与 pin 完全一致）。Windows 面：运行时发现/加载/stdin 私有化/DPI unaware 代码齐备并编译面可达，但实机实测门未执行（如实注明，见 lib.rs 头注）。三方依赖仅 serde_json（workspace 单源），动态加载自写零依赖（unix dlopen / win32 LoadLibraryExW）。对 mdcore 零 path 依赖（三域纪律，循 mdc-office/office-io 先例）。"
+description = "LibreOfficeKit 隔离 worker 原型（#633）：LOK 内核动态加载（dlopen/dlsym libreofficekit_hook_2 + sofficeapp>1000B 回退，对齐官方 LibreOfficeKitInit.h 引导序）+ 单文档 worker 进程（JSON-lines stdio 协议：请求 ID 关联 / 帧长上限 / 超时看门狗 / 错误码化）+ 会话独立 user profile（SAL_NOLOCK_PROFILE，多会话不互锁）+ 真实运行时 smoke（documentLoad→initializeForRendering→getDocumentSize→paintTile 非空像素→postKeyEvent/postUnoCommand→回调脏态→saveAs→重开校验）。ABI 面 = LibreOfficeKit.h pin commit 0d51fdc，逐成员 nSize/offset 守卫（本机实测运行时 25.2.3.2 的 Doc 0-18 / Kit 0-12 布局与 pin 完全一致）。Windows 面：运行时发现/加载/stdin 私有化/DPI unaware/#104 message-only window 消息驱动主循环（RegisterClassW+CreateWindowExW+PostMessageW+runLoop 空钩子，ElyOffice messages.rs 参照，unipoll 机件 cfg 收窄到非 Windows）代码齐备并编译面可达，但实机实测门未执行（如实注明，见 lib.rs 头注；验收脚本 scripts/lok/win104_messages_accept.ps1）。三方依赖仅 serde_json（workspace 单源），动态加载自写零依赖（unix dlopen / win32 LoadLibraryExW）。对 mdcore 零 path 依赖（三域纪律，循 mdc-office/office-io 先例）。"
 
 [dependencies]
 serde_json.workspace = true

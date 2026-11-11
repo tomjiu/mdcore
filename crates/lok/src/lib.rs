@@ -25,9 +25,15 @@
 //!   `lok_dlopen`+`dlsym("libreofficekit_hook_2")` 引导序一致）。
 //! - ⛔ **Windows 实测门未执行**（无实机）：运行时发现序 / `LoadLibraryExW`
 //!   加载 / stdin 私有化（LO 内核会读 fd 0，ElyOffice `worker/stdin.rs`
-//!   实证） / DPI unaware（tile 假定 96 DPI）代码已实现并纳入
+//!   实证） / DPI unaware（tile 假定 96 DPI）/**message-only window
+//!   消息驱动主循环（#104，#69 终局：Windows 分支
+//!   `messages_loop`——RegisterClassW + CreateWindowExW(HWND_MESSAGE) +
+//!   PostMessageW 投递 + WndProc 同步分发 + runLoop 空钩子；ElyOffice
+//!   `worker/messages.rs` 参照）**代码已实现并纳入
 //!   `cargo check --target x86_64-pc-windows-msvc` 编译面，但**未经
-//!   Windows 实机验证**。复现清单见 [`runtime`] 模块文档。
+//!   Windows 实机验证**。实机验收脚本
+//!   `scripts/lok/win104_messages_accept.ps1`（三帧全应答 + 存活门 +
+//!   干净关机）。复现清单见 [`runtime`] 模块文档。
 //! - ⛔ macOS 实测门未执行（同上）。
 //!
 //! ## ABI 防漂移（issue「nSize/member 检查」要求）

@@ -87,10 +87,17 @@ cargo test -p mdc-lok -- --test-threads=1
 
 - 代码就绪面：发现序 Windows 段（`Program Files` 候选）/
   `LoadLibraryExW` 搜索标志 / `steal_stdin_fd` win 分支（`_dup`/
-  `_dup2`/`NUL`）/ runLoop 集成（poll/wake 为平台无关 C ABI）。
+  `_dup2`/`NUL`）/ **#104 message-only window 消息驱动主循环**
+  （`messages_loop`：RegisterClassW + CreateWindowExW(HWND_MESSAGE)
+  + reader 线程 PostMessageW(ASK/CLOSED) + WndProc 复用 handle_frame
+  同步分发 + runLoop 空钩子——unipoll 机件已 cfg 收窄到非 Windows；
+  ElyOffice `worker/messages.rs` 参照；Windows 编译面
+  `--target x86_64-pc-windows-msvc --all-targets` 绿）。
 - **实机门未执行**（沙箱无 Windows）：全链 + 故障三件套按
   `runtime.rs` 模块文档「Windows 复现清单」在实机执行（#48/#52
-  协调）；不得以 Linux 结果或测试绿宣称 Windows 完成。
+  协调）；不得以 Linux 结果或测试绿宣称 Windows 完成。#104 实机
+  验收脚本：`scripts/lok/win104_messages_accept.ps1`（三帧全应答 +
+  存活门 + 干净关机，_ape2.ps1 匿名管道逐帧模式）。
 - 已知未实测风险面（ElyOffice 实证，防御已内置）：fd 0 抢读 /
   per-monitor DPI tile 偏移 / liblangtag LT_LOCK 句柄泄漏（长会话
   反复开关可能泄漏，冒烟一轮不受影响）。
