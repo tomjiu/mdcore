@@ -5911,6 +5911,284 @@ mod pdf_search_wiring_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #51 D4d 接线面：**跨页拖选与复制**全链——真实鼠标管线（页 0
+    /// 按下 → 跨槽拖入页 1 → 页 1 松开）→ 触达页层串行泵取（队列
+    /// 续泵）→ 两页文本读序拼接（页间断行恰一条）→ Ctrl+C 剪贴板
+    /// 逐字一致 → Esc 清。语料 zh_embedded_font.pdf（两页均有文本
+    /// 层——页 1 头部「中文嵌入字体测试 · 第 2 页」/页 0 尾行
+    /// 「mdcore 显示语料」为跨页读序锚点）。引擎门控同 D4a。
+    #[gpui::test]
+    fn pdf_view_ctrl_c_copies_cross_page_selection(cx: &mut gpui::TestAppContext) {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/display_corpus/zh_embedded_font.pdf");
+        let bytes = std::fs::read(&corpus).unwrap_or_else(|e| panic!("语料不可读（{e}）"));
+        let dir = std::env::temp_dir().join(format!("mdc-d4d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("m.pdf");
+        std::fs::write(&pdf, bytes);
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf.clone(), window, cx);
+            });
+        });
+        let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view = match view {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4d 跨页拖选 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        // ① 首屏位图就绪（真实渲染管线——泵同 D4a 口径）。
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.page_ready_for_test(0)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4d 首屏位图泵超时（真缺陷不放过）"
+            );
+        }
+
+        // ② 中途滚动把页界拉进同帧视口：页 1 顶对齐视口顶（scroll_
+        // to_page——页空间锚点）再回滚 300px——页 0 尾带 + 页 1 头带
+        // 同帧可见（跨页拖选产品手势 = 页界附近拖；gpui::list 槽实例域
+        // = 视口 ± overdraw，槽高超视口时两侧不同帧存在则跨页手势
+        // 不可派发）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        cx.update(|app| view.update(app, |v, _| v.scroll_to_page(1)));
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.top_visible_page() == 1) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4d 页 1 对齐泵超时（真缺陷不放过）"
+            );
+        }
+        cx.update(|app| view.update(app, |v, _| v.scroll_by_for_test(-300.)));
+        visual.update(|window, app| window.draw(app).clear(app));
+        // 两页槽真实几何（页界两侧同帧在位——debug_selector 观测面）。
+        let b0 = visual
+            .debug_bounds("pdf-visible-page-0")
+            .expect("页 0 槽真实渲染（回滚后尾带可见）");
+        let b1 = visual
+            .debug_bounds("pdf-visible-page-1")
+            .expect("页 1 槽真实渲染（回滚后头带可见——跨页拖选两端同帧在位）");
+        let rect = |b: &gpui::Bounds<gpui::Pixels>| {
+            (
+                f32::from(b.origin.x),
+                f32::from(b.origin.y),
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+            )
+        };
+        let (bx0, _by0, bw0, _bh0) = rect(&b0);
+        let (bx1, by1, bw1, _bh1) = rect(&b1);
+        let pt = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+        let down = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position: pt(x, y),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .expect("按下派发");
+        };
+        let move_to = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position: pt(x, y),
+                        pressed_button: Some(gpui::MouseButton::Left),
+                        modifiers: Default::default(),
+                    }),
+                    cx,
+                );
+            })
+            .expect("拖动派发");
+        };
+        let up = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position: pt(x, y),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("松开派发");
+        };
+        // 跨页拖选带：页 0 尾带（页界上方 130px——尾部文本行区）按下
+        // → 跨槽拖入页 1 头带（页界下方 200px——顶边距 72pt 下探到首
+        // 文本行区；A4 适宽槽 200px ≈ 103pt——头部行深度实测 > 57pt）松
+        // 开。角域语义：页 0 = 锚点 → 页底、页 1 = 页顶 → 游标。页界 y
+        // = 页 1 顶（槽邻接）。
+        let boundary_y = by1;
+        down(cx, bx0 + bw0 * 0.15, boundary_y - 130.);
+        move_to(cx, bx1 + bw1 * 0.85, boundary_y + 200.);
+        up(cx, bx1 + bw1 * 0.85, boundary_y + 200.);
+        view.read_with(&visual, |v, _| {
+            assert!(
+                v.has_selection_for_test(),
+                "跨页拖选后选择会话必须在位（页 0 按下 → 页 1 松开跨槽接线）"
+            );
+        });
+
+        // ③ 两页层就绪 + 拼接文本（串行队列续泵——一页一线程）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.selection_text_for_test().is_some()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4d 跨页选择文本泵超时（两页层串行提取未就绪——真缺陷不放过）"
+            );
+        }
+        let selected = view.read_with(&visual, |v, _| {
+            v.selection_text_for_test().unwrap().to_owned()
+        });
+        // 跨页读序双锚点：页 0 尾行（角域 → 页底）在前、页 1 头部行
+        // （角域 ← 页顶）在后；页 0 头部行（锚点上方）不得入选（角域
+        // 语义反证）。
+        let pos_tail = selected
+            .find("mdcore 显示语料")
+            .expect("页 0 尾行「mdcore 显示语料」必须入选（锚点 → 页底角域）");
+        let pos_p1head = selected
+            .find("第 2 页")
+            .expect("页 1 头部「第 2 页」必须入选（页顶 → 游标角域——跨页触达）");
+        assert!(
+            pos_tail < pos_p1head,
+            "读序拼接恒 lo → hi（页 0 尾在前、页 1 头在后；实得 {pos_tail} vs {pos_p1head}）"
+        );
+        assert!(
+            !selected.contains("第 1 页"),
+            "页 0 头部行在锚点上方——角域语义不得入选（倒推反证）"
+        );
+        // 页间断行存在性（单侧守卫——直接拼接无分隔即红）。
+        assert!(
+            !selected.contains("语料中文"),
+            "页界必须有断行分隔（直接拼接 = join 缺失）"
+        );
+        eprintln!(
+            "#51 D4d ✓ 跨页拖选就绪：{} 字符（页 0 尾 + 页界 + 页 1 头读序拼接）",
+            selected.chars().count()
+        );
+
+        // ④ 真实键击管线 Ctrl+C → 剪贴板逐字一致。
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        key: "c".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Ctrl+C");
+        let clipboard = cx.read(|app| app.read_from_clipboard());
+        let copied = clipboard.and_then(|item| item.text()).unwrap_or_default();
+        assert_eq!(
+            copied, selected,
+            "剪贴板读回必须与跨页选择文本逐字一致（#51 D4d 复制链）"
+        );
+        eprintln!(
+            "#51 D4d ✓ Ctrl+C 复制：剪贴板逐字一致（{} 字符）",
+            copied.chars().count()
+        );
+
+        // ⑤ Esc 清选择（真实键击管线 → 视图键域）。
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: Default::default(),
+                        key: "escape".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Esc");
+        visual.update(|window, app| window.draw(app).clear(app));
+        view.read_with(&visual, |v, _| {
+            assert!(
+                !v.has_selection_for_test() && v.selection_text_for_test().is_none(),
+                "Esc 清跨页选择（会话与文本双清零）"
+            );
+        });
+        eprintln!("#51 D4d ✓ Esc 清跨页选择");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #51 D4b 接线面：**当前页/缩放状态一致性**两面全链——
     ///
     /// 1. **页码读数活更新**：页视图 emit（TopPageChanged）在页变化

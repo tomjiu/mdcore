@@ -45,9 +45,8 @@
 //! ## 文本选择与复制（#51 D4——页面视图内）
 //!
 //! - **左键拖选**：页槽内按下 → 拖动（游标实时更新）→ 松开定稿；
-//!   3px 内退化单击清选择（不遗留幽灵框）；跨页拖选 v1 截停在
-//!   锚点页（与右键批注拖框同口径，跨页登记后续轮）；
-//! - **选择层**：按下页单次后台线程提取 `positioned_chars` + 页变换
+//!   3px 内退化单击清选择（不遗留幽灵框）；跨页拖选见下条（D4d）；
+//! - **选择层**：触达页逐页后台线程提取 `positioned_chars` + 页变换
 //!   （复用 #422 文本层类型——独立于查找索引的常驻轻量面：只存
 //!   选择触及的页，批注 flush 不废）；层落地经 16ms 轮询回流——
 //!   拖选中实时高亮（选择蓝 40% α 与查找黄并存）；
@@ -55,6 +54,11 @@
 //!   命中字符阅读序拼接、行间断点（垂直中心距 > 高度均值 × 30%，
 //!   与 `match_quads` 归行同判据）插换行；无选择不吞键照常下沉；
 //!   Esc 清选择（选择层保留供下次即时高亮）；
+//! - **跨页拖选**（D4d）：锚点/游标可异页——触达页段 `[lo, hi]`
+//!   角域覆盖（低页端点→页底角、高页页顶角→端点、中间页全页；
+//!   跳页快拖由两端点推导）；读序拼接恒 lo → hi（倒拖不倒文本）；
+//!   页间断行恰一条（`join_page_texts`）；触达页层串行泵取（一次
+//!   一线程——引擎不翻倍，队列续泵见 `drain_selection_layer`）；
 //! - **坐标链**（`selection_user_rect` 纯函数单测锚定）：槽域 →
 //!   扣 letterbox 偏移 → 钳内容盒 → `screen_rect_to_quad`（旋转
 //!   90° 倍仍轴对齐）——与批注拖框 / #422 高亮同源变换；
@@ -114,6 +118,10 @@
 //!   文本层后台线程索引 + 页上黄色高亮 + Enter/Shift+Enter（Ctrl+G）
 //!   导航 + 「n/m」计数；扫描件无文本层 → 如实「无匹配」（不虚装）；
 //!   无 libpdfium 环境下页视图本就 error 态（面板明示），查找不另设面；
+//! - **多选区**（D4d 评估结论）：v1 = 单连续跨页选择会话（一锚点一
+//!   游标——角域语义见上）；多离散选区（Ctrl+点选追加等）**后置不
+//!   做**——状态机与高亮族需多会话数组化 + 合并/减除语义裁定，产品
+//!   收益（连续引用批注等）待真实用户面反馈再启（登记后续轮）；
 //! - **#421 缩放已接**：FitWidth（默认——v1 适宽行为零变化）/
 //!   FitPage / ActualSize / Custom 四态——Ctrl+滚轮（capture 期拦截）
 //!   + 键域 Ctrl+0/Ctrl+1/Ctrl+Shift+0/Ctrl+=·Ctrl+-（shell 键分派
@@ -297,12 +305,15 @@ pub struct PdfPagesView {
     annotate_rev: u64,
     /// 右键拖框会话（按下时的页号 + 页内像素起点；None = 非拖框中）。
     drag_start: Option<(u32, f32, f32)>,
-    /// #51 D4：文本选择会话（左键拖选——页面视图内）：`(页, x0, y0,
-    /// x1, y1)` 内容盒像素域（letterbox 偏移扣除前为槽域坐标，扣偏移
-    /// 与 DPI 基准在消费点统一解析——与批注拖框同口径）。拖选期间
-    /// 实时更新游标端；松开定稿保留（复制源；Esc / 新按下清零）。
-    text_selection: Option<(u32, f32, f32, f32, f32)>,
-    /// #51 D4：选择文本层（按下页单次后台提取——`positioned_chars`
+    /// #51 D4(d)：文本选择会话（左键拖选——页面视图内，跨页）：
+    /// 锚点 + 游标（[`SelectionDrag`]——游标页可与锚点页异页）。拖
+    /// 选期间实时更新游标端；松开定稿保留（复制源；Esc / 新按下
+    /// 清零）。
+    text_selection: Option<SelectionDrag>,
+    /// #51 D4d：选择层待提取页队列（跨页触达页串行泵取——一次只
+    /// 起一个提取线程，防引擎开翻倍；层缓存命中页不入队）。
+    selection_pending: Vec<u32>,
+    /// #51 D4：选择文本层（触达页逐页后台提取——`positioned_chars`
     /// + 页变换；跨选择复用，批注 flush 不废——#422 同口径：高亮/
     /// 下划线/便签不改文本层）。仅存选择触及的页（常驻轻量面）。
     selection_layers: BTreeMap<u32, Arc<PageTextLayer>>,
@@ -402,6 +413,17 @@ struct PageTextLayer {
     /// 页变换（#634：几何 + 旋转单一事实源——高亮 quad 四角映射与
     /// 跳转滚动的 `user_to_screen` 基准，替换 v1 的宽高轴缩放）。
     transform: PageTransform,
+}
+
+/// #51 D4d：拖选会话——锚点（左键按下位）与游标（当前/松开位）各
+/// 自携带页号（**可异页**——跨页拖选）；坐标 = 各页本地槽域（扣
+/// letterbox 偏移与 DPI 在消费点统一解析，与页内 D4a 同口径）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SelectionDrag {
+    /// 锚点（页号, x, y——按下位）。
+    anchor: (u32, f32, f32),
+    /// 游标（页号, x, y——拖动位/松开定稿位）。
+    cursor: (u32, f32, f32),
 }
 
 /// 索引线程 → 视图回流消息（通道关闭 = 查找条已关，线程自然退出）。
@@ -573,6 +595,68 @@ fn selection_user_rect(
     )
 }
 
+/// #51 D4d：跨页选区槽域哨兵——「扫到页边」的开放端（`selection_
+/// user_rect` 的内容盒钳制自然收边：letterbox 留白不算选区，故
+/// 任何大数值语义等价；取 1e6 使单测断言可读）。
+const SEL_EDGE_SENTINEL: f32 = 1.0e6;
+
+/// #51 D4d：跨页拖选 → 各触达页槽域矩形（纯函数——单测锚点）。
+///
+/// 语义 = **角域**（与页内拖选同源——所见即所选）：设触达页段
+/// `[lo, hi]`（锚点页与游标页的有序闭段）——低页从端点扫到页底
+/// 右角、高页从页顶左角扫到端点、中间页全页；单页段退化 = 页内
+/// 矩形（D4a 原语义不动）。**读序组装恒 lo → hi**（倒拖不倒文本——
+/// 文本拼接面见 [`join_page_texts`]）；矩形对角序不敏感（下游
+/// `selection_user_rect` 归一）。
+///
+/// 跳页快拖（中间页无 move 事件）由两端点推导覆盖——矩形推导只
+/// 看锚点/游标两端。
+fn cross_page_slot_rects(drag: &SelectionDrag) -> BTreeMap<u32, (f32, f32, f32, f32)> {
+    let (pa, xa, ya) = drag.anchor;
+    let (pc, xc, yc) = drag.cursor;
+    let (lo, hi) = (pa.min(pc), pa.max(pc));
+    let s = SEL_EDGE_SENTINEL;
+    let mut out = BTreeMap::new();
+    for page in lo..=hi {
+        let r = if lo == hi {
+            // 单页段——页内矩形（任意对角序）。
+            (xa, ya, xc, yc)
+        } else if page == lo {
+            // 低页：本页端点（前进 = 锚点 / 后退 = 游标）→ 页底右角。
+            let (ex, ey) = if pa <= pc { (xa, ya) } else { (xc, yc) };
+            (ex, ey, s, s)
+        } else if page == hi {
+            // 高页：页顶左角 → 本页端点（前进 = 游标 / 后退 = 锚点）。
+            let (ex, ey) = if pa <= pc { (xc, yc) } else { (xa, ya) };
+            (-s, -s, ex, ey)
+        } else {
+            // 中间页：全页。
+            (-s, -s, s, s)
+        };
+        out.insert(page, r);
+    }
+    out
+}
+
+/// #51 D4d：页间断行拼接（纯函数——单测锚点）：读序（入参序）拼
+/// 接各页文本，**页界处补一个换行**（前页尾已是行尾则不重复补；
+/// 空文本页整页跳过——不生空行不生连续换行）。
+fn join_page_texts(pages: &[String]) -> String {
+    let mut out = String::new();
+    let mut seen = false;
+    for t in pages {
+        if t.is_empty() {
+            continue; // 该页无命中文本——页界不生空行。
+        }
+        if seen && !out.ends_with('\n') {
+            out.push('\n'); // 页间断行——恰一条（不叠不缺）。
+        }
+        out.push_str(t);
+        seen = true;
+    }
+    out
+}
+
 /// #51 D4：选择矩形命中的字符（阅读序——`layer.chars` 即文档序；
 /// 纯函数——单测锚点）。字符 quad 与用户空间矩形相交即入选。
 fn selection_chars(layer: &PageTextLayer, rect_user: (f32, f32, f32, f32)) -> Vec<PositionedChar> {
@@ -681,6 +765,7 @@ impl PdfPagesView {
             annotate_rev: 0,
             drag_start: None,
             text_selection: None,
+            selection_pending: Vec::new(),
             selection_layers: BTreeMap::new(),
             selection_rx: None,
             selection_polling: false,
@@ -732,6 +817,7 @@ impl PdfPagesView {
             annotate_rev: 0,
             drag_start: None,
             text_selection: None,
+            selection_pending: Vec::new(),
             selection_layers: BTreeMap::new(),
             selection_rx: None,
             selection_polling: false,
@@ -864,6 +950,14 @@ impl PdfPagesView {
             item_ix: idx,
             offset_in_item: px(0.),
         });
+    }
+
+    /// #51 D4d 测试面：垂直位移滚动（跨页拖选 e2e 把页界拉进同帧
+    /// 视口——gpui::list 槽实例域 = 视口 ± overdraw，页界外两侧槽
+    /// 不同帧存在时跨页手势不可派发）。
+    #[cfg(test)]
+    pub fn scroll_by_for_test(&self, dy: f32) {
+        self.scroll.scroll_by(px(dy));
     }
 
     /// #420：源字节（缩略图侧栏共享同源字节快照——零拷贝零重复内存；
@@ -1581,21 +1675,25 @@ impl PdfPagesView {
         out
     }
 
-    /// #51 D4：本页文本选择高亮元素族（与 [`Self::search_highlights`]
+    /// #51 D4(d)：本页文本选择高亮元素族（与 [`Self::search_highlights`]
     /// 同映射链：命中字符 `match_quads` 归行 → quad 四角 user_to_screen
-    /// + letterbox 偏移；空 = 无选择/层未就绪/本页无命中）。选择色 =
-    /// 主题外联蓝 40% α（与查找黄区分——两高亮可同屏并存）。
+    /// + letterbox 偏移；空 = 无选择/本页不在触达段/层未就绪/本页无
+    /// 命中）。**D4d 跨页**：本页矩形由 [`cross_page_slot_rects`] 推导
+    ///（低页端点→页底角、高页页顶角→端点、中间页全页——角域语义
+    /// 所见即所选）。选择色 = 主题外联蓝 40% α（与查找黄区分——两
+    /// 高亮可同屏并存）。
     fn selection_highlights(&self, page: u32, fit_w: f32, slot_h: f32) -> Vec<AnyElement> {
-        let Some((sel_page, sx0, sy0, sx1, sy1)) = self.text_selection else {
+        let Some(drag) = self.text_selection else {
             return Vec::new();
         };
-        if sel_page != page {
-            return Vec::new();
-        }
+        let rects = cross_page_slot_rects(&drag);
+        let Some(slot_rect) = rects.get(&page) else {
+            return Vec::new(); // 本页不在触达段。
+        };
         let Some(layer) = self.selection_layers.get(&page) else {
             return Vec::new(); // 层提取中——高亮随层落地帧出现（诚实面）
         };
-        let rect = selection_user_rect(layer, fit_w, slot_h, (sx0, sy0, sx1, sy1));
+        let rect = selection_user_rect(layer, fit_w, slot_h, *slot_rect);
         let chars = selection_chars(layer, rect);
         if chars.is_empty() {
             return Vec::new();
@@ -1704,69 +1802,126 @@ impl PdfPagesView {
     // #51 D4：文本选择与复制（左键拖选 → Ctrl+C——页面视图内）
     // ------------------------------------------------------------------
 
-    /// #51 D4：选择开始——清旧选择、记锚点（槽域坐标）、懒提取本页
-    /// 文本层（一次开线程——层就绪后拖选实时高亮 + 复制可用）。
+    /// #51 D4(d)：选择开始——清旧选择、记锚点（槽域坐标）、懒提取
+    /// 本页文本层（一次开线程——层就绪后拖选实时高亮 + 复制可用）。
+    /// D4d：新会话重置待提取队列（在飞层自然落地为缓存，不废）。
     fn begin_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
         self.selection_text = None;
-        self.text_selection = Some((page, x, y, x, y));
-        if !self.selection_layers.contains_key(&page) {
-            self.spawn_selection_layer(page, cx);
+        self.text_selection = Some(SelectionDrag {
+            anchor: (page, x, y),
+            cursor: (page, x, y),
+        });
+        self.selection_pending.clear(); // 新会话重排队（旧在飞层照常落地为缓存）。
+        self.queue_selection_layer(page, cx);
+        cx.notify();
+    }
+
+    /// #51 D4d：拖选游标更新（**跨页启程**——D4a 的页界截停语义
+    /// 升格为跨页拖动：游标页可与锚点页异页，触达页段 `[lo, hi]`
+    /// 全程覆盖；无选择会话 no-op——鼠标悬停不误触）。游标换页时
+    /// 整段补层入队（跳页快拖中间页无 move 事件也覆盖——矩形推导
+    /// 只看两端点）。
+    fn move_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.text_selection else {
+            return;
+        };
+        let prev_page = drag.cursor.0;
+        self.text_selection = Some(SelectionDrag {
+            cursor: (page, x, y),
+            ..drag
+        });
+        if page != prev_page {
+            let (lo, hi) = (drag.anchor.0.min(page), drag.anchor.0.max(page));
+            for p in lo..=hi {
+                self.queue_selection_layer(p, cx);
+            }
         }
         cx.notify();
     }
 
-    /// #51 D4：拖选游标更新（仅锚点同页生效——跨页 v1 语义 = 页界
-    /// 截停，与批注拖框同口径；无选择会话 no-op——鼠标悬停不误触）。
-    fn move_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
-        if let Some((p, x0, y0, _, _)) = self.text_selection {
-            if p == page {
-                self.text_selection = Some((p, x0, y0, x, y));
-                cx.notify();
-            }
-        }
-    }
-
-    /// #51 D4：选择定稿（左键松开）——游标更新为松开位；3px 内退化
-    /// 单击清选择（不遗留幽灵框）；真拖选即时解析复制文本（层就绪
-    /// 时；未就绪留空，层落地轮询补算）。
+    /// #51 D4(d)：选择定稿（左键松开）——游标更新为松开位；同页 3px
+    /// 内退化单击清选择（不遗留幽灵框）；**跨页松开 = 真拖选**（页间
+    /// 位移远超 3px——不误判）定稿即时解析复制文本（层就绪时；未就绪
+    /// 留空，层落地轮询补算）。触达段整段补层（松开位页可能从未在
+    /// move 事件中出现——快速拖动直接松开）。
     fn finish_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
-        let Some((p, x0, y0, _, _)) = self.text_selection else {
+        let Some(drag) = self.text_selection else {
             return;
         };
-        if p != page {
-            return; // 跨页松开——页界截停（游标留在最后一次同页更新）。
-        }
-        if (x - x0).abs() < 3.0 && (y - y0).abs() < 3.0 {
+        let (pa, xa, ya) = drag.anchor;
+        if pa == page && (x - xa).abs() < 3.0 && (y - ya).abs() < 3.0 {
             self.text_selection = None; // 无拖选意图的单击——清零不猜。
             self.selection_text = None;
+            self.selection_pending.clear();
             cx.notify();
             return;
         }
-        self.text_selection = Some((p, x0, y0, x, y));
+        self.text_selection = Some(SelectionDrag {
+            cursor: (page, x, y),
+            ..drag
+        });
+        let (lo, hi) = (pa.min(page), pa.max(page));
+        for p in lo..=hi {
+            self.queue_selection_layer(p, cx);
+        }
         self.selection_text = self.compute_selection_text();
         cx.notify();
     }
 
-    /// #51 D4：当前选择 → 复制文本（层就绪时解析；槽域 → 内容盒域
-    /// → 用户空间矩形 → 命中字符归行拼接）。层未就绪 → None（层
-    /// 落地轮询会重算；复制 no-op 诚实面）。
+    /// #51 D4(d)：当前选择 → 复制文本（**触达页段逐页拼接**：各页槽
+    /// 域矩形 → 内容盒域 → 用户空间矩形 → 命中字符归行拼接 →
+    /// [`join_page_texts`] 页间断行；读序恒 lo → hi——倒拖不倒文本）。
+    /// 任一触达页层未就绪 → None（层落地轮询会重算；复制 no-op 诚实
+    /// 面）。
     fn compute_selection_text(&self) -> Option<String> {
-        let (page, sx0, sy0, sx1, sy1) = self.text_selection?;
-        let layer = self.selection_layers.get(&page)?;
+        let drag = self.text_selection?;
         let (vw, vh) = self.viewport_size;
         let fit_w = self.raster_width(vw, vh);
-        let slot_h = self.page_slot_height(fit_w, page as usize);
-        let rect = selection_user_rect(layer, fit_w as f32, slot_h, (sx0, sy0, sx1, sy1));
-        let text = selection_text(layer, rect);
+        let mut pages: Vec<String> = Vec::new();
+        for (&page, &slot_rect) in cross_page_slot_rects(&drag).iter() {
+            // BTreeMap 读序 = 页号升序。
+            let layer = self.selection_layers.get(&page)?; // 任一层未就绪 → None（轮询补算）。
+            let slot_h = self.page_slot_height(fit_w, page as usize);
+            let rect = selection_user_rect(layer, fit_w as f32, slot_h, slot_rect);
+            pages.push(selection_text(layer, rect));
+        }
+        let text = join_page_texts(&pages);
         (!text.is_empty()).then_some(text)
+    }
+
+    /// #51 D4d：页入待提取队列（未缓存才入；层缓存命中页不入队——
+    /// 二次拖选即时高亮）后尝试泵取。
+    fn queue_selection_layer(&mut self, page: u32, cx: &mut Context<Self>) {
+        if !self.selection_layers.contains_key(&page) && !self.selection_pending.contains(&page) {
+            self.selection_pending.push(page);
+        }
+        self.pump_selection_queue(cx);
+    }
+
+    /// #51 D4d：队首页出队起飞（仅当无在飞层——串行防引擎开翻
+    /// 倍；跨页触达段逐页落地，在飞尽位由 [`Self::drain_selection_layer`]
+    /// 续泵）。
+    fn pump_selection_queue(&mut self, cx: &mut Context<Self>) {
+        if self.selection_rx.is_some() {
+            return; // 在飞层未尽——排队等续泵。
+        }
+        while let Some(page) = self.selection_pending.first().copied() {
+            self.selection_pending.remove(0);
+            if self.selection_layers.contains_key(&page) {
+                continue; // 排队期间被在飞会话落地——跳过。
+            }
+            self.spawn_selection_layer(page, cx);
+            return; // 一次只飞一个。
+        }
     }
 
     /// #51 D4：起单页文本层提取线程（引擎一次开 → 单页 position_ed_chars
     /// + 页变换；通道关闭/发送失败自然退——视图已释放）。层落地经
-    /// 轮询回流 + notify（拖选实时高亮）。
+    /// 轮询回流 + notify（拖选实时高亮）。D4d：队列泵 [`Self::
+    /// pump_selection_queue`] 唯一调用面（串行门锥在位）。
     fn spawn_selection_layer(&mut self, page: u32, cx: &mut Context<Self>) {
         if self.selection_rx.is_some() {
-            return; // 提取中（单页会话——本批只处理锚点页）。
+            return; // 在飞未尽（泵口双重门锥——正常不可达，防御态）。
         }
         let (tx, rx) = std::sync::mpsc::channel::<Box<PageTextLayer>>();
         let bytes = self.bytes.clone();
@@ -1796,12 +1951,16 @@ impl PdfPagesView {
             }
         });
         self.selection_rx = Some((rx, page));
-        self.selection_polling = true;
-        Self::spawn_selection_poll_loop(cx);
+        if !self.selection_polling {
+            self.selection_polling = true; // 环在位旗（防叠环——队列
+            // 泵多次 spawn，环只一条长寿命直到队列尽）。
+            Self::spawn_selection_poll_loop(cx);
+        }
     }
 
     /// 选择层回流轮询（16ms 定时 drain——层落地重算选择文本 + notify；
-    /// 单层单次，通道空 + 旗复位即止）。
+    /// **D4d：队列驱动长寿命**——在飞层尽位时续泵下一待提取页，
+    /// rx 置空且队列尽时旗复位即止。多会话不叠环（旗门锥）。
     fn spawn_selection_poll_loop(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
@@ -1810,7 +1969,7 @@ impl PdfPagesView {
                 match this.update(cx, |view, cx| {
                     view.drain_selection_layer(cx);
                     if view.selection_rx.is_none() {
-                        view.selection_polling = false;
+                        view.selection_polling = false; // 队列尽——环退位旗复位。
                         stop = true;
                     }
                 }) {
@@ -1828,7 +1987,8 @@ impl PdfPagesView {
     /// 收选择层：落地（页号随通道携带——与选择会话状态解耦：选择已
     /// 清也不丢层，下次拖选即时高亮）→ 选择文本补算 → notify。
     /// 通道语义：Empty = 线程未尽继续轮询；Disconnected = 线程尽
-    /// （层已尽或引擎失败）止轮询。
+    /// （层已尽或引擎失败）→ **D4d：续泵队列下一页**（跨页触达段
+    /// 串行落地；队列尽 → rx 空 → 轮询环退）。
     fn drain_selection_layer(&mut self, cx: &mut Context<Self>) {
         let Some((rx, page)) = self.selection_rx.take() else {
             return;
@@ -1849,7 +2009,8 @@ impl PdfPagesView {
             }
         }
         if exhausted {
-            self.selection_rx = None; // 止轮询（poll 循环据此退）
+            self.selection_rx = None; // 本在飞层尽——队列续泵前先置空。
+            self.pump_selection_queue(cx); // 下一待提取页（有则 rx 复置，轮询环继续）。
         } else {
             self.selection_rx = Some((rx, page));
         }
@@ -3575,6 +3736,84 @@ mod tests {
         let (r_x0, r_y0, r_x1, r_y1) =
             selection_user_rect(&layer, fit_w, slot_h, (576., 407.8, 0., 0.));
         assert_eq!((x0, y0, x1, y1), (r_x0, r_y0, r_x1, r_y1), "对角序无关");
+    }
+
+    /// #51 D4d：跨页拖选 → 各触达页槽域矩形——前进/后退/单页退化
+    /// 三面。角域语义：低页端点→页底右角、高页页顶左角→端点、中间
+    /// 页全页；哨兵端 = 开放边（下游内容盒钳制收边）。
+    #[test]
+    fn cross_page_slot_rects_forward_backward_and_degenerate() {
+        let s = SEL_EDGE_SENTINEL;
+        // 前进：页 0 锚点 (10, 20) → 页 2 游标 (30, 40)。
+        let fwd = SelectionDrag {
+            anchor: (0, 10., 20.),
+            cursor: (2, 30., 40.),
+        };
+        let rects = cross_page_slot_rects(&fwd);
+        assert_eq!(rects.len(), 3, "触达页段 [0, 2] 恰三页");
+        assert_eq!(rects[&0], (10., 20., s, s), "低页 = 锚点端 → 页底右角");
+        assert_eq!(rects[&1], (-s, -s, s, s), "中间页 = 全页");
+        assert_eq!(rects[&2], (-s, -s, 30., 40.), "高页 = 页顶左角 → 游标端");
+
+        // 后退：页 2 锚点 (10, 20) → 页 0 游标 (30, 40)——低页端 = 游标，
+        // 高页端 = 锚点（倒拖不倒文本——读序组装恒 lo → hi）。
+        let bwd = SelectionDrag {
+            anchor: (2, 10., 20.),
+            cursor: (0, 30., 40.),
+        };
+        let rects = cross_page_slot_rects(&bwd);
+        assert_eq!(rects.len(), 3, "触达页段 [0, 2] 恰三页");
+        assert_eq!(rects[&0], (30., 40., s, s), "低页 = 游标端 → 页底右角");
+        assert_eq!(rects[&1], (-s, -s, s, s), "中间页 = 全页");
+        assert_eq!(rects[&2], (-s, -s, 10., 20.), "高页 = 页顶左角 → 锚点端");
+
+        // 单页退化（D4a 原语义不动）：锚点 = 游标页——页内矩形原样。
+        let same = SelectionDrag {
+            anchor: (1, 10., 20.),
+            cursor: (1, 30., 40.),
+        };
+        let rects = cross_page_slot_rects(&same);
+        assert_eq!(rects.len(), 1, "单页段");
+        assert_eq!(rects[&1], (10., 20., 30., 40.), "页内矩形（任意对角序）");
+
+        // 跳页快拖（页 0 → 页 4，中间页无 move 事件）：两端点推导整段。
+        let skip = SelectionDrag {
+            anchor: (0, 5., 5.),
+            cursor: (4, 6., 7.),
+        };
+        let rects = cross_page_slot_rects(&skip);
+        assert_eq!(rects.len(), 5, "触达页段 [0, 4] 恰五页（推导不看事件流）");
+        assert_eq!(rects[&3], (-s, -s, s, s), "未经过的中间页也全页覆盖");
+    }
+
+    /// #51 D4d：页间断行拼接——恰一条（不叠不缺）；空文本页整页跳
+    /// 过（不生空行不生连续换行）；空入参 = 空串。
+    #[test]
+    fn join_page_texts_page_break_lines() {
+        use super::join_page_texts;
+        // 基本页界：两页各一段 → 中间恰一条换行。
+        assert_eq!(
+            join_page_texts(&["第一页尾".into(), "第二页头".into()]),
+            "第一页尾\n第二页头"
+        );
+        // 前页尾已是行尾 → 不重复补。
+        assert_eq!(
+            join_page_texts(&["第一页尾\n".into(), "第二页头".into()]),
+            "第一页尾\n第二页头"
+        );
+        // 空文本页整页跳过——不生空行。
+        assert_eq!(
+            join_page_texts(&["首页".into(), "".into(), "末页".into()]),
+            "首页\n末页"
+        );
+        // 全空段 = 空串（无选择语义——消费点另判空）。
+        assert_eq!(join_page_texts(&[]), "");
+        assert_eq!(join_page_texts(&["".into(), "".into()]), "");
+        // 三页链：页界各恰一条。
+        assert_eq!(
+            join_page_texts(&["甲".into(), "乙".into(), "丙".into()]),
+            "甲\n乙\n丙"
+        );
     }
 
     /// 计数条文案四态：空查询 / 索引中 / 完成无匹配（含失败页脚注）/
