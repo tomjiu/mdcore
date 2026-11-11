@@ -695,6 +695,20 @@ impl<'a> DocHandle<'a> {
         Ok(())
     }
 
+    /// IME 文本（LOK 槽 #40 postWindowExtTextInputEvent）。
+    /// `commit=false` = 组合期（LOK_EXT_TEXTINPUT）；`commit=true` =
+    /// 提交（LOK_EXT_TEXTINPUT_END）。
+    ///
+    /// **⚠️ stock 25.2.3.2 语义不可靠（契约文档 §10 实证登记）**：首个
+    /// 会话组合串被当定稿插入、后续会话事件被静默丢弃——产品 IME
+    /// 通道用 [`Self::type_text`]（preedit 宿主渲染，定稿逐字符下发，
+    /// #50 C3 / A 线批次 12 架构）；本方法保留为内核 preedit 通道的
+    /// 机械面，待 LO 升级/补丁运行时重实证后解锁。
+    pub fn post_text(&self, commit: bool, text: &str) -> Result<(), LokError> {
+        self.edit_request("post_text", json!({"commit": commit, "text": text}))?;
+        Ok(())
+    }
+
     /// postUnoCommand（args = JSON 字符串）。编辑类命令成功置脏位
     /// （查询类命令由调用方用 [`Self::uno_query`]）。
     pub fn uno(&self, command: &str, args: Option<&str>, notify: bool) -> Result<Value, LokError> {
@@ -947,6 +961,21 @@ impl DocSession {
             self.client
                 .request("post_key", json!({"char": ch as i32, "key_code": 0}))?;
         }
+        Ok(())
+    }
+
+    /// IME 文本（LOK 槽 #40 postWindowExtTextInputEvent；B2 契约面）。
+    /// `commit=false` = 组合期；`commit=true` = 提交。
+    /// 成功：dirty=true、revision+1。
+    ///
+    /// **⚠️ stock 25.2.3.2 语义不可靠（契约文档 §10 实证登记）**：产品
+    /// IME 通道用 [`Self::type_text`]（GPUI preedit 宿主渲染 + 定稿逐
+    /// 字符 postKeyEvent，tests/ime_text.rs 实证全链含落盘）；本方法
+    /// 为内核 preedit 通道机械面，待重实证后解锁。
+    pub fn post_text(&mut self, commit: bool, text: &str) -> Result<(), LokError> {
+        self.edit_ok();
+        self.client
+            .request("post_text", json!({"commit": commit, "text": text}))?;
         Ok(())
     }
 

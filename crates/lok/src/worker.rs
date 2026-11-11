@@ -714,6 +714,32 @@ impl WorkerState {
         Ok(json!({"key": ch}))
     }
 
+    /// postWindowExtTextInputEvent（槽 #40；IME 组合/提交流——
+    /// #50 C3 中文输入数据源，与 A 线批次 12 GPUI 侧 IME 卫对接）。
+    /// commit=false → LOK_EXT_TEXTINPUT(0) 预编辑串；commit=true →
+    /// LOK_EXT_TEXTINPUT_END(2) 定稿串。
+    fn op_post_text(&mut self, commit: bool, text: &str) -> DispatchResult {
+        unsafe {
+            self.doc_guard(
+                abi::doc_offsets::POST_WINDOW_EXT_TEXT_INPUT_EVENT,
+                "postWindowExtTextInputEvent",
+            )?;
+            let f = (*self.doc_class)
+                .post_window_ext_text_input_event
+                .ok_or((codes::MEMBER, "缺 postWindowExtTextInputEvent".to_string()))?;
+            let text_c =
+                CString::new(text).map_err(|_| (codes::BAD_REQUEST, "text 含 NUL".into()))?;
+            // CString 生命周期纪律：具名绑定活到调用结束（悬垂指针事故教训）
+            let n_type = if commit {
+                abi::EXT_TEXTINPUT_END
+            } else {
+                abi::EXT_TEXTINPUT
+            };
+            f(self.doc, abi::MAIN_WINDOW_ID, n_type, text_c.as_ptr());
+        }
+        Ok(json!({"commit": commit, "text": text}))
+    }
+
     /// postMouseEvent。
     #[allow(clippy::too_many_arguments)]
     fn op_post_mouse(
@@ -1252,6 +1278,12 @@ fn dispatch(state: &mut WorkerState, op: &str, v: &Value) -> DispatchResult {
                 .ok_or((codes::BAD_REQUEST, "post_key 需要 char".to_string()))?;
             let kc = protocol::req_i32(v, "key_code").unwrap_or(0);
             state.op_post_key(ch, kc)
+        }
+        "post_text" => {
+            let text = protocol::req_str(v, "text")
+                .ok_or((codes::BAD_REQUEST, "post_text 需要 text".to_string()))?;
+            let commit = v.get("commit").and_then(Value::as_bool).unwrap_or(false);
+            state.op_post_text(commit, &text)
         }
         "post_mouse" => {
             let n_type = protocol::req_i32(v, "type").unwrap_or(abi::MOUSEEVENT_BUTTON_DOWN);
