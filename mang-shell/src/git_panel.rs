@@ -461,6 +461,44 @@ impl Render for GitPanel {
             .child(div().w_full().flex_1().min_h_0().child(body))
     }
 }
+
+// ---------------------------------------------------------------------------
+// #119（mdc-dock 批①）：GitPanel 作为 dock 面板（行为层）。
+//
+// 左栏 git 视图经 [`mdc_dock::Dock`] 激活协议接管（git_view 布尔退役）。
+// 激活焦点 = 面板根句柄（蓝本 dock.rs:44 缺省口径——本面板的
+// `panel_focus` 即键位域根）。
+// ---------------------------------------------------------------------------
+
+/// #119：git 面板的 dock 身份键（左栏激活协议）。发布后不可改
+/// （布局序列化依赖——蓝本 dock.rs:37 警告同款）。
+pub const GIT_PANEL_KEY: &str = "git";
+
+impl gpui::EventEmitter<mdc_dock::PanelEvent> for GitPanel {}
+
+impl gpui::Focusable for GitPanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> gpui::FocusHandle {
+        self.panel_focus.clone()
+    }
+}
+
+impl mdc_dock::Panel for GitPanel {
+    fn persistent_name() -> &'static str {
+        GIT_PANEL_KEY
+    }
+
+    fn panel_key() -> &'static str {
+        GIT_PANEL_KEY
+    }
+
+    fn position(&self) -> mdc_dock::DockPosition {
+        mdc_dock::DockPosition::Left
+    }
+
+    fn position_is_valid(&self, position: mdc_dock::DockPosition) -> bool {
+        position == mdc_dock::DockPosition::Left
+    }
+}
 // ---------------------------------------------------------------------------
 // #575/#577 键盘导航无头测试（lib 树——CI 可见）。焦点面用合成行
 // （零 git 依赖）；激活面用临时真仓库（git init + 提交 + 改动——

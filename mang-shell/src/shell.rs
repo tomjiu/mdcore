@@ -171,11 +171,14 @@ pub struct ShellApp {
     workspace: Option<Entity<FileTree>>,
     /// F7：git 面板（工作区打开即建——非 git 目录走面板内提示态）。
     git_panel: Option<Entity<GitPanel>>,
+    /// #119（mdc-dock 批①）：左栏 dock 实体——文件树/git 视图切换经
+    /// 统一激活协议（`git_view` 布尔退役）。面板未物化（无工作区）时
+    /// `activate_key` 记录预物化意图，渲染面据 `active_key` 呈占位视图
+    /// ——与旧 git_view=true + git_panel=None 的占位语义一比一等价。
+    left_dock: Entity<mdc_dock::Dock>,
     /// #571：大纲面板实体（批 7——激活标签的键盘导航结构树；
     /// 换绑判据见 [`Self::sync_outline`]）。
     outline: Option<Entity<OutlinePanel>>,
-    /// F7：左栏视图（文件树 / git——图标条切换）。
-    git_view: bool,
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
     /// 左条设置钮/菜单「设置」打开，Esc/点遮罩/关闭钮关闭）。
     settings_open: bool,
@@ -452,7 +455,9 @@ impl ShellApp {
             workspace,
             git_panel: None,
             outline: None,
-            git_view: false,
+            // #119（mdc-dock 批①）：左栏激活协议实体（空起——面板在
+            // 工作区打开时注册；激活语义见字段文档）。
+            left_dock: cx.new(|cx| mdc_dock::Dock::new(mdc_dock::DockPosition::Left, cx)),
             settings_open: false,
             pdf_pages: None,
             pdf_thumbs: None,
@@ -501,6 +506,15 @@ impl ShellApp {
         this.apply_font_size(px(this.font_size), cx);
         // #571：启动标签的大纲面板落位。
         this.sync_outline(cx);
+        // #119（mdc-dock 批①）：构造期工作区（F2 记忆恢复/CLI 参数）的
+        // 树面板注册进左栏 dock（不激活——active 无即文件树视图缺省渲染
+        // 语义，与旧 git_view=false 起始一比一等价；git 面板沿旧例不在
+        // 构造期建——预物化意图承接其占位语义）。
+        if let Some(tree) = this.workspace.clone() {
+            this.left_dock.update(cx, |dock, cx| {
+                dock.add_panel(&tree, cx);
+            });
+        }
         this
     }
 
@@ -701,8 +715,10 @@ impl ShellApp {
     /// 折叠/展开左栏（文件树）。图标条 `act-file-tree` 触发——已开且
     /// 在 git 视图时切回文件树视图（F7）。
     pub fn toggle_left(&mut self, cx: &mut Context<Self>) {
-        if self.left_open && self.git_view {
-            self.git_view = false;
+        if self.left_open && self.git_active(cx) {
+            // #119（mdc-dock 批①）：回切文件树视图经统一激活协议
+            //（原 git_view 布尔置位退役）。
+            self.activate_left_view(crate::file_tree::FILE_TREE_PANEL_KEY, cx);
         } else {
             self.left_open = !self.left_open;
         }
@@ -712,13 +728,31 @@ impl ShellApp {
     /// F7：切到 git 视图（图标条 `act-git` 触发——已开且在 git 视图时
     /// 折叠左栏，再开切回）。
     pub fn toggle_git(&mut self, cx: &mut Context<Self>) {
-        if self.left_open && self.git_view {
+        if self.left_open && self.git_active(cx) {
             self.left_open = false;
         } else {
             self.left_open = true;
-            self.git_view = true;
+            // #119：直达 git 视图经统一激活协议——git 面板未物化（无
+            // 工作区）时 dock 记预物化意图，渲染面呈占位视图（旧
+            // git_view=true + git_panel=None 语义一比一等价）。
+            self.activate_left_view(crate::git_panel::GIT_PANEL_KEY, cx);
         }
         cx.notify();
+    }
+
+    /// #119（mdc-dock 批①）：左栏当前是否 git 视图（dock 激活键裁决
+    /// ——含预物化意图口径；菜单勾选/图标条选中态/渲染面共用）。
+    pub fn git_active(&self, cx: &App) -> bool {
+        self.left_dock
+            .read(cx)
+            .active_is(crate::git_panel::GIT_PANEL_KEY)
+    }
+
+    /// #119：左栏视图激活单点（统一激活协议入口——图标条/菜单/快捷
+    /// 键三入口共用；后续批多面板扩展不再扩布尔）。
+    fn activate_left_view(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        let dock = self.left_dock.clone();
+        dock.update(cx, |dock, cx| dock.activate_key(key, cx));
     }
 
     /// F7：git 面板实体（烟雾钩子/内部访问）。
@@ -1529,7 +1563,7 @@ impl ShellApp {
             font_size: self.font_size,
             theme_mode: self.theme_mode,
             left_open: self.left_open,
-            git_view: self.git_view,
+            git_view: self.git_active(cx),
             // #307：「导出为 PDF」门槛（仅 docx 形态提供；md/pdf/xlsx/
             // canvas 标签上灰显）。
             active_is_docx: tab.is_some_and(|t| t.editor.read(cx).doc_kind() == "docx"),
@@ -3027,11 +3061,31 @@ impl ShellApp {
         let shell = cx.entity().downgrade();
         let tree =
             cx.new(|cx| FileTree::new(root.clone(), Self::file_tree_hooks(shell.clone()), cx));
-        self.workspace = Some(tree);
+        self.workspace = Some(tree.clone());
         // F7：git 面板（工作区打开即建——非 git 目录/缺 git 走提示态，
         // 不崩溃不拦截）。
         let git = cx.new(|cx| GitPanel::new(root.clone(), Self::git_panel_hooks(shell), cx));
-        self.git_panel = Some(git);
+        self.git_panel = Some(git.clone());
+        // #119（mdc-dock 批①）：面板注册进左栏 dock——旧面板撤注、新面
+        // 板入列、激活键承接（无历史激活 → 文件树缺省；旧 git 态/预物化
+        // 意图经 add_panel 与 activate_key 自动兑现——与旧 git_view 保
+        // 语义：换工作区时视图不跳变）。
+        let prev_view = self.left_dock.read(cx).active_key();
+        let dock = self.left_dock.clone();
+        dock.update(cx, |dock, cx| {
+            dock.remove_panel_by_key(crate::file_tree::FILE_TREE_PANEL_KEY, cx);
+            dock.remove_panel_by_key(crate::git_panel::GIT_PANEL_KEY, cx);
+            dock.add_panel(&tree, cx);
+            dock.add_panel(&git, cx);
+            match prev_view {
+                Some(key) => {
+                    dock.activate_key(key, cx);
+                }
+                None => {
+                    dock.activate_key(crate::file_tree::FILE_TREE_PANEL_KEY, cx);
+                }
+            }
+        });
         crate::settings::remember_workspace(&root);
         self.recent.record_workspace(&root);
         cx.notify();
@@ -3417,7 +3471,8 @@ impl Render for ShellApp {
                     .overflow_hidden()
                     .child(activity_bar::activity_bar(
                         self.left_open,
-                        self.git_view,
+                        // #119：视图归属从 dock 激活键读（含预物化意图）。
+                        self.git_active(cx),
                         self.settings_open,
                         cx,
                     ))
@@ -3426,7 +3481,7 @@ impl Render for ShellApp {
                             self.editor(),
                             self.workspace.as_ref(),
                             self.git_panel.as_ref(),
-                            self.git_view,
+                            self.git_active(cx),
                             // G4：可拖拽宽度（域钳制 + settings 持久化）
                             self.left_width,
                             // #571：大纲面板实体（键盘导航 + #289-④
@@ -6952,25 +7007,29 @@ mod settings_lifecycle_tests {
 
     /// 验收 4b：左栏/git 视图开合双分支——toggle_left（git 态回切
     /// 文件树不折叠 / 非 git 态折叠展开）+ toggle_git（git 态折叠 /
-    /// 非 git 态〔含栏折叠〕双置直达）。
+    /// 非 git 态〔含栏折叠〕双置直达）。#119：git_view 布尔退役，
+    /// 视图归属从 dock 激活键读（git_active——真实激活协议终点）。
     #[gpui::test]
     fn left_git_toggle_branches(cx: &mut gpui::TestAppContext) {
         let (shell, _window) = shell_window(cx);
         shell.update(cx, |shell, cx| {
-            // 前置：left_open=true / git_view=false（shell.rs:386/401）。
-            assert!(shell.left_open && !shell.git_view);
+            // 前置：left_open=true / 非 git 视图（shell.rs 字段区 +
+            // left_dock 空起缺省）。
+            assert!(shell.left_open && !shell.git_active(cx));
 
-            // toggle_git 分支①：非 git 态 → 直达（开栏 + git 视图）。
+            // toggle_git 分支①：非 git 态 → 直达（开栏 + git 视图——
+            // git 面板未物化，预物化意图口径）。
             shell.toggle_git(cx);
             assert!(
-                shell.left_open && shell.git_view,
+                shell.left_open && shell.git_active(cx),
                 "toggle_git：非 git 态直达"
             );
 
-            // toggle_left 分支①：git 态 → 回切文件树（栏不折叠）。
+            // toggle_left 分支①：git 态 → 回切文件树（栏不折叠；
+            // 预物化意图被实际换面丢弃——树视图承接）。
             shell.toggle_left(cx);
             assert!(
-                shell.left_open && !shell.git_view,
+                shell.left_open && !shell.git_active(cx),
                 "toggle_left：git 态回切文件树"
             );
 
@@ -6980,20 +7039,20 @@ mod settings_lifecycle_tests {
             shell.toggle_left(cx);
             assert!(shell.left_open, "toggle_left：重开");
 
-            // toggle_git 分支②：git 态 → 折叠左栏（git_view 保持——
+            // toggle_git 分支②：git 态 → 折叠左栏（git 激活态保持——
             // 重开直达 git 视图的状态记忆）。
             shell.toggle_git(cx);
-            assert!(shell.left_open && shell.git_view, "再直达");
+            assert!(shell.left_open && shell.git_active(cx), "再直达");
             shell.toggle_git(cx);
             assert!(
-                !shell.left_open && shell.git_view,
-                "toggle_git：git 态折叠左栏（git_view 保持）"
+                !shell.left_open && shell.git_active(cx),
+                "toggle_git：git 态折叠左栏（git 激活态保持）"
             );
 
-            // 折叠态直达 git：双置（left_open + git_view）。
+            // 折叠态直达 git：双置（left_open + git 激活）。
             shell.toggle_git(cx);
             assert!(
-                shell.left_open && shell.git_view,
+                shell.left_open && shell.git_active(cx),
                 "折叠态 toggle_git：双置直达"
             );
         });

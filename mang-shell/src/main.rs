@@ -1462,7 +1462,8 @@ async fn run_hover_state_script(
     // set_theme_mode 真实动作链）；4.6s 停驻中性位（清 hover 面，refresh
     // 让基态帧定版）；5.2s 悬停 git 钮（refresh 排帧——实测 hover 底色
     // 在 +1.4s 已落像素，外层 B 帧采 5.2+1.5s）；7.4/7.55s down/up
-    // （toggle_git：git_view = true → git 钮选中 + 左面板切视图）；
+    // （toggle_git：dock 激活 git 视图 → git 钮选中 + 左面板切视图
+    // [#119 批①]）；
     // 工作区 2.5s 由 --smoke-workspace 开，留渲染窗。
     cx.background_executor()
         .timer(Duration::from_millis(1000))
