@@ -61,6 +61,38 @@ fn session_contract_full_chain() {
     let (w, h) = s1.size().expect("size");
     assert!(w > 0 && h > 0, "文档几何非零（实测 {w}x{h} twips）");
 
+    // ---- 契约 2b：页几何（page_geometry：C 线跳页/页码数据源）----
+    // 25.2.3.2 实测语义：画布坐标系（与 paintTile 同源），画布 = 页 +
+    // 对称边距（实测 284 twips），页隙 284。断言按实测语义锁：
+    // 非空、宽高为正、A4 页尺寸、边距对称（左右相等、上下相等）。
+    let pages = s1.page_geometry().expect("page_geometry");
+    assert!(!pages.is_empty(), "页矩形非空（Writer 分页模式每页一条）");
+    assert!(
+        pages.iter().all(|p| p.w > 0 && p.h > 0),
+        "每页宽高为正（实测 {pages:?}）"
+    );
+    let first = pages[0];
+    let last = *pages.last().unwrap();
+    assert_eq!(
+        (first.w, first.h),
+        (11906, 16838),
+        "A4 页尺寸（夹具确定性；画布边距不含在内）"
+    );
+    assert_eq!(
+        first.x,
+        w - first.x - first.w,
+        "左右画布边距相等（跳页滚动锚定的几何自洽；实测边距 284 twips）"
+    );
+    assert_eq!(
+        first.y,
+        h - last.y - last.h,
+        "上下画布边距相等（首顶 == 末底余量；实测 284 twips）"
+    );
+    assert!(
+        pages.windows(2).all(|pw| pw[1].y >= pw[0].y + pw[0].h),
+        "y 单调不重叠（页序即视口序）"
+    );
+
     // ---- 契约 3：tile（side-file BMP；tile_w/h 为文档 twips，1px=15twips）----
     let tile = s1.paint(256, 256, 0, 0, 256 * 15, 256 * 15).expect("paint");
     let non_white = tile

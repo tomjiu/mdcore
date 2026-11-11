@@ -39,13 +39,25 @@
 ## 4. 几何与 tile
 
 - `size() -> (width_twips, height_twips)`（§2）。
+- `page_geometry() -> Vec<PageRect>`（B 线 2026-11-11，#50 C 线跳页/
+  页码/页间分隔的协议缺口应答）：LOK `getPartPageRectangles` → 每页一条
+  `{x, y, w, h}`、顺序即页序、**画布坐标系 twips（与 paintTile 同源）**。
+  25.2.3.2 实测语义：画布 = 页 + 四周 **284 twips 边距**、页间隙同为
+  **284**——单页 `(284, 284, w, h)`，第 i 页 `y = 284 + (页高+284)×i`，
+  画布总高 = 末页底 + 284（与 `size()` 自洽；A4 = 11906×16838）。
+  **页数 = `pages.len()`**（派生；内核 `getPagesCount` 在 #19+ 未实证
+  vtable 槽，不扩绑——ABI 防漂移纪律）。跳页目标 y 直接取 `pages[n].y`；
+  页码视口映射 = 包含视口顶的首个页。**跨版本哨兵**：LO 26.x 若改边距/
+  页隙，`tests/page_geometry.rs` 三页契约会亮黄牌，须重实证再放行。
 - `paint(canvas_w_px, canvas_h_px, tile_x, tile_y, tile_w_twips, tile_h_twips)`：
   **tile 尺寸是文档 twips（1px = 15twips）**——canvas 是像素目标、tile
   是文档坐标窗口；返回 JSON：`tile`（side-file BMP 路径）、`tile_mode`
   （实测 1=BGRA）、`stats.{unique_colors, non_white_ratio, colored_ratio}`
   （§3：非白 >0.5% 证明真实渲染）。
 - **tile 失效**：`INVALIDATE_TILES` 回调（Event::Callback name=
-  `INVALIDATE_TILES`，§10）；C 线收到即重画对应区域。
+  `INVALIDATE_TILES`，§10）；C 线收到即重画对应区域。文档尺寸变化后
+  （`DOCUMENT_SIZE_CHANGED`）页几何需随 `size()` 同拍重查（与 C2 的
+  失效链同拍——页矩形源自布局，布局变即变）。
 
 ## 5. dirty / revision
 

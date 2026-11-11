@@ -72,6 +72,65 @@ FODT = f"""<?xml version="1.0" encoding="UTF-8"?>
 (HERE / "fixture-src.fodt").write_text(FODT, encoding="utf-8")
 
 
+
+THREE_PAGES_FODT = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.text">
+  <office:styles/>
+  <office:automatic-styles>
+    <style:style style:name="Pbrk" style:family="paragraph">
+      <style:paragraph-properties fo:break-before="page"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body>
+    <office:text>
+      <text:p>三页夹具第一页锚点 PG1-ANCHOR-首。</text:p>
+      <text:p text:style-name="Pbrk">三页夹具第二页锚点 PG2-ANCHOR-中。</text:p>
+      <text:p text:style-name="Pbrk">三页夹具第三页锚点 PG3-ANCHOR-末。</text:p>
+    </office:text>
+  </office:body>
+</office:document>
+"""
+
+
+def gen_three_pages() -> int:
+    """3 页夹具（page_geometry 多页契约用：页隙/边距/页序断言的数据源）。
+
+    产物 three-pages.docx：三段锚文本 + 两次显式分页（break-before）。
+    转换后校验：三个锚点 + ≥2 个分页符（zip 层面）。
+    """
+    src = HERE / "three-pages-src.fodt"
+    src.write_text(THREE_PAGES_FODT, encoding="utf-8")
+    out = HERE / "three-pages.docx"
+    if out.exists():
+        out.unlink()
+    profile = pathlib.Path("/tmp") / f"mdc-lok-gen3-profile-{__import__('os').getpid()}"
+    r = subprocess.run(
+        ["soffice", "--headless",
+         f"-env:UserInstallation=file://{profile}",
+         "--convert-to", "docx", str(src), "--outdir", str(HERE)],
+        capture_output=True, text=True, timeout=180,
+    )
+    raw = HERE / "three-pages-src.docx"
+    if r.returncode != 0 or not raw.exists():
+        print("[gen3] soffice 转换失败:", r.returncode, r.stderr[:400])
+        return 1
+    raw.rename(out)
+    import zipfile
+    with zipfile.ZipFile(out) as z:
+        doc = z.read("word/document.xml").decode("utf-8", "replace")
+    checks = {
+        "锚点PG1": "PG1-ANCHOR" in doc,
+        "锚点PG2": "PG2-ANCHOR" in doc,
+        "锚点PG3": "PG3-ANCHOR" in doc,
+        "分页符>=2": doc.count('w:type="page"') >= 2,
+    }
+    bad = [k for k, v in checks.items() if not v]
+    for k, v in checks.items():
+        print(f"[gen3] {'OK ' if v else 'FAIL'} {k}")
+    print(f"[gen3] 产物: {out} ({out.stat().st_size} bytes)")
+    return 1 if bad else 0
+
+
 def main() -> int:
     out = HERE / "smoke-chars-img-table.docx"
     if out.exists():
@@ -109,7 +168,8 @@ def main() -> int:
     for k, v in checks.items():
         print(f"[gen] {'OK ' if v else 'FAIL'} {k}")
     print(f"[gen] 产物: {out} ({out.stat().st_size} bytes)")
-    return 1 if bad else 0
+    rc2 = gen_three_pages()
+    return 1 if bad else rc2
 
 
 if __name__ == "__main__":

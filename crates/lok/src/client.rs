@@ -93,6 +93,46 @@ pub enum Event {
     Life { kind: String, detail: Value },
 }
 
+/// 页矩形（twips，**画布坐标系**；`page_geometry` 应答单元）。
+///
+/// 来源 LOK `getPartPageRectangles`（25.2.3.2 实测，2026-11-11）：
+/// Writer 分页模式下每页一条、顺序即页序，坐标与 paintTile 的文档
+/// 坐标同源（跳页滚动锚定可直接用）。画布 = 页 + 四周 284 twips 边距，
+/// 页间隙同为 284：单页为 `(284, 284, w, h)`，第 i 页 `y =
+/// 284 + (页高 + 284) × i`，画布总高 = 末页底 + 284（与
+/// getDocumentSize 自洽）。页数 = `pages.len()`（派生，不单测内核
+/// `getPagesCount`——#19+ 未实证槽不扩绑，见 abi.rs 防漂移纪律）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRect {
+    /// 页左上角 x（twips；画布坐标，单栏排版恒等于左边距 284）。
+    pub x: i64,
+    /// 页顶 y（twips；画布坐标：首页 284，后续页 = 前页底 + 284 页隙）。
+    pub y: i64,
+    /// 页宽（twips；A4 纵向 11906，不含画布边距）。
+    pub w: i64,
+    /// 页高（twips；含页边距，A4 纵向 16838）。
+    pub h: i64,
+}
+
+/// `page_geometry` 应答 → 页矩形列表（两面共用：DocHandle / DocSession）。
+fn parse_page_geometry(v: &Value) -> Result<Vec<PageRect>, LokError> {
+    let arr = v
+        .get("pages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| LokError::Protocol("page_geometry 应答缺 pages 数组".into()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for p in arr {
+        let g = |k: &str| p.get(k).and_then(Value::as_i64).unwrap_or(0);
+        out.push(PageRect {
+            x: g("x"),
+            y: g("y"),
+            w: g("w"),
+            h: g("h"),
+        });
+    }
+    Ok(out)
+}
+
 /// 默认每操作超时（LO 首启慢：hook_2 一次性数秒属正常）。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -619,6 +659,13 @@ impl<'a> DocHandle<'a> {
         ))
     }
 
+    /// 页几何（getPartPageRectangles → 按页序的页矩形，twips）。
+    /// 跳页/页码/页间分隔的数据源（#50 C 线 2026-11-10 协议缺口登记）。
+    pub fn page_geometry(&self) -> Result<Vec<PageRect>, LokError> {
+        let v = self.client.request("page_geometry", json!({}))?;
+        parse_page_geometry(&v)
+    }
+
     /// paintTile（返回 side file 路径与统计）。
     pub fn paint(
         &self,
@@ -857,6 +904,13 @@ impl DocSession {
             v.get("width_twips").and_then(Value::as_i64).unwrap_or(0),
             v.get("height_twips").and_then(Value::as_i64).unwrap_or(0),
         ))
+    }
+
+    /// 页几何（getPartPageRectangles → 按页序的页矩形，twips；
+    /// B2 契约面——C 线跳页/页码/页间分隔的数据源）。页数 = 返回长度。
+    pub fn page_geometry(&self) -> Result<Vec<PageRect>, LokError> {
+        let v = self.client.request("page_geometry", json!({}))?;
+        parse_page_geometry(&v)
     }
 
     /// paintTile：tile 像素经 side file（BMP）返回，JSON 含

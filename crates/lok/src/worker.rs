@@ -592,6 +592,53 @@ impl WorkerState {
         Ok(json!({"width_twips": w, "height_twips": h}))
     }
 
+    /// getPartPageRectangles → 页矩形列表（twips；跳页/页码/页间分隔
+    /// 数据源——#50 C 线 2026-11-10 协议缺口登记的应答）。
+    /// 返回串按 kit freeError 释放（跨 CRT 纪律，同 text_selection）；
+    /// 格式解析见 [`parse_page_rectangles`]（25.2.3.2 实测）。
+    fn op_page_geometry(&mut self) -> DispatchResult {
+        let raw: *mut c_char;
+        unsafe {
+            self.doc_guard(
+                abi::doc_offsets::GET_PART_PAGE_RECTANGLES,
+                "getPartPageRectangles",
+            )?;
+            let f = (*self.doc_class)
+                .get_part_page_rectangles
+                .ok_or((codes::MEMBER, "缺 getPartPageRectangles".to_string()))?;
+            raw = f(self.doc);
+        }
+        let s = unsafe { cstr_take(raw) }.unwrap_or_default();
+        // LOK 返回内存必须 kit freeError 释放（跨 CRT 纪律，同 text_selection）
+        unsafe {
+            if !raw.is_null() {
+                if let Some(free) = (*self.kit_class).free_error {
+                    free(raw);
+                }
+            }
+        }
+        if s.is_empty() {
+            return Err((
+                codes::INTERNAL,
+                "内核返回空页矩形串（getPartPageRectangles；非分页文档或内核异常）".to_string(),
+            ));
+        }
+        let rects = parse_page_rectangles(&s).map_err(|e| {
+            let head: String = s.chars().take(120).collect();
+            (
+                codes::INTERNAL,
+                format!("页矩形串解析失败：{e}（原文前 120 字节：{head}）"),
+            )
+        })?;
+        Ok(json!({
+            "pages": rects.iter().map(|r| json!({
+                "x": r[0], "y": r[1], "w": r[2], "h": r[3],
+            })).collect::<Vec<_>>(),
+            "page_count": rects.len(),
+            "units": "twips",
+        }))
+    }
+
     /// paintTile → side file（BMP）+ 统计（帧内不传像素——帧长纪律）。
     fn op_paint(
         &mut self,
@@ -1184,6 +1231,7 @@ fn dispatch(state: &mut WorkerState, op: &str, v: &Value) -> DispatchResult {
             state.op_init_rendering(args.as_deref())
         }
         "size" => state.op_size(),
+        "page_geometry" => state.op_page_geometry(),
         "paint" => {
             let cw = protocol::req_u64(v, "canvas_w")
                 .ok_or((codes::BAD_REQUEST, "paint 需要 canvas_w".to_string()))?
@@ -1265,5 +1313,87 @@ impl StderrTail {
             .lock()
             .map(|q| q.iter().rev().take(n).cloned().collect())
             .unwrap_or_default()
+    }
+}
+
+/// 解析 LOK `getPartPageRectangles` 返回串 → 页矩形列表。
+///
+/// 实测格式（LibreOffice 25.2.3.2，Debian 13，2026-11-11，真内核链
+/// 取证——smoke bin 3 页夹具）：`"x, y, width, height; "` 每页一条、
+/// 顺序即页序、`; ` 分隔（尾项可带或不带分隔符）。坐标为**画布坐标
+/// 系 twips**（与 paintTile 同源）：画布 = 页 + 四周 284 twips 边距，
+/// 页间隙同为 284——单页为 `(284, 284, w, h)`，第 i 页 y =
+/// 284 + (页高 + 284) × i。解析器对空项容错（尾/连续分隔符），对
+/// 非四元组条目明确报错（不猜造语义）。
+fn parse_page_rectangles(s: &str) -> Result<Vec<[i64; 4]>, String> {
+    let mut out = Vec::new();
+    for (idx, entry) in s.split(';').enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue; // 尾分隔符 / 连续分隔符容错
+        }
+        let nums: Vec<&str> = entry.split(',').map(str::trim).collect();
+        if nums.len() != 4 {
+            return Err(format!(
+                "第 {} 项应为 x, y, w, h 四元组，实得 {} 元：{:?}",
+                idx + 1,
+                nums.len(),
+                entry
+            ));
+        }
+        let mut r = [0i64; 4];
+        for (slot, tok) in nums.iter().enumerate() {
+            r[slot] = tok
+                .parse::<i64>()
+                .map_err(|_| format!("第 {} 项坐标 {:?} 不是整数", idx + 1, tok))?;
+        }
+        out.push(r);
+    }
+    if out.is_empty() {
+        return Err("串内无有效页矩形项".to_string());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_page_rectangles;
+
+    /// 25.2.3.2 实测格式回归（smoke bin --fixture 3page.docx 取证原文：
+    /// 页矩形在画布坐标系，含 284 twips 边距与页隙，非原点首尾相接）。
+    #[test]
+    fn parses_three_pages_with_border_and_gap() {
+        let raw = "284, 284, 11906, 16838; 284, 17406, 11906, 16838; 284, 34528, 11906, 16838";
+        let r = parse_page_rectangles(raw).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0], [284, 284, 11906, 16838]);
+        // 画布几何自洽：页隙 = 首页顶边距 = 284（25.2.3.2 实测不变量）
+        let gap1 = r[1][1] - (r[0][1] + r[0][3]);
+        let gap2 = r[2][1] - (r[1][1] + r[1][3]);
+        assert_eq!(gap1, 284);
+        assert_eq!(gap2, 284);
+        assert_eq!(r[2][1] + r[2][3] + 284, 51650, "末页底 + 下边距 = 画布高");
+    }
+
+    #[test]
+    fn tolerates_whitespace_and_missing_tail_separator() {
+        let raw = "  0,0,11906,16838 ;\n 0,16838 , 11906,16838";
+        let r = parse_page_rectangles(raw).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1], [0, 16838, 11906, 16838]);
+    }
+
+    #[test]
+    fn rejects_non_four_tuples_and_garbage() {
+        assert!(
+            parse_page_rectangles("0, 0, 11906").is_err(),
+            "三元组必须拒"
+        );
+        assert!(
+            parse_page_rectangles("abc, def, ghi, jkl").is_err(),
+            "非数字必须拒"
+        );
+        assert!(parse_page_rectangles("").is_err(), "空串必须拒");
+        assert!(parse_page_rectangles("; ;").is_err(), "仅分隔符必须拒");
     }
 }

@@ -212,6 +212,8 @@ fn external_kill_death_and_recovery() {
     let src_hash_before = sha256_of(&work);
 
     let s = DocSession::open(None, &dir.join("s"), &file_url(&work), None).expect("会话");
+    // 仅 unix 外杀路径消费（Windows 目标下无使用者——cfg 门防 unused 警告）
+    #[cfg(unix)]
     let pid = s.pid();
 
     // 外杀 worker（模拟崩溃）
