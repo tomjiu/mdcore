@@ -189,9 +189,14 @@ python packaging/nsis/build-installer.py
   `portable-smoke/report.json` 记录窗口 HWND/响应、版本/head、退出码；
   启动失败阻止安装包上传，失败日志仍作为独立 artifact 保留；
 - **待 Lead Windows 实机复核清单**：安装/卸载走查；注册表
-  `DisplayName=mang` / `DisplayVersion=<版本>` / `InstallDir`；开始菜单
-  快捷方式；.md 关联；安装后自检弹窗（拔掉 `pdfium.dll` 复跑安装应见
-  告警而非静默）。
+  `DisplayName=mang` / `DisplayVersion=<版本>` / `InstallDir`（#143 起
+  HKCU 面：`HKCU\Software\dev.mdcore.editor` 与其下 `Uninstall` 键，
+  安装全程免管理员）；开始菜单快捷方式；.md 礼貌注册（#143）——
+  **预装关联验证**：装前设 .md=别的程序 → 安装后默认不动、mang 仅入
+  「打开方式」；干净机（.md 无主）→ 默认与「新建」菜单归 mang；
+  卸载后 .md 登记随卸载清除、别家登记原样；换目录重装后跑旧目录的
+  卸载器 → 新安装的类型登记不动；安装后自检弹窗（拔掉 `pdfium.dll`
+  复跑安装应见告警而非静默）。
 
 ### 登记边界（诚实面）
 
