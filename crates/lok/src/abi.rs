@@ -16,7 +16,7 @@
 //!   越界成员需要扩绑时必须先补实证。
 
 use std::ffi::c_void;
-use std::os::raw::{c_char, c_int, c_long, c_ulonglong};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulonglong};
 
 /// 官方回调签名：`void (*)(int nType, const char* pPayload, void* pData)`
 /// （LibreOfficeKitTypes.h @ pin commit）。回调在 LO 内核线程触发，
@@ -94,7 +94,20 @@ pub struct LokKitClass {
     >,
 }
 
-/// 文档类结构（绑定到 `getTextSelection`#18 为止；#19 `paste` 起不绑）。
+/// 文档类结构（绑定面止于 #40 `postWindowExtTextInputEvent`；#41 起
+/// 不绑——需要时逐槽实证再扩）。
+///
+/// **#19-#40 扩绑实证（2026-11-11，LibreOffice 25.2.3.2 Debian 13
+/// `libreofficekit-dev` 头）**：`libreofficekit-dev` 包头逐槽枚举
+/// Doc 类共 79 个函数指针成员（#19 paste、#20 setGraphicSelection、
+/// #22 getCommandValues、#23 setClientZoom、#24 setClientVisibleArea、
+/// #27 setView、#40 postWindowExtTextInputEvent…），与运行时实测
+/// `nSize=640`（= 8 字节 × (1 nSize + 79 成员)）吻合；与仓内既有实证
+/// 「#19 位两版同在 paste」一致。#19-#39 声明为 dead_code（仅占位对
+/// 齐布局，未调用零风险）；#40 为本批消费面（post_text IME）。
+/// 注意：ely-lok 按自家补丁版 LO 绝对槽号绑定，不可照抄（比对报告
+/// #115 §3）；本表槽号仅对 25.2.3.2 头负责，跨版本调用前必过
+/// `has_member` 运行时守卫。
 #[repr(C)]
 pub struct LokDocClass {
     pub n_size: usize,
@@ -183,6 +196,175 @@ pub struct LokDocClass {
             p_used_mime_type: *mut *mut c_char,
         ) -> *mut c_char,
     >,
+    /// #19 paste（25.2.3.2 头；dead_code 占位对齐）。
+    #[allow(dead_code)]
+    pub paste: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            p_mime_type: *const c_char,
+            p_data: *const c_char,
+            n_size: usize,
+        ) -> bool,
+    >,
+    /// #20 setGraphicSelection（dead_code 占位）。
+    #[allow(dead_code)]
+    pub set_graphic_selection: Option<
+        unsafe extern "C" fn(p_this: *mut LokDocument, n_type: c_int, n_x: c_int, n_y: c_int),
+    >,
+    /// #21 resetSelection（dead_code 占位）。
+    #[allow(dead_code)]
+    pub reset_selection: Option<unsafe extern "C" fn(p_this: *mut LokDocument)>,
+    /// #22 getCommandValues（dead_code 占位）。
+    #[allow(dead_code)]
+    pub get_command_values: Option<
+        unsafe extern "C" fn(p_this: *mut LokDocument, p_command: *const c_char) -> *mut c_char,
+    >,
+    /// #23 setClientZoom（dead_code 占位；表格面/视口协作批次启用）。
+    #[allow(dead_code)]
+    pub set_client_zoom: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_tile_pixel_width: c_int,
+            n_tile_pixel_height: c_int,
+            n_tile_twip_width: c_int,
+            n_tile_twip_height: c_int,
+        ),
+    >,
+    /// #24 setClientVisibleArea（dead_code 占位）。
+    #[allow(dead_code)]
+    pub set_client_visible_area: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_x: c_int,
+            n_y: c_int,
+            n_width: c_int,
+            n_height: c_int,
+        ),
+    >,
+    /// #25 createView（dead_code 占位）。
+    #[allow(dead_code)]
+    pub create_view: Option<unsafe extern "C" fn(p_this: *mut LokDocument) -> c_int>,
+    /// #26 destroyView（dead_code 占位）。
+    #[allow(dead_code)]
+    pub destroy_view: Option<unsafe extern "C" fn(p_this: *mut LokDocument, n_id: c_int)>,
+    /// #27 setView（dead_code 占位；多视图/Calc 激活面）。
+    #[allow(dead_code)]
+    pub set_view: Option<unsafe extern "C" fn(p_this: *mut LokDocument, n_id: c_int)>,
+    /// #28 getView（dead_code 占位）。
+    #[allow(dead_code)]
+    pub get_view: Option<unsafe extern "C" fn(p_this: *mut LokDocument) -> c_int>,
+    /// #29 getViewsCount（dead_code 占位）。
+    #[allow(dead_code)]
+    pub get_views_count: Option<unsafe extern "C" fn(p_this: *mut LokDocument) -> c_int>,
+    /// #30 renderFont（dead_code 占位）。
+    #[allow(dead_code)]
+    pub render_font: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            p_font_name: *const c_char,
+            p_char: *const c_char,
+            p_font_width: *mut c_int,
+            p_font_height: *mut c_int,
+        ) -> *mut u8,
+    >,
+    /// #31 getPartHash（dead_code 占位）。
+    #[allow(dead_code)]
+    pub get_part_hash:
+        Option<unsafe extern "C" fn(p_this: *mut LokDocument, n_part: c_int) -> *mut c_char>,
+    /// #32 paintPartTile（dead_code 占位；演示面批次启用）。
+    #[allow(dead_code)]
+    pub paint_part_tile: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            p_buffer: *mut u8,
+            n_part: c_int,
+            n_mode: c_int,
+            n_canvas_width: c_int,
+            n_canvas_height: c_int,
+            n_tile_pos_x: c_int,
+            n_tile_pos_y: c_int,
+            n_tile_width: c_int,
+            n_tile_height: c_int,
+        ),
+    >,
+    /// #33 getViewIds（dead_code 占位）。
+    #[allow(dead_code)]
+    pub get_view_ids: Option<
+        unsafe extern "C" fn(p_this: *mut LokDocument, p_array: *mut c_int, n_size: usize) -> bool,
+    >,
+    /// #34 setOutlineState（dead_code 占位）。
+    #[allow(dead_code)]
+    pub set_outline_state: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            b_column: bool,
+            n_level: c_int,
+            n_index: c_int,
+            b_hidden: bool,
+        ),
+    >,
+    /// #35 paintWindow（dead_code 占位）。
+    #[allow(dead_code)]
+    pub paint_window: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_window_id: c_uint,
+            p_buffer: *mut u8,
+            x: c_int,
+            y: c_int,
+            width: c_int,
+            height: c_int,
+        ),
+    >,
+    /// #36 postWindow（dead_code 占位）。
+    #[allow(dead_code)]
+    pub post_window: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_window_id: c_uint,
+            n_action: c_int,
+            p_data: *const c_char,
+        ),
+    >,
+    /// #37 postWindowKeyEvent（dead_code 占位）。
+    #[allow(dead_code)]
+    pub post_window_key_event: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_window_id: c_uint,
+            n_type: c_int,
+            n_char_code: c_int,
+            n_key_code: c_int,
+        ),
+    >,
+    /// #38 postWindowMouseEvent（dead_code 占位）。
+    #[allow(dead_code)]
+    pub post_window_mouse_event: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_window_id: c_uint,
+            n_type: c_int,
+            n_x: c_int,
+            n_y: c_int,
+            n_count: c_int,
+            n_buttons: c_int,
+            n_modifier: c_int,
+        ),
+    >,
+    /// #39 setViewLanguage（dead_code 占位）。
+    #[allow(dead_code)]
+    pub set_view_language: Option<
+        unsafe extern "C" fn(p_this: *mut LokDocument, n_id: c_int, language: *const c_char),
+    >,
+    /// #40 postWindowExtTextInputEvent（IME 组合/提交；本批消费面）。
+    pub post_window_ext_text_input_event: Option<
+        unsafe extern "C" fn(
+            p_this: *mut LokDocument,
+            n_window_id: c_uint,
+            n_type: c_int,
+            p_text: *const c_char,
+        ),
+    >,
 }
 
 /// `LIBREOFFICEKIT_HAS_MEMBER` 的 Rust 等价：`offsetof(member) + size
@@ -233,6 +415,10 @@ pub mod doc_offsets {
     off!(POST_MOUSE_EVENT, post_mouse_event);
     off!(POST_UNO_COMMAND, post_uno_command);
     off!(GET_TEXT_SELECTION, get_text_selection);
+    off!(
+        POST_WINDOW_EXT_TEXT_INPUT_EVENT,
+        post_window_ext_text_input_event
+    );
 }
 
 /// 文档类型（LibreOfficeKitEnums.h：TEXT=0 / SPREADSHEET=1 /
@@ -261,6 +447,18 @@ impl DocType {
 /// 键事件类型（LOK_KEYEVENT_KEYINPUT=0 / KEYUP=1）。
 pub const KEYEVENT_KEYINPUT: c_int = 0;
 pub const KEYEVENT_KEYUP: c_int = 1;
+
+/// 扩展文本输入（IME）事件类型（LibreOfficeKitEnums.h
+/// LibreOfficeKitExtTextInputType，25.2.3.2 逐值实证：TEXTINPUT=0 /
+/// TEXTINPUT_POS=1 / TEXTINPUT_END=2）。组合期发 0（预编辑串），
+/// 提交发 2（定稿串）——ELYOffice ely-lok「LOK-07」同语义。
+pub const EXT_TEXTINPUT: c_int = 0;
+pub const EXT_TEXTINPUT_POS: c_int = 1;
+pub const EXT_TEXTINPUT_END: c_int = 2;
+
+/// postWindowExtTextInputEvent 的 window id：文档主窗口 = 0
+/// （无弹窗对话框场景；#35+ 弹窗面启用前恒 0）。
+pub const MAIN_WINDOW_ID: c_uint = 0;
 
 /// 鼠标事件类型（LibreOfficeKitEnums.h 实证序：BUTTONDOWN=0 /
 /// BUTTONUP=1 / MOVE=2——注意不是 down/up/move 的直觉序）。

@@ -71,6 +71,12 @@
 
 - `type_text(&mut self, &str)`：逐字符 KEYINPUT+KEYUP，**选区被替换**
   （标准编辑语义；先 `uno(".uno:SelectAll")` 再输入 = 全文替换）。
+  **这是产品 IME 定稿通道**（2026-11-11 实证，tests/ime_text.rs）：
+  GPUI 宿主渲染 preedit（A 线批次 12 架构），定稿串经 type_text 下发，
+  中文全链（落盘/重开）实测绿。
+- `post_text(&mut self, commit, text)`：LOK 槽 #40 内核 preedit 通道
+  （机械面可用：帧到达/守卫生效/编辑类语义正确）——**stock 25.2.3.2
+  语义不可靠，产品勿用**（见 §10.6 实证记录）。
 - `uno(&mut self, command, args)`：变更类（**dirty+rev 推进**）——
   实测可用：`.uno:Undo` / `.uno:Redo` / `.uno:SelectAll`（§4-§7）。
 - `uno_query(&self, ...)`：查询类（不置脏）：`.uno:ExecuteSearch` 等。
@@ -132,6 +138,20 @@ UNO_COMMAND_RESULT=16 / SEARCH_RESULT_SELECTION / …）。回调在 LO 内核
    `WorkerClient::request("post_mouse", …)` 通路可用）。
 5. IME / 组合输入：postKeyEvent 通路对 IME 组合不适用（GPUI 侧组词
    完成后整体 type_text，或 B4 评估 setTextSelection+paste 通路）。
+   **2026-11-11 实证更新**：type_text 通道的中文定稿全链绿
+   （tests/ime_text.rs）；内核 preedit 通道（post_text）不可靠见 6。
+6. **post_text（槽 #40 postWindowExtTextInputEvent）语义不可靠**
+   （2026-11-11 六流探针 + 会话序数实验，LibreOffice 25.2.3.2）：
+   - 「进程首个 LOK 会话」：TEXTINPUT 组合串被当**定稿文本**插入
+     （preedit 语义破缺），END 载荷被忽略；
+   - 「后续会话」：事件被**静默丢弃**（零效果）；
+   - 单帧 END 带文本（ely 形态）/ 空 END / ASCII vs CJK 均不改变上述
+     行为（行为由会话序数决定，非帧序列）；
+   - ElyOffice ely-lok 的可靠 postText 依赖其补丁版 LO（#115 比对
+     报告 §3 patches/ 发现）——stock 内核不可复现。
+   结论：`post_text` 保留为机械面（op/守卫/编辑类语义已验证）；
+   产品 IME = type_text 通道（§6）。LO 升级或补丁运行时到位后
+   重实证，恢复 tests/ime_text.rs 的文本落地断言。
 
 ## 11. 版本与来源
 
