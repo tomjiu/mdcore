@@ -888,6 +888,23 @@ impl PdfPagesView {
         self.top_page as usize
     }
 
+    /// #51 D4b：视图状态快照（标签切换时保留——缩放档 + 顶部页；
+    /// Shell 存 `pdf_view_snapshots`，重建后 [`Self::restore_state`]
+    /// 回放）。
+    pub fn snapshot(&self) -> (ZoomMode, usize) {
+        (self.zoom_mode, self.top_page as usize)
+    }
+
+    /// #51 D4b：快照回放（新建实体后调用——缩放档恢复 + 跳回原页；
+    /// ListState 锚点在页空间，首帧前设置即生效）。
+    pub fn restore_state(&mut self, mode: ZoomMode, page: usize) {
+        if self.page_count == 0 {
+            return;
+        }
+        self.zoom_mode = mode;
+        self.scroll_to_page(page);
+    }
+
     /// #634 测试读数（`#[cfg(test)]` 不入产线）：可见页位图就绪——与
     /// [`Self::render_page_slot`] 同键径（光栅宽随缩放档、几何高随引擎
     /// 实测），键在缓存即「可上屏」。
@@ -1166,7 +1183,12 @@ impl PdfPagesView {
         // （混合尺寸档该除法会错位）；±1 页过扫描与 v1 同义。
         let top = self.scroll.logical_scroll_top();
         let idx = top.item_ix.min(self.page_count.saturating_sub(1));
-        self.top_page = idx as u32;
+        // #51 D4b：页变化即 emit（Shell 订阅 → 状态栏页码活更新；
+        // render 期 emit 入队延迟分发——无重入）。
+        if idx as u32 != self.top_page {
+            self.top_page = idx as u32;
+            cx.emit(PdfPagesEvent::TopPageChanged);
+        }
         let top_off = f32::from(top.offset_in_item)
             .max(0.)
             .min(self.page_slot_height(fit_w, idx).max(0.5));
@@ -2404,6 +2426,14 @@ impl PdfPagesView {
         }
     }
 }
+
+/// #51 D4b：页视图事件（Shell 订阅面——状态栏页码读数活更新）。
+pub(crate) enum PdfPagesEvent {
+    /// 顶部可见页变化（滚动/跳页/缩放重排——`submit_visible` 期 emit）。
+    TopPageChanged,
+}
+
+impl gpui::EventEmitter<PdfPagesEvent> for PdfPagesView {}
 
 impl Focusable for PdfPagesView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

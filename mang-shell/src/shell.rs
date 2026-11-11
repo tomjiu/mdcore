@@ -179,6 +179,10 @@ pub struct ShellApp {
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
     /// 左条设置钮/菜单「设置」打开，Esc/点遮罩/关闭钮关闭）。
     settings_open: bool,
+    /// #51 D4b：pdf 页视图状态快照（路径 → （缩放档, 顶部页）——切
+    /// 标签重建实体时保留/回放：「当前页与缩放状态一致」——回来还在
+    /// 原页原档，不从首页 FitWidth 重来）。
+    pdf_view_snapshots: std::collections::HashMap<PathBuf, (crate::pdf_pages::ZoomMode, usize)>,
     /// #289-④：pdf 页面视图（当前 pdf 标签的位图渲染实体 + 归属路径
     /// ——切到不同 pdf 标签时重建；关闭该标签时丢弃）。
     pdf_pages: Option<(PathBuf, Entity<PdfPagesView>)>,
@@ -459,6 +463,7 @@ impl ShellApp {
             ocr_rx: None,
             ocr_polling: false,
             pdf_view_mode: true,
+            pdf_view_snapshots: std::collections::HashMap::new(),
             docx_pages: None,
             docx_view_mode: true,
             xlsx_grid: None,
@@ -983,10 +988,16 @@ impl ShellApp {
             return;
         }
         let path = tab.path.clone();
-        if let Some((owned, _)) = &self.pdf_pages {
-            if *owned == path {
-                return;
+        match self.pdf_pages.as_ref().map(|(owned, _)| *owned == path) {
+            Some(true) => return, // 同路径实体已在位——无操作。
+            Some(false) => {
+                // #51 D4b：让位前快照（缩放档 + 顶部页）——回来时回放，
+                // 「当前页与缩放状态一致」（不从首页 FitWidth 重来）。
+                let (old_path, old_view) = self.pdf_pages.take().expect("在位已判");
+                let snap = old_view.read(cx).snapshot();
+                self.pdf_view_snapshots.insert(old_path, snap);
             }
+            None => {}
         }
         // 读盘（pdf_doc::load 同源 100MB 前置门——超限不入页视图，
         // 文本模型不受影响）。
@@ -1007,6 +1018,16 @@ impl ShellApp {
             return;
         }
         let entity = cx.new(|cx| PdfPagesView::new(bytes, cx));
+        // #51 D4b：快照回放（同路径此前打开过——缩放档 + 跳回原页）。
+        if let Some((mode, page)) = self.pdf_view_snapshots.get(&path).copied() {
+            entity.update(cx, |v, _| v.restore_state(mode, page));
+        }
+        // #51 D4b：页码读数活更新订阅（页变化 emit → Shell 重渲——
+        // 状态栏「第 N / M 页」跟随滚动/跳页/缩放重排）。
+        cx.subscribe(&entity, |_, _, _: &crate::pdf_pages::PdfPagesEvent, cx| {
+            cx.notify();
+        })
+        .detach();
         self.pdf_pages = Some((path, entity.clone()));
         // #420：缩略图侧栏——与页视图同源字节/几何；error 态（缺
         // pdfium/引擎失败）不挂空壳。联动钩子：点击 → scroll_to_page；
@@ -1905,12 +1926,17 @@ impl ShellApp {
             return;
         }
         // #289-④：被关标签若持有页视图，一并丢弃（缓存随实体释放）。
+        // #51 D4b：丢弃前快照（重开同文件回到原页原档——关标签不丢
+        // 阅读位置）。
         let closed_path = self.tabs[idx].path.clone();
-        if let Some((owned, _)) = &self.pdf_pages {
-            if *owned == closed_path {
-                self.pdf_pages = None;
+        if let Some((owned, view)) = self.pdf_pages.take() {
+            if owned == closed_path {
+                let snap = view.read(cx).snapshot();
+                self.pdf_view_snapshots.insert(owned, snap);
                 // #420：侧栏与页视图同生命周期（同路径丢弃）。
                 self.pdf_thumbs = None;
+            } else {
+                self.pdf_pages = Some((owned, view)); // 非本标签——放回。
             }
         }
         // #389 阶段 1：网格视图同款生命周期（关标签丢弃）。
@@ -3504,6 +3530,19 @@ impl Render for ShellApp {
                 self.pdf_view_mode,
                 self.xlsx_grid_view_mode,
                 self.docx_view_mode,
+                // #51 D4b：页面视图态的页码读数（页视图 top_visible_page
+                // 驱动——emit 订阅活更新；文本态 None 沿用编辑器光标
+                // 页表映射，零变化）。
+                self.pdf_view_mode
+                    .then(|| {
+                        self.pdf_pages.as_ref().and_then(|(_, e)| {
+                            let v = e.read(cx);
+                            (v.page_count() > 0).then(|| {
+                                format!("第 {} / {} 页", v.top_visible_page() + 1, v.page_count())
+                            })
+                        })
+                    })
+                    .flatten(),
                 cx,
             ))
             // G4：面板拖拽收尾钩（窗口级 mouseup——canvas paint 期每帧
@@ -5741,6 +5780,176 @@ mod pdf_search_wiring_tests {
             );
         });
         eprintln!("#51 D4 ✓ Esc 清选择");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #51 D4b 接线面：**当前页/缩放状态一致性**两面全链——
+    ///
+    /// 1. **页码读数活更新**：页视图 emit（TopPageChanged）在页变化
+    ///    时真实发出（Shell 订阅 → 状态栏「第 N / M 页」跟随滚动）；
+    /// 2. **标签切换状态保持**：ActualSize 档 + 页 2 → 切走（异路径
+    ///    重建）→ 切回 → 缩放档与顶部页**原样回放**（快照机制）；
+    ///    关标签重开同文件亦回放（关标签路径快照）。
+    #[gpui::test]
+    fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
+        let corpus = |name: &str| {
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/display_corpus")
+                    .join(name),
+            )
+            .unwrap_or_else(|e| panic!("语料不可读（{name}）：{e}"))
+        };
+        let dir = std::env::temp_dir().join(format!("mdc-d4b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_a = dir.join("a.pdf");
+        let pdf_b = dir.join("b.pdf");
+        std::fs::write(&pdf_a, corpus("mixed_features.pdf"));
+        std::fs::write(&pdf_b, corpus("landscape_mixed.pdf"));
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf_a.clone(), window, cx);
+            });
+        });
+        let view_a = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_a = match view_a {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4b 状态一致性 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+        // 泵（实体可换——A/B/重建 A/重开 A 各阶段传各实体）。
+        let pump = |cx: &mut gpui::TestAppContext,
+                    visual: &mut gpui::VisualTestContext,
+                    view: &Entity<PdfPagesView>,
+                    what: &str,
+                    ready: &dyn Fn(&PdfPagesView) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                cx.background_executor
+                    .advance_clock(std::time::Duration::from_millis(20));
+                cx.background_executor.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                visual.update(|window, app| window.draw(app).clear(app));
+                if view.read_with(visual, |v, _| ready(v)) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} 泵超时（真缺陷不放过）"
+                );
+            }
+        };
+        pump(cx, &mut visual, &view_a, "A 首屏", &|v| {
+            v.page_ready_for_test(0)
+        });
+
+        // ① 页变化 emit（Shell 订阅 → 状态栏活更新的信号源）。
+        let emit_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = emit_count.clone();
+        {
+            let counter = counter.clone();
+            cx.update(|app| {
+                app.subscribe(&view_a, move |_, _: &crate::pdf_pages::PdfPagesEvent, _| {
+                    counter.set(counter.get() + 1);
+                })
+                .detach();
+            });
+        }
+        cx.update(|app| view_a.update(app, |v, _| v.scroll_to_page(2)));
+        pump(cx, &mut visual, &view_a, "A 跳页 2", &|v| {
+            v.top_visible_page() == 2 && v.page_ready_for_test(2)
+        });
+        assert!(
+            emit_count.get() >= 1,
+            "页变化必须 emit（状态栏信号源），实得 {}",
+            emit_count.get()
+        );
+        eprintln!(
+            "#51 D4b ✓ 页变化 emit ×{}（状态栏信号源在位）",
+            emit_count.get()
+        );
+
+        // ② ActualSize 档（Ctrl+1 真路径——快照素材）。
+        cx.update(|app| view_a.update(app, |v, cx| v.dispatch_zoom_key("1", true, false, cx)));
+        pump(cx, &mut visual, &view_a, "A 实际大小档", &|v| {
+            v.page_ready_for_test(2) && v.raster_width_for_test() == 640
+        });
+        eprintln!("#51 D4b ✓ ActualSize 档就位（光栅宽 640）");
+
+        // ③ 切走：开 B（异路径重建——A 快照落账）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf_b.clone(), window, cx);
+            });
+        });
+        let view_b = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_b = view_b.expect("B 实体在位（打开链成功）");
+        pump(cx, &mut visual, &view_b, "B 首屏", &|v| {
+            v.page_ready_for_test(0)
+        });
+
+        // ④ 切回 A：快照回放——顶部页 2 + ActualSize 档原样。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| shell.activate_tab(0, window, cx));
+        });
+        let view_a2 = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_a2 = view_a2.expect("A 实体重建（快照回放路径）");
+        pump(cx, &mut visual, &view_a2, "A 回放", &|v| {
+            v.top_visible_page() == 2 && v.page_ready_for_test(2)
+        });
+        assert_eq!(
+            view_a2.read_with(&visual, |v, _| v.raster_width_for_test()),
+            640,
+            "切回后缩放档回放（ActualSize 640——不从 FitWidth 576 重来）"
+        );
+        eprintln!("#51 D4b ✓ 切标签回放：页 2 + ActualSize 档原样");
+
+        // ⑤ 关标签路径快照：关 A → 重开同文件 → 原页原档。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_tab_no_confirm(0, window, cx);
+            });
+        });
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf_a.clone(), window, cx);
+            });
+        });
+        let view_a3 = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_a3 = view_a3.expect("A 重开实体");
+        pump(cx, &mut visual, &view_a3, "A 重开回放", &|v| {
+            v.top_visible_page() == 2 && v.page_ready_for_test(2)
+        });
+        assert_eq!(
+            view_a3.read_with(&visual, |v, _| v.raster_width_for_test()),
+            640,
+            "关后重开缩放档回放"
+        );
+        eprintln!("#51 D4b ✓ 关标签重开回放：页 2 + ActualSize 档原样");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
