@@ -251,8 +251,13 @@ pub struct PdfPagesView {
     worker: Option<RenderWorker<PdfiumEngine>>,
     /// 页面缓存（RenderKey 键控——含 annotation_rev；LRU 字节预算）。
     cache: mdc_pdf::cache::PageCache<RenderKey, Arc<gpui::RenderImage>>,
-    /// 在途作业：job_id → 缓存键（回执对账 + 失败不再无限重提）。
-    pending: HashMap<u64, PageKey>,
+    /// 在途作业：job_id → （缓存键, **提交时 annotate_rev**）。rev 随行
+    /// 是「旧任务不覆写新文档」的硬守卫（#51 D3 尾巴）：Done 回执若
+    /// 携带 rev ≠ 当前（批注 flush 换代后的迟到回执——理论上
+    /// `reload_after_flush` 已清 pending 使其不可达，纵深防御面）
+    /// → 机械丢弃不落缓存，当前 rev 键交给新工人重光栅——键与产物
+    /// （该 rev 对应字节快照渲染出的位图）恒一致。
+    pending: HashMap<u64, (PageKey, u64)>,
     /// 失败页（Done(Err)/Timeout 一次性登记——不无限重试敌意页）。
     failed: HashSet<PageKey>,
     /// 引擎侧实际光栅高（页各自纵横比）：(页, 宽) → 高——RenderKey
@@ -799,7 +804,7 @@ impl PdfPagesView {
     /// pending 只应含当前设备宽键；empty = 无在飞）。
     #[cfg(test)]
     pub fn pending_widths_for_test(&self) -> Vec<u32> {
-        self.pending.values().map(|k| k.1).collect()
+        self.pending.values().map(|(k, _)| k.1).collect()
     }
 
     /// #51 D3 测试读数：缓存条目的宽度族——旧宽残留观测（陈旧取消只
@@ -818,6 +823,46 @@ impl PdfPagesView {
     #[cfg(test)]
     pub fn error_for_test(&self) -> Option<String> {
         self.error.clone()
+    }
+
+    /// #51 D3 尾巴测试读数：当前标注修订号（flush 换代断言——
+    /// rev 随行守卫与缓存 rev 族的基准）。
+    #[cfg(test)]
+    pub fn annotate_rev_for_test(&self) -> u64 {
+        self.annotate_rev
+    }
+
+    /// #51 D3 尾巴测试读数：缓存条目的 rev 族（去重升序）——换代后
+    /// 断言「无旧 rev 条目残留」（`invalidate_stale_revisions` 即时
+    /// 回收 + 迟到回执不落新键的合成读数面）。
+    #[cfg(test)]
+    pub fn cache_rev_families_for_test(&self) -> Vec<u64> {
+        let mut revs: Vec<u64> = self
+            .cache
+            .entries()
+            .into_iter()
+            .map(|(k, _)| k.annotation_rev)
+            .collect();
+        revs.sort_unstable();
+        revs.dedup();
+        revs
+    }
+
+    /// #51 D3 尾巴测试读数：缓存「键-产物」不一致条目清单——
+    /// RenderKey 的 (width_px, height_px) 必须与所存 RenderImage 帧
+    /// 实测尺寸逐项相等（键控缓存的基本契约：命中即该宽该高该 rev
+    /// 的位图）。空 = 全一致。
+    #[cfg(test)]
+    pub fn cache_key_product_mismatches_for_test(&self) -> Vec<(u32, u32, u32, u32)> {
+        self.cache
+            .entries()
+            .into_iter()
+            .filter_map(|(k, img)| {
+                let sz = img.size(0);
+                let (iw, ih) = (sz.width.0 as u32, sz.height.0 as u32);
+                (k.width_px != iw || k.height_px != ih).then_some((k.width_px, k.height_px, iw, ih))
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------------
@@ -1016,7 +1061,7 @@ impl PdfPagesView {
         let stale_ids: Vec<u64> = self
             .pending
             .iter()
-            .filter(|(_, k)| k.1 != dev_w)
+            .filter(|(_, (k, _))| k.1 != dev_w)
             .map(|(id, _)| *id)
             .collect();
         if !stale_ids.is_empty() {
@@ -1039,7 +1084,7 @@ impl PdfPagesView {
                 .render_key(&key)
                 .is_some_and(|k| self.cache.contains(&k))
                 || self.failed.contains(&key)
-                || self.pending.values().any(|k| *k == key)
+                || self.pending.values().any(|(k, _)| *k == key)
             {
                 continue;
             }
@@ -1047,7 +1092,9 @@ impl PdfPagesView {
                 page: PageIndex(key.0),
                 width_px: key.1,
             });
-            self.pending.insert(id, key);
+            // #51 D3 尾巴：rev 随行（提交时快照）——换代后迟到回执
+            // 的机械丢弃判据（见字段注释）。
+            self.pending.insert(id, (key, self.annotate_rev));
             submitted = true;
         }
         if first < idx as u32 {
@@ -1056,13 +1103,13 @@ impl PdfPagesView {
                 .render_key(&key)
                 .is_some_and(|k| self.cache.contains(&k))
                 || self.failed.contains(&key)
-                || self.pending.values().any(|k| *k == key))
+                || self.pending.values().any(|(k, _)| *k == key))
             {
                 let id = self.worker.as_mut().unwrap().submit(RenderRequest {
                     page: PageIndex(key.0),
                     width_px: key.1,
                 });
-                self.pending.insert(id, key);
+                self.pending.insert(id, (key, self.annotate_rev));
                 submitted = true;
             }
         }
@@ -1129,9 +1176,19 @@ impl PdfPagesView {
         while let Some(reply) = worker.try_recv() {
             match reply {
                 WorkerReply::Done { id, result } => {
-                    let Some(key) = self.pending.remove(&id) else {
+                    let Some((key, rev_at_submit)) = self.pending.remove(&id) else {
                         continue; // 迟到回执（换代竞态）——机械丢弃。
                     };
+                    // #51 D3 尾巴：rev 一致性硬守卫——该位图是对 rev_at_submit
+                    // 时点字节快照渲染的产物；若当前已 flush 换代（rev
+                    // 推进），落缓存会造成「旧内容占新 rev 键」（新批注
+                    // 不可见直到 LRU 逐出——正是「旧任务不覆写新页/
+                    // 新文档」要堵的洞）。正常路径 flush 即清 pending
+                    // + 换工人使本分支不可达；本守卫 = 纵深防御（万一
+                    // 未来路径漏了清 pending，这里仍然不落错键）。
+                    if rev_at_submit != self.annotate_rev {
+                        continue; // 换代迟到回执——机械丢弃（新 rev 重派单）。
+                    }
                     match result {
                         Ok(page) => {
                             if let Some(image) = rendered_page_to_image(&page) {
@@ -1155,7 +1212,7 @@ impl PdfPagesView {
                     }
                 }
                 WorkerReply::Cancelled { id } | WorkerReply::Timeout { id } => {
-                    if let Some(key) = self.pending.remove(&id) {
+                    if let Some((key, _)) = self.pending.remove(&id) {
                         self.failed.insert(key);
                         cx.notify();
                     }
