@@ -3404,6 +3404,22 @@ impl Render for ShellApp {
                         view.update(cx, |v, cx| v.open_search(window, cx));
                         return;
                     }
+                    // #51 D4：pdf 页面视图内复制——Ctrl+C（或用户换绑的
+                    // copy）把当前文本选择送剪贴板（左键拖选产物）。
+                    // 编辑器不在树内同上——查 keymap 编辑表换绑跟随；
+                    // 视图吞键与否自报（无选择不吞照常下沉，编辑器
+                    // Copy 语义零冲突——页面视图态编辑器不在场）。
+                    if let keymap::EditorOutcome::Matched(keymap::EditorAction::Copy) =
+                        editor_outcome
+                    {
+                        let mut copied = false;
+                        view.update(cx, |v, cx| {
+                            copied = v.copy_selection(cx);
+                        });
+                        if copied {
+                            return;
+                        }
+                    }
                 }
             }))
             .child(title_bar::title_bar(&title, &menus, self.menu_bar_open, cx))
@@ -5488,6 +5504,243 @@ mod pdf_search_wiring_tests {
                 });
             })
             .expect("断言");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #51 D4 接线面：页面视图内**文本选择与复制**全链——真实鼠标管线
+    /// （按下 → 拖动 → 松开，平台事件派发）→ 选择层后台提取 → 选择文
+    /// 本就绪 → 真实键击管线 Ctrl+C（keymap E18 换绑跟随路由）→ 测试
+    /// 平台剪贴板读回逐字一致 → Esc 清选择。引擎门控同 Ctrl+F 测试。
+    #[gpui::test]
+    fn pdf_view_ctrl_c_copies_text_selection(cx: &mut gpui::TestAppContext) {
+        // 语料：mixed_features.pdf（D1 内容对照夹具——必有文本层）。
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/display_corpus/mixed_features.pdf");
+        let bytes = std::fs::read(&corpus).unwrap_or_else(|e| panic!("语料不可读（{e}）"));
+        let dir = std::env::temp_dir().join(format!("mdc-d4sel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("m.pdf");
+        std::fs::write(&pdf, bytes);
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf.clone(), window, cx);
+            });
+        });
+        let open_notice = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, _| {
+                    shell.notice_board.message().map(str::to_owned)
+                })
+            })
+            .expect("窗口更新");
+        let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view = match (view, open_notice) {
+            (None, Some(msg)) if msg.contains("libpdfium") => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4 选择复制 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            (None, other) => {
+                panic!("pdf 标签未开（夹具/真缺陷，非环境缺件）：{other:?}")
+            }
+            (Some(view), _) => view,
+        };
+
+        // ① 首屏位图就绪（真实渲染管线——泵同 pdf_display_verify 口径）。
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.page_ready_for_test(0)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4 首屏位图泵超时（真缺陷不放过）"
+            );
+        }
+
+        // ② 真实鼠标拖选：页 0 槽内横向拖选（debug_bounds 定位真实槽
+        // 几何——title bar 等树内偏移自然计入）。
+        let b = visual
+            .debug_bounds("pdf-visible-page-0")
+            .expect("页 0 槽真实渲染（debug_selector 观测面）");
+        let (bx, by, bw, bh) = (
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height),
+        );
+        let pt = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+        let down = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position: pt(x, y),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .expect("按下派发");
+        };
+        let move_to = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position: pt(x, y),
+                        pressed_button: Some(gpui::MouseButton::Left),
+                        modifiers: Default::default(),
+                    }),
+                    cx,
+                );
+            })
+            .expect("拖动派发");
+        };
+        let up = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position: pt(x, y),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("松开派发");
+        };
+        // 拖选带：x 跨 15% → 85%（覆盖文本主列），y 跨 20% → 60%
+        //（避开页头页脚装饰，覆盖正文前中段）。
+        down(cx, bx + bw * 0.15, by + bh * 0.20);
+        move_to(cx, bx + bw * 0.85, by + bh * 0.60);
+        up(cx, bx + bw * 0.85, by + bh * 0.60);
+        // 诊断断言：拖选三事件后选择会话必须在位（鼠标管线接线直接
+        // 证据——失败即派发链断点定位面）。
+        view.read_with(&visual, |v, _| {
+            assert!(
+                v.has_selection_for_test(),
+                "拖选后选择会话必须在位（鼠标事件 → begin/move/finish 接线断点）"
+            );
+        });
+
+        // ③ 选择文本就绪（层后台提取 + 16ms 轮询 drain 泵）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.selection_text_for_test().is_some()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4 选择文本泵超时（层提取未就绪——真缺陷不放过）"
+            );
+        }
+        let selected = view.read_with(&visual, |v, _| {
+            v.selection_text_for_test().unwrap().to_owned()
+        });
+        assert!(!selected.trim().is_empty(), "拖选带必须覆盖到文本");
+        eprintln!(
+            "#51 D4 ✓ 拖选就绪：{} 字符（首 40：{:?}）",
+            selected.chars().count(),
+            selected.chars().take(40).collect::<String>()
+        );
+
+        // ④ 真实键击管线 Ctrl+C（换绑跟随路由——shell 分支 → 视图复制
+        // → 测试平台剪贴板）。
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        key: "c".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Ctrl+C");
+        let clipboard = cx.read(|app| app.read_from_clipboard());
+        let copied = clipboard.and_then(|item| item.text()).unwrap_or_default();
+        assert_eq!(
+            copied, selected,
+            "剪贴板读回必须与选择文本逐字一致（#51 D4 复制链）"
+        );
+        eprintln!(
+            "#51 D4 ✓ Ctrl+C 复制：剪贴板逐字一致（{} 字符）",
+            copied.chars().count()
+        );
+
+        // ⑤ Esc 清选择（真实键击管线 → 视图键域）。
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: Default::default(),
+                        key: "escape".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Esc");
+        visual.update(|window, app| window.draw(app).clear(app));
+        view.read_with(&visual, |v, _| {
+            assert!(
+                !v.has_selection_for_test() && v.selection_text_for_test().is_none(),
+                "Esc 清选择（会话与文本双清零）"
+            );
+        });
+        eprintln!("#51 D4 ✓ Esc 清选择");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

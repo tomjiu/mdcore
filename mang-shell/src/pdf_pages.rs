@@ -42,6 +42,29 @@
 //!   flush（#302④）后旧位图自然 miss，重渲染即见新批注；旧 rev
 //!   条目经 `invalidate_stale_revisions` 即刻回收预算。
 //!
+//! ## 文本选择与复制（#51 D4——页面视图内）
+//!
+//! - **左键拖选**：页槽内按下 → 拖动（游标实时更新）→ 松开定稿；
+//!   3px 内退化单击清选择（不遗留幽灵框）；跨页拖选 v1 截停在
+//!   锚点页（与右键批注拖框同口径，跨页登记后续轮）；
+//! - **选择层**：按下页单次后台线程提取 `positioned_chars` + 页变换
+//!   （复用 #422 文本层类型——独立于查找索引的常驻轻量面：只存
+//!   选择触及的页，批注 flush 不废）；层落地经 16ms 轮询回流——
+//!   拖选中实时高亮（选择蓝 40% α 与查找黄并存）；
+//! - **Ctrl+C 复制**（Shell 键域路由——keymap E18 换绑跟随）：
+//!   命中字符阅读序拼接、行间断点（垂直中心距 > 高度均值 × 30%，
+//!   与 `match_quads` 归行同判据）插换行；无选择不吞键照常下沉；
+//!   Esc 清选择（选择层保留供下次即时高亮）；
+//! - **坐标链**（`selection_user_rect` 纯函数单测锚定）：槽域 →
+//!   扣 letterbox 偏移 → 钳内容盒 → `screen_rect_to_quad`（旋转
+//!   90° 倍仍轴对齐）——与批注拖框 / #422 高亮同源变换；
+//! - **探针 canvas 命中域**（`annotate_overlay`）：in-flow 零尺寸
+//!   探针取窗口原点 + render_page_slot 同帧几何（fit_w × slot_h）
+//!   构造槽命中域——**absolute 定位子树在 gpui::list 项内的 paint
+//!   坐标实测不可靠**（0 高度 + 偏移），探针方案左键选择与右键
+//!   批注观察器共用（右键拖框从「编译面验证」升为真实鼠标管线
+//!   可测——本批顺带修正其坐标系）。
+//!
 //! ## 批注交互（#302 阶段 2·④——验收 1 三手势）
 //!
 //! **右键拖框 = 按当前工具提交批注**（右键不占列表滚动）：按下记录
@@ -98,9 +121,12 @@
 //!   菜单）。横向平移（超宽裁边导航）属后续轮；
 //! - 扫描件（无文本层）在页面视图下**正是正确呈现**（位图就是内容）
 //!   ——文本视图的「OCR 不支持」提示不再挡路；
-//! - **沙箱无 GUI**：右键拖框交互层只有编译面验证（本机 cargo check），
-//!   手势体验待真机；写路径逻辑面（坐标变换/命令/flush/落盘/签名
-//!   保持）在 `tests/pdf_annotate_e2e.rs` 全量真跑（无 GUI 依赖）。
+//! - **鼠标管线可测性**：页槽观察器经 in-flow 探针命中域（见上文
+//!   D4 节）——左键拖选在 `pdf_view_ctrl_c_copies_text_selection`
+//!   （shell.rs，真实平台事件管线）全链真跑；右键批注手势同一注册
+//!   面顺带进入可测域（真机手感仍待 #48 验收）；写路径逻辑面（坐标
+//!   变换/命令/flush/落盘/签名保持）在 `tests/pdf_annotate_e2e.rs`
+//!   全量真跑（无 GUI 依赖）。
 //!
 //! ## 引擎绑定纪律
 //!
@@ -118,9 +144,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, DispatchPhase, FocusHandle, Focusable, ImageSource,
-    KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, ScrollDelta, ScrollEvent, StyledText, Window, px,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, DispatchPhase, FocusHandle, Focusable,
+    ImageSource, KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollEvent, StyledText, Window, px,
 };
 use image::{Frame, ImageBuffer};
 use mdc_pdf::annotation::Point;
@@ -271,6 +297,23 @@ pub struct PdfPagesView {
     annotate_rev: u64,
     /// 右键拖框会话（按下时的页号 + 页内像素起点；None = 非拖框中）。
     drag_start: Option<(u32, f32, f32)>,
+    /// #51 D4：文本选择会话（左键拖选——页面视图内）：`(页, x0, y0,
+    /// x1, y1)` 内容盒像素域（letterbox 偏移扣除前为槽域坐标，扣偏移
+    /// 与 DPI 基准在消费点统一解析——与批注拖框同口径）。拖选期间
+    /// 实时更新游标端；松开定稿保留（复制源；Esc / 新按下清零）。
+    text_selection: Option<(u32, f32, f32, f32, f32)>,
+    /// #51 D4：选择文本层（按下页单次后台提取——`positioned_chars`
+    /// + 页变换；跨选择复用，批注 flush 不废——#422 同口径：高亮/
+    /// 下划线/便签不改文本层）。仅存选择触及的页（常驻轻量面）。
+    selection_layers: BTreeMap<u32, Arc<PageTextLayer>>,
+    /// #51 D4：选择层提取通道（线程 → 视图，携目标页号——层与页
+    /// 号绑定，与选择会话状态解耦；视图释放通道即断）。
+    selection_rx: Option<(Receiver<Box<PageTextLayer>>, u32)>,
+    /// #51 D4：选择层轮询旗（层落地驱动重绘——拖选实时高亮）。
+    selection_polling: bool,
+    /// #51 D4：已定稿选择文本（Ctrl+C 复制源；空 = 选择未覆盖任何
+    /// 字符或层未就绪——复制 no-op 不虚构）。None = 无选择。
+    selection_text: Option<String>,
     /// #421：缩放模式（FitWidth = v1 现状默认——行为零变化）。
     zoom_mode: ZoomMode,
     /// #421：首页宽（pt）——ActualSize 基准 + 百分比换算（构造期几何
@@ -489,6 +532,81 @@ fn find_in_layer(layer: &PageTextLayer, query_lower: &str) -> Vec<(usize, usize)
         .collect()
 }
 
+/// #51 D4：选择矩形 → 用户空间轴对齐矩形（纯函数——单测锚点）。
+/// 输入 = 槽域屏幕矩形（任意对角序）+ 本页内容盒几何（`fit_w` ×
+/// `slot_h`）；输出 = 用户空间 pt `(x_min, y_min, x_max, y_max)`。
+/// 变换链与批注拖框 / #422 高亮同源：槽域 → 扣 letterbox 偏移 → 钳
+/// 内容盒 → `screen_rect_to_quad`（旋转 90° 倍仍轴对齐）→ 组盒。
+fn selection_user_rect(
+    layer: &PageTextLayer,
+    fit_w: f32,
+    slot_h: f32,
+    sel: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+    let d = layer.transform.display_size();
+    let page_aspect = if d.width > 0. {
+        d.height / d.width
+    } else {
+        1.414
+    };
+    let (cw, ch, ox, oy) = crate::pdf_pages::PdfPagesView::contain_box(fit_w, slot_h, page_aspect);
+    let dpi = if d.width > 0. {
+        cw / d.width * 72.0
+    } else {
+        72.0
+    };
+    // 槽域 → 内容盒域（扣偏移 + 钳边界——letterbox 留白不算选区）。
+    let (sx0, sy0, sx1, sy1) = sel;
+    let clamp = |v: f32, hi: f32| v.clamp(0., hi);
+    let x0 = clamp(sx0 - ox, cw);
+    let x1 = clamp(sx1 - ox, cw);
+    let y0 = clamp(sy0 - oy, ch);
+    let y1 = clamp(sy1 - oy, ch);
+    let quad = layer.transform.screen_rect_to_quad(x0, y0, x1, y1, dpi);
+    let xs = quad.points.map(|p| p.x);
+    let ys = quad.points.map(|p| p.y);
+    (
+        xs.iter().copied().fold(f32::INFINITY, f32::min),
+        ys.iter().copied().fold(f32::INFINITY, f32::min),
+        xs.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+        ys.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+    )
+}
+
+/// #51 D4：选择矩形命中的字符（阅读序——`layer.chars` 即文档序；
+/// 纯函数——单测锚点）。字符 quad 与用户空间矩形相交即入选。
+fn selection_chars(layer: &PageTextLayer, rect_user: (f32, f32, f32, f32)) -> Vec<PositionedChar> {
+    let (rx0, ry0, rx1, ry1) = rect_user;
+    layer
+        .chars
+        .iter()
+        .filter(|c| c.left <= rx1 && c.right >= rx0 && c.bottom <= ry1 && c.top >= ry0)
+        .cloned()
+        .collect()
+}
+
+/// #51 D4：命中字符 → 复制文本（纯函数——单测锚点）：阅读序拼接，
+/// 行间断点（垂直中心距 > 高度均值 × 30%——与 `match_quads` 归行
+/// 判据同源）插入换行。部分行选中的行首/行尾空白按命中面如实保留
+/// （所见即所选——不替用户猜去留）。
+fn selection_text(layer: &PageTextLayer, rect_user: (f32, f32, f32, f32)) -> String {
+    let chars = selection_chars(layer, rect_user);
+    let mut text = String::new();
+    let mut prev: Option<&PositionedChar> = None;
+    for ch in &chars {
+        if let Some(p) = prev {
+            let dy = ((p.top + p.bottom) / 2. - (ch.top + ch.bottom) / 2.).abs();
+            let avg_h = (((p.top - p.bottom) + (ch.top - ch.bottom)).max(1.) / 2.) * 0.3;
+            if dy > avg_h {
+                text.push('\n');
+            }
+        }
+        text.push(ch.ch);
+        prev = Some(ch);
+    }
+    text
+}
+
 impl PdfPagesView {
     /// 构造：主线程一次性 open 读页数/几何（毫秒级），随即把引擎交
     /// 给看门狗工人在渲染线程重建（工厂持字节快照——换代同源）。
@@ -562,6 +680,11 @@ impl PdfPagesView {
             annotate: None,
             annotate_rev: 0,
             drag_start: None,
+            text_selection: None,
+            selection_layers: BTreeMap::new(),
+            selection_rx: None,
+            selection_polling: false,
+            selection_text: None,
             annotate_tool: AnnotateTool::Highlight,
             annotate_error: None,
             annotate_hint: None,
@@ -608,6 +731,11 @@ impl PdfPagesView {
             annotate: None,
             annotate_rev: 0,
             drag_start: None,
+            text_selection: None,
+            selection_layers: BTreeMap::new(),
+            selection_rx: None,
+            selection_polling: false,
+            selection_text: None,
             annotate_tool: AnnotateTool::Highlight,
             annotate_error: None,
             annotate_hint: None,
@@ -1244,7 +1372,9 @@ impl PdfPagesView {
             .and_then(|k| self.cache.get(&k).cloned());
         // #422：本页查找高亮层（#634：quad 四角页变换映射 + 内容盒
         // letterbox；当前命中橙色加描边，其余黄色）。
-        let highlights = self.search_highlights(idx as u32, fit_w as f32, slot_h);
+        let mut highlights = self.search_highlights(idx as u32, fit_w as f32, slot_h);
+        // #51 D4：文本选择高亮同层叠加（选择蓝与查找黄并存不互斥）。
+        highlights.extend(self.selection_highlights(idx as u32, fit_w as f32, slot_h));
         match image {
             Some(image) => {
                 // #634：位图等比内接（contain）——本页显示纵横比 ≠ 首页
@@ -1429,6 +1559,88 @@ impl PdfPagesView {
         out
     }
 
+    /// #51 D4：本页文本选择高亮元素族（与 [`Self::search_highlights`]
+    /// 同映射链：命中字符 `match_quads` 归行 → quad 四角 user_to_screen
+    /// + letterbox 偏移；空 = 无选择/层未就绪/本页无命中）。选择色 =
+    /// 主题外联蓝 40% α（与查找黄区分——两高亮可同屏并存）。
+    fn selection_highlights(&self, page: u32, fit_w: f32, slot_h: f32) -> Vec<AnyElement> {
+        let Some((sel_page, sx0, sy0, sx1, sy1)) = self.text_selection else {
+            return Vec::new();
+        };
+        if sel_page != page {
+            return Vec::new();
+        }
+        let Some(layer) = self.selection_layers.get(&page) else {
+            return Vec::new(); // 层提取中——高亮随层落地帧出现（诚实面）
+        };
+        let rect = selection_user_rect(layer, fit_w, slot_h, (sx0, sy0, sx1, sy1));
+        let chars = selection_chars(layer, rect);
+        if chars.is_empty() {
+            return Vec::new();
+        }
+        let quads = match_quads(&chars);
+        // 与 search_highlights 同源：显示域 → 内容盒 → DPI。
+        let d = layer.transform.display_size();
+        let page_aspect = if d.width > 0. {
+            d.height / d.width
+        } else {
+            1.414
+        };
+        let (cw, _ch, ox, oy) = Self::contain_box(fit_w, slot_h, page_aspect);
+        let dpi = if d.width > 0. {
+            cw / d.width * 72.0
+        } else {
+            72.0
+        };
+        let mut out = Vec::new();
+        for (qi, q) in quads.iter().enumerate() {
+            let tl = layer.transform.user_to_screen(
+                Point {
+                    x: q.left,
+                    y: q.top,
+                },
+                dpi,
+            );
+            let tr = layer.transform.user_to_screen(
+                Point {
+                    x: q.right,
+                    y: q.top,
+                },
+                dpi,
+            );
+            let bl = layer.transform.user_to_screen(
+                Point {
+                    x: q.left,
+                    y: q.bottom,
+                },
+                dpi,
+            );
+            let br = layer.transform.user_to_screen(
+                Point {
+                    x: q.right,
+                    y: q.bottom,
+                },
+                dpi,
+            );
+            let x = tl.0.min(tr.0).min(bl.0).min(br.0).max(0.) + ox;
+            let y = tl.1.min(tr.1).min(bl.1).min(br.1).max(0.) + oy;
+            let w = (tr.0.max(br.0).max(tl.0).max(bl.0) - (x - ox)).max(2.);
+            let h = (bl.1.max(br.1).max(tl.1).max(tr.1) - (y - oy)).max(2.);
+            out.push(
+                div()
+                    .id(gpui::SharedString::from(format!("pdf-sel-{page}-{qi}")))
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .h(px(h))
+                    .bg(gpui::rgba(0x3b82f666))
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
     // ------------------------------------------------------------------
     // #302 阶段 2·④：右键拖框批注（三手势）→ 增量写 → 渲染刷新
     // ------------------------------------------------------------------
@@ -1464,6 +1676,187 @@ impl PdfPagesView {
             Err(e) => self.annotate_error = Some(e.to_string()),
         }
         cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // #51 D4：文本选择与复制（左键拖选 → Ctrl+C——页面视图内）
+    // ------------------------------------------------------------------
+
+    /// #51 D4：选择开始——清旧选择、记锚点（槽域坐标）、懒提取本页
+    /// 文本层（一次开线程——层就绪后拖选实时高亮 + 复制可用）。
+    fn begin_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.selection_text = None;
+        self.text_selection = Some((page, x, y, x, y));
+        if !self.selection_layers.contains_key(&page) {
+            self.spawn_selection_layer(page, cx);
+        }
+        cx.notify();
+    }
+
+    /// #51 D4：拖选游标更新（仅锚点同页生效——跨页 v1 语义 = 页界
+    /// 截停，与批注拖框同口径；无选择会话 no-op——鼠标悬停不误触）。
+    fn move_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
+        if let Some((p, x0, y0, _, _)) = self.text_selection {
+            if p == page {
+                self.text_selection = Some((p, x0, y0, x, y));
+                cx.notify();
+            }
+        }
+    }
+
+    /// #51 D4：选择定稿（左键松开）——游标更新为松开位；3px 内退化
+    /// 单击清选择（不遗留幽灵框）；真拖选即时解析复制文本（层就绪
+    /// 时；未就绪留空，层落地轮询补算）。
+    fn finish_text_selection(&mut self, page: u32, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some((p, x0, y0, _, _)) = self.text_selection else {
+            return;
+        };
+        if p != page {
+            return; // 跨页松开——页界截停（游标留在最后一次同页更新）。
+        }
+        if (x - x0).abs() < 3.0 && (y - y0).abs() < 3.0 {
+            self.text_selection = None; // 无拖选意图的单击——清零不猜。
+            self.selection_text = None;
+            cx.notify();
+            return;
+        }
+        self.text_selection = Some((p, x0, y0, x, y));
+        self.selection_text = self.compute_selection_text();
+        cx.notify();
+    }
+
+    /// #51 D4：当前选择 → 复制文本（层就绪时解析；槽域 → 内容盒域
+    /// → 用户空间矩形 → 命中字符归行拼接）。层未就绪 → None（层
+    /// 落地轮询会重算；复制 no-op 诚实面）。
+    fn compute_selection_text(&self) -> Option<String> {
+        let (page, sx0, sy0, sx1, sy1) = self.text_selection?;
+        let layer = self.selection_layers.get(&page)?;
+        let (vw, vh) = self.viewport_size;
+        let fit_w = self.raster_width(vw, vh);
+        let slot_h = self.page_slot_height(fit_w, page as usize);
+        let rect = selection_user_rect(layer, fit_w as f32, slot_h, (sx0, sy0, sx1, sy1));
+        let text = selection_text(layer, rect);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// #51 D4：起单页文本层提取线程（引擎一次开 → 单页 position_ed_chars
+    /// + 页变换；通道关闭/发送失败自然退——视图已释放）。层落地经
+    /// 轮询回流 + notify（拖选实时高亮）。
+    fn spawn_selection_layer(&mut self, page: u32, cx: &mut Context<Self>) {
+        if self.selection_rx.is_some() {
+            return; // 提取中（单页会话——本批只处理锚点页）。
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Box<PageTextLayer>>();
+        let bytes = self.bytes.clone();
+        std::thread::spawn(move || {
+            let Ok(engine) = PdfiumEngine::open((*bytes).clone()) else {
+                return; // 引擎面失败——选择高亮/复制不就绪（诚实面）
+            };
+            // #634：页变换（几何 + 旋转单一事实源）——A4 兜底同索引线程。
+            let transform = engine
+                .page_geometry(PageIndex(page))
+                .ok()
+                .and_then(|g| PageTransform::from_geometry(&g).ok())
+                .unwrap_or_else(|| {
+                    PageTransform::from_geometry(&PageGeometry::default())
+                        .expect("A4 兜底几何必可构造变换")
+                });
+            if let Ok(chars) = engine.positioned_chars(PageIndex(page)) {
+                let lower = chars
+                    .iter()
+                    .map(|c| c.ch.to_lowercase().collect::<String>())
+                    .collect::<String>();
+                let _ = tx.send(Box::new(PageTextLayer {
+                    chars,
+                    lower,
+                    transform,
+                }));
+            }
+        });
+        self.selection_rx = Some((rx, page));
+        self.selection_polling = true;
+        Self::spawn_selection_poll_loop(cx);
+    }
+
+    /// 选择层回流轮询（16ms 定时 drain——层落地重算选择文本 + notify；
+    /// 单层单次，通道空 + 旗复位即止）。
+    fn spawn_selection_poll_loop(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+                let mut stop = false;
+                match this.update(cx, |view, cx| {
+                    view.drain_selection_layer(cx);
+                    if view.selection_rx.is_none() {
+                        view.selection_polling = false;
+                        stop = true;
+                    }
+                }) {
+                    Ok(()) => {}
+                    Err(_) => break, // 实体已释放——轮询链随退。
+                }
+                if stop {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 收选择层：落地（页号随通道携带——与选择会话状态解耦：选择已
+    /// 清也不丢层，下次拖选即时高亮）→ 选择文本补算 → notify。
+    /// 通道语义：Empty = 线程未尽继续轮询；Disconnected = 线程尽
+    /// （层已尽或引擎失败）止轮询。
+    fn drain_selection_layer(&mut self, cx: &mut Context<Self>) {
+        let Some((rx, page)) = self.selection_rx.take() else {
+            return;
+        };
+        let mut touched = false;
+        let mut exhausted = false;
+        loop {
+            match rx.try_recv() {
+                Ok(layer) => {
+                    self.selection_layers.insert(page, Arc::new(*layer));
+                    touched = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break, // 提取中
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            self.selection_rx = None; // 止轮询（poll 循环据此退）
+        } else {
+            self.selection_rx = Some((rx, page));
+        }
+        if touched {
+            self.selection_text = self.compute_selection_text();
+            cx.notify();
+        }
+    }
+
+    /// #51 D4：Ctrl+C 复制（Shell 键域路由——keymap E18 换绑跟随）：
+    /// 选择文本就绪 → 剪贴板；未就绪（无选择/层提取中/空选择）no-op
+    /// 不吞键（照常下沉）。复制后选择保留（多次粘贴语义——Esc 清）。
+    pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selection_text.clone() else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    /// #51 D4：Esc 清选择（视图态——查找条未开时才吞；选择面清零，
+    /// 选择层保留供下次拖选即时高亮）。
+    fn clear_text_selection(&mut self) -> bool {
+        if self.text_selection.is_none() && self.selection_text.is_none() {
+            return false;
+        }
+        self.text_selection = None;
+        self.selection_text = None;
+        true
     }
 
     /// 提交批注（三手势派发）：懒初始化控制器 → #304 坐标变换（屏幕
@@ -1685,6 +2078,22 @@ impl PdfPagesView {
         search.current = search.current.min(search.matches.len().saturating_sub(1));
     }
 
+    /// 槽渲染 + 观察器包装（list 条目回调单点）：`render_page_slot`
+    /// 的槽几何（fit_w / slot_h——同帧同源）转交 [`annotate_overlay`]
+    /// 的探针命中域；实体弱引用由 list 回调侧捕获传入。
+    fn render_page_slot_wrapped(
+        &mut self,
+        idx: usize,
+        entity: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
+        let (vw, vh) = self.viewport_size;
+        let fit_w = self.raster_width(vw, vh);
+        let slot_h = self.page_slot_height(fit_w, idx);
+        let slot = self.render_page_slot(idx, cx);
+        annotate_overlay(slot, idx, entity, fit_w as f32, slot_h)
+    }
+
     /// 命中导航（Enter / Shift+Enter / Ctrl+G / 计数条箭头钮）：
     /// 环回推进 + 滚动到当前命中（**页空间锚点**——目标置于视口
     /// 上部 30% 处）。
@@ -1879,7 +2288,8 @@ impl PdfPagesView {
     }
 
     /// #422：视图态按键（视图焦点面）：Ctrl+F（换绑跟随）开页内查找
-    /// 条。仅解析 OpenFind——其余键不吞不拦（滚轮/拖拽不依赖焦点，
+    /// 条。#51 D4：Esc 清文本选择（选择面清零，层保留）。仅解析
+    /// OpenFind + Esc——其余键不吞不拦（滚轮/拖拽不依赖焦点，
     /// 本层零副作用）。
     fn dispatch_view_key(
         &mut self,
@@ -1899,7 +2309,27 @@ impl PdfPagesView {
             crate::keymap::store().resolve_editor_main(&kq, None)
         {
             self.open_search(window, cx);
+            return;
         }
+        // #51 D4：Esc 清选择（查找条未开时才处理——查找态 Esc 走其
+        // 自身键域关条；选择在位才吞，否则不拦）。
+        if !ctrl && ks.key == "escape" && !self.search_open() && self.clear_text_selection() {
+            cx.notify();
+        }
+    }
+
+    /// #51 D4 测试读数：当前选择文本（Some = 已定稿且非空；None =
+    /// 无选择/层未就绪/空选择——复制 no-op 同判据）。
+    #[cfg(test)]
+    pub fn selection_text_for_test(&self) -> Option<&str> {
+        self.selection_text.as_deref()
+    }
+
+    /// #51 D4 测试读数：选择会话在位（拖选中/已定稿——单击清零面
+    /// 断言）。
+    #[cfg(test)]
+    pub fn has_selection_for_test(&self) -> bool {
+        self.text_selection.is_some()
     }
 
     /// #386：是否有未落盘批注（Shell 据此驱动关闭确认与标题栏脏标；
@@ -2028,9 +2458,10 @@ impl Render for PdfPagesView {
         let list = gpui::list(
             scroll,
             move |idx: usize, _window: &mut Window, cx: &mut App| match entity
-                .update(cx, |view, cx| view.render_page_slot(idx, cx))
-            {
-                Ok(slot) => annotate_overlay(slot, idx, entity.clone()),
+                .update(cx, |view, cx| {
+                    view.render_page_slot_wrapped(idx, entity.clone(), cx)
+                }) {
+                Ok(slot) => slot,
                 Err(_) => div().into_any_element(),
             },
         )
@@ -2574,14 +3005,23 @@ pub(crate) fn mixed_size_pdf_bytes_for_tests() -> Vec<u8> {
 // #302④：右键拖框观察器（页槽叠加透明 canvas——paint 期窗口级注册）
 // ---------------------------------------------------------------------------
 
-/// 页槽包装：叠加透明 canvas，paint 期注册右键按下/松开观察器
-/// （窗口级 `on_mouse_event` + 自身 bounds 过滤——与 shell 面板拖拽
-/// 收尾钩同模式：每帧重注册，事件只落在自己 bounds 内才动作；
-/// 无命中区不挡列表滚轮，右键不占左键交互）。
+/// 页槽包装：**in-flow 零尺寸探针 canvas**——paint 期给出本页槽的
+/// 窗口原点，据此注册五组鼠标观察器（#51 D4 左键选择三事件 +
+/// #302④ 右键批注两事件；窗口级 `on_mouse_event` + 槽几何过滤——
+/// 每帧重注册，事件只落在自己槽内才动作；无命中区不挡列表滚轮，
+/// 右键不占左键交互）。
+///
+/// 坐标系教训（#51 D4 实测）：absolute 定位子树在 gpui::list 项内
+/// 的 paint 坐标不可靠（0 高度 + 偏移）——原「absolute 包裹透明
+/// canvas」方案同理可疑；探针 = in-flow 零尺寸（不占布局、平移
+/// 与槽本体同源正确），`slot_bounds = 探针原点 + (fit_w, slot_h)`
+/// （render_page_slot 同帧几何——不依赖探针自身尺寸）。
 fn annotate_overlay(
     slot: AnyElement,
     idx: usize,
     entity: gpui::WeakEntity<PdfPagesView>,
+    fit_w: f32,
+    slot_h: f32,
 ) -> AnyElement {
     let page = idx as u32;
     div()
@@ -2589,18 +3029,85 @@ fn annotate_overlay(
         .debug_selector(move || format!("pdf-visible-page-{idx}"))
         .relative()
         .flex_none()
-        .child(slot)
+        // 探针（先于槽——原点 = 槽左上角）：零尺寸 in-flow。
         .child(
             div()
-                .id(gpui::SharedString::from(format!("pdf-annot-canvas-{idx}")))
-                .absolute()
-                .size_full()
+                .id(gpui::SharedString::from(format!("pdf-annot-probe-{idx}")))
+                .flex_none()
+                .w(px(0.))
+                .h(px(0.))
                 .child(gpui::canvas(
                     move |bounds, _window, _cx| bounds,
-                    move |bounds: gpui::Bounds<gpui::Pixels>,
+                    move |probe: gpui::Bounds<gpui::Pixels>,
                           _t,
                           window: &mut Window,
                           _cx: &mut App| {
+                        // 槽命中域 = 探针原点 + render_page_slot 同帧几何。
+                        let slot_bounds = gpui::Bounds {
+                            origin: probe.origin,
+                            size: gpui::size(px(fit_w), px(slot_h)),
+                        };
+                        // #51 D4：左键按下 = 文本选择锚点（清旧选择 +
+                        // 懒提取本页文本层；与右键批注按钮分流）。
+                        let ent_sel = entity.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseDownEvent,
+                                  phase: DispatchPhase,
+                                  _w: &mut Window,
+                                  cx: &mut App| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.button != MouseButton::Left
+                                {
+                                    return;
+                                }
+                                let Some((x, y)) = local_point(event.position, slot_bounds) else {
+                                    return;
+                                };
+                                let _ = ent_sel.update(cx, |view, cx| {
+                                    view.begin_text_selection(page, x, y, cx);
+                                });
+                            },
+                        );
+                        // #51 D4：拖选中游标实时更新（同页才动——悬停/
+                        // 跨页 no-op；松开位即游标，无按钮态判据 = 选
+                        // 择会话在位）。
+                        let ent_move = entity.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseMoveEvent,
+                                  phase: DispatchPhase,
+                                  _w: &mut Window,
+                                  cx: &mut App| {
+                                if phase != DispatchPhase::Bubble {
+                                    return;
+                                }
+                                let Some((x, y)) = local_point(event.position, slot_bounds) else {
+                                    return;
+                                };
+                                let _ = ent_move.update(cx, |view, cx| {
+                                    view.move_text_selection(page, x, y, cx);
+                                });
+                            },
+                        );
+                        // #51 D4：左键松开 = 选择定稿（3px 退化清零）。
+                        let ent_selup = entity.clone();
+                        window.on_mouse_event(
+                            move |event: &MouseUpEvent,
+                                  phase: DispatchPhase,
+                                  _w: &mut Window,
+                                  cx: &mut App| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.button != MouseButton::Left
+                                {
+                                    return;
+                                }
+                                let Some((x, y)) = local_point(event.position, slot_bounds) else {
+                                    return;
+                                };
+                                let _ = ent_selup.update(cx, |view, cx| {
+                                    view.finish_text_selection(page, x, y, cx);
+                                });
+                            },
+                        );
                         // 右键按下：记录页内像素起点。
                         let ent_down = entity.clone();
                         window.on_mouse_event(
@@ -2613,7 +3120,7 @@ fn annotate_overlay(
                                 {
                                     return;
                                 }
-                                let Some((x, y)) = local_point(event.position, bounds) else {
+                                let Some((x, y)) = local_point(event.position, slot_bounds) else {
                                     return;
                                 };
                                 let _ = ent_down.update(cx, |view, _cx| {
@@ -2633,7 +3140,7 @@ fn annotate_overlay(
                                 {
                                     return;
                                 }
-                                let Some((x, y)) = local_point(event.position, bounds) else {
+                                let Some((x, y)) = local_point(event.position, slot_bounds) else {
                                     return;
                                 };
                                 let _ = ent_up.update(cx, |view, cx| {
@@ -2644,6 +3151,7 @@ fn annotate_overlay(
                     },
                 )),
         )
+        .child(slot)
         .into_any_element()
 }
 
@@ -2964,6 +3472,79 @@ mod tests {
         let hits = find_in_layer(&layer, "三");
         assert_eq!(hits.len(), 1);
         assert!(find_in_layer(&layer, "").is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // #51 D4：文本选择——纯函数面（矩形→字符 / 行间断点 / 坐标变换）
+    // -----------------------------------------------------------------
+
+    /// 合成两行层（用户空间 pt：行 1 基线 y=600「Alpha」，行 2 基线
+    /// y=560「Beta Gamma」——中心差 40pt 远超 30% 行容差）。
+    fn two_line_layer() -> PageTextLayer {
+        let mut chars = Vec::new();
+        for (i, c) in "Alpha".chars().enumerate() {
+            chars.push(ch(c, i as f32 * 10., 600.));
+        }
+        for (i, c) in "Beta Gamma".chars().enumerate() {
+            chars.push(ch(c, i as f32 * 10., 560.));
+        }
+        PageTextLayer {
+            lower: "alpha beta gamma".into(),
+            chars,
+            transform: PageTransform::from_geometry(&PageGeometry::simple(
+                595.,
+                842.,
+                Rotation::Deg0,
+            ))
+            .expect("A4 简单几何必可构造变换"),
+        }
+    }
+
+    /// 矩形命中：整页矩形 → 全字符（阅读序）；窄矩形 → 只命中覆盖列
+    /// 的字符（相交判据）；行间断点 → 复制文本换行。
+    #[test]
+    fn selection_chars_and_line_breaks() {
+        let layer = two_line_layer();
+        // 整页矩形（用户空间全覆盖）→ 两行全选。
+        let full = (0., 0., 595., 842.);
+        let chars = selection_chars(&layer, full);
+        assert_eq!(chars.len(), 15, "两行 5 + 10 字符全命中");
+        let text = selection_text(&layer, full);
+        assert_eq!(text, "Alpha\nBeta Gamma", "跨行选择 = 行间换行");
+        // 窄矩形（x∈[51, 91] 只覆盖行 2 的「Gamma」列——左界过空格
+        // 右缘（50）避带空格；用户空间 y∈[550, 575] 只碰行 2）。
+        let narrow = (51., 550., 91., 575.);
+        let text = selection_text(&layer, narrow);
+        assert_eq!(text, "Gamma", "窄矩形只选覆盖列（相交判据）");
+        // 空白区矩形（页边留白）→ 零命中零文本。
+        let blank = (0., 800., 100., 842.);
+        assert!(selection_chars(&layer, blank).is_empty());
+        assert_eq!(selection_text(&layer, blank), "", "空白区选择 = 空文本");
+    }
+
+    /// 槽域 → 用户空间变换链（letterbox 偏移扣除 + DPI + 组盒）：A4
+    /// 适宽 576px 槽（纵横比恰好 → 零留白偏移）下，屏幕矩形映射 =
+    /// 用户空间等比矩形（576/595 ≈ 0.968 缩放，y 翻转，y 底对齐 842）。
+    #[test]
+    fn selection_user_rect_identity_chain() {
+        let layer = two_line_layer();
+        // fit_w=576、slot_h=842×576/595 ≈ 815.7——纵横比与页一致
+        //（contain 无 letterbox 偏移），内容盒即整槽。
+        let fit_w = 576.;
+        let slot_h = 815.7;
+        // 屏幕矩形（左上原点 y 向下）：x∈[0, 576]、y∈[0, 407.8]（半页）
+        // → 用户空间 = y∈[842/2, 842]（下半页）。
+        let (x0, y0, x1, y1) = selection_user_rect(&layer, fit_w, slot_h, (0., 0., 576., 407.8));
+        let sx = 595. / 576.; // 用户 pt / 屏幕 px
+        assert!((x0 - 0.).abs() < 0.5, "左缘对齐（实得 {x0}）");
+        assert!((x1 - 595.).abs() < 1., "右缘对齐（实得 {x1}）");
+        assert!((y0 - 421.).abs() < 1., "下缘半页（实得 {y0}）");
+        assert!((y1 - 842.).abs() < 1., "上缘页顶（实得 {y1}）");
+        let _ = (y0, y1, sx);
+        // 反向对角序（拖选从右下往左上）→ 同一矩形（归一化）。
+        let (r_x0, r_y0, r_x1, r_y1) =
+            selection_user_rect(&layer, fit_w, slot_h, (576., 407.8, 0., 0.));
+        assert_eq!((x0, y0, x1, y1), (r_x0, r_y0, r_x1, r_y1), "对角序无关");
     }
 
     /// 计数条文案四态：空查询 / 索引中 / 完成无匹配（含失败页脚注）/
