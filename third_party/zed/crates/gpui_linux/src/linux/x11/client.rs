@@ -292,6 +292,13 @@ impl X11ClientStatePtr {
             state.ximc = Some(ximc);
             return;
         };
+        // Before the open's reply there is no input method id: setting
+        // the context then broke fcitx5 under XWayland (Ely R14.48d).
+        if !xim_handler.connected {
+            state.ximc = Some(ximc);
+            state.xim_handler = Some(xim_handler);
+            return;
+        }
         let scaled_bounds = bounds.scale(state.scale_factor);
         let ic_attributes = ximc
             .build_ic_attributes()

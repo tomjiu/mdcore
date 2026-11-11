@@ -423,9 +423,24 @@ for name in sorted(closure):
 
 gen_workspace(closure)
 
+# ---------- 第二层：缺陷补丁（patches/zed/*.patch） ----------
+# 两层机制（issue #137，照 ElyOffice vendor-gpui.sh 模式）：搬运只还原
+# 上游基线，缺陷修复以补丁登记于 patches/zed/（见 third_party/zed/PROVENANCE.md
+# 「补丁层」段）。搬运后自动重放，保证「上游 pin + 补丁集」可复现。
+patch_applier = os.path.join(LAB, 'scripts', 'zed_patches.py')
+if os.path.exists(patch_applier):
+    r = os.system(f'{sys.executable} {patch_applier} apply')
+    if r != 0:
+        print("FATAL: 补丁层重放失败（上方 [失败] 行）——上游已修/树漂移，"
+              "人工核对 patches/zed/ 后更新 PROVENANCE.md")
+        sys.exit(1)
+else:
+    print("[提示] scripts/zed_patches.py 不存在，跳过补丁层")
+
 print("\n[改写报告] 删除的 dev-deps / 未解析项：")
 for name, dropped in report.items():
     if dropped:
         print(f"  {name}: {dropped}")
 print(f"\n[产出] {ZED_DIR}/ （{len(closure)} crates + workspace 根）")
+print("[下一步] python3 scripts/zed_patches.py check  # 补丁层门禁")
 print("[下一步] cd", ZED_DIR, "&& cargo build -p gpui  # 最重一环先验证")

@@ -1,0 +1,36 @@
+gpui: the topmost window control wins the hit test
+
+Window control areas were asked in paint order, so a title bar hit
+before the caption button drawn on it: buttons missed clicks to the
+drag area. The hit test now walks the hovered hitboxes from the
+topmost (upstream zed@1663af41 unfixed; cf. ElyOffice gpui patch 0002).
+
+diff --git a/third_party/zed/crates/gpui/src/window.rs b/third_party/zed/crates/gpui/src/window.rs
+--- a/third_party/zed/crates/gpui/src/window.rs
++++ b/third_party/zed/crates/gpui/src/window.rs
+@@ -2132,12 +2132,19 @@ impl Window {
+             Box::new(move || {
+                 handle
+                     .update(&mut cx, |_, window, _cx| {
+-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
+-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
+-                                return Some(*area);
+-                            }
+-                        }
+-                        None
++                        // Topmost first: a caption button wins over the
++                        // title bar hitbox it is painted on.
++                        let areas = &window.rendered_frame.window_control_hitboxes;
++                        let hit = &window.mouse_hit_test;
++                        hit.ids
++                            .iter()
++                            .take(hit.hover_hitbox_count)
++                            .find_map(|id| {
++                                areas
++                                    .iter()
++                                    .find(|(_, hitbox)| hitbox.id == *id)
++                                    .map(|(area, _)| *area)
++                            })
+                     })
+                     .log_err()
+                     .unwrap_or(None)
