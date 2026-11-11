@@ -86,6 +86,45 @@ pub fn load_panel_widths() -> Option<(f32, f32)> {
     Some((left, right))
 }
 
+/// #120（mdc-dock 批②）：dock 布局节点读写。
+///
+/// 结构（serde 形状发布冻结——[`mdc_dock::DockAreaState`]）:
+/// `{"dock": {"left": <DockAreaState>, "right_open": <bool>}}`
+///
+/// 版本裁决在 [`mdc_dock::Dock::restore`]（不符整份丢弃回默认，
+/// Q-IDE layout.rs:518-521 口径）；本层只管存取与坏值容忍：
+/// 缺键/坏 JSON/类型不符 → `None` → 调用方走默认（开/无激活/缺省宽）。
+/// #106 报告 §6 顺手缺陷（开合态不持久化）收口。
+pub fn save_dock_layout(left: &mdc_dock::DockAreaState, right_open: bool) {
+    if let Some(dir) = config_dir() {
+        save_dock_layout_in(&dir, left, right_open);
+    }
+}
+
+/// #120：dock 布局记忆读取（无/坏/缺 = None——调用方走默认）。
+pub fn load_dock_layout() -> Option<(mdc_dock::DockAreaState, bool)> {
+    let dir = config_dir()?;
+    load_dock_layout_in(&dir)
+}
+
+fn save_dock_layout_in(dir: &Path, left: &mdc_dock::DockAreaState, right_open: bool) {
+    let mut value = load_from(dir);
+    value["dock"] = serde_json::json!({
+        // left 整体经 serde 序列化（version 在其内——恢复时校验）。
+        "left": left,
+        "right_open": right_open,
+    });
+    save_to(dir, &value);
+}
+
+fn load_dock_layout_in(dir: &Path) -> Option<(mdc_dock::DockAreaState, bool)> {
+    let value = load_from(dir);
+    let node = value.get("dock")?;
+    let left: mdc_dock::DockAreaState = serde_json::from_value(node.get("left")?.clone()).ok()?;
+    let right_open = node.get("right_open")?.as_bool()?;
+    Some((left, right_open))
+}
+
 /// 记住工作区（`workspace` 键——路径以 lossy 写入，非 UTF-8 路径的
 /// 记忆为近似值[边界登记]）。
 pub fn remember_workspace(root: &Path) {

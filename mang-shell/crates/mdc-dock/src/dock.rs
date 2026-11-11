@@ -88,6 +88,10 @@ pub struct PanelEntry {
     panel: Arc<dyn PanelHandle>,
     #[allow(dead_code)] // 存续语义：Drop 即退订（蓝本同构）。
     subscriptions: Vec<Subscription>,
+    /// #120（批②）：per-panel 记忆尺寸（px；None = 无记忆——
+    /// 蓝本 dock.rs:377-381 `PanelSizeState` 的单 dock 简化面；
+    /// 拖拽结束由宿主回写，渲染宽由宿主读激活面板值）。
+    size: Option<f32>,
 }
 
 impl PanelEntry {
@@ -106,6 +110,10 @@ pub struct Dock {
     /// 预物化激活意图（key 未注册时 `activate_key` 记录；物化即激活；
     /// 用户实际换面时丢弃——蓝本 dock.rs:938 discard_pending 同语义）。
     pending_activation: Option<&'static str>,
+    /// #120（批②）：预物化尺寸意图（restore 时未注册面板的记忆宽——
+    /// 面板物化时兑现；与 pending_activation 对称。真实流：重启后
+    /// 「打开文件夹」建树 → 上次的树宽恢复）。
+    pending_sizes: std::collections::HashMap<String, f32>,
     focus_handle: FocusHandle,
 }
 
@@ -123,6 +131,7 @@ impl Dock {
             is_open: true,
             tracker: ActiveTracker::new(),
             pending_activation: None,
+            pending_sizes: std::collections::HashMap::new(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -235,8 +244,14 @@ impl Dock {
         self.entries.push(PanelEntry {
             panel: Arc::new(panel.clone()),
             subscriptions: vec![subscription],
+            size: None,
         });
         let ix = self.entries.len() - 1;
+        // #120（批②）：预物化尺寸意图兑现（restore 时面板未注册——
+        // 物化时吃回）。
+        if let Some(size) = self.pending_sizes.remove(T::panel_key()) {
+            self.entries[ix].size = Some(size);
+        }
         if self
             .pending_activation
             .is_some_and(|k| k == T::panel_key() || k == T::persistent_name())
@@ -309,5 +324,97 @@ impl Dock {
                 false
             }
         }
+    }
+
+    /// #120（批②）：按键读记忆尺寸（无面板/无记忆 = None）。
+    pub fn panel_size(&self, key: &str) -> Option<f32> {
+        self.panel_index_for_key(key)
+            .and_then(|ix| self.entries[ix].size)
+    }
+
+    /// #120：按键写记忆尺寸（面板在列才存——未注册键丢弃；
+    /// 新值与旧值相等零通知）。
+    pub fn set_panel_size(&mut self, key: &str, size: f32, cx: &mut Context<Self>) {
+        if let Some(ix) = self.panel_index_for_key(key) {
+            if self.entries[ix].size != Some(size) {
+                self.entries[ix].size = Some(size);
+                cx.notify();
+            }
+        }
+    }
+
+    /// #120：restore 内部写入面（恢复期不逐面板 notify——末尾统一
+    /// set_open/activate 通知）。
+    fn set_panel_size_at(&mut self, ix: usize, size: Option<f32>) {
+        if let Some(entry) = self.entries.get_mut(ix) {
+            entry.size = size;
+        }
+    }
+
+    /// #120：清全部面板记忆尺寸（重置语义——宿主「重置默认宽」调用）。
+    pub fn clear_panel_sizes(&mut self, cx: &mut Context<Self>) {
+        let had = self.entries.iter().any(|entry| entry.size.is_some());
+        if had {
+            for entry in &mut self.entries {
+                entry.size = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// #120（批②）：布局快照（版本号写 [`DOCK_LAYOUT_VERSION`]；
+    /// 激活键走 `active_key()`——预物化意图一并携带；面板尺寸按条目
+    /// 记忆值）。serde 数据面见 [`super::state`]。
+    pub fn dump(&self) -> super::state::DockAreaState {
+        super::state::DockAreaState {
+            version: super::state::DOCK_LAYOUT_VERSION,
+            open: self.is_open,
+            active: self.active_key().map(str::to_owned),
+            panels: self
+                .entries
+                .iter()
+                .map(|entry| super::state::PanelState {
+                    key: entry.panel.panel_key().to_owned(),
+                    size: entry.size,
+                })
+                .collect(),
+        }
+    }
+
+    /// #120（批②）：布局恢复。**版本不符 → 整份丢弃回默认**（返回
+    /// `Err` 交宿主静默重建，Q-IDE layout.rs:518-521 裁决同款；坏
+    /// JSON 由宿主 serde_json 解析层拦——本层只见合法结构）。
+    ///
+    /// 恢复面：开合态（`set_open` 协议）；激活键（仅当下面板真激活
+    /// ——未注册键静默丢弃，不灌预物化意图：恢复键集仅当下面板，
+    /// 坏键不崩）；面板尺寸（按键匹配写入记忆值——未注册键忽略，
+    /// 越界值由宿主 clamp 收口）。
+    pub fn restore(
+        &mut self,
+        state: super::state::DockAreaState,
+        cx: &mut Context<Self>,
+    ) -> Result<(), super::state::DockLayoutVersionMismatch> {
+        if state.version != super::state::DOCK_LAYOUT_VERSION {
+            return Err(super::state::DockLayoutVersionMismatch {
+                found: state.version,
+                expected: super::state::DOCK_LAYOUT_VERSION,
+            });
+        }
+        self.set_open(state.open, cx);
+        for panel in &state.panels {
+            if let Some(ix) = self.panel_index_for_key(&panel.key) {
+                self.set_panel_size_at(ix, panel.size);
+            } else if let Some(size) = panel.size {
+                // 面板未物化：记入预物化尺寸意图（物化时兑现——
+                // 真实流：重启后打开文件夹才建树）。
+                self.pending_sizes.insert(panel.key.clone(), size);
+            }
+        }
+        if let Some(key) = state.active {
+            if let Some(ix) = self.panel_index_for_key(&key) {
+                self.activate_panel(ix, cx);
+            }
+        }
+        Ok(())
     }
 }

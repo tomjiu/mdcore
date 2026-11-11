@@ -154,7 +154,6 @@ struct ConfirmState {
 }
 
 pub struct ShellApp {
-    left_open: bool,
     right_open: bool,
     document_info_open: bool,
     /// G4：左右栏宽度（拖拽热区调整；settings `panel_widths` 持久化，
@@ -175,6 +174,8 @@ pub struct ShellApp {
     /// 统一激活协议（`git_view` 布尔退役）。面板未物化（无工作区）时
     /// `activate_key` 记录预物化意图，渲染面据 `active_key` 呈占位视图
     /// ——与旧 git_view=true + git_panel=None 的占位语义一比一等价。
+    /// #120（批②）：左栏开合态（原 `left_open` 布尔退役）与 per-panel
+    /// 记忆尺寸随 [`mdc_dock::DockAreaState`] 持久化（settings `dock` 节点）。
     left_dock: Entity<mdc_dock::Dock>,
     /// #571：大纲面板实体（批 7——激活标签的键盘导航结构树；
     /// 换绑判据见 [`Self::sync_outline`]）。
@@ -438,8 +439,9 @@ impl ShellApp {
             });
         }
         let mut this = Self {
-            left_open: true,
-            right_open: true,
+            right_open: crate::settings::load_dock_layout()
+                .map(|(_, r)| r)
+                .unwrap_or(true),
             document_info_open: false,
             // G4：面板宽度记忆恢复（无记忆 = 缺省宽；手改配置越界时
             // 载入即钳制到拖拽域——不信任磁盘值）。
@@ -455,8 +457,8 @@ impl ShellApp {
             workspace,
             git_panel: None,
             outline: None,
-            // #119（mdc-dock 批①）：左栏激活协议实体（空起——面板在
-            // 工作区打开时注册；激活语义见字段文档）。
+            // #119（mdc-dock 批①）：左栏激活协议实体；#120（批②）：
+            // 布局恢复在构造尾（面板注册之后——见下）。
             left_dock: cx.new(|cx| mdc_dock::Dock::new(mdc_dock::DockPosition::Left, cx)),
             settings_open: false,
             pdf_pages: None,
@@ -515,6 +517,16 @@ impl ShellApp {
                 dock.add_panel(&tree, cx);
             });
         }
+        // #120（批②）：布局恢复——**面板注册之后**（记忆对已物化面板
+        // 生效：开合态/激活键/per-panel 尺寸；未物化键静默丢弃——
+        // 与旧「重启回默认全开」相比仅新增能力，零行为回退）。版本
+        // 不符 → 整份丢弃回默认（Q-IDE layout.rs:518-521 口径）。
+        if let Some((state, _)) = crate::settings::load_dock_layout() {
+            let dock = this.left_dock.clone();
+            let _ = dock.update(cx, |dock, cx| dock.restore(state, cx));
+        }
+        // #120：左栏渲染宽同步到恢复后的激活面板记忆宽。
+        this.sync_left_width_to_active(cx);
         this
     }
 
@@ -713,31 +725,46 @@ impl ShellApp {
     }
 
     /// 折叠/展开左栏（文件树）。图标条 `act-file-tree` 触发——已开且
-    /// 在 git 视图时切回文件树视图（F7）。
+    /// 在 git 视图时切回文件树视图（F7）。#120（批②）：开合态归
+    /// dock（`set_open` 协议）+ 持久化。
     pub fn toggle_left(&mut self, cx: &mut Context<Self>) {
-        if self.left_open && self.git_active(cx) {
+        if self.left_open(cx) && self.git_active(cx) {
             // #119（mdc-dock 批①）：回切文件树视图经统一激活协议
             //（原 git_view 布尔置位退役）。
             self.activate_left_view(crate::file_tree::FILE_TREE_PANEL_KEY, cx);
         } else {
-            self.left_open = !self.left_open;
+            let dock = self.left_dock.clone();
+            dock.update(cx, |dock, cx| {
+                let next = !dock.is_open();
+                dock.set_open(next, cx);
+            });
         }
+        self.persist_dock_layout(cx);
         cx.notify();
     }
 
     /// F7：切到 git 视图（图标条 `act-git` 触发——已开且在 git 视图时
     /// 折叠左栏，再开切回）。
     pub fn toggle_git(&mut self, cx: &mut Context<Self>) {
-        if self.left_open && self.git_active(cx) {
-            self.left_open = false;
+        if self.left_open(cx) && self.git_active(cx) {
+            let dock = self.left_dock.clone();
+            dock.update(cx, |dock, cx| dock.set_open(false, cx));
         } else {
-            self.left_open = true;
+            let dock = self.left_dock.clone();
+            dock.update(cx, |dock, cx| dock.set_open(true, cx));
             // #119：直达 git 视图经统一激活协议——git 面板未物化（无
             // 工作区）时 dock 记预物化意图，渲染面呈占位视图（旧
             // git_view=true + git_panel=None 语义一比一等价）。
             self.activate_left_view(crate::git_panel::GIT_PANEL_KEY, cx);
         }
+        self.persist_dock_layout(cx);
         cx.notify();
+    }
+
+    /// #120（批②）：左栏开合态（dock `is_open`——原 `left_open` 布尔
+    /// 退役；菜单勾选/图标条选中态/渲染门/测试共用）。
+    pub fn left_open(&self, cx: &App) -> bool {
+        self.left_dock.read(cx).is_open()
     }
 
     /// #119（mdc-dock 批①）：左栏当前是否 git 视图（dock 激活键裁决
@@ -749,10 +776,32 @@ impl ShellApp {
     }
 
     /// #119：左栏视图激活单点（统一激活协议入口——图标条/菜单/快捷
-    /// 键三入口共用；后续批多面板扩展不再扩布尔）。
+    /// 键三入口共用；后续批多面板扩展不再扩布尔）。#120（批②）：
+    /// 激活后同步该面板的记忆宽到渲染宽 + 持久化。
     fn activate_left_view(&mut self, key: &'static str, cx: &mut Context<Self>) {
         let dock = self.left_dock.clone();
         dock.update(cx, |dock, cx| dock.activate_key(key, cx));
+        self.sync_left_width_to_active(cx);
+        self.persist_dock_layout(cx);
+    }
+
+    /// #120（批②）：左栏渲染宽同步激活面板记忆宽（无记忆 = 不动；
+    /// 越界值钳制到拖拽域——与启动载入同口径，不信任磁盘值）。
+    fn sync_left_width_to_active(&mut self, cx: &App) {
+        let dock = self.left_dock.read(cx);
+        let Some(key) = dock.active_key() else {
+            return;
+        };
+        if let Some(width) = dock.panel_size(key) {
+            self.left_width = px(panels::clamp_panel_width(true, width));
+        }
+    }
+
+    /// #120（批②）：dock 布局落盘单点（左 dock 快照 + 右栏开合态——
+    /// 开/切/拖宽/换工作区四类变更点统一走此）。
+    fn persist_dock_layout(&self, cx: &App) {
+        let state = self.left_dock.read(cx).dump();
+        crate::settings::save_dock_layout(&state, self.right_open);
     }
 
     /// F7：git 面板实体（烟雾钩子/内部访问）。
@@ -893,12 +942,21 @@ impl ShellApp {
 
     /// G4：拖拽收尾（窗口级 mouseup——任意位置抬起；与 editor 同模式
     /// 每帧注册）。宽度落 settings（持久化）+ 证据行；非拖拽中为空操作。
+    /// #120（批②）：左栏宽同步写激活面板的 per-panel 记忆宽（dock
+    /// 快照随 persist_dock_layout 落盘——文件树/git 面各记各宽）。
     fn finish_panel_drag(&mut self, cx: &mut Context<Self>) {
         if self.panel_drag.take().is_none() {
             return;
         }
         let (left, right) = (f32::from(self.left_width), f32::from(self.right_width));
         crate::settings::save_panel_widths(left, right);
+        let dock = self.left_dock.clone();
+        dock.update(cx, |dock, cx| {
+            if let Some(key) = dock.active_key() {
+                dock.set_panel_size(key, left, cx);
+            }
+        });
+        self.persist_dock_layout(cx);
         eprintln!("panel-resize: left {left} right {right} (persist)");
         cx.notify();
     }
@@ -964,6 +1022,8 @@ impl ShellApp {
     /// 触发（#289-⑤：右栏开关归右缘——不再占用左图标条）。
     pub fn toggle_right(&mut self, cx: &mut Context<Self>) {
         self.right_open = !self.right_open;
+        // #120（批②）：右栏开合态随 dock 节点持久化（#106 报告 §6 顺手缺陷）。
+        self.persist_dock_layout(cx);
         cx.notify();
     }
 
@@ -1562,7 +1622,7 @@ impl ShellApp {
             }),
             font_size: self.font_size,
             theme_mode: self.theme_mode,
-            left_open: self.left_open,
+            left_open: self.left_open(cx),
             git_view: self.git_active(cx),
             // #307：「导出为 PDF」门槛（仅 docx 形态提供；md/pdf/xlsx/
             // canvas 标签上灰显）。
@@ -3006,6 +3066,10 @@ impl ShellApp {
         self.right_width = panels::RIGHT_PANEL_WIDTH;
         let (left, right) = (f32::from(self.left_width), f32::from(self.right_width));
         crate::settings::save_panel_widths(left, right);
+        // #120（批②）：per-panel 记忆宽一并清（重置语义 = 全部回缺省宽）。
+        let dock = self.left_dock.clone();
+        dock.update(cx, |dock, cx| dock.clear_panel_sizes(cx));
+        self.persist_dock_layout(cx);
         eprintln!("panel-reset: left {left} right {right} (persist)");
         cx.notify();
     }
@@ -3069,14 +3133,20 @@ impl ShellApp {
         // #119（mdc-dock 批①）：面板注册进左栏 dock——旧面板撤注、新面
         // 板入列、激活键承接（无历史激活 → 文件树缺省；旧 git 态/预物化
         // 意图经 add_panel 与 activate_key 自动兑现——与旧 git_view 保
-        // 语义：换工作区时视图不跳变）。
-        let prev_view = self.left_dock.read(cx).active_key();
+        // 语义：换工作区时视图不跳变）。#120（批②）：开合态跨撤注保持
+        //（撤注激活面板会收起 dock——蓝本 ：911 语义，换工作区不是用户
+        // 关栏意图，保开）；per-panel 尺寸与激活键随后同步 + 落盘。
+        let (prev_view, prev_open) = {
+            let dock = self.left_dock.read(cx);
+            (dock.active_key(), dock.is_open())
+        };
         let dock = self.left_dock.clone();
         dock.update(cx, |dock, cx| {
             dock.remove_panel_by_key(crate::file_tree::FILE_TREE_PANEL_KEY, cx);
             dock.remove_panel_by_key(crate::git_panel::GIT_PANEL_KEY, cx);
             dock.add_panel(&tree, cx);
             dock.add_panel(&git, cx);
+            dock.set_open(prev_open, cx);
             match prev_view {
                 Some(key) => {
                     dock.activate_key(key, cx);
@@ -3086,6 +3156,8 @@ impl ShellApp {
                 }
             }
         });
+        self.sync_left_width_to_active(cx);
+        self.persist_dock_layout(cx);
         crate::settings::remember_workspace(&root);
         self.recent.record_workspace(&root);
         cx.notify();
@@ -3470,13 +3542,13 @@ impl Render for ShellApp {
                     .w_full()
                     .overflow_hidden()
                     .child(activity_bar::activity_bar(
-                        self.left_open,
-                        // #119：视图归属从 dock 激活键读（含预物化意图）。
+                        // #119/#120：视图归属与开合态均从 dock 读。
+                        self.left_open(cx),
                         self.git_active(cx),
                         self.settings_open,
                         cx,
                     ))
-                    .when(self.left_open, |el| {
+                    .when(self.left_open(cx), |el| {
                         el.child(panels::left_panel(
                             self.editor(),
                             self.workspace.as_ref(),
@@ -7013,15 +7085,12 @@ mod settings_lifecycle_tests {
     fn left_git_toggle_branches(cx: &mut gpui::TestAppContext) {
         let (shell, _window) = shell_window(cx);
         shell.update(cx, |shell, cx| {
-            // 前置：left_open=true / 非 git 视图（shell.rs 字段区 +
-            // left_dock 空起缺省）。
-            assert!(shell.left_open && !shell.git_active(cx));
+            // 前置：左栏开（dock is_open 缺省）/ 非 git 视图。
+            assert!(shell.left_open(cx) && !shell.git_active(cx));
 
-            // toggle_git 分支①：非 git 态 → 直达（开栏 + git 视图——
-            // git 面板未物化，预物化意图口径）。
             shell.toggle_git(cx);
             assert!(
-                shell.left_open && shell.git_active(cx),
+                shell.left_open(cx) && shell.git_active(cx),
                 "toggle_git：非 git 态直达"
             );
 
@@ -7029,33 +7098,82 @@ mod settings_lifecycle_tests {
             // 预物化意图被实际换面丢弃——树视图承接）。
             shell.toggle_left(cx);
             assert!(
-                shell.left_open && !shell.git_active(cx),
+                shell.left_open(cx) && !shell.git_active(cx),
                 "toggle_left：git 态回切文件树"
             );
 
             // toggle_left 分支②：非 git 态 → 折叠/展开。
             shell.toggle_left(cx);
-            assert!(!shell.left_open, "toggle_left：非 git 态折叠");
+            assert!(!shell.left_open(cx), "toggle_left：非 git 态折叠");
             shell.toggle_left(cx);
-            assert!(shell.left_open, "toggle_left：重开");
+            assert!(shell.left_open(cx), "toggle_left：重开");
 
             // toggle_git 分支②：git 态 → 折叠左栏（git 激活态保持——
             // 重开直达 git 视图的状态记忆）。
             shell.toggle_git(cx);
-            assert!(shell.left_open && shell.git_active(cx), "再直达");
+            assert!(shell.left_open(cx) && shell.git_active(cx), "再直达");
             shell.toggle_git(cx);
             assert!(
-                !shell.left_open && shell.git_active(cx),
+                !shell.left_open(cx) && shell.git_active(cx),
                 "toggle_git：git 态折叠左栏（git 激活态保持）"
             );
 
-            // 折叠态直达 git：双置（left_open + git 激活）。
+            // 折叠态直达 git：双置（左栏开 + git 激活）。
             shell.toggle_git(cx);
             assert!(
-                shell.left_open && shell.git_active(cx),
+                shell.left_open(cx) && shell.git_active(cx),
                 "折叠态 toggle_git：双置直达"
             );
         });
+    }
+
+    /// #120（批②）验收 ④：开合态跨「重启」恢复——收起右栏/左栏 →
+    /// 新建 ShellApp（读 settings 恢复）→ 仍是收起。环境隔离：
+    /// 临时 XDG_CONFIG_HOME（settings.json 全落临时区，测试结束还原）。
+    #[gpui::test]
+    fn dock_open_states_persist_across_restart(cx: &mut gpui::TestAppContext) {
+        let tmp = std::env::temp_dir().join(format!("mdock-restart-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // 测试进程单线程跑（--test-threads=1 门禁）——env 变更不进并行面。
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        // ① 模拟「上次会话」落盘：左栏收起 + 右栏收起 + 树宽 305。
+        let last = mdc_dock::DockAreaState {
+            version: mdc_dock::DOCK_LAYOUT_VERSION,
+            open: false,
+            active: Some(crate::file_tree::FILE_TREE_PANEL_KEY.to_owned()),
+            panels: vec![mdc_dock::PanelState {
+                key: crate::file_tree::FILE_TREE_PANEL_KEY.to_owned(),
+                size: Some(305.),
+            }],
+        };
+        crate::settings::save_dock_layout(&last, false);
+        // ② 「重启」：新建 ShellApp（构造尾恢复——面板未物化，尺寸走
+        // 预物化意图）。
+        let (shell, _window) = shell_window(cx);
+        shell.update(cx, |shell, cx| {
+            assert!(!shell.left_open(cx), "验收④：左栏收起跨重启保持");
+            assert!(!shell.right_open, "验收④：右栏收起跨重启保持");
+            assert!(!shell.git_active(cx), "激活键未物化 → 缺省树视图");
+        });
+        // ③ 「打开文件夹」物化面板——预物化尺寸兑现 + 渲染宽同步。
+        let root = std::env::temp_dir().join(format!("mdock-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        shell.update(cx, |shell, cx| shell.open_workspace(root, cx));
+        shell.update(cx, |shell, cx| {
+            let left = f32::from(shell.left_width);
+            assert_eq!(left, 305., "验收③：预物化树宽在物化后兑现并同步渲染宽");
+            assert!(
+                shell.git_panel.is_some(),
+                "工作区打开即建 git 面（既例保持）"
+            );
+        });
+        // ④ 清理：还原环境 + 删临时目录（后续测试不受污染）。
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
