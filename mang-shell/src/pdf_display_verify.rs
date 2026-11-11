@@ -1260,6 +1260,115 @@ fn robustness_damaged_oversized_multi_tab(cx: &mut gpui::TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// #51 D5：产品验收扫描（批次 D5a——15 夹具视图级全景）
+// ---------------------------------------------------------------------------
+
+/// **D5 产品验收扫描**：全部语料（15 文件）视图级全景——
+///
+/// - **正常档**（12 文件：中文嵌入/缺失字体、扫描图、透明/裁剪、
+///   CropBox 偏移/内缩、旋转 90/180、矢量、横竖混合、多页长档、
+///   超常尺寸、综合特征）：open → 首屏位图就绪 → 跳页中位 → 缩放
+///   步进换档重渲 → 预算不变量（每档窗口真开真渲——产品验收口径：
+///   SKIP/尺寸非空不能代替页面正确，位图就绪 + 跳页读回双断言）；
+/// - **坏档**（2 文件：垃圾/截断）：typed error 态（错误信息非空、
+///   不 panic 不白屏——面板渲染在健壮性测试锚定）；
+/// - 窗口逐档开关（真关窗 → 实体释放 → 工人收束，同测试 2 口径）。
+#[gpui::test]
+fn product_acceptance_corpus_view_sweep(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let files = [
+        "cropbox_inset.pdf",
+        "cropbox_offset.pdf",
+        "damaged_garbage.pdf",
+        "damaged_truncated.pdf",
+        "landscape_mixed.pdf",
+        "long_doc_120p.pdf",
+        "mixed_features.pdf",
+        "oversized_page.pdf",
+        "rotated_180.pdf",
+        "rotated_90.pdf",
+        "scanned_page.pdf",
+        "transparency_clip.pdf",
+        "vector_graphics.pdf",
+        "zh_embedded_font.pdf",
+        "zh_missing_font.pdf",
+    ];
+    let mut healthy = 0usize;
+    let mut broken = 0usize;
+    for name in files {
+        let bytes = fixture_bytes(name);
+        let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+        let err = view.read_with(cx, |v, _| v.error_for_test());
+        let Some(err) = err else {
+            // 正常档：真开窗 → 首屏 → 跳页中位 → 缩放步进 → 预算。
+            let pages = view.read_with(cx, |v, _| v.page_count());
+            assert!(pages >= 1, "{name}：页数 ≥ 1");
+            let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+                let view = view.clone();
+                move |_, _| PagesHost(view)
+            });
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.update(|window, app| window.draw(app).clear(app));
+            pump_ready(cx, &mut visual, &view, 30, &format!("{name} 首屏"), |v| {
+                v.page_ready_for_test(0)
+            });
+            // 跳页中位（单页档 = 页 0；多页档真跳）。
+            let mid = (pages - 1) / 2;
+            if mid > 0 {
+                cx.update(|app| view.update(app, |v, _| v.scroll_to_page(mid)));
+                pump_ready(
+                    cx,
+                    &mut visual,
+                    &view,
+                    30,
+                    &format!("{name} 跳页 {mid}"),
+                    |v| v.top_visible_page() == mid && v.page_ready_for_test(mid),
+                );
+            }
+            // 缩放步进换档重渲 + 预算不变量。
+            cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+            pump_ready(
+                cx,
+                &mut visual,
+                &view,
+                30,
+                &format!("{name} 缩放档"),
+                |v| v.page_ready_for_test(mid.min(v.page_count() - 1)),
+            );
+            let (used, _entries) = view.read_with(&visual, |v, _| v.cache_stats_for_test());
+            assert!(
+                used <= crate::pdf_pages::CACHE_BUDGET_BYTES,
+                "{name}：缓存 {used}B 越预算"
+            );
+            // 真关窗（工人收束——同测试 2 关闭口径）。
+            visual.update(|window, _| window.remove_window());
+            drop(visual);
+            drop(view);
+            healthy += 1;
+            eprintln!("#51 D5 ✓ {name}：{pages} 页，首屏 + 跳页 {mid} + 缩放档 + 预算全过");
+            continue;
+        };
+        // 坏档 / 缺库：typed error（区分坏档与全档失败——缺库即 SKIP 全测）。
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "产品验收扫描");
+            return;
+        }
+        assert!(
+            name.starts_with("damaged"),
+            "{name} 非坏档不该 error 态：{err}"
+        );
+        assert!(!err.is_empty(), "{name}：坏档错误信息非空（typed 拒绝）");
+        broken += 1;
+        eprintln!("#51 D5 ✓ {name}：typed error 态（面板明示面在健壮性测试锚定）");
+    }
+    assert_eq!(healthy + broken, 15, "15 夹具全覆盖");
+    eprintln!("#51 D5 ✓ 产品验收扫描：{healthy} 正常档全链 + {broken} 坏档 typed 态 / 15 夹具");
+}
+
+// ---------------------------------------------------------------------------
 // #51 D3 尾巴（批次 D3b）：旧任务不覆写新页/新文档 + 缓存键与产物一致
 // ---------------------------------------------------------------------------
 
