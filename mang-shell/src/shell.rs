@@ -5954,6 +5954,198 @@ mod pdf_search_wiring_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #51 D4c 接线面：**旋转/CropBox 档批注命中与保存重开**（视图级
+    /// 全链）——真鼠标管线（右键拖框）→ 控制器写链（旋转/CropBox 变
+    /// 换单元面已在 pdf_annotate_e2e 锚定；本测补**视图级命中链**：
+    /// 探针命中域 → finish_drag → commit → flush → rev 换代重渲）→
+    /// save_annotations 落盘（磁盘 /Highlight 面在位）→ 重开渲染成功。
+    /// 夹具双档：rotated_90.pdf（旋转页）+ cropbox_offset.pdf（偏移
+    /// CropBox letterbox 档）。
+    #[gpui::test]
+    fn pdf_view_right_drag_annotate_rotated_and_cropbox(cx: &mut gpui::TestAppContext) {
+        for name in ["rotated_90.pdf", "cropbox_offset.pdf"] {
+            let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/display_corpus")
+                .join(name);
+            let bytes =
+                std::fs::read(&corpus).unwrap_or_else(|e| panic!("语料不可读（{name}）：{e}"));
+            let dir = std::env::temp_dir().join(format!("mdc-d4c-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let pdf = dir.join("t.pdf");
+            std::fs::write(&pdf, bytes.clone());
+
+            cx.update(|app| {
+                theme::init(theme::LoadThemes::JustBase, app);
+                theme::set_theme_settings_provider(
+                    Box::new(crate::settings::ShellThemeSettings),
+                    app,
+                );
+            });
+            let mut slot: Option<Entity<ShellApp>> = None;
+            let window = cx.add_window(|window, cx| {
+                let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+                slot = Some(shell.clone());
+                WiringHost(shell)
+            });
+            let shell = slot.expect("宿主构造即置");
+            window.update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(pdf.clone(), window, cx);
+                });
+            });
+            let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+            let Some(view) = view else {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4c {name} 批注链 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            };
+            let any: gpui::AnyWindowHandle = window.clone().into();
+            let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+            let pump = |cx: &mut gpui::TestAppContext,
+                        visual: &mut gpui::VisualTestContext,
+                        view: &Entity<PdfPagesView>,
+                        what: &str,
+                        ready: &dyn Fn(&PdfPagesView) -> bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    cx.background_executor
+                        .advance_clock(std::time::Duration::from_millis(20));
+                    cx.background_executor.run_until_parked();
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    visual.update(|window, app| window.draw(app).clear(app));
+                    if view.read_with(visual, |v, _| ready(v)) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{name}：{what} 泵超时（真缺陷不放过）"
+                    );
+                }
+            };
+            pump(cx, &mut visual, &view, "首屏", &|v| {
+                v.page_ready_for_test(0)
+            });
+            let bytes_before = view.read_with(&visual, |v, _| v.bytes());
+
+            // ① 真右键拖框（探针命中域 → drag_start → finish → 三手势
+            //    默认 Highlight → commit 真写链）。
+            let b = visual
+                .debug_bounds("pdf-visible-page-0")
+                .expect("页 0 槽真实渲染");
+            let (bx, by, bw, bh) = (
+                f32::from(b.origin.x),
+                f32::from(b.origin.y),
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+            );
+            let pt = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Right,
+                        position: pt(bx + bw * 0.30, by + bh * 0.30),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .expect("右键按下");
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Right,
+                        position: pt(bx + bw * 0.60, by + bh * 0.50),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("右键松开");
+            // ② flush 换代重渲（rev 推进 + 新 rev 位图就绪 + 脏标）。
+            pump(cx, &mut visual, &view, "换代重渲", &|v| {
+                v.annotate_rev_for_test() == 1 && v.page_ready_for_test(0)
+            });
+            assert!(
+                view.read_with(&visual, |v, _| v.is_dirty()),
+                "批注后脏标在位"
+            );
+            let bytes_after = view.read_with(&visual, |v, _| v.bytes());
+            assert!(
+                bytes_after.len() > bytes_before.len(),
+                "{name}：flush 后字节追加（增量写链真实发生）"
+            );
+            assert_eq!(
+                view.read_with(&visual, |v, _| v.cache_rev_families_for_test()),
+                vec![1u64],
+                "{name}：换代后缓存 rev 族只剩新 rev（D3b 语义在此复验）"
+            );
+            eprintln!("#51 D4c ✓ {name}：右键拖框 → flush 换代 → 新 rev 重渲");
+
+            // ③ 落盘（save_annotations 增量写——前缀保持）+ 磁盘面在位。
+            let saved = window
+                .update(cx, |_host, _window, cx| {
+                    view.update(cx, |v, _| v.save_annotations(&pdf))
+                })
+                .expect("保存调用");
+            let stats = saved
+                .expect("保存成功（真 pdfium 增量写链）")
+                .expect("有未落盘批注（脏标在位）");
+            // 既有语义：commit 内 flush 已追加（内存产物）→ save = 零脏
+            // 幂等写盘（零追加——不产生空修订；e2e 语义锚定沿用）。
+            assert_eq!(
+                stats.bytes_appended, 0,
+                "{name}：已 flush 后 save = 零脏幂等（追加发生在 commit 的 flush）"
+            );
+            let disk = std::fs::read(&pdf).expect("磁盘产物可读");
+            let marker: &[u8] = b"/Highlight";
+            assert!(
+                disk.windows(marker.len()).any(|w| w == marker),
+                "{name}：磁盘 /Highlight 面在位（保存重开的物证）"
+            );
+            assert!(
+                disk.starts_with(bytes.as_slice()),
+                "{name}：产物 = 原字节逐位前缀（增量语义）"
+            );
+            eprintln!(
+                "#51 D4c ✓ {name}：落盘 {}B 追加（前缀保持 + /Highlight 在位）",
+                stats.bytes_appended
+            );
+
+            // ④ 关标签重开（保存重开）：磁盘字节新会话渲染成功。
+            window.update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.close_tab_no_confirm(0, window, cx);
+                });
+            });
+            window.update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(pdf.clone(), window, cx);
+                });
+            });
+            let view2 = cx
+                .read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()))
+                .expect("重开实体");
+            pump(cx, &mut visual, &view2, "重开首屏", &|v| {
+                v.page_ready_for_test(0)
+            });
+            eprintln!("#51 D4c ✓ {name}：保存重开渲染成功（批注字节新会话）");
+
+            // 清场：本档窗口/实体随循环丢弃（下一档新窗口）。
+            drop(visual);
+            window.update(cx, |_, window, _| window.remove_window());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// WiringHost 整树 + md 标签窗口（#47 A4 查找框焦点链——md 面）。
     fn md_wiring_window(
         cx: &mut gpui::TestAppContext,
