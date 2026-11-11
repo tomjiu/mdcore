@@ -24,6 +24,17 @@
 //!    坏文件视图 error 态明示（不白屏不 panic）；多视图并存快速切换/
 //!    关闭后回来（多会话互不锁死）；超常尺寸页正常渲染（2000×2800pt）。
 //!
+//! # D3 尾巴（#51 工作线 D——批次 D3b）：
+//!
+//! 4. [`render_lifecycle_reload_epoch_no_crosswrite`]：**旧任务不覆写
+//!    新页/新文档**——批注 flush 换代瞬间的在飞作业处理链（pending 清零
+//!    + 工人换代 + 旧 rev 缓存即时回收 + rev 随行守卫纵深）；
+//! 5. [`render_lifecycle_cache_key_product_consistency`]：**缓存键与
+//!    产物一致**——RenderKey (width, height, rev) 与所存位图帧实测尺寸
+//!    逐项相等（跨两个缩放宽族的合成断言面）；
+//! 6. [`render_lifecycle_flush_isolation_between_tabs`]：**跨实体 flush
+//!    隔离**——A 标签批注换代不触 B 标签（B 的 rev 族/就绪态零扰动）。
+//!
 //! 参照语义要点（语料构建实测的跨引擎差异，已在校准吸收）：
 //! - poppler CLI 默认渲染 MediaBox、PDFium 默认 CropBox——参照命令
 //!   固化 `-cropbox`；
@@ -1246,4 +1257,247 @@ fn robustness_damaged_oversized_multi_tab(cx: &mut gpui::TestAppContext) {
         v.page_ready_for_test(0)
     });
     eprintln!("#634 健壮 ✓ 超常尺寸页（2000×2800pt）首屏位图就绪");
+}
+
+// ---------------------------------------------------------------------------
+// #51 D3 尾巴（批次 D3b）：旧任务不覆写新页/新文档 + 缓存键与产物一致
+// ---------------------------------------------------------------------------
+
+/// **D3b-1：批注 flush 换代瞬间的在飞作业处理链**——「旧任务不覆写
+/// 新页/新文档」的全链断言：
+///
+/// 1. 首屏就绪（rev 0 位图在缓存）；
+/// 2. 缩放换档制造在飞作业（pending 非空）；
+/// 3. **在飞期间提交批注**（commit_annotation 真路径——控制器写入 +
+///    flush + reload_after_flush 换代）；
+/// 4. 断言换代即刻：pending 清零、failed 清零、annotate_rev 推进、
+///    **缓存 rev 族只剩新 rev**（旧 rev 条目 invalidate_stale_revisions
+///    即时回收——预算即刻归位）；
+/// 5. 新 rev 位图经新工人重光栅就绪（迟到旧回执机械丢弃——rev 随行
+///    守卫的纵深面由 pending 清零 + 工人换代双保险）。
+#[gpui::test]
+fn render_lifecycle_reload_epoch_no_crosswrite(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = fixture_bytes("mixed_features.pdf");
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "换代不覆写");
+            return;
+        }
+        panic!("smoke 夹具打开失败：{err}");
+    }
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "D3b 首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.annotate_rev_for_test()),
+        0,
+        "基线 rev = 0（未 flush）"
+    );
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.cache_rev_families_for_test()),
+        vec![0u64],
+        "首屏位图落 rev 0 键"
+    );
+
+    // ① 制造在飞作业：缩放步进一档（新宽未缓存）——draw 同帧提交
+    //    （submit_visible 在 render 期同步派单；不推时钟 → 无轮询
+    //    drain，在飞面完整保留到换代瞬间）。
+    cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+    visual.update(|window, app| window.draw(app).clear(app));
+    let in_flight = view.read_with(&visual, |v, _| v.pending_widths_for_test());
+    assert!(
+        !in_flight.is_empty(),
+        "前置：换档后必须有在飞作业（本批测的就是在飞期换代）"
+    );
+
+    // ② 在飞期间提交批注（真写路径：open_scan + 写器门 + 坐标变换 +
+    //    增量 flush + reload_after_flush）。页 0 槽内 100,100→200,160
+    //    矩形——高亮工具（默认）。
+    cx.update(|app| view.update(app, |v, _| v.commit_annotation(0, 100., 100., 200., 160.)))
+        .expect("批注提交（真 pdfium 写链）");
+
+    // ③ 换代即刻断言：旧工人退役、在飞清零、旧 rev 缓存即时回收。
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.pending_widths_for_test()),
+        Vec::<u32>::new(),
+        "flush 换代必须清 pending（旧工人回执不再落地——不落错键）"
+    );
+    let rev = view.read_with(&visual, |v, _| v.annotate_rev_for_test());
+    assert_eq!(rev, 1, "flush 推进 annotate_rev（RenderKey 键控源）");
+    // 换代即刻缓存 rev 族**不含旧 rev**（invalidate_stale_revisions 即时
+    // 回收——预算归位；此刻新 rev 位图尚未重光栅，族可能为空或仅新
+    // rev——「无旧 rev 残留」即达标，迟到旧任务回执无处可落）。
+    let families = view.read_with(&visual, |v, _| v.cache_rev_families_for_test());
+    assert!(
+        families.iter().all(|&r| r >= rev),
+        "旧 rev 条目必须即时回收（实得族 {families:?}——新 rev {rev} 之前\
+         的任何残留都是换代失效缺口）"
+    );
+    assert!(
+        view.read_with(&visual, |v, _| v.is_dirty()),
+        "flush 后内存已新而盘未落——脏标在位（#386 语义）"
+    );
+
+    // ④ 新 rev 位图经新工人重光栅就绪（迟到旧回执被机械丢弃，当前键
+    //    由新派单填充）。
+    pump_ready(cx, &mut visual, &view, 30, "新 rev 重光栅", |v| {
+        v.page_ready_for_test(0)
+    });
+    assert_eq!(
+        view.read_with(&visual, |v, _| v.cache_rev_families_for_test()),
+        vec![rev],
+        "重光栅落新 rev 键（页/宽/rev 与产物一致）"
+    );
+    eprintln!(
+        "#51 D3b ✓ 换代不覆写：在飞 {} 项 → flush 后 pending 0 / 缓存 rev 族 [{}] / 新 rev 位图就绪",
+        in_flight.len(),
+        rev
+    );
+}
+
+/// **D3b-2：缓存键与产物一致**——RenderKey 的 (width_px, height_px)
+/// 必须与所存位图帧实测尺寸逐项相等。跨两个缩放宽族（576 → 640 档）
+/// 合成断言：任何一处键-产物背离都会以 (键宽, 键高, 图宽, 图高)
+/// 元组暴露。
+#[gpui::test]
+fn render_lifecycle_cache_key_product_consistency(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let bytes = fixture_bytes("long_doc_120p.pdf");
+    let view = cx.update(|app| app.new(|cx| PdfPagesView::new(bytes.clone(), cx)));
+    if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+        if is_missing_library_error(&err) {
+            missing_guard(&err, "键产物一致");
+            return;
+        }
+        panic!("百页夹具打开失败：{err}");
+    }
+    let window = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view = view.clone();
+        move |_, _| PagesHost(view)
+    });
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual, &view, 30, "键产物首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    assert!(
+        view.read_with(&visual, |v, _| v.cache_key_product_mismatches_for_test())
+            .is_empty(),
+        "宽族 1：键 (宽, 高) 必须与位图帧尺寸逐项相等"
+    );
+    let family1 = view.read_with(&visual, |v, _| v.cache_widths_for_test());
+
+    // 第二宽族：Ctrl+1 实际大小（576 → 640 换档）——两族并存后同断言。
+    cx.update(|app| view.update(app, |v, cx| v.dispatch_zoom_key("1", true, false, cx)));
+    pump_ready(cx, &mut visual, &view, 30, "键产物换档", |v| {
+        v.page_ready_for_test(0)
+    });
+    let family2 = view.read_with(&visual, |v, _| v.cache_widths_for_test());
+    assert!(
+        family2.len() >= family1.len(),
+        "换档后缓存宽族只增不减（LRU 语义）"
+    );
+    assert!(
+        view.read_with(&visual, |v, _| v.cache_key_product_mismatches_for_test())
+            .is_empty(),
+        "宽族 2 并存后：键-产物仍逐项相等（键控缓存基本契约）"
+    );
+    let (used, entries) = view.read_with(&visual, |v, _| v.cache_stats_for_test());
+    assert!(
+        used <= crate::pdf_pages::CACHE_BUDGET_BYTES,
+        "双宽族预算不变量"
+    );
+    eprintln!("#51 D3b ✓ 键-产物一致：双宽族 {entries} 条零背离（预算 {used}B）");
+}
+
+/// **D3b-3：跨实体 flush 隔离**——A 标签批注换代（pending 清零 / 工人
+/// 换代 / 缓存失效）不得扰动 B 标签：B 的 rev 族不动、就绪态不破坏、
+/// B 自身后续操作照常。多标签场景下「旧任务不覆写新文档」的实体边界
+/// 断言（多标签并发/关闭面在健壮性测试 3 覆盖——本测补 rev/缓存角）。
+#[gpui::test]
+fn render_lifecycle_flush_isolation_between_tabs(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| {
+        theme::init(theme::LoadThemes::JustBase, app);
+        theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+    });
+    let view_a =
+        cx.update(|app| app.new(|cx| PdfPagesView::new(fixture_bytes("mixed_features.pdf"), cx)));
+    let view_b =
+        cx.update(|app| app.new(|cx| PdfPagesView::new(fixture_bytes("scanned_page.pdf"), cx)));
+    for view in [&view_a, &view_b] {
+        if let Some(err) = view.read_with(cx, |v, _| v.error_for_test()) {
+            if is_missing_library_error(&err) {
+                missing_guard(&err, "flush 跨实体隔离");
+                return;
+            }
+            panic!("双文档打开失败：{err}");
+        }
+    }
+    let window_a = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view_a = view_a.clone();
+        move |_, _| PagesHost(view_a)
+    });
+    let mut visual_a = gpui::VisualTestContext::from_window(window_a.into(), cx);
+    let window_b = cx.open_window(gpui::size(gpui::px(600.), gpui::px(480.)), {
+        let view_b = view_b.clone();
+        move |_, _| PagesHost(view_b)
+    });
+    let mut visual_b = gpui::VisualTestContext::from_window(window_b.into(), cx);
+    visual_a.update(|window, app| window.draw(app).clear(app));
+    visual_b.update(|window, app| window.draw(app).clear(app));
+    pump_ready(cx, &mut visual_a, &view_a, 30, "A 首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    pump_ready(cx, &mut visual_b, &view_b, 30, "B 首屏", |v| {
+        v.page_ready_for_test(0)
+    });
+    let (b_rev, mut b_widths) = (
+        view_b.read_with(&visual_b, |v, _| v.annotate_rev_for_test()),
+        view_b.read_with(&visual_b, |v, _| v.cache_widths_for_test()),
+    );
+    b_widths.sort_unstable();
+
+    // A 批注换代（真写链）——B 的键面必须零扰动。
+    cx.update(|app| view_a.update(app, |v, _| v.commit_annotation(0, 100., 100., 200., 160.)))
+        .expect("A 标签批注提交");
+    assert_eq!(
+        view_a.read_with(&visual_a, |v, _| v.annotate_rev_for_test()),
+        1
+    );
+    assert_eq!(
+        view_b.read_with(&visual_b, |v, _| v.annotate_rev_for_test()),
+        b_rev,
+        "B 的 rev 镜像不受 A 的 flush 推进影响"
+    );
+    let mut b_widths_after = view_b.read_with(&visual_b, |v, _| v.cache_widths_for_test());
+    b_widths_after.sort_unstable();
+    assert_eq!(
+        b_widths_after, b_widths,
+        "B 的缓存键面不受 A 的换代失效影响"
+    );
+    assert!(
+        view_b.read_with(&visual_b, |v, _| v.page_ready_for_test(0)),
+        "B 首屏位图仍然命中（A 换代未废 B 的产物）"
+    );
+
+    // B 后续操作照常（隔离后可用性）。
+    cx.update(|app| view_b.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx)));
+    pump_ready(cx, &mut visual_b, &view_b, 30, "B 换档", |v| {
+        v.page_ready_for_test(0)
+    });
+    eprintln!("#51 D3b ✓ 跨实体 flush 隔离：A 换代 rev 1，B rev/缓存/就绪零扰动");
 }
