@@ -26,10 +26,12 @@
 #   PKG_CONFIG_PATH  ②的 .pc 面（zed 闭包个别 build script 用）
 #   MDC_PDFIUM_LIB   ③的引擎指路
 #   PATH             ④/⑤ 的工具面
-#   CARGO_PROFILE_DEV_DEBUG=0 / CARGO_PROFILE_TEST_DEBUG=0
-#     磁盘纪律（ai-bid 同口径）：debuginfo 关闭后链接产物 ~40MB vs ~300MB；
-#     9.9G 盘装得下全树测试。开着 debuginfo 链接第 ~30 个测试二进制即
-#     Bus error/ENOSPC（实测教训）。
+#   CARGO_PROFILE_DEV_DEBUG=0 / CARGO_PROFILE_TEST_DEBUG=0 / CARGO_INCREMENTAL=0
+#     磁盘纪律（ai-bid 同口径 + 本仓补遗）：debuginfo 关闭后链接产物
+#     ~40MB vs ~300MB；**增量目录单独即可打满盘**（2026-11-11 实测：
+#     DEBUG=0 全开但无 INCREMENTAL=0 时 target/debug/incremental/ 仍
+#     ENOSPC——两开关必须并用）；开着 debuginfo 链接第 ~30 个测试二进制
+#     即 Bus error/ENOSPC（实测教训）。
 #
 # 四条门的对照（2026-11-11 裸沙箱实测，2 核沙箱）：
 #   cargo test -p mdshell --test r24_packaging   ①即可，~30s
@@ -58,6 +60,7 @@ SOURCED=0
 
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_INCREMENTAL=0
 
 # ---- ① Rust 工具链（pin 解析自 rust-toolchain.toml，不硬编码）------------
 if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
@@ -182,7 +185,7 @@ export LIBRARY_PATH="$SYSLIBS/root/usr/lib/x86_64-linux-gnu\${LIBRARY_PATH:+:\$L
 export LD_LIBRARY_PATH="$SYSLIBS/root/usr/lib/x86_64-linux-gnu\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export PKG_CONFIG_PATH="$SYSLIBS/root/usr/lib/x86_64-linux-gnu/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}"
 export MDC_PDFIUM_LIB="$PDFIUM_DIR/lib/libpdfium.so"
-export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 ENVECHO
 )
 if [ "$SOURCED" = 1 ]; then
