@@ -881,6 +881,65 @@ impl WorkerState {
         Ok(json!({"part": part}))
     }
 
+    /// 导出 PDF（LOK saveAs(url, "pdf", typed options)——暗标导出线 /
+    /// #52 分发验收的参数化面；options 形态循 ely-lok `save.rs` 同源
+    /// typed JSON：`{type, value}` 包裹，LO PDF 过滤器契约）。
+    /// 源文件守卫与 save_as 同拍（导出目标不得别名源文件）。
+    fn op_export_pdf(
+        &mut self,
+        url: &str,
+        from: Option<u32>,
+        to: Option<u32>,
+        notes_in_margin: bool,
+        tracked_changes: bool,
+    ) -> DispatchResult {
+        unsafe {
+            self.doc_guard(abi::doc_offsets::SAVE_AS, "saveAs")?;
+            crate::save_guard::check(&self.loaded_url, url)
+                .map_err(|message| (codes::SAVE, message))?;
+            let f = (*self.doc_class)
+                .save_as
+                .ok_or((codes::MEMBER, "缺 saveAs".to_string()))?;
+            let url_c = CString::new(url).map_err(|_| (codes::BAD_REQUEST, "url 含 NUL".into()))?;
+            let fmt_c =
+                CString::new("pdf").map_err(|_| (codes::BAD_REQUEST, "format 含 NUL".into()))?;
+            let flag = |on: bool| json!({"type": "boolean", "value": on.to_string()});
+            let mut options = json!({
+                "ExportNotes": flag(false),
+                "ExportNotesInMargin": flag(notes_in_margin),
+                "ExportTrackedChanges": flag(tracked_changes),
+            });
+            if let (Some(from), Some(to)) = (from, to) {
+                if from == 0 || to == 0 || from > to {
+                    return Err((
+                        codes::BAD_REQUEST,
+                        format!("页范围必须 1 起且 from ≤ to：{from}-{to}"),
+                    ));
+                }
+                options["PageRange"] = json!({"type": "string", "value": format!("{from}-{to}")});
+            }
+            let opts_c = CString::new(options.to_string())
+                .map_err(|_| (codes::BAD_REQUEST, "options 含 NUL".into()))?;
+            let ok = f(self.doc, url_c.as_ptr(), fmt_c.as_ptr(), opts_c.as_ptr());
+            if ok != 1 {
+                let why = self.kit_error_text().unwrap_or_default();
+                return Err((
+                    codes::SAVE,
+                    format!("导出 PDF 失败：{why}；url={url}（range={from:?}-{to:?}）"),
+                ));
+            }
+        }
+        Ok(json!({
+            "exported": true,
+            "url": url,
+            "format": "pdf",
+            "page_from": from,
+            "page_to": to,
+            "notes_in_margin": notes_in_margin,
+            "tracked_changes": tracked_changes,
+        }))
+    }
+
     /// close（单文档 worker：**不调用 LO destroy**——LO 25.2 实测：销毁带
     /// doc 级回调的文档在内核 teardown 路径 SalAbort 直退（C++ 对照实验
     /// 2026-11-09：无 doc 回调时 destroy 干净，有则必 SalAbort；setTextSelection
@@ -1318,6 +1377,27 @@ fn dispatch(state: &mut WorkerState, op: &str, v: &Value) -> DispatchResult {
             let part = protocol::req_i32(v, "part")
                 .ok_or((codes::BAD_REQUEST, "set_part 需要 part".to_string()))?;
             state.op_set_part(part)
+        }
+        "export_pdf" => {
+            let url = protocol::req_str(v, "url")
+                .ok_or((codes::BAD_REQUEST, "export_pdf 需要 url".to_string()))?;
+            let from = protocol::req_u64(v, "page_from").and_then(|x| u32::try_from(x).ok());
+            let to = protocol::req_u64(v, "page_to").and_then(|x| u32::try_from(x).ok());
+            if v.get("page_from").is_some() != v.get("page_to").is_some() {
+                return Err((
+                    codes::BAD_REQUEST,
+                    "page_from/page_to 必须成对出现".to_string(),
+                ));
+            }
+            let notes = v
+                .get("notes_in_margin")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let changes = v
+                .get("tracked_changes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            state.op_export_pdf(&url, from, to, notes, changes)
         }
         "shutdown" => {
             let _ = state.op_close();

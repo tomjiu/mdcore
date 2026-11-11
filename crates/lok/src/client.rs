@@ -757,6 +757,30 @@ impl<'a> DocHandle<'a> {
         r
     }
 
+    /// 导出 PDF（LOK saveAs(url, "pdf", typed options)；详见 B2 契约文档
+    /// §7。`page_range = Some((from, to))` 1 起含端，None=全文；
+    /// `notes_in_margin` 批注边栏；`tracked_changes` 修订标记。
+    /// 非变更类：dirty 不动（产物是新文件，不改文档状态）。
+    pub fn export_pdf(
+        &self,
+        url: &str,
+        page_range: Option<(u32, u32)>,
+        notes_in_margin: bool,
+        tracked_changes: bool,
+    ) -> Result<Value, LokError> {
+        crate::save_guard::check(&self.loaded_url, url).map_err(LokError::Protocol)?;
+        let mut a = json!({
+            "url": url,
+            "notes_in_margin": notes_in_margin,
+            "tracked_changes": tracked_changes,
+        });
+        if let Some((from, to)) = page_range {
+            a["page_from"] = json!(from);
+            a["page_to"] = json!(to);
+        }
+        self.client.request("export_pdf", a)
+    }
+
     pub fn close(&self) -> Result<Value, LokError> {
         self.client.request("close", json!({}))
     }
@@ -1029,6 +1053,30 @@ impl DocSession {
         self.dirty = false;
         self.revision += 1;
         Ok(r)
+    }
+
+    /// 导出 PDF（LOK saveAs(url, "pdf", typed options)；B2 契约面——
+    /// 暗标导出线消费面）。`page_range = Some((from, to))` 1 起含端，
+    /// None=全文；`notes_in_margin` 批注边栏；`tracked_changes` 修订标记。
+    /// 非变更类：dirty/revision 不动（产物是新文件，不改文档状态）。
+    pub fn export_pdf(
+        &self,
+        url: &str,
+        page_range: Option<(u32, u32)>,
+        notes_in_margin: bool,
+        tracked_changes: bool,
+    ) -> Result<Value, LokError> {
+        crate::save_guard::check(&self.loaded_url, url).map_err(LokError::Protocol)?;
+        let mut a = json!({
+            "url": url,
+            "notes_in_margin": notes_in_margin,
+            "tracked_changes": tracked_changes,
+        });
+        if let Some((from, to)) = page_range {
+            a["page_from"] = json!(from);
+            a["page_to"] = json!(to);
+        }
+        self.client.request("export_pdf", a)
     }
 
     /// 逻辑关闭（单文档 worker：close 后本会话 doc 请求明确
