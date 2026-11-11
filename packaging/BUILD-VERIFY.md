@@ -182,6 +182,10 @@ python packaging/nsis/build-installer.py
 - **本地（Linux，Debian nsis 3.11 + NSISDIR 指路）**：stub 载荷全链绿
   ——版本提取 0.1.0 → staging → 渲染（占位符零残留）→ makensis 编译 →
   产物 `mdcore-setup-0.1.0.exe`（109,192 B，stub）+ SHA256；
+  **#143 后**：注册表面 per-user 全 HKCU + 礼貌类型注册——结构钉子
+  `packaging/tests/test_ns_polite_registration.py` 18 项（Linux 已跑
+  全绿，含渲染产物断言与 makensis 编译面）；产物尺寸随礼貌注册面
+  增长（#143 实测 109,720 B，stub）
 - **CI（`windows-installer.yml`）**：release 构建、独立发行缓存，产
   `windows-installer-release`；最终 NSIS 先经 7-Zip 解包并与 staging
   比对 exe/DLL 哈希，再搬到 checkout 外的临时目录，隐藏
@@ -189,9 +193,11 @@ python packaging/nsis/build-installer.py
   `portable-smoke/report.json` 记录窗口 HWND/响应、版本/head、退出码；
   启动失败阻止安装包上传，失败日志仍作为独立 artifact 保留；
 - **待 Lead Windows 实机复核清单**：安装/卸载走查；注册表
-  `DisplayName=mang` / `DisplayVersion=<版本>` / `InstallDir`；开始菜单
-  快捷方式；.md 关联；安装后自检弹窗（拔掉 `pdfium.dll` 复跑安装应见
-  告警而非静默）。
+  `DisplayName=mang` / `DisplayVersion=<版本>` / `InstallDir`（**#143
+  起全部在 HKCU**，验证时用 `reg query` 查 `HKCU\...`，不再查
+  HKLM）；开始菜单快捷方式；.md 关联（**礼貌面**：预装第三方关联
+  应保持不动，详见 checklist D2a）；安装后自检弹窗（拔掉
+  `pdfium.dll` 复跑安装应见告警而非静默）。
 
 ### 登记边界（诚实面）
 

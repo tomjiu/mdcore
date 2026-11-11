@@ -52,7 +52,18 @@
 - [ ] D2 Windows：NSIS 安装/卸载注册表面（开始菜单快捷方式 + 默认程序
       注册 + 安装后 pdfium 部署自检 `--check-pdfium` 冒烟——#228 起
       安装包捆载 pdfium.dll 并复用 #224 自检；WebView2 面已随主线壳
-      mang-shell 的 GPU 自绘（DirectX 后端）架构移除）
+      mang-shell 的 GPU 自绘（DirectX 后端）架构移除；
+      **#143 起注册表面为 per-user 全 HKCU + 礼貌类型注册**——安装
+      免管理员、.md 只在无现有处理程序时接管、进「默认应用」列表
+      而不强制接管；结构面钉子 =
+      `packaging/tests/test_ns_polite_registration.py`（18 项，Linux/Win
+      双平台），编译面 = makensis 3.11（BUILD-VERIFY §3 口径））
+- [ ] D2a R24-d 预装关联验证（#143 登记，真机窗口执行）：装前设
+      `.md` = 别的程序（reg 写入第三方 progid）→ 安装后 .md 关联
+      **不动**（保留用户选择）；干净机安装 → .md 归本程序且「新建」
+      菜单含空 Markdown 项；安装后在 Windows「默认应用」列表可见
+      mang；换文件夹重装 → 运行旧目录 uninstall.exe 只清旧目录、
+      新安装完好；卸载 → .md 关联仅当仍指向本程序时清理
 - [ ] D3 macOS：Info.plist 文档类型（.md）+ URL scheme（mdcore://）声明，
       Gatekeeper 冒烟（未签名时的用户引导文案）
 
