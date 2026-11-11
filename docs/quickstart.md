@@ -8,24 +8,34 @@
 ### 1.1 Linux（开发主环境）
 
 ```bash
+# 一条命令自愈（推荐——沙箱/无 root 环境唯一路径）：
+#   覆盖 ①rustup+仓 pin 工具链 ②mang-shell 链接系库（xkbcommon/-x11，
+#   免 root apt download + dpkg -x）③pdfium（MDC_PDFIUM_LIB）；
+#   --with-mingw 加 Windows 交叉检查链，--with-nsis 加 NSIS 打包验证链。
+#   幂等（每步先探测已在位）；导出面 = LIBRARY_PATH/LD_LIBRARY_PATH/
+#   PKG_CONFIG_PATH/MDC_PDFIUM_LIB/磁盘纪律 CARGO_PROFILE_*_DEBUG=0。
+bash scripts/rust-env.sh                 # 或 source 进当前 shell
+bash scripts/rust-env.sh --with-mingw --with-nsis   # 全四门
+
+# 手工路径（有 root 的常规桌面仍可用；下面两组依赖对应两个壳）：
 # Rust 工具链（仓内 rust-toolchain.toml 钉 1.99.0——进仓自动装，含 wasm32/clippy/rustfmt）
 curl -sSfL https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init
 chmod +x /tmp/rustup-init && /tmp/rustup-init -y --default-toolchain none --profile minimal --no-modify-path
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# 桌面壳系统依赖（GTK3 + WebKitGTK 4.1——mdshell-native 链接面）
-# Debian/Ubuntu：
-sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
-# Fedora：sudo dnf install gtk3-devel webkit2gtk4.1-devel pkgconf-pkg-config
-# Arch：sudo pacman -S gtk3 webkit2gtk-4.1 pkgconf
+# 桌面壳系统依赖——主线壳 mang-shell（GPUI 自绘，DirectX 后端系）：
+sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+# 旧壳 mdshell-native（Linux GTK 面，不随主线发行）链接面：
+# Debian/Ubuntu：sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
 
 # web 面依赖
 # node >= 18 / npm；python3 >= 3.10 + playwright（chromium）
 python3 -m pip install playwright && python3 -m playwright install chromium
 ```
 
-受限/离线环境备选：仓外 optroot 提取树（pkg-config/ld/GI 四面前置叠加）
-可替代系统安装——`source optroot/env.sh` 后同下。
+受限/离线环境备选：`scripts/rust-env.sh` 的 ② 即为免 root 的同类方案
+（apt download + dpkg -x 解包树 + 环境变量导出）；旧 optroot 口径
+（`source optroot/env.sh`）仍可用，两者取一。
 
 ### 1.2 Windows（CI 口径——本地开发同此）
 
