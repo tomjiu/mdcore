@@ -183,6 +183,10 @@ pub struct ShellApp {
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
     /// 左条设置钮/菜单「设置」打开，Esc/点遮罩/关闭钮关闭）。
     settings_open: bool,
+    /// #51 D4b：pdf 页视图状态快照（路径 → （缩放档, 顶部页）——切
+    /// 标签重建实体时保留/回放：「当前页与缩放状态一致」——回来还在
+    /// 原页原档，不从首页 FitWidth 重来）。
+    pdf_view_snapshots: std::collections::HashMap<PathBuf, (crate::pdf_pages::ZoomMode, usize)>,
     /// #289-④：pdf 页面视图（当前 pdf 标签的位图渲染实体 + 归属路径
     /// ——切到不同 pdf 标签时重建；关闭该标签时丢弃）。
     pdf_pages: Option<(PathBuf, Entity<PdfPagesView>)>,
@@ -466,6 +470,7 @@ impl ShellApp {
             ocr_rx: None,
             ocr_polling: false,
             pdf_view_mode: true,
+            pdf_view_snapshots: std::collections::HashMap::new(),
             docx_pages: None,
             docx_view_mode: true,
             xlsx_grid: None,
@@ -1077,10 +1082,16 @@ impl ShellApp {
             return;
         }
         let path = tab.path.clone();
-        if let Some((owned, _)) = &self.pdf_pages {
-            if *owned == path {
-                return;
+        match self.pdf_pages.as_ref().map(|(owned, _)| *owned == path) {
+            Some(true) => return, // 同路径实体已在位——无操作。
+            Some(false) => {
+                // #51 D4b：让位前快照（缩放档 + 顶部页）——回来时回放，
+                // 「当前页与缩放状态一致」（不从首页 FitWidth 重来）。
+                let (old_path, old_view) = self.pdf_pages.take().expect("在位已判");
+                let snap = old_view.read(cx).snapshot();
+                self.pdf_view_snapshots.insert(old_path, snap);
             }
+            None => {}
         }
         // 读盘（pdf_doc::load 同源 100MB 前置门——超限不入页视图，
         // 文本模型不受影响）。
@@ -1101,6 +1112,16 @@ impl ShellApp {
             return;
         }
         let entity = cx.new(|cx| PdfPagesView::new(bytes, cx));
+        // #51 D4b：快照回放（同路径此前打开过——缩放档 + 跳回原页）。
+        if let Some((mode, page)) = self.pdf_view_snapshots.get(&path).copied() {
+            entity.update(cx, |v, _| v.restore_state(mode, page));
+        }
+        // #51 D4b：页码读数活更新订阅（页变化 emit → Shell 重渲——
+        // 状态栏「第 N / M 页」跟随滚动/跳页/缩放重排）。
+        cx.subscribe(&entity, |_, _, _: &crate::pdf_pages::PdfPagesEvent, cx| {
+            cx.notify();
+        })
+        .detach();
         self.pdf_pages = Some((path, entity.clone()));
         // #420：缩略图侧栏——与页视图同源字节/几何；error 态（缺
         // pdfium/引擎失败）不挂空壳。联动钩子：点击 → scroll_to_page；
@@ -1999,12 +2020,17 @@ impl ShellApp {
             return;
         }
         // #289-④：被关标签若持有页视图，一并丢弃（缓存随实体释放）。
+        // #51 D4b：丢弃前快照（重开同文件回到原页原档——关标签不丢
+        // 阅读位置）。
         let closed_path = self.tabs[idx].path.clone();
-        if let Some((owned, _)) = &self.pdf_pages {
-            if *owned == closed_path {
-                self.pdf_pages = None;
+        if let Some((owned, view)) = self.pdf_pages.take() {
+            if owned == closed_path {
+                let snap = view.read(cx).snapshot();
+                self.pdf_view_snapshots.insert(owned, snap);
                 // #420：侧栏与页视图同生命周期（同路径丢弃）。
                 self.pdf_thumbs = None;
+            } else {
+                self.pdf_pages = Some((owned, view)); // 非本标签——放回。
             }
         }
         // #389 阶段 1：网格视图同款生命周期（关标签丢弃）。
@@ -3530,6 +3556,22 @@ impl Render for ShellApp {
                         view.update(cx, |v, cx| v.open_search(window, cx));
                         return;
                     }
+                    // #51 D4：pdf 页面视图内复制——Ctrl+C（或用户换绑的
+                    // copy）把当前文本选择送剪贴板（左键拖选产物）。
+                    // 编辑器不在树内同上——查 keymap 编辑表换绑跟随；
+                    // 视图吞键与否自报（无选择不吞照常下沉，编辑器
+                    // Copy 语义零冲突——页面视图态编辑器不在场）。
+                    if let keymap::EditorOutcome::Matched(keymap::EditorAction::Copy) =
+                        editor_outcome
+                    {
+                        let mut copied = false;
+                        view.update(cx, |v, cx| {
+                            copied = v.copy_selection(cx);
+                        });
+                        if copied {
+                            return;
+                        }
+                    }
                 }
             }))
             .child(title_bar::title_bar(&title, &menus, self.menu_bar_open, cx))
@@ -3615,6 +3657,19 @@ impl Render for ShellApp {
                 self.pdf_view_mode,
                 self.xlsx_grid_view_mode,
                 self.docx_view_mode,
+                // #51 D4b：页面视图态的页码读数（页视图 top_visible_page
+                // 驱动——emit 订阅活更新；文本态 None 沿用编辑器光标
+                // 页表映射，零变化）。
+                self.pdf_view_mode
+                    .then(|| {
+                        self.pdf_pages.as_ref().and_then(|(_, e)| {
+                            let v = e.read(cx);
+                            (v.page_count() > 0).then(|| {
+                                format!("第 {} / {} 页", v.top_visible_page() + 1, v.page_count())
+                            })
+                        })
+                    })
+                    .flatten(),
                 cx,
             ))
             // G4：面板拖拽收尾钩（窗口级 mouseup——canvas paint 期每帧
@@ -5617,6 +5672,605 @@ mod pdf_search_wiring_tests {
             .expect("断言");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #51 D4 接线面：页面视图内**文本选择与复制**全链——真实鼠标管线
+    /// （按下 → 拖动 → 松开，平台事件派发）→ 选择层后台提取 → 选择文
+    /// 本就绪 → 真实键击管线 Ctrl+C（keymap E18 换绑跟随路由）→ 测试
+    /// 平台剪贴板读回逐字一致 → Esc 清选择。引擎门控同 Ctrl+F 测试。
+    #[gpui::test]
+    fn pdf_view_ctrl_c_copies_text_selection(cx: &mut gpui::TestAppContext) {
+        // 语料：mixed_features.pdf（D1 内容对照夹具——必有文本层）。
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/display_corpus/mixed_features.pdf");
+        let bytes = std::fs::read(&corpus).unwrap_or_else(|e| panic!("语料不可读（{e}）"));
+        let dir = std::env::temp_dir().join(format!("mdc-d4sel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("m.pdf");
+        std::fs::write(&pdf, bytes);
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf.clone(), window, cx);
+            });
+        });
+        let open_notice = window
+            .update(cx, |_host, _window, cx| {
+                shell.update(cx, |shell, _| {
+                    shell.notice_board.message().map(str::to_owned)
+                })
+            })
+            .expect("窗口更新");
+        let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view = match (view, open_notice) {
+            (None, Some(msg)) if msg.contains("libpdfium") => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4 选择复制 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            (None, other) => {
+                panic!("pdf 标签未开（夹具/真缺陷，非环境缺件）：{other:?}")
+            }
+            (Some(view), _) => view,
+        };
+
+        // ① 首屏位图就绪（真实渲染管线——泵同 pdf_display_verify 口径）。
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.page_ready_for_test(0)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4 首屏位图泵超时（真缺陷不放过）"
+            );
+        }
+
+        // ② 真实鼠标拖选：页 0 槽内横向拖选（debug_bounds 定位真实槽
+        // 几何——title bar 等树内偏移自然计入）。
+        let b = visual
+            .debug_bounds("pdf-visible-page-0")
+            .expect("页 0 槽真实渲染（debug_selector 观测面）");
+        let (bx, by, bw, bh) = (
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height),
+        );
+        let pt = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+        let down = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Left,
+                        position: pt(x, y),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .expect("按下派发");
+        };
+        let move_to = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position: pt(x, y),
+                        pressed_button: Some(gpui::MouseButton::Left),
+                        modifiers: Default::default(),
+                    }),
+                    cx,
+                );
+            })
+            .expect("拖动派发");
+        };
+        let up = |cx: &mut gpui::TestAppContext, x: f32, y: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Left,
+                        position: pt(x, y),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("松开派发");
+        };
+        // 拖选带：x 跨 15% → 85%（覆盖文本主列），y 跨 20% → 60%
+        //（避开页头页脚装饰，覆盖正文前中段）。
+        down(cx, bx + bw * 0.15, by + bh * 0.20);
+        move_to(cx, bx + bw * 0.85, by + bh * 0.60);
+        up(cx, bx + bw * 0.85, by + bh * 0.60);
+        // 诊断断言：拖选三事件后选择会话必须在位（鼠标管线接线直接
+        // 证据——失败即派发链断点定位面）。
+        view.read_with(&visual, |v, _| {
+            assert!(
+                v.has_selection_for_test(),
+                "拖选后选择会话必须在位（鼠标事件 → begin/move/finish 接线断点）"
+            );
+        });
+
+        // ③ 选择文本就绪（层后台提取 + 16ms 轮询 drain 泵）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.selection_text_for_test().is_some()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D4 选择文本泵超时（层提取未就绪——真缺陷不放过）"
+            );
+        }
+        let selected = view.read_with(&visual, |v, _| {
+            v.selection_text_for_test().unwrap().to_owned()
+        });
+        assert!(!selected.trim().is_empty(), "拖选带必须覆盖到文本");
+        eprintln!(
+            "#51 D4 ✓ 拖选就绪：{} 字符（首 40：{:?}）",
+            selected.chars().count(),
+            selected.chars().take(40).collect::<String>()
+        );
+
+        // ④ 真实键击管线 Ctrl+C（换绑跟随路由——shell 分支 → 视图复制
+        // → 测试平台剪贴板）。
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        key: "c".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Ctrl+C");
+        let clipboard = cx.read(|app| app.read_from_clipboard());
+        let copied = clipboard.and_then(|item| item.text()).unwrap_or_default();
+        assert_eq!(
+            copied, selected,
+            "剪贴板读回必须与选择文本逐字一致（#51 D4 复制链）"
+        );
+        eprintln!(
+            "#51 D4 ✓ Ctrl+C 复制：剪贴板逐字一致（{} 字符）",
+            copied.chars().count()
+        );
+
+        // ⑤ Esc 清选择（真实键击管线 → 视图键域）。
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any.clone(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: Default::default(),
+                        key: "escape".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("派发 Esc");
+        visual.update(|window, app| window.draw(app).clear(app));
+        view.read_with(&visual, |v, _| {
+            assert!(
+                !v.has_selection_for_test() && v.selection_text_for_test().is_none(),
+                "Esc 清选择（会话与文本双清零）"
+            );
+        });
+        eprintln!("#51 D4 ✓ Esc 清选择");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #51 D4b 接线面：**当前页/缩放状态一致性**两面全链——
+    ///
+    /// 1. **页码读数活更新**：页视图 emit（TopPageChanged）在页变化
+    ///    时真实发出（Shell 订阅 → 状态栏「第 N / M 页」跟随滚动）；
+    /// 2. **标签切换状态保持**：ActualSize 档 + 页 2 → 切走（异路径
+    ///    重建）→ 切回 → 缩放档与顶部页**原样回放**（快照机制）；
+    ///    关标签重开同文件亦回放（关标签路径快照）。
+    #[gpui::test]
+    fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
+        let corpus = |name: &str| {
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/display_corpus")
+                    .join(name),
+            )
+            .unwrap_or_else(|e| panic!("语料不可读（{name}）：{e}"))
+        };
+        let dir = std::env::temp_dir().join(format!("mdc-d4b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_a = dir.join("a.pdf");
+        let pdf_b = dir.join("b.pdf");
+        std::fs::write(&pdf_a, corpus("mixed_features.pdf"));
+        std::fs::write(&pdf_b, corpus("landscape_mixed.pdf"));
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf_a.clone(), window, cx);
+            });
+        });
+        let view_a = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_a = match view_a {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4b 状态一致性 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+        // 泵（实体可换——A/B/重建 A/重开 A 各阶段传各实体）。
+        let pump = |cx: &mut gpui::TestAppContext,
+                    visual: &mut gpui::VisualTestContext,
+                    view: &Entity<PdfPagesView>,
+                    what: &str,
+                    ready: &dyn Fn(&PdfPagesView) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                cx.background_executor
+                    .advance_clock(std::time::Duration::from_millis(20));
+                cx.background_executor.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                visual.update(|window, app| window.draw(app).clear(app));
+                if view.read_with(visual, |v, _| ready(v)) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} 泵超时（真缺陷不放过）"
+                );
+            }
+        };
+        pump(cx, &mut visual, &view_a, "A 首屏", &|v| {
+            v.page_ready_for_test(0)
+        });
+
+        // ① 页变化 emit（Shell 订阅 → 状态栏活更新的信号源）。
+        let emit_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = emit_count.clone();
+        {
+            let counter = counter.clone();
+            cx.update(|app| {
+                app.subscribe(&view_a, move |_, _: &crate::pdf_pages::PdfPagesEvent, _| {
+                    counter.set(counter.get() + 1);
+                })
+                .detach();
+            });
+        }
+        cx.update(|app| view_a.update(app, |v, _| v.scroll_to_page(2)));
+        pump(cx, &mut visual, &view_a, "A 跳页 2", &|v| {
+            v.top_visible_page() == 2 && v.page_ready_for_test(2)
+        });
+        assert!(
+            emit_count.get() >= 1,
+            "页变化必须 emit（状态栏信号源），实得 {}",
+            emit_count.get()
+        );
+        eprintln!(
+            "#51 D4b ✓ 页变化 emit ×{}（状态栏信号源在位）",
+            emit_count.get()
+        );
+
+        // ② ActualSize 档（Ctrl+1 真路径——快照素材）。
+        cx.update(|app| view_a.update(app, |v, cx| v.dispatch_zoom_key("1", true, false, cx)));
+        pump(cx, &mut visual, &view_a, "A 实际大小档", &|v| {
+            v.page_ready_for_test(2) && v.raster_width_for_test() == 640
+        });
+        eprintln!("#51 D4b ✓ ActualSize 档就位（光栅宽 640）");
+
+        // ③ 切走：开 B（异路径重建——A 快照落账）。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf_b.clone(), window, cx);
+            });
+        });
+        let view_b = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_b = view_b.expect("B 实体在位（打开链成功）");
+        pump(cx, &mut visual, &view_b, "B 首屏", &|v| {
+            v.page_ready_for_test(0)
+        });
+
+        // ④ 切回 A：快照回放——顶部页 2 + ActualSize 档原样。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| shell.activate_tab(0, window, cx));
+        });
+        let view_a2 = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_a2 = view_a2.expect("A 实体重建（快照回放路径）");
+        pump(cx, &mut visual, &view_a2, "A 回放", &|v| {
+            v.top_visible_page() == 2 && v.page_ready_for_test(2)
+        });
+        assert_eq!(
+            view_a2.read_with(&visual, |v, _| v.raster_width_for_test()),
+            640,
+            "切回后缩放档回放（ActualSize 640——不从 FitWidth 576 重来）"
+        );
+        eprintln!("#51 D4b ✓ 切标签回放：页 2 + ActualSize 档原样");
+
+        // ⑤ 关标签路径快照：关 A → 重开同文件 → 原页原档。
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_tab_no_confirm(0, window, cx);
+            });
+        });
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf_a.clone(), window, cx);
+            });
+        });
+        let view_a3 = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view_a3 = view_a3.expect("A 重开实体");
+        pump(cx, &mut visual, &view_a3, "A 重开回放", &|v| {
+            v.top_visible_page() == 2 && v.page_ready_for_test(2)
+        });
+        assert_eq!(
+            view_a3.read_with(&visual, |v, _| v.raster_width_for_test()),
+            640,
+            "关后重开缩放档回放"
+        );
+        eprintln!("#51 D4b ✓ 关标签重开回放：页 2 + ActualSize 档原样");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #51 D4c 接线面：**旋转/CropBox 档批注命中与保存重开**（视图级
+    /// 全链）——真鼠标管线（右键拖框）→ 控制器写链（旋转/CropBox 变
+    /// 换单元面已在 pdf_annotate_e2e 锚定；本测补**视图级命中链**：
+    /// 探针命中域 → finish_drag → commit → flush → rev 换代重渲）→
+    /// save_annotations 落盘（磁盘 /Highlight 面在位）→ 重开渲染成功。
+    /// 夹具双档：rotated_90.pdf（旋转页）+ cropbox_offset.pdf（偏移
+    /// CropBox letterbox 档）。
+    #[gpui::test]
+    fn pdf_view_right_drag_annotate_rotated_and_cropbox(cx: &mut gpui::TestAppContext) {
+        for name in ["rotated_90.pdf", "cropbox_offset.pdf"] {
+            let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/display_corpus")
+                .join(name);
+            let bytes =
+                std::fs::read(&corpus).unwrap_or_else(|e| panic!("语料不可读（{name}）：{e}"));
+            let dir = std::env::temp_dir().join(format!("mdc-d4c-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let pdf = dir.join("t.pdf");
+            std::fs::write(&pdf, bytes.clone());
+
+            cx.update(|app| {
+                theme::init(theme::LoadThemes::JustBase, app);
+                theme::set_theme_settings_provider(
+                    Box::new(crate::settings::ShellThemeSettings),
+                    app,
+                );
+            });
+            let mut slot: Option<Entity<ShellApp>> = None;
+            let window = cx.add_window(|window, cx| {
+                let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+                slot = Some(shell.clone());
+                WiringHost(shell)
+            });
+            let shell = slot.expect("宿主构造即置");
+            window.update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(pdf.clone(), window, cx);
+                });
+            });
+            let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+            let Some(view) = view else {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#51 D4c {name} 批注链 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═══════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            };
+            let any: gpui::AnyWindowHandle = window.clone().into();
+            let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+            let pump = |cx: &mut gpui::TestAppContext,
+                        visual: &mut gpui::VisualTestContext,
+                        view: &Entity<PdfPagesView>,
+                        what: &str,
+                        ready: &dyn Fn(&PdfPagesView) -> bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    cx.background_executor
+                        .advance_clock(std::time::Duration::from_millis(20));
+                    cx.background_executor.run_until_parked();
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    visual.update(|window, app| window.draw(app).clear(app));
+                    if view.read_with(visual, |v, _| ready(v)) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{name}：{what} 泵超时（真缺陷不放过）"
+                    );
+                }
+            };
+            pump(cx, &mut visual, &view, "首屏", &|v| {
+                v.page_ready_for_test(0)
+            });
+            let bytes_before = view.read_with(&visual, |v, _| v.bytes());
+
+            // ① 真右键拖框（探针命中域 → drag_start → finish → 三手势
+            //    默认 Highlight → commit 真写链）。
+            let b = visual
+                .debug_bounds("pdf-visible-page-0")
+                .expect("页 0 槽真实渲染");
+            let (bx, by, bw, bh) = (
+                f32::from(b.origin.x),
+                f32::from(b.origin.y),
+                f32::from(b.size.width),
+                f32::from(b.size.height),
+            );
+            let pt = |x: f32, y: f32| gpui::point(gpui::px(x), gpui::px(y));
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Right,
+                        position: pt(bx + bw * 0.30, by + bh * 0.30),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .expect("右键按下");
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Right,
+                        position: pt(bx + bw * 0.60, by + bh * 0.50),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("右键松开");
+            // ② flush 换代重渲（rev 推进 + 新 rev 位图就绪 + 脏标）。
+            pump(cx, &mut visual, &view, "换代重渲", &|v| {
+                v.annotate_rev_for_test() == 1 && v.page_ready_for_test(0)
+            });
+            assert!(
+                view.read_with(&visual, |v, _| v.is_dirty()),
+                "批注后脏标在位"
+            );
+            let bytes_after = view.read_with(&visual, |v, _| v.bytes());
+            assert!(
+                bytes_after.len() > bytes_before.len(),
+                "{name}：flush 后字节追加（增量写链真实发生）"
+            );
+            assert_eq!(
+                view.read_with(&visual, |v, _| v.cache_rev_families_for_test()),
+                vec![1u64],
+                "{name}：换代后缓存 rev 族只剩新 rev（D3b 语义在此复验）"
+            );
+            eprintln!("#51 D4c ✓ {name}：右键拖框 → flush 换代 → 新 rev 重渲");
+
+            // ③ 落盘（save_annotations 增量写——前缀保持）+ 磁盘面在位。
+            let saved = window
+                .update(cx, |_host, _window, cx| {
+                    view.update(cx, |v, _| v.save_annotations(&pdf))
+                })
+                .expect("保存调用");
+            let stats = saved
+                .expect("保存成功（真 pdfium 增量写链）")
+                .expect("有未落盘批注（脏标在位）");
+            // 既有语义：commit 内 flush 已追加（内存产物）→ save = 零脏
+            // 幂等写盘（零追加——不产生空修订；e2e 语义锚定沿用）。
+            assert_eq!(
+                stats.bytes_appended, 0,
+                "{name}：已 flush 后 save = 零脏幂等（追加发生在 commit 的 flush）"
+            );
+            let disk = std::fs::read(&pdf).expect("磁盘产物可读");
+            let marker: &[u8] = b"/Highlight";
+            assert!(
+                disk.windows(marker.len()).any(|w| w == marker),
+                "{name}：磁盘 /Highlight 面在位（保存重开的物证）"
+            );
+            assert!(
+                disk.starts_with(bytes.as_slice()),
+                "{name}：产物 = 原字节逐位前缀（增量语义）"
+            );
+            eprintln!(
+                "#51 D4c ✓ {name}：落盘 {}B 追加（前缀保持 + /Highlight 在位）",
+                stats.bytes_appended
+            );
+
+            // ④ 关标签重开（保存重开）：磁盘字节新会话渲染成功。
+            window.update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.close_tab_no_confirm(0, window, cx);
+                });
+            });
+            window.update(cx, |_host, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.open_document(pdf.clone(), window, cx);
+                });
+            });
+            let view2 = cx
+                .read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()))
+                .expect("重开实体");
+            pump(cx, &mut visual, &view2, "重开首屏", &|v| {
+                v.page_ready_for_test(0)
+            });
+            eprintln!("#51 D4c ✓ {name}：保存重开渲染成功（批注字节新会话）");
+
+            // 清场：本档窗口/实体随循环丢弃（下一档新窗口）。
+            drop(visual);
+            window.update(cx, |_, window, _| window.remove_window());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// WiringHost 整树 + md 标签窗口（#47 A4 查找框焦点链——md 面）。

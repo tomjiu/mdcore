@@ -21,6 +21,9 @@
 `smoke.docx` / `smoke.canvas` / `mouse_smoke.md` / `thumbs_100p.pdf`。
 安装包与文件关联面归旧 #270 范围，不在本清单。
 
+D 线（#51 PDF 阅读/批注/选择/状态一致/异常）专清单见
+[d-line-pdf.md](d-line-pdf.md)——两清单合走即 #48 完整验收。
+
 ## 二、A. 窗口与布局（阶段 A1）
 
 | # | 检查项 | 操作 | 期望 | 自动化背书（Linux） |

@@ -45,6 +45,7 @@ pub fn status_bar(
     pdf_view_mode: bool,
     xlsx_grid_view_mode: bool,
     docx_view_mode: bool,
+    pdf_page_label: Option<String>,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -116,9 +117,13 @@ pub fn status_bar(
                 ""
             };
             // 页码标签（批 4：pdf 态「第 N / M 页」——光标行经页表映射；
-            // md/docx 态无页语义，不占位）。
-            let page = ed
-                .page_label()
+            // md/docx 态无页语义，不占位）。#51 D4b：**页面视图态改由
+            // 页视图 top_visible_page 驱动**（Shell 传入——emit 订阅
+            // 活更新；此前文本光标映射在页面态读到的是隐形编辑器的
+            // 旧光标位——「当前页状态不一致」本修）。文本态 None
+            // 沿用编辑器映射（零变化）。
+            let page = pdf_page_label
+                .or_else(|| ed.page_label().map(|l| l.to_string()))
                 .map(|l| format!("  ·  {l}"))
                 .unwrap_or_default();
             format!(
