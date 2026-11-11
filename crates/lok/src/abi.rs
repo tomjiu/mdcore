@@ -109,7 +109,6 @@ pub struct LokDocClass {
     >,
     pub get_document_type: Option<unsafe extern "C" fn(p_this: *mut LokDocument) -> c_int>,
     pub get_parts: Option<unsafe extern "C" fn(p_this: *mut LokDocument) -> c_int>,
-    #[allow(dead_code)]
     pub get_part_page_rectangles:
         Option<unsafe extern "C" fn(p_this: *mut LokDocument) -> *mut c_char>,
     #[allow(dead_code)]
@@ -224,6 +223,7 @@ pub mod doc_offsets {
     off!(SAVE_AS, save_as);
     off!(GET_DOCUMENT_TYPE, get_document_type);
     off!(GET_PARTS, get_parts);
+    off!(GET_PART_PAGE_RECTANGLES, get_part_page_rectangles);
     off!(SET_PART, set_part);
     off!(PAINT_TILE, paint_tile);
     off!(GET_DOCUMENT_SIZE, get_document_size);

@@ -214,6 +214,56 @@ pub fn run(
         json!({"width_twips": w_tw, "height_twips": h_tw}),
     );
 
+    // ---- 6b. 页几何（getPartPageRectangles：跳页/页码数据源，C 线缺口）----
+    // 25.2.3.2 实测语义：页矩形在**画布坐标系**（与 paintTile 同源），
+    // 画布 = 页 + 四周 284 twips 边距、页隙 284。验收口径：非空、每页
+    // 宽高为正、y 单调不重叠、统一 x（单栏）、页在画布内、边距对称、
+    // A4 页尺寸（夹具确定性）。
+    match doc.page_geometry() {
+        Ok(pages) => {
+            let all_positive = pages.iter().all(|p| p.w > 0 && p.h > 0);
+            let monotonic = pages.windows(2).all(|w| w[1].y >= w[0].y + w[0].h);
+            let uniform_x = pages.iter().map(|p| p.x).min() == pages.iter().map(|p| p.x).max();
+            let within_canvas = pages.iter().all(|p| p.x + p.w <= w_tw)
+                && pages.last().is_some_and(|p| p.y + p.h <= h_tw);
+            let first = pages.first();
+            let last = pages.last();
+            let border_symmetric = first.is_some_and(|f| {
+                f.x == w_tw - f.x - f.w && last.is_some_and(|l| f.y == h_tw - l.y - l.h)
+            });
+            let a4 = first.is_some_and(|f| f.w == 11906 && f.h == 16838);
+            overall &= log.check(
+                "doc.page_geometry",
+                !pages.is_empty()
+                    && all_positive
+                    && monotonic
+                    && uniform_x
+                    && within_canvas
+                    && border_symmetric
+                    && a4,
+                json!({
+                    "page_count": pages.len(),
+                    "pages": pages.iter().map(|p|
+                        json!({"x": p.x, "y": p.y, "w": p.w, "h": p.h})
+                    ).collect::<Vec<_>>(),
+                    "checks": {
+                        "non_empty": !pages.is_empty(),
+                        "all_positive": all_positive,
+                        "y_monotonic_nonoverlap": monotonic,
+                        "uniform_x": uniform_x,
+                        "within_canvas": within_canvas,
+                        "border_symmetric": border_symmetric,
+                        "a4_page": a4,
+                    },
+                    "doc_size_twips": [w_tw, h_tw],
+                }),
+            );
+        }
+        Err(e) => {
+            overall &= log.check("doc.page_geometry", false, json!({"error": e.to_string()}));
+        }
+    }
+
     // ---- 7. paintTile 首块（左上 256x256；非空像素证明）----
     let t1 = doc
         .paint(
