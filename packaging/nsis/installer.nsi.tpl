@@ -25,12 +25,17 @@
 ;      （.md\OpenWithProgids 值），绝不动用户已有默认处理程序；.md
 ;      默认值与「新建」菜单仅在无主时写入（默认空 / 默认值指向不存在
 ;      的类 / 已归自己——Ely types.sh 的 handlerless 判定）。
-;   3. 写不进即失败：类型面逐写检查，首败键记名（$TypeFailKey）→
+;   3. 「默认应用」面（跟进件）：RegisteredApplications + Capabilities
+;      把应用**列进** Windows 设置的默认应用列表——用户可从系统设置
+;      一键设默认；列不列由安装器、选不选由用户（与「打开方式」面
+;      互补，同为不接管语义；Ely 假 scheme 进「默认应用」同构）。
+;   4. 写不进即失败：类型面逐写检查，首败键记名（$TypeFailKey）→
 ;      弹窗 + Abort（安装失败，非静默继续）。
-;   4. 卸载所有权：progid 的 open 命令仍指向本安装目录才清理类型面
+;   5. 卸载所有权：progid 的 open 命令仍指向本安装目录才清理类型面
 ;      （换目录重装后，旧卸载器不动新安装的登记）；文件面只删本安装
-;      写入的载荷，目录非空则留（用户自放文件不删）。
-;   5. SHChangeNotify(SHCNE_ASSOCCHANGED)：类型面变更后通知 Explorer。
+;      写入的载荷，目录非空则留（用户自放文件不删）；「默认应用」
+;      列表登记随卸载键整树清理（RegisteredApplications 值单独删）。
+;   6. SHChangeNotify(SHCNE_ASSOCCHANGED)：类型面变更后通知 Explorer。
 ; 载荷语义：pdfium.dll 与 mdcore.exe 同目录安装 = 定位序 exe-dir 候选
 ;   （#223/#224）；安装后自检复用 --check-pdfium（退出码 0=已绑定 /
 ;   3=未绑定）。
@@ -169,7 +174,18 @@ Function RegisterTypes
     ${EndIf}
   ${EndIf}
 
-  ; ④ 通知 Explorer 关联已变（SHCNE_ASSOCCHANGED）
+  ; ④ 「默认应用」面（跟进件 #143：注册应用进 Windows 设置的默认应用
+  ;   列表——用户可从系统设置一键设默认；与「打开方式」面互补，
+  ;   同为不接管语义：列不列由我们，选不选由用户（Ely 假 scheme 面
+  ;   同构）。写进 ${APPID} 键下，随卸载键同树清理。
+  !insertmacro TypePut "Software\${APPID}\Capabilities" "ApplicationName" "${APPNAME}"
+  !insertmacro TypePut "Software\${APPID}\Capabilities" "ApplicationDescription" \
+    "mang —— PDF / DOCX / Markdown 文档编辑器"
+  !insertmacro TypePut "Software\${APPID}\Capabilities\FileAssociations" ".md" "${PROGID}"
+  !insertmacro TypePut "Software\RegisteredApplications" "${APPNAME}" \
+    "Software\${APPID}\Capabilities"
+
+  ; ⑤ 通知 Explorer 关联已变（SHCNE_ASSOCCHANGED）
   System::Call "shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)"
 FunctionEnd
 
@@ -218,7 +234,10 @@ Section "Uninstall"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
-  ; ── 注册面：卸载键 + 安装目录记忆（HKCU）────────────────────────────
+  ; ── 注册面：卸载键 + 安装目录记忆 + 「默认应用」列表登记（HKCU）────
+  ;   Capabilities 在 ${APPID} 键下随下一行整树清理；
+  ;   RegisteredApplications 是独立键上的值（登记名 = ${APPNAME}），单独删。
+  DeleteRegValue HKCU "Software\RegisteredApplications" "${APPNAME}"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\${APPID}"
 SectionEnd
