@@ -6189,6 +6189,258 @@ mod pdf_search_wiring_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #421 尾接线面：**超宽档横向平移导航**全链——真实滚轮管线
+    /// （触控板横扫 dx / Shift+纵向）+ 中键拖拽（按下 → 拖 → 松开）
+    /// → pan 状态推进 + 页槽真实位移（debug_bounds 视口坐标断言）→
+    /// 两端硬钳制 → 缩放档切回适宽 pan 复位。无溢出（适宽基线）滚轮
+    /// 平移不吞（pan 恒 0）。语料 mixed_features.pdf（A4 适宽 → 步进
+    /// 125% 超视口）。引擎门控同 D4a。
+    #[gpui::test]
+    fn pdf_view_zoom_pan_navigation(cx: &mut gpui::TestAppContext) {
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/display_corpus/mixed_features.pdf");
+        let bytes = std::fs::read(&corpus).unwrap_or_else(|e| panic!("语料不可读（{e}）"));
+        let dir = std::env::temp_dir().join(format!("mdc-421pan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("m.pdf");
+        std::fs::write(&pdf, bytes);
+
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+        window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(pdf.clone(), window, cx);
+            });
+        });
+        let view = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
+        let view = match view {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "\n══════ SKIP（环境缺件，不伪装通过）══════\n  \
+                     本机无 libpdfium——#421 横向平移 e2e 未真跑。\n  \
+                     有 libpdfium 的环境（MDC_PDFIUM_LIB=<库路径> \
+                     cargo test）全量执行。\n═════════════════════════\n"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        // ① 首屏位图就绪（真实渲染管线——泵同 D4a 口径）。
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any.clone(), cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(20));
+            cx.background_executor.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            visual.update(|window, app| window.draw(app).clear(app));
+            if view.read_with(&visual, |v, _| v.page_ready_for_test(0)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "421pan 首屏位图泵超时（真缺陷不放过）"
+            );
+        }
+        // 适宽基线：无溢出（FitWidth 量子化伪溢出 32px 经量子门控归
+        // 零——平移面不启用，滚轮横扫不吞照常冒泡）。
+        view.read_with(&visual, |v, _| {
+            assert!(
+                v.pan_overflow_for_test() < 0.5,
+                "适宽基线无溢出（实得 {}）",
+                v.pan_overflow_for_test()
+            );
+            assert_eq!(v.pan_x_for_test(), 0., "基线 pan = 0");
+        });
+
+        // ② 步进放大 125%（Ctrl+= 真键路径）→ 光栅宽超视口 → 溢出面
+        // 启用。A4 适宽 ≈ 视口宽 → 125% 溢出 ≈ 25% 视口宽。
+        cx.update(|app| {
+            view.update(app, |v, cx| v.dispatch_zoom_key("=", true, false, cx));
+        });
+        visual.update(|window, app| window.draw(app).clear(app));
+        let overflow = view.read_with(&visual, |v, _| v.pan_overflow_for_test());
+        assert!(
+            overflow > 50.,
+            "125% 档溢出面必须启用（实得 {overflow}——夹具/视口几何先查）"
+        );
+        assert_eq!(
+            view.read_with(&visual, |v, _| v.pan_x_for_test()),
+            0.,
+            "溢出启用时基线 pan 仍 0（左缘对齐）"
+        );
+        let base = visual
+            .debug_bounds("pdf-visible-page-0")
+            .expect("页 0 槽真实渲染");
+        let base_x = f32::from(base.origin.x);
+
+        // ③ 触控板横扫（真实滚轮管线）：dx = +200 → pan = 200 → 页槽
+        // 真实左移 200（视口坐标断言——debug_selector 观测面）。派发
+        // 位置 = 视口域中心（125% 档页槽纵向超出视口——槽中心已出
+        // 探针域；滚轮命中域 = 视口探针，槽内位置无关）。
+        let viewport_b = visual
+            .debug_bounds("pdf-pages-list")
+            .expect("视口观测面在位");
+        let (cx0, cy0) = (
+            f32::from(viewport_b.origin.x) + f32::from(viewport_b.size.width) / 2.,
+            f32::from(viewport_b.origin.y) + f32::from(viewport_b.size.height) / 2.,
+        );
+        let scroll = |cx: &mut gpui::TestAppContext, dx: f32, dy: f32, shift: bool| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::Scroll(gpui::ScrollEvent {
+                        position: gpui::point(gpui::px(cx0), gpui::px(cy0)),
+                        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(dx), gpui::px(dy))),
+                        modifiers: gpui::Modifiers {
+                            shift,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .expect("滚轮派发");
+        };
+        scroll(cx, 200., 0., false);
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            (view.read_with(&visual, |v, _| v.pan_x_for_test()) - 200.).abs() < 1.,
+            "横扫 dx=+200 → pan=200（实得 {}）",
+            view.read_with(&visual, |v, _| v.pan_x_for_test())
+        );
+        let shifted = visual
+            .debug_bounds("pdf-visible-page-0")
+            .expect("平移后页 0 槽仍在观测面");
+        assert!(
+            (f32::from(shifted.origin.x) - (base_x - 200.)).abs() < 2.,
+            "页槽真实左移 200（实得 x {} vs 基线 {}-200）",
+            f32::from(shifted.origin.x),
+            base_x
+        );
+        eprintln!("#421 ✓ 横扫平移：pan 200 / 槽位移 200（基线 x={base_x}）");
+
+        // ④ 硬钳制：大幅右扫超溢出 → 钳到 overflow（右缘对齐——两端
+        // 硬边界不越界）。
+        scroll(cx, 5000., 0., false);
+        visual.update(|window, app| window.draw(app).clear(app));
+        let pan_max = view.read_with(&visual, |v, _| v.pan_x_for_test());
+        assert!(
+            (pan_max - overflow).abs() < 1.,
+            "右扫钳到溢出宽（实得 {pan_max} vs {overflow}）"
+        );
+
+        // ⑤ Shift+纵向滚轮横滚惯例（真键族手势）：dy = -100（上滚）→
+        // pan 减 100（左向——键盘族横滚与触控板同源方向）。
+        scroll(cx, 0., -100., true);
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            (view.read_with(&visual, |v, _| v.pan_x_for_test()) - (pan_max - 100.)).abs() < 1.,
+            "Shift+上滚 100 → pan -100（实得 {}）",
+            view.read_with(&visual, |v, _| v.pan_x_for_test())
+        );
+
+        // ⑥ 中键拖拽（真鼠标管线）：按下 → 右拖 60（内容随游标右移 =
+        // pan 减 60）→ 左拖回 60 → 松开收尾（会话清）。
+        let mid_down = |cx: &mut gpui::TestAppContext, x: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                        button: gpui::MouseButton::Middle,
+                        position: gpui::point(gpui::px(x), gpui::px(cy0)),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    cx,
+                );
+            })
+            .expect("中键按下派发");
+        };
+        let mid_move = |cx: &mut gpui::TestAppContext, x: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position: gpui::point(gpui::px(x), gpui::px(cy0)),
+                        pressed_button: Some(gpui::MouseButton::Middle),
+                        modifiers: Default::default(),
+                    }),
+                    cx,
+                );
+            })
+            .expect("中键拖动派发");
+        };
+        let mid_up = |cx: &mut gpui::TestAppContext, x: f32| {
+            cx.update_window(any.clone(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                        button: gpui::MouseButton::Middle,
+                        position: gpui::point(gpui::px(x), gpui::px(cy0)),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }),
+                    cx,
+                );
+            })
+            .expect("中键松开派发");
+        };
+        let pan_before_drag = view.read_with(&visual, |v, _| v.pan_x_for_test());
+        mid_down(cx, cx0);
+        mid_move(cx, cx0 + 60.);
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            (view.read_with(&visual, |v, _| v.pan_x_for_test()) - (pan_before_drag - 60.)).abs()
+                < 1.,
+            "中键右拖 60 → 内容随游标右移（pan -60；实得 {}）",
+            view.read_with(&visual, |v, _| v.pan_x_for_test())
+        );
+        mid_move(cx, cx0);
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            (view.read_with(&visual, |v, _| v.pan_x_for_test()) - pan_before_drag).abs() < 1.,
+            "左拖回 60 → pan 复位拖前值"
+        );
+        mid_up(cx, cx0);
+        eprintln!("#421 ✓ 中键拖拽平移（右拖 -60 / 左拖复位 / 松开收尾）");
+
+        // ⑦ 切回适宽（Ctrl+Shift+0 真键路径）：溢出消除 → pan 钳制复位
+        // 0 + 页槽回基线（缩放档切换横向锚对称）。
+        cx.update(|app| {
+            view.update(app, |v, cx| v.dispatch_zoom_key("0", true, true, cx));
+        });
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert_eq!(
+            view.read_with(&visual, |v, _| v.pan_x_for_test()),
+            0.,
+            "切回适宽 pan 复位（缩放档切换钳制）"
+        );
+        let restored = visual
+            .debug_bounds("pdf-visible-page-0")
+            .expect("复位后页 0 槽仍在观测面");
+        assert!(
+            (f32::from(restored.origin.x) - base_x).abs() < 2.,
+            "页槽回基线（实得 x {} vs {}）",
+            f32::from(restored.origin.x),
+            base_x
+        );
+        eprintln!("#421 ✓ 适宽复位：pan 0 / 槽回基线");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #51 D4b 接线面：**当前页/缩放状态一致性**两面全链——
     ///
     /// 1. **页码读数活更新**：页视图 emit（TopPageChanged）在页变化
