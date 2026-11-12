@@ -4,6 +4,9 @@
 > 模块文档（权威）；会话 API 契约见 `docs/lok-session-contract.md`。
 > 本文是 **B5 交付**：可运行冒烟/依赖部署清单、诊断收集、故障损失
 > 边界声明。
+>
+> **Windows 内核不在这里编**：云沙箱编不动 LibreOffice，产物以 release 附件分发；
+> 下载方式、982 MiB 体积拆解、三个 Windows 平台坑见 `docs/lok-windows-build.md`。
 
 ## 1. 依赖部署（Linux，已实测链）
 
