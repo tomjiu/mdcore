@@ -116,9 +116,7 @@ impl PanelEntry {
 
     /// #121（批③a）：拔出拆解面（`take_panel` 中转态构造用——记忆
     /// 尺寸随面板走，落位侧继承）。
-    pub(crate) fn into_parts(
-        self,
-    ) -> (Arc<dyn PanelHandle>, Vec<Subscription>, Option<f32>) {
+    pub(crate) fn into_parts(self) -> (Arc<dyn PanelHandle>, Vec<Subscription>, Option<f32>) {
         (self.panel, self.subscriptions, self.size)
     }
 }
@@ -458,9 +456,7 @@ impl Dock {
         let (panel, subscriptions, size) = self.entries.remove(ix).into_parts();
         // 激活位修正（remove_at 的索引语义：命中清空/前移收缩）。
         self.tracker.remove_at(ix);
-        if was_active
-            && let Some(next) = self.first_enabled_panel_idx(cx)
-        {
+        if was_active && let Some(next) = self.first_enabled_panel_idx(cx) {
             // 拔的是激活面板：切首个启用面板保视图（无启用面 = 无激活，
             // dock 保持开——拖拽不是关栏）。
             self.tracker.transition(Some(next));
@@ -491,7 +487,8 @@ impl Dock {
             subscriptions,
             size,
         } = detachment;
-        self.entries.push(PanelEntry::from_parts(panel, subscriptions, size));
+        self.entries
+            .push(PanelEntry::from_parts(panel, subscriptions, size));
         let ix = self.entries.len() - 1;
         self.activate_panel(ix, cx);
         self.set_open(true, cx);

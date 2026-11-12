@@ -41,8 +41,8 @@ mod tests;
 
 pub use dock::{ActiveTracker, Dock, DockPosition, PanelEntry};
 pub use drag::{
-    drop_is_intended, drop_zone_at, placement_for, DockDropZone, DraggedPanel, PanelDetachment,
-    Placement,
+    DockDropZone, DraggedPanel, PanelDetachment, Placement, drop_is_intended, drop_zone_at,
+    placement_for,
 };
 pub use handle::{PanelHandle, PanelId};
 pub use panel::{Panel, PanelEvent};

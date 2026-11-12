@@ -688,7 +688,7 @@ fn registry_rebuilds_by_persistent_name(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 use crate::drag::{
-    drop_is_intended, drop_zone_at, placement_for, DockDropZone, DraggedPanel, Placement,
+    DockDropZone, DraggedPanel, Placement, drop_is_intended, drop_zone_at, placement_for,
 };
 
 /// 可停靠三侧的面板（拖拽换侧的裁决面——区别于 Left-only 的
@@ -936,11 +936,9 @@ fn drag_round_trip_survives_dump_restore(cx: &mut TestAppContext) {
         d.set_panel_size("rover", 320., cx);
     });
     // 拖拽序列：裁决（右分区合法）→ take → receive。
-    let placement = placement_for(
-        DockDropZone::Right,
-        DockPosition::Left,
-        |p| p != DockPosition::Bottom,
-    );
+    let placement = placement_for(DockDropZone::Right, DockPosition::Left, |p| {
+        p != DockPosition::Bottom
+    });
     assert_eq!(placement, Placement::Dock(DockPosition::Right));
     let detached = left.update(cx, |d, cx| d.take_panel("rover", cx)).unwrap();
     right.update(cx, |d, cx| {
@@ -956,11 +954,7 @@ fn drag_round_trip_survives_dump_restore(cx: &mut TestAppContext) {
     fresh.update(cx, |d, cx| {
         d.add_panel(&rover_here, cx);
         d.restore(snapshot.clone(), cx).unwrap();
-        assert_eq!(
-            d.active_key(),
-            Some("rover"),
-            "restore 兑现拖拽后的激活面"
-        );
+        assert_eq!(d.active_key(), Some("rover"), "restore 兑现拖拽后的激活面");
         assert_eq!(
             d.panel_size("rover"),
             Some(320.),
