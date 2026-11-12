@@ -218,10 +218,17 @@ impl WorkerClient {
         // 环境卫生（worker 启动时也会自设；双侧幂等）
         cmd.env("SAL_NOLOCK_PROFILE", "1");
         cmd.env("SAL_DISABLE_OPENCL", "1");
-        // B1 unipoll 主循环契约（worker.rs 模块头「为什么 unipoll」）：
-        // 必须在 hook_2 之前生效；只设 env 不进 runLoop 会 SIGSEGV——
-        // worker 侧必配套 runLoop（unipoll_loop）。
-        cmd.env("SAL_LOK_OPTIONS", "unipoll");
+        // 【Windows 实测 2026-11-12】unipoll 在 Windows 上会让 LO 跳过内核
+        // 主线程启动（init.cxx 仅在非 unipoll 分支 osl_createThread
+        // (lo_startmain)），user installation 因此不建立，documentLoad 实测
+        // 访问违例（0xC0000005，stock 26.8 同症）。故 Windows 侧清掉该变量
+        // （含宿主环境继承值），交由 worker 的 serial_loop 串行直调；
+        // 非 Windows 仍走 unipoll 主循环。证据链见 worker.rs `serial_loop`。
+        if cfg!(windows) {
+            cmd.env_remove("SAL_LOK_OPTIONS");
+        } else {
+            cmd.env("SAL_LOK_OPTIONS", "unipoll");
+        }
         if cfg!(windows) {
             cmd.env("SAL_SKIA", "raster");
         } else {

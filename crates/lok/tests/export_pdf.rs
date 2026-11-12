@@ -66,13 +66,13 @@ fn export_pdf_full_and_page_range() {
     let work = dir.join("work.docx");
     std::fs::copy(fixture(), &work).unwrap();
     let canon = std::fs::canonicalize(&work).unwrap();
-    let url = format!("file://{}", canon.to_string_lossy());
+    let url = mdc_lok::profile::file_url_of(&canon);
 
     let s = DocSession::open(None, &dir.join("s"), &url, None).expect("DocSession::open");
 
     let pdf_url = |name: &str| -> String {
         let dir_canon = std::fs::canonicalize(&dir).unwrap();
-        format!("file://{}", dir_canon.join(name).to_string_lossy())
+        mdc_lok::profile::file_url_of(&dir_canon.join(name))
     };
 
     // ---- 全文导出（3 页夹具）----

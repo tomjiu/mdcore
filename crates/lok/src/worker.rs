@@ -176,11 +176,18 @@ pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
                     no_kernel_loop(protocol_fd, &tx, code, msg);
                 }
             };
-            // 平台路由（模块头「线程模型」两节）：Windows 走 message-only
-            // window 消息驱动（#104），其余平台走 unipoll 主循环（B1）。
+            // 平台路由（模块头「线程模型」两节）：Windows 默认走**非 unipoll
+            // 串行分发**（[serial_loop]，2026-11-12 实测修订——原
+            // messages_loop 依赖 unipoll，而 unipoll 在 Windows 上使
+            // documentLoad 访问违例）；其余平台走 unipoll 主循环（B1）。
+            // 旧 message-loop 路径保留为诊断开关 MDC_LOK_WIN_MSGLOOP。
             #[cfg(windows)]
             {
-                messages_loop(state, &tx, protocol_fd)
+                if std::env::var_os(WIN_MSGLOOP_ENV).is_some() {
+                    messages_loop(state, &tx, protocol_fd)
+                } else {
+                    serial_loop(state, &tx, protocol_fd)
+                }
             }
             #[cfg(not(windows))]
             {
@@ -229,13 +236,34 @@ pub fn hard_exit(code: i32) -> ! {
     }
 }
 
+/// 诊断开关：非空即回退到旧的 message-only window + runLoop 路径
+/// （`#[cfg(windows)]`）。**仅供 A/B 对照与问题复位，不是产品路径**——
+/// unipoll 在 Windows 上不可用，见 [`serial_loop`] 文档的证据链。
+const WIN_MSGLOOP_ENV: &str = "MDC_LOK_WIN_MSGLOOP";
+
 /// 环境卫生（见模块头）。
 fn env_hygiene() {
     unsafe {
         std::env::set_var("SAL_NOLOCK_PROFILE", "1");
         std::env::set_var("SAL_DISABLE_OPENCL", "1");
-        // unipoll 主循环契约（模块头「为什么 unipoll」）：必须在 hook_2
-        // 之前生效；宿主 spawn 侧也设（client.rs，幂等双保险）。
+        // 【Windows 实测结论 2026-11-12】unipoll 在 Windows 上不可用：
+        // LO 只在非 unipoll 分支起内核主线程（init.cxx `if (!bUnipoll)
+        // … osl_createThread(lo_startmain, nullptr) … else InitVCL();`）。
+        // unipoll 路径下 user installation 不被建立：hook_2 仍返回非空
+        // kit（宿主能看到 ready），但 documentLoad 直接访问违例（实测
+        // 0xC0000005；stock 26.8.2.2 与自建 26.2.6.3 同症 ⇒ 与 Ely 补丁
+        // 无关）。非 unipoll 由 LO 自起主线程，宿主在 hook_2 同线程串行
+        // 调用 LOK API 即可（完整证据链见 [serial_loop] 文档）。
+        // Windows 默认清掉该变量（含宿主继承值）；旧路径留诊断开关。
+        #[cfg(windows)]
+        {
+            if std::env::var_os(WIN_MSGLOOP_ENV).is_some() {
+                std::env::set_var("SAL_LOK_OPTIONS", "unipoll");
+            } else {
+                std::env::remove_var("SAL_LOK_OPTIONS");
+            }
+        }
+        #[cfg(not(windows))]
         std::env::set_var("SAL_LOK_OPTIONS", "unipoll");
         if cfg!(windows) {
             std::env::set_var("SAL_SKIA", "raster");
@@ -388,16 +416,25 @@ fn bind_kernel(
             "setOptionalFeatures",
         ),
         (abi::kit_offsets::GET_VERSION_INFO, "getVersionInfo"),
-        // B1：unipoll 主循环的硬依赖（缺槽 = 本 worker 不支持该运行时，
-        // boot-failed 明确报错——不回退直调模式：直调有异步事件黑洞，
-        // 产品不可用，宁可明确失败）。
-        (abi::kit_offsets::RUN_LOOP, "runLoop"),
     ];
     for (off, name) in need {
         if !abi::has_member(n, off, std::mem::size_of::<usize>()) {
             return Err((
                 codes::MEMBER,
                 format!("Kit 类 nSize={n} 缺成员 {name}（offset={off}）——运行时过旧，不支持 LOK 原型所需面"),
+            ));
+        }
+    }
+
+    // runLoop 槽位：非 Windows 的 unipoll 主循环是硬依赖；Windows 仅在
+    // 诊断开关 MDC_LOK_WIN_MSGLOOP 走旧 message-loop 路径时才需要——
+    // 默认的 [serial_loop] 不调 runLoop，故不把它当硬依赖。
+    if cfg!(not(windows)) || std::env::var_os(WIN_MSGLOOP_ENV).is_some() {
+        let off = abi::kit_offsets::RUN_LOOP;
+        if !abi::has_member(n, off, std::mem::size_of::<usize>()) {
+            return Err((
+                codes::MEMBER,
+                format!("Kit 类 nSize={n} 缺成员 runLoop（offset={off}）——运行时过旧，不支持 LOK 原型所需面"),
             ));
         }
     }
@@ -1246,6 +1283,47 @@ struct WndClassW {
     background: *mut c_void,
     menu_name: *const u16,
     class_name: *const u16,
+}
+
+/// Windows 默认主循环（2026-11-12 实测修订）：**非 unipoll 串行分发**。
+///
+/// 为什么不复用 [`messages_loop`] 的 message-only window + runLoop：
+/// unipoll 在 Windows 上会让 LO 跳过内核主线程启动（`desktop/source/lib/
+/// init.cxx`：`if (!bUnipoll) pLib->maThread = osl_createThread(lo_startmain,
+/// nullptr); RequestHandler::WaitForReady(); else InitVCL();`），user
+/// installation 因此不被建立——`hook_2` 仍返回非空 kit（宿主能看到
+/// `ready`），但 `documentLoad` 直接访问违例（实测 0xC0000005；stock
+/// 26.8.2.2 与自建 26.2.6.3 同症 ⇒ 与 Ely 补丁无关，是宿主侧用法问题）。
+///
+/// 非 unipoll 下 LO 自起主线程并跑 `soffice_main`，此时再调 `runLoop`
+/// 会二次启动主循环——所以宿主**不碰 runLoop**，只在 `hook_2` 同线程
+/// （本线程）串行调用全部 LOK API，这正是 LO 非 unipoll 的契约。实测
+/// load + getDocumentSize + paintTile 全通（1024×1024 出 2711359 个
+/// 非零像素）。
+///
+/// 线程模型：本线程独占所有 LOK 调用（串行 ⇒ 无并发）；内核回调仍由
+/// LO 自己的线程经 [`kit_callback`] 入队写线程（mpsc 线程安全），事件
+/// 语义与 unipoll 路径一致。
+#[cfg(windows)]
+fn serial_loop(state: WorkerState, tx: &Sender<ToWriter>, protocol_fd: std::fs::File) -> ! {
+    // WRITER_TX 注入（op_load 的 doc 回调注册面；与 unipoll_loop 同构）。
+    WRITER_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
+
+    let mut ctx = Box::new(LoopCtx {
+        state,
+        tx: tx.clone(),
+    });
+    let mut reader = BufReader::new(protocol_fd);
+    loop {
+        match protocol::read_frame(&mut reader) {
+            Ok(Some(frame)) => handle_frame(&mut *ctx, frame),
+            Ok(None) => loop_exit(&mut *ctx, 0, "stdin-eof"),
+            Err(e) => {
+                eprintln!("mdc-lok-worker: 帧读取失败：{e}");
+                loop_exit(&mut *ctx, 2, "oversize");
+            }
+        }
+    }
 }
 
 /// Windows 真实主循环（#104）：先建 message-only window，reader 线程把
