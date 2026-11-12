@@ -26,6 +26,19 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke-chars-img-table.docx")
 }
 
+/// 夹具复制到 tmp（**既有约定**：全部 LO 测试先复制再加载——LO 打开写
+/// `.~lock` 锁；worker 硬杀（SIGKILL）后锁残留 → 同路径重开 = **只读
+/// 模式**，postKeyEvent 回 ok 但编辑静默丢弃。本文件三测试并行跑，
+/// 直接加载原夹具还会**互相锁**（两个 worker 同路径）——复制品各走
+/// 各的 tmp，锁随目录清理。
+/// **第二坑**：spawn 会清空 session_root——work 文件必须放 session_root
+/// **之外**（session 一律 `dir.join("s")` 子目录，work 在 `dir` 下）。
+fn work_fixture(dir: &std::path::Path) -> PathBuf {
+    let work = dir.join("work.docx");
+    std::fs::copy(fixture(), &work).expect("复制夹具");
+    work
+}
+
 fn tmp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mdc-lok-115parity-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -61,10 +74,10 @@ fn closing_accelerators_rejected_kernel_frame_stays() {
     }
     let dir = tmp_dir("closing");
     let rt = mdc_lok::runtime::discover().expect("discover（环境门已过）");
-    let w = WorkerClient::spawn(Some(&rt), &dir, None, None).expect("spawn");
+    let w = WorkerClient::spawn(Some(&rt), &dir.join("s"), None, None).expect("spawn");
     w.request_with_timeout(
         "load",
-        json!({"url": file_url(&fixture())}),
+        json!({"url": file_url(&work_fixture(&dir))}),
         Duration::from_secs(30),
     )
     .expect("load 夹具");
@@ -113,11 +126,11 @@ fn load_repaginates_initial_layout() {
     }
     let dir = tmp_dir("repaginate");
     let rt = mdc_lok::runtime::discover().expect("discover（环境门已过）");
-    let w = WorkerClient::spawn(Some(&rt), &dir, None, None).expect("spawn");
+    let w = WorkerClient::spawn(Some(&rt), &dir.join("s"), None, None).expect("spawn");
     let v = w
         .request_with_timeout(
             "load",
-            json!({"url": file_url(&fixture())}),
+            json!({"url": file_url(&work_fixture(&dir))}),
             Duration::from_secs(30),
         )
         .expect("load 夹具");
@@ -148,7 +161,8 @@ fn save_options_whitelist_take_ownership() {
         return;
     }
     let dir = tmp_dir("saveopts");
-    let mut s = DocSession::open(None, &dir, &file_url(&fixture()), None).expect("open");
+    let mut s = DocSession::open(None, &dir.join("s"), &file_url(&work_fixture(&dir)), None)
+        .expect("open");
     s.type_text("白名单").expect("编辑置脏");
     assert!(s.is_dirty(), "编辑后必脏");
 
