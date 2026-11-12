@@ -196,7 +196,10 @@ python packaging/nsis/build-installer.py
   「打开方式」；干净机（.md 无主）→ 默认与「新建」菜单归 mang；
   卸载后 .md 登记随卸载清除、别家登记原样；换目录重装后跑旧目录的
   卸载器 → 新安装的类型登记不动；安装后自检弹窗（拔掉 `pdfium.dll`
-  复跑安装应见告警而非静默）。
+  复跑安装应见告警而非静默）。**「默认应用」面（跟进件）**：安装后
+  Windows「设置 → 默认应用」列表可见 mang（`HKCU\Software\RegisteredApplications`
+  值 + `dev.mdcore.editor\Capabilities` 树），卸载后列表登记消失；本地
+  结构钉 = `packaging/tests/test_ns_polite_registration.py`（20 项，双平台）。
 
 ### 登记边界（诚实面）
 

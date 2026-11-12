@@ -55,7 +55,21 @@
       开始菜单快捷方式 + 安装后 pdfium 部署自检 `--check-pdfium` 冒烟
       ——#228 起安装包捆载 pdfium.dll 并复用 #224 自检；WebView2 面已随
       主线壳 mang-shell 的 GPU 自绘（DirectX 后端）架构移除。实机验证
-      面见 BUILD-VERIFY §3 复核清单）
+      面见 BUILD-VERIFY §3 复核清单。跟进件加「默认应用」面：应用列进
+      Windows 设置默认应用列表（RegisteredApplications + Capabilities，
+      跟进 PR 登记）；结构面钉子 =
+      `packaging/tests/test_ns_polite_registration.py`（20 项，Linux/Win
+      双平台），编译面 = makensis 3.11（BUILD-VERIFY §3 口径））
+- [ ] D2a R24-d 预装关联验证（#143 登记五条，真机窗口执行）：
+      ① 装前设 `.md` = 别的程序 → 安装后 .md 关联**不动**（礼貌不接管）
+      ② 干净机安装 → .md 无主时归本程序且「新建」菜单含空 Markdown 项
+        （悬空 progid 情形同判无主）
+      ③ 安装后 Windows「设置 → 默认应用」列表可见 mang（Capabilities
+        面）且「打开方式」菜单含 mang（OpenWithProgids 面）
+      ④ 换文件夹重装 → 运行旧目录 uninstall.exe 只清旧目录与新登记无涉
+        （open 命令所有权闸）
+      ⑤ 卸载 → .md 默认值/「新建」仅当仍归本程序时清理；「默认应用」
+        列表登记随卸载消失（RegisteredApplications 值删除）
 - [ ] D3 macOS：Info.plist 文档类型（.md）+ URL scheme（mdcore://）声明，
       Gatekeeper 冒烟（未签名时的用户引导文案）
 
