@@ -60,6 +60,7 @@
 pub mod abi;
 pub mod bmp;
 pub mod client;
+pub mod events;
 pub mod ffi;
 pub mod profile;
 pub mod protocol;
