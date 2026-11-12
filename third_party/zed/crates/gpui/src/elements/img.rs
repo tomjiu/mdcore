@@ -683,9 +683,7 @@ impl Asset for ImageAssetLoader {
                                 }
                                 // A bad frame ends it: the decoder may
                                 // never stop.
-                                Err(err) => {
-                                    return Err(ImageCacheError::Image(Arc::new(err)))
-                                }
+                                Err(err) => return Err(ImageCacheError::Image(Arc::new(err))),
                             }
                         }
 
@@ -715,9 +713,7 @@ impl Asset for ImageAssetLoader {
                                     }
                                     // A bad frame ends it: the decoder may
                                     // never stop.
-                                    Err(err) => {
-                                        return Err(ImageCacheError::Image(Arc::new(err)))
-                                    }
+                                    Err(err) => return Err(ImageCacheError::Image(Arc::new(err))),
                                 }
                             }
 

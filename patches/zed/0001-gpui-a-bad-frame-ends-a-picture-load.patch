@@ -8,18 +8,18 @@ with the decoder's error, and the no-frames error names no source
 diff --git a/third_party/zed/crates/gpui/src/elements/img.rs b/third_party/zed/crates/gpui/src/elements/img.rs
 --- a/third_party/zed/crates/gpui/src/elements/img.rs
 +++ b/third_party/zed/crates/gpui/src/elements/img.rs
-@@ -681,17 +681,17 @@ impl Asset for ImageAssetLoader {
+@@ -681,17 +681,15 @@ impl Asset for ImageAssetLoader {
                                      }
                                      frames.push(frame);
                                  }
-+                                // A bad frame ends it: the decoder may
-+                                // never stop.
-                                 Err(err) => {
+-                                Err(err) => {
 -                                    log::debug!(
 -                                        "Skipping GIF frame in {source:?} due to decode error: {err}"
 -                                    );
-+                                    return Err(ImageCacheError::Image(Arc::new(err)))
-                                 }
+-                                }
++                                // A bad frame ends it: the decoder may
++                                // never stop.
++                                Err(err) => return Err(ImageCacheError::Image(Arc::new(err))),
                              }
                          }
  
@@ -30,18 +30,18 @@ diff --git a/third_party/zed/crates/gpui/src/elements/img.rs b/third_party/zed/c
                              ))));
                          }
  
-@@ -713,17 +713,17 @@ impl Asset for ImageAssetLoader {
+@@ -713,17 +711,15 @@ impl Asset for ImageAssetLoader {
                                          }
                                          frames.push(frame);
                                      }
-+                                    // A bad frame ends it: the decoder may
-+                                    // never stop.
-                                     Err(err) => {
+-                                    Err(err) => {
 -                                        log::debug!(
 -                                            "Skipping WebP frame in {source:?} due to decode error: {err}"
 -                                        );
-+                                        return Err(ImageCacheError::Image(Arc::new(err)))
-                                     }
+-                                    }
++                                    // A bad frame ends it: the decoder may
++                                    // never stop.
++                                    Err(err) => return Err(ImageCacheError::Image(Arc::new(err))),
                                  }
                              }
  

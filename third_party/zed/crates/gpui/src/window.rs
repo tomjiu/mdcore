@@ -2136,15 +2136,12 @@ impl Window {
                         // title bar hitbox it is painted on.
                         let areas = &window.rendered_frame.window_control_hitboxes;
                         let hit = &window.mouse_hit_test;
-                        hit.ids
-                            .iter()
-                            .take(hit.hover_hitbox_count)
-                            .find_map(|id| {
-                                areas
-                                    .iter()
-                                    .find(|(_, hitbox)| hitbox.id == *id)
-                                    .map(|(area, _)| *area)
-                            })
+                        hit.ids.iter().take(hit.hover_hitbox_count).find_map(|id| {
+                            areas
+                                .iter()
+                                .find(|(_, hitbox)| hitbox.id == *id)
+                                .map(|(area, _)| *area)
+                        })
                     })
                     .log_err()
                     .unwrap_or(None)
