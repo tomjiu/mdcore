@@ -49,10 +49,13 @@
 - [ ] D1 Linux：`.desktop` 入口 + `text/markdown` mime 关联 +
       `x-scheme-handler/mdcore` scheme 注册（update-desktop-database /
       update-mime-database 刷新验证）
-- [ ] D2 Windows：NSIS 安装/卸载注册表面（开始菜单快捷方式 + 默认程序
-      注册 + 安装后 pdfium 部署自检 `--check-pdfium` 冒烟——#228 起
-      安装包捆载 pdfium.dll 并复用 #224 自检；WebView2 面已随主线壳
-      mang-shell 的 GPU 自绘（DirectX 后端）架构移除）
+- [ ] D2 Windows：NSIS 安装/卸载注册表面（#143 起 HKCU 用户级：免管理员，
+      InstallDir=$LOCALAPPDATA\Programs；礼貌类型注册——.md 只进「打开
+      方式」列表，默认与「新建」仅在无主时写入，写不进即安装失败；
+      开始菜单快捷方式 + 安装后 pdfium 部署自检 `--check-pdfium` 冒烟
+      ——#228 起安装包捆载 pdfium.dll 并复用 #224 自检；WebView2 面已随
+      主线壳 mang-shell 的 GPU 自绘（DirectX 后端）架构移除。实机验证
+      面见 BUILD-VERIFY §3 复核清单）
 - [ ] D3 macOS：Info.plist 文档类型（.md）+ URL scheme（mdcore://）声明，
       Gatekeeper 冒烟（未签名时的用户引导文案）
 
