@@ -52,13 +52,16 @@
 | D-13 | Ctrl+F 开条 | 页面视图内 Ctrl+F | 不切文本视图直接开条；黄色高亮 + n/m 计数 + Enter/Shift+Enter 导航 | `pdf_view_ctrl_f_opens_in_page_search`（shell e2e） |
 | D-14 | 旋转页高亮 | `rotated_90.pdf` 查找命中 | 高亮 quad 页变换映射不错位 | `pdf_view_search_full_flow`（视图级） |
 
-## 五、文本选择与复制（D4a——本批新增）
+## 五、文本选择与复制（D4a + D4d 跨页）
 
 | # | 检查项 | 操作 | 期望 | Linux 自动化背书 |
 |---|---|---|---|---|
 | D-15 | 拖选 | 左键拖选一段文字 | 选择蓝高亮实时跟随拖选（与查找黄并存） | `pdf_view_ctrl_c_copies_text_selection`（shell e2e，真实鼠标管线） |
 | D-16 | 复制 | 选中后 Ctrl+C → 记事本 Ctrl+V | 逐字一致（含跨行换行）；无选择 Ctrl+C 不吞 | 同上（测试平台剪贴板逐字断言） |
 | D-17 | Esc 清选择 | 选中后 Esc | 选择清零；再拖选即时高亮（层保留） | 同上 |
+| D-28 | 跨页拖选 | `zh_embedded_font.pdf` 页 1 中下部按下 → 拖过页界到页 2 上部松开 | 两页选择蓝同帺高亮（页 1 尾带 + 页 2 头带——角域语义：低页端点→页底角、高页页顶角→端点）；两页文本层串行提取不卡界面 | `pdf_view_ctrl_c_copies_cross_page_selection`（跨槽真鼠标链 e2e） |
+| D-29 | 跨页复制 | 跨页选中后 Ctrl+C → 记事本 Ctrl+V | 两页文本读序拼接（页间断行恰一条——前页尾已是行尾不重复补）；页 0 尾在前、页 1 头在后 | 同上（读序双锚点 + 剪贴板逐字断言 + Esc 清跨页面） |
+| D-30 | 倒拖读序 | 从页 2 拖回页 1（反向）松开 → 复制 | 文本仍按页序 1→2 拼接（倒拖不倒文本——读序组装恒 lo→hi） | `cross_page_slot_rects_forward_backward_and_degenerate`（纯函数单测：前进/后退/单页退化/跳页快拖四面） |
 
 ## 六、批注（#302/#386 + D4c）
 
@@ -96,6 +99,7 @@ d05-scanned.png         d14-rotated-find.png    d22-status-page.png
 d06-oversized.png       d15-drag-select.png     d23-tab-back.png
 d07-scroll-120p.png     d16-copy-paste.png      d25-damaged-panel.png
 d08-jump-60.png         d17-esc-clear.png      d27-two-tabs.png
+d28-cross-drag.png      d29-cross-copy.png      d30-backward-drag.png
 ```
 
 ## 十、Linux 侧证据摘要（先行验证口径）
@@ -106,7 +110,10 @@ d08-jump-60.png         d17-esc-clear.png      d27-two-tabs.png
 - 视图链/生命周期/健壮性：`pdf_display_verify` 全组（634 lib 测试全绿）；
 - 批注 e2e：`pdf_annotate_e2e` 10/10；
 - shell 键域/鼠标管线 e2e：Ctrl+F / Ctrl+C / 快照回放 / 右键拖框链
-  （`pdf_search_wiring_tests` 组）。
+  （`pdf_search_wiring_tests` 组）；跨页拖选/复制/Esc
+  （`pdf_view_ctrl_c_copies_cross_page_selection`——D4d 新面）；
+  跨页几何纯函数单测（`cross_page_slot_rects_forward_backward_and_
+  degenerate` + `join_page_texts_page_break_lines`）。
 - 命令（派工单结束条件，Linux 已跑通的三条原文）：
   `cargo test -p mdc-pdf --features engine-lopdf,engine-pdfium --test pdfr_display_matrix -- --nocapture --test-threads=1`；
   `cargo test --manifest-path mang-shell/Cargo.toml --lib pdf_display_verify -- --nocapture --test-threads=1`；
