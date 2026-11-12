@@ -26,3 +26,6 @@
 # git 入库时若转成 LF，用例数会从 655/652 掉到 0（CI 上实测）。
 # 标记为 binary 保证入库/检出不触碰字节。
 test-artifacts/external-corpus/** binary
+
+# shell 脚本必须 LF（云沙箱是 Linux，CRLF 会让 shebang 失效：bad interpreter）
+*.sh   text eol=lf
