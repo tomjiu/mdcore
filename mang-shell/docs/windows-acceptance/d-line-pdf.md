@@ -42,8 +42,9 @@
 | D-8 | 跳页 | 状态栏/书签跳第 60 页 | 顶部页读回 60；位图就绪 | `view_chain_first_screen_scroll_zoom_close_reopen` |
 | D-9 | 缩略图侧栏 | 右 dock 缩略图 | 点击跳页；高亮随滚动跟随 | `pdf_thumbs` 既有面（#420） |
 | D-10 | 缩放四态 | Ctrl+0 适应页面 / Ctrl+1 实际大小 / Ctrl+Shift+0 适应宽度 / Ctrl+=·Ctrl+- 步进 | 档位切换重渲不跳页（页空间锚点）；百分比 chip 正确 | `view_chain_first_screen_scroll_zoom_close_reopen`（576→640 换档） |
-| D-11 | Ctrl+滚轮缩放 | Ctrl+滚轮 | 窗口级拦截（列表不随滚）+ 步进 10% | 编译面 + 键域同构（真机手感待验） |
+| D-11 | Ctrl+滚轮缩放 | Ctrl+滚轮 | 窗口级拦截（列表不随滚）+ 步进 10% | `pdf_view_zoom_pan_navigation`（滚轮/中键真事件管线 e2e） |
 | D-12 | 高 DPI | 150%/200% 显示缩放后 Ctrl+= | 密度随 sf 升档（不发虚）；交互坐标仍逻辑域 | `hidpi_device_width_scales_display_stays_logical`（单元）+ `render_lifecycle_fast_zoom_stale_cancel` |
+| D-31 | 超宽横向平移 | Ctrl+= 放大超视口后：触控板双指横扫 / Shift+滚轮 / 中键拖拽 | 三手势平移看右侧溢出带（硬钳两端不越界）；中键拖拽内容随游标；切回适宽 pan 复位 | `pdf_view_zoom_pan_navigation`（滚轮管线 + 中键拖拽 + 槽位移断言）+ `gated_pan_overflow_quantum_threshold`（量子门控单元） |
 
 ## 四、页内查找（#422）
 
@@ -100,6 +101,7 @@ d06-oversized.png       d15-drag-select.png     d23-tab-back.png
 d07-scroll-120p.png     d16-copy-paste.png      d25-damaged-panel.png
 d08-jump-60.png         d17-esc-clear.png      d27-two-tabs.png
 d28-cross-drag.png      d29-cross-copy.png      d30-backward-drag.png
+d31-pan-wheel.png      d32-pan-mid-drag.png    d33-pan-fit-reset.png
 ```
 
 ## 十、Linux 侧证据摘要（先行验证口径）
@@ -113,7 +115,8 @@ d28-cross-drag.png      d29-cross-copy.png      d30-backward-drag.png
   （`pdf_search_wiring_tests` 组）；跨页拖选/复制/Esc
   （`pdf_view_ctrl_c_copies_cross_page_selection`——D4d 新面）；
   跨页几何纯函数单测（`cross_page_slot_rects_forward_backward_and_
-  degenerate` + `join_page_texts_page_break_lines`）。
+  degenerate` + `join_page_texts_page_break_lines`）；横向平移三手势
+  （`pdf_view_zoom_pan_navigation`——#421 尾新面 + 量子门控单元）。
 - 命令（派工单结束条件，Linux 已跑通的三条原文）：
   `cargo test -p mdc-pdf --features engine-lopdf,engine-pdfium --test pdfr_display_matrix -- --nocapture --test-threads=1`；
   `cargo test --manifest-path mang-shell/Cargo.toml --lib pdf_display_verify -- --nocapture --test-threads=1`；

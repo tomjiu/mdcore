@@ -126,7 +126,10 @@
 //!   FitPage / ActualSize / Custom 四态——Ctrl+滚轮（capture 期拦截）
 //!   + 键域 Ctrl+0/Ctrl+1/Ctrl+Shift+0/Ctrl+=·Ctrl+-（shell 键分派
 //!   前置分支——canvas 态键域同构）+ 右下角百分比 chip（可点开预设
-//!   菜单）。横向平移（超宽裁边导航）属后续轮；
+//!   菜单）。**横向平移已接**（#421 尾——超宽裁边导航）：光栅宽超
+//!   视口时触控板横扫 / Shift+纵向滚轮 / 中键拖拽三手势平移（钳
+//!   [0, 溢出宽] 两端硬边界；无溢出不吞事件照常冒泡；缩放档切换
+//!   pan 随光栅宽同比缩放——横向锚语义与纵向对称）；
 //! - 扫描件（无文本层）在页面视图下**正是正确呈现**（位图就是内容）
 //!   ——文本视图的「OCR 不支持」提示不再挡路；
 //! - **鼠标管线可测性**：页槽观察器经 in-flow 探针命中域（见上文
@@ -333,6 +336,12 @@ pub struct PdfPagesView {
     /// #421：缩放预设菜单开（右下角百分比 chip 点击弹出——backdrop
     /// 模态；点选项/点空白即关，不再占屏）。
     zoom_menu_open: bool,
+    /// #421 横向平移：当前内容左移量（逻辑 px；0 = 左缘对齐/无溢出
+    /// 居中；钳 [0, 光栅宽-视口宽]——缩放后超宽导航面）。
+    pan_x: f32,
+    /// #421 横向平移中键拖拽会话：`(拖起时 pan_x, 拖起时窗口 x)`。
+    /// None = 非中键拖拽中（窗口坐标域——游标全程跟随，越槽不中断）。
+    pan_drag: Option<(f32, f32)>,
     /// #302 验收 1：当前批注工具（三手势——高亮/下划线/便签；退化
     /// 右键单击循环切换，见 [`Self::finish_drag_annotation`]）。
     annotate_tool: AnnotateTool,
@@ -756,6 +765,8 @@ impl PdfPagesView {
             page_pt_w,
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
+            pan_x: 0.,
+            pan_drag: None,
             worker: Some(worker),
             cache: mdc_pdf::cache::PageCache::new(CACHE_BUDGET_BYTES),
             pending: HashMap::new(),
@@ -808,6 +819,8 @@ impl PdfPagesView {
             page_pt_w: PAGE_PT_W_FALLBACK,
             zoom_mode: ZoomMode::FitWidth,
             zoom_menu_open: false,
+            pan_x: 0.,
+            pan_drag: None,
             worker: None,
             cache: mdc_pdf::cache::PageCache::new(CACHE_BUDGET_BYTES),
             pending: HashMap::new(),
@@ -1195,7 +1208,8 @@ impl PdfPagesView {
     /// 成立——旧像素直设法在异尺寸档会跳页）。gpui::list 的 layout 以
     /// 锚点页起排、页高当帧实测（渲染回调里已是新槽高），锚点页之
     /// 下的未渲染页随滚动逐页修正。首帧视口未记录（逻辑锚恒首页）
-    /// 与同宽零变无操作。
+    /// 与同宽零变无操作。**#421 横向平移同步**：pan 随光栅宽同比缩放
+    /// （视口内相对横向位置不跳变——与纵向锚语义对称）。
     fn rescale_scroll_offset(&mut self, old_w: f32, new_w: f32) {
         if old_w <= 0. || (new_w - old_w).abs() < 0.5 || self.page_count == 0 {
             return;
@@ -1207,6 +1221,63 @@ impl PdfPagesView {
             item_ix: idx,
             offset_in_item: top.offset_in_item * ratio,
         });
+        // #421：横向平移同比缩放（新溢出域内钳制——量子门控同
+        // pan_overflow 单点口径；缩回适宽内 → 0）。
+        let (vw, _) = self.viewport_size;
+        let overflow = Self::gated_pan_overflow(new_w - vw);
+        self.pan_x = (self.pan_x * ratio).clamp(0., overflow);
+    }
+
+    /// #421 横向平移：当前溢出宽（光栅宽 - 视口宽；**量子门控**——
+    /// < [`WIDTH_QUANTUM`] 的伪溢出归零：FitWidth 光栅 div_ceil 上
+    /// 量化的过冲（≤63px 右缘裁剪，v1 同款行为）不是产品溢出，平移
+    /// 面不启用）。0 = 无溢出（内容适宽居中）。
+    fn pan_overflow(&self) -> f32 {
+        let (vw, vh) = self.viewport_size;
+        if vw <= 0. {
+            return 0.;
+        }
+        Self::gated_pan_overflow(self.raster_width(vw, vh) as f32 - vw)
+    }
+
+    /// #421 横向平移：量子门控静态面（单点口径——`pan_overflow` /
+    /// `rescale_scroll_offset` 两消费点同源：伪溢出（< 量子梯）归零）。
+    fn gated_pan_overflow(raw: f32) -> f32 {
+        if raw < WIDTH_QUANTUM as f32 {
+            0.
+        } else {
+            raw.max(0.)
+        }
+    }
+
+    /// #421 横向平移：按增量平移（正 = 视点右移看右侧内容；钳
+    /// [0, 溢出宽]——两端硬边界不越界）。**无溢出 = 复位归零 + 返回
+    /// false**（调用方据此不吞事件——冒泡照常，键盘/触控板语义不变）。
+    fn pan_by(&mut self, delta: f32, cx: &mut Context<Self>) -> bool {
+        let overflow = self.pan_overflow();
+        if overflow <= 0.5 {
+            self.pan_x = 0.; // 无溢出——平移面不启用（复位防陈旧值）。
+            return false;
+        }
+        let next = (self.pan_x + delta).clamp(0., overflow);
+        if (next - self.pan_x).abs() < 0.05 {
+            return false; // 钳边界内微抖——不重绘不吞键。
+        }
+        self.pan_x = next;
+        cx.notify();
+        true
+    }
+
+    /// #421 横向平移测试读数：当前内容左移量（逻辑 px）。
+    #[cfg(test)]
+    pub fn pan_x_for_test(&self) -> f32 {
+        self.pan_x
+    }
+
+    /// #421 横向平移测试读数：当前溢出宽（0 = 无平移面）。
+    #[cfg(test)]
+    pub fn pan_overflow_for_test(&self) -> f32 {
+        self.pan_overflow()
     }
 
     /// #421：预设行是否为当前态（Custom 档比倍率近似——0.5% 内视为
@@ -2661,11 +2732,39 @@ impl Render for PdfPagesView {
         // 观测面包装：list 元素自身无 Interactivity/调试选择器——
         // 外层 div 挂 id + debug_selector（debug_bounds("pdf-pages-list")
         // 既有断言面不迁移；尺寸代理 = list 满充容器，等值）。
-        let list = div()
-            .id("pdf-pages-list")
-            .debug_selector(|| "pdf-pages-list".into())
-            .size_full()
-            .child(list);
+        // **#421 横向平移**：光栅宽超视口时包一层平移容器（absolute
+        // 定位 left = -pan_x——内容左移 pan_x 看右侧溢出带；子树全体
+        // 随移：槽高亮/探针命中域/批注 overlay 坐标系槽内不变）；
+        // 溢出消除（含 FitWidth 量子化伪溢出门控——pan_overflow 单
+        // 点口径）走 v1 直挂布局（零视觉变化）+ 每帧钳制复位。外层
+        // overflow_hidden 防负偏移越界绘制。
+        let overflow = self.pan_overflow();
+        self.pan_x = self.pan_x.clamp(0., overflow);
+        let list = if overflow > 0.5 {
+            let fit_w = overflow + self.viewport_size.0;
+            div()
+                .id("pdf-pages-list")
+                .debug_selector(|| "pdf-pages-list".into())
+                .size_full()
+                .relative()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("pdf-pages-pan")
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(-self.pan_x))
+                        .w(px(fit_w))
+                        .h_full()
+                        .child(list),
+                )
+        } else {
+            div()
+                .id("pdf-pages-list")
+                .debug_selector(|| "pdf-pages-list".into())
+                .size_full()
+                .child(list)
+        };
         // #302④：批注路径错误横幅（最近一次——不静默丢，用户可重试）。
         let error_banner = annotate_error.map(|message| {
             div()
@@ -2905,22 +3004,25 @@ impl Render for PdfPagesView {
                                     let _ = viewport_entity.update(cx, |_, cx| cx.notify());
                                 });
                             }
-                            // #421：Ctrl+滚轮缩放——capture 期窗口级拦截
+                            // #421：滚轮域三手势——capture 期窗口级拦截
                             //（annotate_overlay paint 注册先例同款；capture
-                            // 先于 bubble = 先于 uniform_list 滚动消费，
-                            // stop_propagation 后列表不随缩放滚动）。横向
-                            // 分量占优（触控板双指横扫）不拦截——让事件
-                            // 冒泡照常滚动。修饰键 control||platform 归一
-                            //（与 shell 键分派同口径）。
+                            // 先于 bubble = 先于列表滚动消费，
+                            // stop_propagation 后列表不随缩放滚动）：
+                            // ① Ctrl+滚轮 = 缩放（纵向分量占优才拦——
+                            // 触控板双指横扫归平移）；② 无修饰横向分量
+                            // 占优 = **横向平移**（超宽档导航——无溢出
+                            // 不吞照常冒泡）；③ Shift+纵向滚轮 = 横向平移
+                            //（键盘族横滚惯例——Windows 触控板/真机验证
+                            // 手感，方向与 ② 同源）。修饰键 control||platform
+                            // 归一（与 shell 键分派同口径）。
+                            let wheel_zoom_entity = zoom_entity.clone();
+                            let pan_entity = zoom_entity.clone();
                             window.on_mouse_event(
                                 move |event: &ScrollEvent,
                                       phase: DispatchPhase,
                                       _window: &mut Window,
                                       cx: &mut App| {
                                     if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    if !(event.modifiers.control || event.modifiers.platform) {
                                         return;
                                     }
                                     if !bounds.contains(&event.position) {
@@ -2932,14 +3034,100 @@ impl Render for PdfPagesView {
                                             (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
                                         }
                                     };
-                                    if dy.abs() < dx.abs() {
-                                        return; // 横向手势不缩放——冒泡照旧。
+                                    let ctrl = event.modifiers.control || event.modifiers.platform;
+                                    if ctrl {
+                                        if dy.abs() < dx.abs() {
+                                            return; // 横向手势不缩放——归平移分支。
+                                        }
+                                        let steps = dy / WHEEL_LINE_PX;
+                                        let _ = wheel_zoom_entity.update(cx, |view, cx| {
+                                            view.zoom_wheel(steps, cx);
+                                        });
+                                        cx.stop_propagation();
+                                        return;
                                     }
-                                    let steps = dy / WHEEL_LINE_PX;
-                                    let _ = zoom_entity.update(cx, |view, cx| {
-                                        view.zoom_wheel(steps, cx);
+                                    // 平移分支：横向占优（触控板横扫）或
+                                    // Shift+纵向（键盘族横滚惯例）。
+                                    let pan_delta = if dx.abs() >= dy.abs() {
+                                        dx
+                                    } else if event.modifiers.shift {
+                                        dy
+                                    } else {
+                                        return;
+                                    };
+                                    let consumed = pan_entity
+                                        .update(cx, |view, cx| view.pan_by(pan_delta, cx))
+                                        .unwrap_or(false);
+                                    if consumed {
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            );
+                            // #421：中键拖拽平移——按下（探针域内）记
+                            // (pan, 窗口 x) 会话；拖动全程跟随（窗口坐标
+                            // 域——越页槽不中断）；松开收尾。会话在位 +
+                            // pressed_button == Middle 双判据——悬停不误触。
+                            let pan_down_entity = zoom_entity.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseDownEvent,
+                                      phase: DispatchPhase,
+                                      _window: &mut Window,
+                                      cx: &mut App| {
+                                    if phase != DispatchPhase::Bubble
+                                        || event.button != MouseButton::Middle
+                                    {
+                                        return;
+                                    }
+                                    if !bounds.contains(&event.position) {
+                                        return;
+                                    }
+                                    let _ = pan_down_entity.update(cx, |view, _| {
+                                        view.pan_drag =
+                                            Some((view.pan_x, f32::from(event.position.x)));
                                     });
-                                    cx.stop_propagation();
+                                },
+                            );
+                            let pan_move_entity = zoom_entity.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent,
+                                      phase: DispatchPhase,
+                                      _window: &mut Window,
+                                      cx: &mut App| {
+                                    if phase != DispatchPhase::Bubble
+                                        || event.pressed_button != Some(MouseButton::Middle)
+                                    {
+                                        return;
+                                    }
+                                    let _ = pan_move_entity.update(cx, |view, cx| {
+                                        let Some((start_pan, start_x)) = view.pan_drag else {
+                                            return;
+                                        };
+                                        // 拖内容随游标：右拖 → 内容右移 →
+                                        // 视点左移（pan 减；对称于触控板横扫）。
+                                        let overflow = view.pan_overflow();
+                                        view.pan_x = (start_pan
+                                            - (f32::from(event.position.x) - start_x))
+                                            .clamp(0., overflow);
+                                        cx.notify();
+                                    });
+                                },
+                            );
+                            let pan_up_entity = zoom_entity.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseUpEvent,
+                                      phase: DispatchPhase,
+                                      _window: &mut Window,
+                                      cx: &mut App| {
+                                    if phase != DispatchPhase::Bubble
+                                        || event.button != MouseButton::Middle
+                                    {
+                                        return;
+                                    }
+                                    let _ = pan_up_entity.update(cx, |view, cx| {
+                                        if view.pan_drag.take().is_some() {
+                                            cx.notify();
+                                        }
+                                    });
                                 },
                             );
                         },
@@ -3813,6 +4001,41 @@ mod tests {
         assert_eq!(
             join_page_texts(&["甲".into(), "乙".into(), "丙".into()]),
             "甲\n乙\n丙"
+        );
+    }
+
+    /// #421 尾：量子门控溢出面——FitWidth div_ceil 上量化伪溢出
+    /// （< WIDTH_QUANTUM=64）归零（平移面不启用——右缘 ≤63px 裁剪与
+    /// v1 同款非产品溢出）；≥ 64px 真溢出如实通过；负值（光栅窄于
+    /// 视口）同归零。
+    #[test]
+    fn gated_pan_overflow_quantum_threshold() {
+        use super::PdfPagesView;
+        let q = WIDTH_QUANTUM as f32;
+        // 伪溢出区（0 < raw < 64）→ 0。
+        assert_eq!(PdfPagesView::gated_pan_overflow(0.), 0., "零溢出");
+        assert_eq!(
+            PdfPagesView::gated_pan_overflow(32.),
+            0.,
+            "FitWidth 量子化过冲 32px = 伪溢出归零"
+        );
+        assert_eq!(
+            PdfPagesView::gated_pan_overflow(63.9),
+            0.,
+            "量子梯下沿仍伪溢出"
+        );
+        // 真溢出（≥ 64）→ 原值通过。
+        assert_eq!(PdfPagesView::gated_pan_overflow(q), q, "恰一梯 = 真溢出");
+        assert_eq!(
+            PdfPagesView::gated_pan_overflow(280.),
+            280.,
+            "125% 档溢出如实"
+        );
+        // 负值（光栅窄于视口——FitPage/小档）→ 0。
+        assert_eq!(
+            PdfPagesView::gated_pan_overflow(-120.),
+            0.,
+            "无溢出归零（负钳）"
         );
     }
 
