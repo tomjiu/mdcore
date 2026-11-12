@@ -6,10 +6,9 @@ description = "LibreOfficeKit 隔离 worker 原型（#633）：LOK 内核动态�
 
 [dependencies]
 serde_json.workspace = true
-# B4：verify.rs 保存产物独立校验的 deflate 解压（Cargo.lock 现解析
-# 版本直依赖——pdfium-render/lopdf 传递引入已编译，零新编译单元，
-# 循 mdc-pdf sha2 先例）。
-flate2 = "1.1.10"
+# B4：verify.rs 保存产物独立校验的 deflate 解压。原 flate2 直依赖系
+# 死重（2026-11 依赖审计：全码零 flate2:: 直用，解压由 zip 的 deflate
+# 特性传递提供）——已移除，此注释留档防止复活。
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 url = "2.5"
 same-file = "1.0"

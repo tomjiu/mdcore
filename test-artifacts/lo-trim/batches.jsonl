@@ -1,0 +1,4 @@
+batch=b1_share_resources status=PASS deleted_entries=13 mb_before=294 mb_after=257
+batch=b3_program_nonwriter status=FAIL_ROLLED_BACK deleted_entries=34 mb_before=257 mb_after=212
+batch=b4_program_assets status=FAIL_ROLLED_BACK deleted_entries=7 mb_before=257 mb_after=256
+final_mb=257
