@@ -1046,10 +1046,25 @@ impl DocSession {
     /// dirty=false、revision+1（保存也是新状态，C 线据此失效旧 tile）。
     /// 失败：dirty/revision 均不动。
     pub fn save_as(&mut self, url: &str, format: &str) -> Result<Value, LokError> {
+        self.save_as_with_options(url, format, None)
+    }
+
+    /// saveAs 带所有权选项（#115 比对缺口 #9 客户端面）：`Some("Take
+    /// Ownership")` 接管被锁文件、`Some("TakeOwnership,TerminateEditing")`
+    /// 另终止编辑态——**白名单外字符串 worker 拒（BAD_REQUEST）**。脏位
+    /// 语义与 [`Self::save_as`] 同拍（成功才清）。
+    pub fn save_as_with_options(
+        &mut self,
+        url: &str,
+        format: &str,
+        options: Option<&str>,
+    ) -> Result<Value, LokError> {
         crate::save_guard::check(&self.loaded_url, url).map_err(LokError::Protocol)?;
-        let r = self
-            .client
-            .request("save_as", json!({"url": url, "format": format}))?;
+        let mut a = json!({"url": url, "format": format});
+        if let Some(o) = options {
+            a["filter_options"] = json!(o);
+        }
+        let r = self.client.request("save_as", a)?;
         self.dirty = false;
         self.revision += 1;
         Ok(r)
