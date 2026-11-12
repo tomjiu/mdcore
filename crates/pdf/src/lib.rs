@@ -90,6 +90,10 @@ pub mod engine_pdfium;
 pub mod deploy_check;
 pub mod outline;
 pub mod page;
+// #162 PDE 兼容抽象层批①（Adobe PDFEdit/PDE 产品架构参照）：对象
+// 模型 + 内容流解析/写回，零引擎依赖（default = [] 纪律不变——纯
+// Rust 内容流面，不引入新依赖）。
+pub mod pde;
 // #240 / Acrobat parity P1：打印渲染原语（DPI 驱动 + 页区间 +
 // 注释打印开关——[`crate::render::Rasterizer::rasterize_with_options`]
 // 的编排面；零引擎依赖，mock 可测）。
