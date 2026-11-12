@@ -3,6 +3,7 @@
 //!
 //! 覆盖面（AGENTS §13 环境门纪律的「恒跑层」）：
 //! - 请求 ID 关联（并发请求不串）
+//! - **应答错号 = 一等协议错误**（crossed-worker 夹具：判死 + 串号诊断，不静默不误导性超时）
 //! - 帧长上限：请求超限拒发 / 应答超限降级 E_OVERSIZE（worker 存活）
 //! - 超时看门狗：挂死 op → Timeout + worker 被杀
 //! - worker 死亡：boom → 后续请求 WorkerDied（含 stderr 尾部）
@@ -35,6 +36,43 @@ fn fake_worker_request_id_correlation() {
             .expect("echo 应答");
         assert_eq!(v["echo"], "op", "echo 模式应回显 op");
     }
+    w.kill();
+}
+
+#[test]
+fn fake_worker_crossed_reply_is_first_class_error() {
+    // #49 ely-ipc check_reply 同构：假 worker 故意答错号（id+1000）。
+    // 旧路径静默丢弃 → 挂起方吃误导性 Timeout；硬化后必须立即
+    // WorkerDied + 串号诊断（detail 含错号与在挂清单）。
+    let dir = tmp("cross");
+    let w = WorkerClient::spawn(None, &dir, Some(&worker_bin()), Some("cross")).expect("spawn");
+    let started = std::time::Instant::now();
+    let err = w
+        .request_with_timeout("ping", json!({}), Duration::from_secs(8))
+        .expect_err("答错号必须一等错误（不得静默）");
+    match &err {
+        LokError::WorkerDied { detail, .. } => {
+            assert!(
+                detail.contains("错号"),
+                "detail 应含错号诊断，实得：{detail}"
+            );
+            assert!(
+                detail.contains("id="),
+                "detail 应含错答 id（定位串号现场），实得：{detail}"
+            );
+        }
+        other => panic!("应为 WorkerDied（错号判死），实得：{other}"),
+    }
+    assert_eq!(err.code(), codes::WORKER_DIED);
+    assert!(w.is_dead(), "错号后 worker 必须判死（关联不可信）");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "错号立即判死，不等 8s 超时（实等 {:?}）",
+        started.elapsed()
+    );
+    // 判死后新请求快速失败（同一诊断面）
+    let err2 = w.request("ping", json!({})).expect_err("死后请求必须报错");
+    assert!(matches!(err2, LokError::WorkerDied { .. }));
     w.kill();
 }
 

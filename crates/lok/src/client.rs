@@ -562,10 +562,38 @@ fn reader_loop<R: Read>(
             continue;
         }
         if let Some(id) = v.get("id").and_then(Value::as_u64) {
-            if let Ok(mut p) = pending.lock() {
-                if let Some(tx) = p.remove(&id) {
-                    let _ = tx.send(v);
-                }
+            // #49 B 线硬化：应答错号 = 一等协议错误（ely-ipc check_reply
+            // 同构——「应答帧的请求 ID 与请求方持有的 ID 不配对即
+            // InvalidData」）。关联表按 id 寻址：错号应答投不进任何挂起
+            // 请求，旧路径**静默丢弃**——挂起方最终吃误导性 Timeout；
+            // 现改为立即判死（detail 带错号与在挂清单），全部挂起以
+            // WorkerDied(串号详情) 扩散——排查串号问题的第一道闸。
+            // 锁毒化 = 宿主侧异常（非 worker 说谎），维持旧静默路径
+            // 不诬判。
+            let delivered = match pending.lock() {
+                Ok(mut p) => match p.remove(&id) {
+                    Some(tx) => {
+                        let _ = tx.send(v);
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => true,
+            };
+            if !delivered {
+                let waiting: Vec<u64> = pending
+                    .lock()
+                    .map(|p| p.keys().copied().collect())
+                    .unwrap_or_default();
+                mark_dead(
+                    &dead,
+                    &death_detail,
+                    &format!(
+                        "应答错号（串号）：worker 应答 id={id}，但在挂请求为 {waiting:?}\
+                         ——协议关联不可信，判死（ely-ipc check_reply 同构：错配即 InvalidData）"
+                    ),
+                );
+                break; // → EOF 尾：清空全部挂起（各等待方得 WorkerDied + 本诊断）
             }
         }
     }
