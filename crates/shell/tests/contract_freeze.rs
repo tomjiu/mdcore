@@ -1,7 +1,7 @@
 //! R23-d — 宿主↔桥↔核契约冻结锁（CONTRACT.md v1）。
 //!
 //! 母本与产品仓（mdcore/）对同一契约面必须逐词面一致：本文件锁 Rust 侧
-//! 可静态断言的面（shell-native 蓝图注入脚本 + 契约文档存在性与版本）；
+//! 可静态断言的面（web 注入桥事件族 + 契约文档存在性与版本）；
 //! window 运行时面由 web/tests/contract_gate.py 锁。
 
 use std::path::Path;
@@ -16,15 +16,22 @@ fn prototype_root() -> &'static Path {
 
 /// 蓝图注入脚本词面锁：事件族 = mdc-inject*（RC 轮统一命名域），
 /// 入口 = __inject / __inject_chunk；旧名 md-inject* 禁止复活。
+/// （旧壳 crates/shell-native 已于 2026-11 架构剪裁轮移除——本锁
+/// 的宿主侧词面锚点随之改挂 web/src/main.ts，事件族命名域纪律不变；
+/// 契约文档 CONTRACT.md 锚点保持原样。）
 #[test]
-fn shell_native_blueprint_uses_frozen_event_family() {
-    let src = include_str!("../../shell-native/src/lib.rs");
-    assert!(src.contains("'mdc-inject'"), "mdc-inject 事件名必须在蓝图");
+fn web_bridge_uses_frozen_event_family() {
+    let src = std::fs::read_to_string(prototype_root().join("web/src/main.ts"))
+        .expect("web/src/main.ts 必须存在（注入桥词面锚点）");
+    assert!(src.contains("__inject"), "__inject 入口必须在桥侧");
     assert!(
-        src.contains("'mdc-inject-chunk'"),
-        "mdc-inject-chunk 事件名必须在蓝图"
+        src.contains("__inject_chunk"),
+        "__inject_chunk 渐进入口必须在桥侧"
     );
-    assert!(src.contains("__inject_chunk"), "渐进入口必须在蓝图");
+    assert!(
+        src.contains("mdc-inject"),
+        "mdc-inject 事件族必须在桥侧（TRADEMARK_RULES §1）"
+    );
     assert!(
         !src.contains("'md-inject'"),
         "旧事件名 md-inject 禁止复活（CONTRACT.md §2）"

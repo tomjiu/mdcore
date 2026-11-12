@@ -25,8 +25,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 # 桌面壳系统依赖——主线壳 mang-shell（GPUI 自绘，DirectX 后端系）：
 sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev pkg-config
-# 旧壳 mdshell-native（Linux GTK 面，不随主线发行）链接面：
-# Debian/Ubuntu：sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
+# （旧壳 mdshell-native 的 GTK/WebKitGTK 链接面已随 2026-11 架构剪裁轮
+#   移除该 crate 一并取消——零消费者死重，主线发行不含该载荷。）
 
 # web 面依赖
 # node >= 18 / npm；python3 >= 3.10 + playwright（chromium）
@@ -34,8 +34,7 @@ python3 -m pip install playwright && python3 -m playwright install chromium
 ```
 
 受限/离线环境备选：`scripts/rust-env.sh` 的 ② 即为免 root 的同类方案
-（apt download + dpkg -x 解包树 + 环境变量导出）；旧 optroot 口径
-（`source optroot/env.sh`）仍可用，两者取一。
+（apt download + dpkg -x 解包树 + 环境变量导出）。
 
 ### 1.2 Windows（CI 口径——本地开发同此）
 
@@ -60,8 +59,8 @@ npm run build:wasm           # cargo wasm32 release + wasm-bindgen（CLI 版本�
 npm run build                # esbuild → dist/
 # PDF 阅读面（可选）：npm run build:wasm:pdf（pkg_pdf/——pdf_view 模型面）
 
-# 桌面壳
-cargo build -p mdshell-native
+# 桌面壳（主线 mang-shell——独立 workspace，GPUI 自绘）
+cargo build --manifest-path mang-shell/Cargo.toml
 ```
 
 ## 3. 起本地服务
@@ -96,8 +95,8 @@ cargo test -p mdc-pdf --features engine-pdfium
 
 | 症状 | 原因与解法 |
 |---|---|
-| `failed to run custom build command for gdk-sys` / `pkg-config` 找不到 gtk | 系统缺 GTK 开发库或 PKG_CONFIG_PATH 未指到——装 §1.1 包，或 `source optroot/env.sh` |
-| 链接期 `rust-lld: unable to find library -lgtk-3 / -lwebkit2gtk-4.1` | pkg-config 找到了（编译过）但链接器搜索路径没带上 `.pc` 的 -L——同上 optroot 前置，或核对 `.pc` 文件 prefix 与实际库路径一致 |
+| ~~`failed to run custom build command for gdk-sys` / `pkg-config` 找不到 gtk~~ | 已随旧壳 mdshell-native 剪裁失效（2026-11 移除，GTK/WebKitGTK 依赖树一并出锁）——仅历史在档 |
+| ~~链接期 `rust-lld: unable to find library -lgtk-3 / -lwebkit2gtk-4.1`~~ | 同上，旧壳链接面已不存在 |
 | `rustup could not choose a version of cargo` | 仓外目录跑了 cargo（rust-toolchain.toml 只在仓内生效）——`export RUSTUP_TOOLCHAIN=1.99.0-x86_64-unknown-linux-gnu` 或进仓再跑 |
 | 磁盘吃紧（target/ 膨胀数 GB） | `export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`（测试二进制 80MB→15MB/件）；长期不用 `cargo clean` 回收 |
 | wasm 运行期 link 失败 | wasm-bindgen CLI 与 Cargo.lock 版本不齐——`cargo install wasm-bindgen-cli --version 0.2.129 --locked`（**前台装**——后台化会被会话收割） |

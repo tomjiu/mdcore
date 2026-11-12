@@ -60,18 +60,19 @@ fn version_single_source_via_workspace() {
         .expect("workspace.package 内必须有 version");
     assert_eq!(ws_version, mdcore::VERSION, "根手写点与运行时常量必须一致");
 
-    // 八 crate 全部继承（独立声明 = 第二手写点 = 漂移源，禁止）。
+    // 七 crate 全部继承（独立声明 = 第二手写点 = 漂移源，禁止）。
     // 清单含 crates/pdf（mdc-pdf，PDF-b 起 workspace 成员——T1 审计 F7
     // 补齐：此前清单漏列，仅由 pdfb_skeleton 的版本自锁补位）与
     // crates/settings（mdc-settings，T3 复用地基轮抽取件）与
     // crates/office（mdc-office，office-impl T1 轮新成员）与
     // crates/office-io（mdc-office-io，xlsx-r1 阶段 B 新成员——双
     // crate 方案 A，IO 三方依赖承载面）。
+    // （crates/shell-native 已于 2026-11 架构剪裁轮移除出 workspace——
+    // 零消费者死重；版本单源继承面随之收窄。）
     for c in [
         "mdcore",
         "mdcore-wasm",
         "shell",
-        "shell-native",
         "pdf",
         "settings",
         "office",

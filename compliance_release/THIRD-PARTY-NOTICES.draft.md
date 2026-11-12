@@ -92,7 +92,7 @@
   + web 随产物分发 npm 包（含传递闭包）+ pdfium 预编译二进制（首个分发资产，三平台）；
   devDependencies（构建期工具）不入正文，见 §dev；引擎二进制 licenses/ 全量见 §pdfium。
 - 工作区自研件（非第三方，单列）：mdcore 0.1.0, mdcore-wasm 0.1.0, mdshell 0.1.0,
-  mdshell-native 0.1.0, mdc-pdf 0.1.0, mdc-settings 0.1.0, mdc-office 0.1.0,
+  mdshell-native 0.1.0（2026-11 架构剪裁轮移除出 workspace，此后 SBOM 四面闭包不再含）, mdc-pdf 0.1.0, mdc-settings 0.1.0, mdc-office 0.1.0,
   mdc-office-io 0.1.0, mdc-evidence 0.1.0, mdc-workbench 0.1.0, mdc-collab 0.1.0
   （v1.2 基准锁后新入 lock 的自研件一并补齐单列；evidence/workbench [S1/S2]、
   collab [v1.6 本轮]）。
