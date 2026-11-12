@@ -1,0 +1,75 @@
+gpui: a bad frame ends a GIF or WebP load
+
+A frame that did not decode was skipped and the loop asked for the
+next; on a damaged file the decoder may never stop. The load now ends
+with the decoder's error, and the no-frames error names no source
+(upstream zed@1663af41 unfixed; cf. ElyOffice gpui patch 0001, Ely C14.7).
+
+diff --git a/third_party/zed/crates/gpui/src/elements/img.rs b/third_party/zed/crates/gpui/src/elements/img.rs
+--- a/third_party/zed/crates/gpui/src/elements/img.rs
++++ b/third_party/zed/crates/gpui/src/elements/img.rs
+@@ -681,17 +681,15 @@ impl Asset for ImageAssetLoader {
+                                     }
+                                     frames.push(frame);
+                                 }
+-                                Err(err) => {
+-                                    log::debug!(
+-                                        "Skipping GIF frame in {source:?} due to decode error: {err}"
+-                                    );
+-                                }
++                                // A bad frame ends it: the decoder may
++                                // never stop.
++                                Err(err) => return Err(ImageCacheError::Image(Arc::new(err))),
+                             }
+                         }
+ 
+                         if frames.is_empty() {
+                             return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+-                                "GIF could not be decoded: all frames failed ({source:?})"
++                                "GIF could not be decoded: no frames"
+                             ))));
+                         }
+ 
+@@ -713,17 +711,15 @@ impl Asset for ImageAssetLoader {
+                                         }
+                                         frames.push(frame);
+                                     }
+-                                    Err(err) => {
+-                                        log::debug!(
+-                                            "Skipping WebP frame in {source:?} due to decode error: {err}"
+-                                        );
+-                                    }
++                                    // A bad frame ends it: the decoder may
++                                    // never stop.
++                                    Err(err) => return Err(ImageCacheError::Image(Arc::new(err))),
+                                 }
+                             }
+ 
+                             if frames.is_empty() {
+                                 return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+-                                    "WebP could not be decoded: all frames failed ({source:?})"
++                                    "WebP could not be decoded: no frames"
+                                 ))));
+                             }
+ 
+diff --git a/third_party/zed/crates/gpui/src/platform.rs b/third_party/zed/crates/gpui/src/platform.rs
+--- a/third_party/zed/crates/gpui/src/platform.rs
++++ b/third_party/zed/crates/gpui/src/platform.rs
+@@ -3447,14 +3447,13 @@ impl Image {
+                             }
+                             frames.push(frame);
+                         }
+-                        Err(err) => {
+-                            log::debug!("Skipping GIF frame due to decode error: {err}");
+-                        }
++                        // A bad frame ends it: the decoder may never stop.
++                        Err(err) => return Err(err.into()),
+                     }
+                 }
+ 
+                 if frames.is_empty() {
+-                    anyhow::bail!("GIF could not be decoded: all frames failed");
++                    anyhow::bail!("GIF could not be decoded: no frames");
+                 }
+ 
+                 frames

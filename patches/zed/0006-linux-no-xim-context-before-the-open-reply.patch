@@ -1,0 +1,24 @@
+linux: no XIM input context before the open's reply
+
+Creating the input context before XIM answered the open broke fcitx5
+under XWayland: set_ic_values ran with no input method id yet. The
+position update now waits for the open's reply (upstream zed@1663af41
+unfixed; cf. ElyOffice gpui patch 0006, Ely R14.48d).
+
+diff --git a/third_party/zed/crates/gpui_linux/src/linux/x11/client.rs b/third_party/zed/crates/gpui_linux/src/linux/x11/client.rs
+--- a/third_party/zed/crates/gpui_linux/src/linux/x11/client.rs
++++ b/third_party/zed/crates/gpui_linux/src/linux/x11/client.rs
+@@ -292,6 +292,13 @@ impl X11ClientStatePtr {
+             state.ximc = Some(ximc);
+             return;
+         };
++        // Before the open's reply there is no input method id: setting
++        // the context then broke fcitx5 under XWayland (Ely R14.48d).
++        if !xim_handler.connected {
++            state.ximc = Some(ximc);
++            state.xim_handler = Some(xim_handler);
++            return;
++        }
+         let scaled_bounds = bounds.scale(state.scale_factor);
+         let ic_attributes = ximc
+             .build_ic_attributes()

@@ -167,3 +167,42 @@ $ cd third_party/zed && cargo check -p gpui_platform --features wayland,x11,font
 2. 修改 `scripts/zed_port.py` 顶部 `ZED` 指向新 clone（或保持路径约定）
 3. `python3 scripts/zed_port.py --clean`（在实验区重建后比对）
 4. `cd third_party/zed && cargo build` 全绿后，更新本文件「来源快照」的 commit 与日期
+
+## 补丁层（patches/zed/ · 2026-11-11 · issue #137）
+
+> 自本节起口径从「源码零修改」改为「**零未登记修改**」：任何对 third_party/zed
+> 源码的修改必须以补丁文件登记在 `patches/zed/`，否则 `scripts/zed_patches.py check`
+> 门禁不绿。机制照 ElyOffice vendor-gpui.sh 两层模式（见 #128/#130 调研）。
+
+补丁格式：Ely 风格纯 unified diff（标题 + 缺陷/复现/修法正文 + `a/third_party/zed/...` 路径），
+`git apply` 于仓根。应用与探测：`python3 scripts/zed_patches.py apply|check|status`；
+上游已修的补丁在 pin 升级时 forward/reverse 双探失败 → 人工确认后从目录移除（「上游收编即移除」）。
+
+| 补丁 | 缺陷 | 改动文件 | 来源 |
+|---|---|---|---|
+| `0001-gpui-a-bad-frame-ends-a-picture-load.patch` | 损坏 GIF/WebP 帧跳过后继续解码 → 死循环挂死 | crates/gpui/src/elements/img.rs · crates/gpui/src/platform.rs | ElyOffice gpui 0001（Ely C14.7），上游 zed@1663af41 未修 |
+| `0002-gpui-the-topmost-window-control-wins-the-hit-test.patch` | 窗口控件命中测试按绘制序而非顶层优先 → title_bar 上 caption 按钮点不中 | crates/gpui/src/window.rs | ElyOffice gpui 0002，上游未修 |
+| `0006-linux-no-xim-context-before-the-open-reply.patch` | XIM open 回复前 set_ic_values → fcitx5 在 XWayland 下坏 | crates/gpui_linux/src/linux/x11/client.rs | ElyOffice gpui 0006（Ely R14.48d），上游未修 |
+| `0008-windows-no-calls-on-destroyed-windows.patch` | WM_DESTROY 后 Drop 二次 Show/Destroy 窗口 + 迟到的激活上报找不到窗口 | crates/gpui_windows/src/events.rs · crates/gpui_windows/src/window.rs | ElyOffice gpui 0008，上游未修 |
+| `0010-windows-han-layout-follows-the-app-language.patch` | DirectWrite 按用户 locale 选 Han 字形 → 英文 locale Windows 中文用户看到日文字形；新增 `gpui_windows::set_text_language` | crates/gpui_windows/Cargo.toml · crates/gpui_windows/src/direct_write.rs · crates/gpui_windows/src/gpui_windows.rs | ElyOffice gpui 0010（Ely R4.13），上游未修 |
+
+五个补丁均为**任何 gpui 应用都会撞的纯缺陷**（非 Ely 业务耦合），计划同步发上游 PR
+（Apache-2.0；收编后本层对应条目移除）。验收（真机，Lead）：见 issue #137 清单。
+0010 的 DirectWrite faces 行为测试需真机 DirectWrite 栈，不在本层（han 分类器已有单元测试）。
+
+### 编译证据（2026-11-11 · 五补丁全打态）
+
+```
+$ cd third_party/zed && cargo check --workspace                       # Linux 全量
+    Finished `dev` profile target(s) in 52.78s
+$ cd third_party/zed && cargo check -p gpui --target x86_64-pc-windows-msvc
+    Finished `dev` profile target(s) in 7.68s
+$ cd third_party/zed && cargo check -p gpui_windows --target x86_64-pc-windows-msvc --all-targets
+    Finished `dev` profile target(s) in 34.19s   # 含 0010 han_tests 单元测试编译
+$ python3 scripts/zed_patches.py check
+    OK: 5 个补丁全部已打、与清单一致
+```
+
+（Windows 交叉 check 依赖：仓库 rust-toolchain.toml 的 1.99.0 工具链装
+`x86_64-pc-windows-msvc` target；llvm-rc 以 shim 满足 embed-resource 契约
+——check 门禁验证类型面，真机验收另做。）

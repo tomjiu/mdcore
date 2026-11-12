@@ -41,8 +41,23 @@ pub(crate) struct DirectWriteTextSystem {
     state: RwLock<DirectWriteState>,
 }
 
+/// The app's Han language, set before any window opens.
+static APP_LANGUAGE: RwLock<Option<HSTRING>> = RwLock::new(None);
+
+/// Han layout follows `tag` when it is Han.
+pub fn set_text_language(tag: &str) {
+    let chosen = han(tag).then(|| HSTRING::from(tag));
+    log::info!(
+        "text: the app's language is {tag}; Han layout follows it: {}",
+        chosen.is_some()
+    );
+    *APP_LANGUAGE.write() = chosen;
+}
+
 struct DirectWriteComponents {
     locale: HSTRING,
+    /// Text's language; picks Han glyphs and fallback fonts.
+    text_locale: HSTRING,
     factory: IDWriteFactory5,
     in_memory_loader: IDWriteInMemoryFontFileLoader,
     builder: IDWriteFontSetBuilder1,
@@ -177,7 +192,12 @@ impl DirectWriteTextSystem {
         let builder = unsafe { factory.CreateFontSetBuilder()? };
         let mut locale = [0u16; LOCALE_NAME_MAX_LENGTH as usize];
         unsafe { GetUserDefaultLocaleName(&mut locale) };
-        let locale = HSTRING::from_wide(&locale);
+        let end = locale
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(locale.len());
+        let locale = HSTRING::from_wide(&locale[..end]);
+        let text_locale = text_locale(&locale);
         let text_renderer = TextRendererWrapper::new(locale.clone());
 
         let gpu_state = directx_devices.map(GPUState::new).transpose()?;
@@ -186,6 +206,7 @@ impl DirectWriteTextSystem {
         let system_ui_font_name = get_system_ui_font_name();
         let components = DirectWriteComponents {
             locale,
+            text_locale,
             factory,
             in_memory_loader,
             builder,
@@ -622,7 +643,10 @@ impl DirectWriteState {
                         font_info.font_face.GetStyle(),
                         DWRITE_FONT_STRETCH_NORMAL,
                         font_size.as_f32(),
-                        &components.locale,
+                        APP_LANGUAGE
+                            .read()
+                            .as_ref()
+                            .unwrap_or(&components.text_locale),
                     )?
                     .cast()?;
                 if let Some(ref fallbacks) = font_info.fallbacks {
@@ -1920,6 +1944,52 @@ const fn make_open_type_tag(tag_name: &str) -> u32 {
 #[inline]
 const fn make_direct_write_tag(tag_name: &str) -> DWRITE_FONT_FEATURE_TAG {
     DWRITE_FONT_FEATURE_TAG(make_open_type_tag(tag_name))
+}
+
+/// The user's locale, or their first Han language.
+fn text_locale(user: &HSTRING) -> HSTRING {
+    if han(&user.to_string()) {
+        return user.clone();
+    }
+    let languages = windows::System::UserProfile::GlobalizationPreferences::Languages();
+    match languages {
+        Ok(languages) => match languages.into_iter().find(|tag| han(&tag.to_string())) {
+            Some(tag) => {
+                log::info!(
+                    "text: laid out as {}, the user's Han language; the locale is {}",
+                    tag.to_string(),
+                    user.to_string()
+                );
+                tag
+            }
+            None => user.clone(),
+        },
+        Err(error) => {
+            log::warn!(
+                "text: the user's languages are unreadable, so text is laid out as {}: {error:#}",
+                user.to_string()
+            );
+            user.clone()
+        }
+    }
+}
+
+/// Whether `tag` is a language written with Han characters.
+fn han(tag: &str) -> bool {
+    matches!(tag.split('-').next(), Some("zh" | "ja" | "ko"))
+}
+
+#[cfg(test)]
+mod han_tests {
+    #[test]
+    fn han_languages_are_told_by_their_first_subtag() {
+        for tag in ["zh-Hans-CN", "zh-TW", "ja-JP", "ko"] {
+            assert!(super::han(tag), "{tag}");
+        }
+        for tag in ["en-US", "zhx-CN", "", "fr"] {
+            assert!(!super::han(tag), "{tag}");
+        }
+    }
 }
 
 #[inline]
