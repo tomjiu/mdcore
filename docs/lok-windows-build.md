@@ -150,6 +150,50 @@ C:\tmp\a.docx        → file:///C:/tmp/a.docx   （三斜杠）
 配套事实：`INVALIDATE_TILES` 单编辑恒 0，只有「全网搜索 + 编辑 + 撤销/重做」全链
 产出 1 次 `EMPTY, 0, 0`。契约用例不要断言它。
 
+## 5. 精简版（默认交付）
+
+全量 982 MiB 里有一半以上我们永远用不到。已按「实际使用路径」分三段裁剪，
+每段都用真机 smoke 验证，**渲染结果逐字节相同**。
+
+| | 全量 | 精简 |
+|---|---|---|
+| 解压后 | 982 MiB | **432.5 MiB**（−56%） |
+| 文件数 | 5,705 | 3,501 |
+| 压缩包 | 305 MiB | ~135 MiB |
+
+### 裁了什么
+
+| 段 | 内容 | 省 | 依据 |
+|---|---|---|---|
+| 1 | `share/extensions` 只留 `dict-en` | **461 MB** | 原有 67 种语言词典 486.9 MB；LO 本来就没有中文 hunspell 词典（`dict-zh` 不存在，中文断词走 ICU） |
+| 2 | Impress/Draw、Base/报表/Presenter、外国格式过滤器、VBA（19 个 DLL） | 44.9 MB | 不做 PPTX/数据库；不打开 MacWrite/Keynote/MS Works/WordPerfect |
+| 3 | `python312.dll` + `python-core-3.12.14/` | 42.4 MB | DOCX/XLSX 编辑链不经过 Python |
+
+### 保留（不可裁）
+
+内核 `mergedlo` 86.5 + ICU 37.4 + Writer 23.5 + Calc 22.1 + 渲染 12.3 + PDF 7.5，
+外加 `share/fonts` 53 MB（**字体度量：裁了 PDF 导出会位移**，故不动）、
+`share/config`+`registry`+`filter`+`xslt` 约 44 MB。
+
+### 验证证据
+
+| 阶段 | 树大小 | smoke | 与基线比对 |
+|---|---|---|---|
+| stage0 全量 | 982 MiB | 27 步 0 失败 | 基线 |
+| stage1 去词典 | 519.9 MB | 27 步 0 失败 | 27 步序列一致，**3 张 tile 逐字节相同** |
+| stage2 去模块 | 475.0 MB | 27 步 0 失败 | 同上，逐字节相同 |
+| stage3 去 Python | 432.5 MB | 27 步 0 失败 | 同上，逐字节相同 |
+
+精简树上重跑全量测试：`cargo test -p mdc-lok` → **10 个二进制 53 个用例全绿，TEST_EXIT=0**。
+
+> 要做 PPTX 时把 `sdlo` / `sduilo` / `slideshowlo` 三个加回来（合计 11.4 MB）。
+
+### 下载
+
+```bash
+FJT=<token> sh scripts/fetch-lok-win-build.sh ./_lok-win minimal
+```
+
 ## 6. 拿到产物后怎么验证（Windows）
 
 ```bat
