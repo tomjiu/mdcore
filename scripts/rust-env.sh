@@ -179,6 +179,10 @@ if [ "$WITH_NSIS" = 1 ]; then
 fi
 
 # ---- 导出面 ----------------------------------------------------------------
+EXTRA_PATH=""
+[ "$WITH_MINGW" = 1 ] && EXTRA_PATH="$TOOLSROOT/mingw/usr/bin"
+[ "$WITH_NSIS" = 1 ] && EXTRA_PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TOOLSROOT/nsis/usr/bin"
+FULLPATH="$HOME/.cargo/bin${EXTRA_PATH:+:$EXTRA_PATH}"
 ENVBLOCK=$(cat <<ENVECHO
 export TOOLSROOT="$TOOLSROOT"
 export LIBRARY_PATH="$SYSLIBS/root/usr/lib/x86_64-linux-gnu\${LIBRARY_PATH:+:\$LIBRARY_PATH}"
@@ -186,6 +190,7 @@ export LD_LIBRARY_PATH="$SYSLIBS/root/usr/lib/x86_64-linux-gnu\${LD_LIBRARY_PATH
 export PKG_CONFIG_PATH="$SYSLIBS/root/usr/lib/x86_64-linux-gnu/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}"
 export MDC_PDFIUM_LIB="$PDFIUM_DIR/lib/libpdfium.so"
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
+export PATH="$FULLPATH:\$PATH"  # rustup 工具面（+ mingw/nsis，--with-* 时）
 ENVECHO
 )
 if [ "$SOURCED" = 1 ]; then
@@ -194,9 +199,5 @@ if [ "$SOURCED" = 1 ]; then
 else
   log "完成。后续 shell 导出（或本脚本 source 执行即自动导出）："
   printf '%s\n' "$ENVBLOCK"
-  EXTRA_PATH=""
-  [ "$WITH_MINGW" = 1 ] && EXTRA_PATH="$TOOLSROOT/mingw/usr/bin"
-  [ "$WITH_NSIS" = 1 ] && EXTRA_PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TOOLSROOT/nsis/usr/bin"
-  [ -n "$EXTRA_PATH" ] && printf 'export PATH="%s:$PATH"  # mingw/nsis 工具面（--with-* 时）\n' "$EXTRA_PATH"
   log "四条门对照见文件头注释；pdfium 引擎测试 = MDC_PDFIUM_LIB 已指路"
 fi
