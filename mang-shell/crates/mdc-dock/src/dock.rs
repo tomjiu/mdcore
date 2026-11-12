@@ -99,6 +99,26 @@ impl PanelEntry {
     pub fn panel(&self) -> &Arc<dyn PanelHandle> {
         &self.panel
     }
+
+    /// #121（批③a）：拖拽中转态重建构造面（面板从源 dock 拔出后
+    /// 原样落位目标侧——订阅与记忆尺寸随行，不退订不丢尺寸）。
+    pub(crate) fn from_parts(
+        panel: Arc<dyn PanelHandle>,
+        subscriptions: Vec<Subscription>,
+        size: Option<f32>,
+    ) -> Self {
+        Self {
+            panel,
+            subscriptions,
+            size,
+        }
+    }
+
+    /// #121（批③a）：拔出拆解面（`take_panel` 中转态构造用——记忆
+    /// 尺寸随面板走，落位侧继承）。
+    pub(crate) fn into_parts(self) -> (Arc<dyn PanelHandle>, Vec<Subscription>, Option<f32>) {
+        (self.panel, self.subscriptions, self.size)
+    }
 }
 
 /// Dock 实体：单边面板列表 + 开合态 + 激活协议（蓝本 dock.rs:283）。
@@ -416,5 +436,62 @@ impl Dock {
             }
         }
         Ok(())
+    }
+
+    /// #121（批③a）：拔出面板（拖拽协议——面板离开源 dock，进拖拽
+    /// 中转态 [`super::drag::PanelDetachment`]）。
+    ///
+    /// 与 [`Self::remove_panel`] 的分界：**不收起 dock**（remove 的
+    /// 激活位命中收起语义是「关闭面板」；拖拽换侧不是用户关栏意图）
+    /// ——激活位修正：命中则切首个启用面板（无则清空），订阅随行不
+    /// 退订，记忆尺寸随行。返回 `None`：键不在列（拖起与落位间的
+    /// 竞态防御）。
+    pub fn take_panel(
+        &mut self,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<super::drag::PanelDetachment> {
+        let ix = self.panel_index_for_key(key)?;
+        let was_active = self.tracker.current() == Some(ix);
+        let (panel, subscriptions, size) = self.entries.remove(ix).into_parts();
+        // 激活位修正（remove_at 的索引语义：命中清空/前移收缩）。
+        self.tracker.remove_at(ix);
+        if was_active && let Some(next) = self.first_enabled_panel_idx(cx) {
+            // 拔的是激活面板：切首个启用面板保视图（无启用面 = 无激活，
+            // dock 保持开——拖拽不是关栏）。
+            self.tracker.transition(Some(next));
+            if let Some(entry) = self.entries.get(next) {
+                entry.panel.set_active(true, cx);
+            }
+        }
+        cx.notify();
+        Some(super::drag::PanelDetachment {
+            panel,
+            subscriptions,
+            size,
+        })
+    }
+
+    /// #121（批③a）：落位接收（拖拽中转态进目标 dock）。
+    ///
+    /// 落位即激活——**挤掉原槽位语义**（Q-IDE `app/dock.rs:550-567`：
+    /// 拖到已占用侧 = 被拖面板成为该侧激活面板，原激活面板让位留列
+    /// 可切换）。落位侧打开。返回新激活下标。
+    pub fn receive_panel(
+        &mut self,
+        detachment: super::drag::PanelDetachment,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let super::drag::PanelDetachment {
+            panel,
+            subscriptions,
+            size,
+        } = detachment;
+        self.entries
+            .push(PanelEntry::from_parts(panel, subscriptions, size));
+        let ix = self.entries.len() - 1;
+        self.activate_panel(ix, cx);
+        self.set_open(true, cx);
+        ix
     }
 }
