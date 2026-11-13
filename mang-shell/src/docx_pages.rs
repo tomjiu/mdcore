@@ -59,6 +59,9 @@ use crate::editor::docx_lok_session::{DocxLokSession, SessionError, SessionReply
 const CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// 回执轮询周期（16ms——pdf_pages `POLL_INTERVAL` 同款）。
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// #186 派单看门狗拍数（≈2 秒无 tile 进账 → 一次全量重派；再 2 秒
+/// → 在途条带转失败——「无进展时明确失败/重试，不无限渲染中」）。
+const WATCHDOG_TICKS: u32 = 125;
 /// 滚轮缩放步进倍率（每「行」——pdf `PDF_ZOOM_WHEEL_STEP` 同值）。
 const DOCX_ZOOM_WHEEL_STEP: f32 = 1.1;
 
@@ -150,6 +153,15 @@ pub struct DocxPagesView {
     /// pdf_pages 同款：避免每帧实体更新）。
     viewport: Rc<Cell<Option<(f32, f32)>>>,
     viewport_size: (f32, f32),
+    /// #186：视口探针已 paint 到的尺寸（`refresh_viewport` 的变化检测
+    /// 基线——探针首帧写 Cell 后由轮询拍接管派单，交互不再前置）。
+    viewport_seen: (f32, f32),
+    /// #186 看门狗：Ready 后经历过的轮询拍数（无 tile 进账时计数）——
+    /// 超过 [`WATCHDOG_TICKS`] 触发一次全量重派；再超则条带转失败
+    /// （不无限「渲染中」）。
+    watchdog_ticks: u32,
+    /// #186 看门狗：已触发过一次重派（仅一次——诚实失败面）。
+    watchdog_retried: bool,
 }
 
 impl DocxPagesView {
@@ -188,6 +200,9 @@ impl DocxPagesView {
             focus_handle,
             viewport: Rc::new(Cell::new(None)),
             viewport_size: (0., 0.),
+            viewport_seen: (0., 0.),
+            watchdog_ticks: 0,
+            watchdog_retried: false,
         };
         view
     }
@@ -239,6 +254,13 @@ impl DocxPagesView {
     #[cfg(test)]
     pub fn failed_for_test(&self) -> usize {
         self.failed.len()
+    }
+
+    /// #186：测试面轮询拍（真实 drain 的单拍语义——含 refresh_viewport
+    /// 与看门狗收口；gpui::test 里直接驱动而无需等 16ms 定时器）。
+    #[cfg(test)]
+    pub fn drain_for_test(&mut self, cx: &mut Context<Self>) {
+        self.drain(cx);
     }
 
     // -----------------------------------------------------------------
@@ -423,7 +445,12 @@ impl DocxPagesView {
             }
         }
 
-        // ---- 2) 会话回执（先集后处理）----
+        // ---- 2) 视口探针收口（#186——置于会话检查前：Ready 但会话尚未
+        // 建立的窗口期同样需要视口进位，且无会话时 submit_visible 自身
+        // 会空转，语义不受影响）----
+        self.refresh_viewport(cx);
+
+        // ---- 3) 会话回执（先集后处理）----
         let Some(session) = &self.session else {
             return;
         };
@@ -434,6 +461,9 @@ impl DocxPagesView {
                 break; // 单拍上限——防极端回调风暴卡帧（下一拍继续）
             }
         }
+        let had_tile = replies
+            .iter()
+            .any(|r| matches!(r, SessionReply::Tile { .. }));
         for reply in replies {
             match reply {
                 SessionReply::Ready {
@@ -502,6 +532,57 @@ impl DocxPagesView {
                 SessionReply::Callback { name, payload } => {
                     self.handle_callback(&name, &payload, cx);
                 }
+            }
+        }
+
+        // ---- 4) #186 派单看门狗（每拍收口）----
+        // 看门狗：Ready 且视口已知但长时间无 tile 进账——一次全量重派
+        // （pending 悬死/派单丢失的自愈）；重派后仍无进账则把在途条带
+        // 转失败呈现（诚实失败面，不无限「渲染中」）。
+        if had_tile {
+            self.watchdog_ticks = 0;
+        } else if matches!(self.boot, Boot::Ready) && self.viewport_size.0 > 0. {
+            self.watchdog_ticks = self.watchdog_ticks.saturating_add(1);
+            let known_missing =
+                !self.cache.is_empty() || !self.pending.is_empty() || !self.failed.is_empty();
+            if self.watchdog_ticks >= WATCHDOG_TICKS && known_missing {
+                if !self.watchdog_retried {
+                    eprintln!(
+                        "docx-pages: #186 看门狗——{WATCHDOG_TICKS} 拍无 tile 进账，\
+                         全量重派（pending={} cache={} failed={}）",
+                        self.pending.len(),
+                        self.cache.len(),
+                        self.failed.len()
+                    );
+                    self.pending.clear();
+                    self.watchdog_retried = true;
+                    self.watchdog_ticks = 0;
+                    self.submit_visible(cx);
+                } else {
+                    eprintln!(
+                        "docx-pages: #186 看门狗——重派后仍无 tile 进账，在途条带\
+                         转失败（不无限渲染中）"
+                    );
+                    let bands: Vec<(u32, u32)> = self.pending.values().copied().collect();
+                    self.pending.clear();
+                    for key in bands {
+                        self.failed.insert(key);
+                    }
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// #186：视口探针读数→派单（轮询拍接管——探针 paint 写 Cell 后由
+    /// 本方法收口，变化才 notify：视口稳定后零额外渲染）。
+    fn refresh_viewport(&mut self, cx: &mut Context<Self>) {
+        if let Some((w, h)) = self.viewport.get() {
+            if w > 0. && h > 0. && (w, h) != self.viewport_seen {
+                eprintln!("docx-pages: #186 视口探针 {w:.0}x{h:.0}px（测量→派单接管）");
+                self.viewport_seen = (w, h);
+                self.submit_visible(cx);
+                cx.notify();
             }
         }
     }
@@ -987,6 +1068,7 @@ impl Render for DocxPagesView {
         let entity = cx.entity().downgrade();
         let viewport_cell = self.viewport.clone();
         let zoom_entity = entity.clone();
+        let notify_entity = entity.clone();
         let (vw, _) = self.viewport_size;
         let rw = self.raster_width(if vw > 0. { vw } else { 256. });
         let count = band_count(w_tw, h_tw, rw);
@@ -1037,54 +1119,66 @@ impl Render for DocxPagesView {
             .child(
                 div()
                     .id("docx-viewport-probe")
+                    .debug_selector(|| "docx-viewport-probe".into())
                     .absolute()
+                    .inset_0()
                     .size_full()
-                    .child(gpui::canvas(
-                        move |bounds, _window, _cx| bounds,
-                        move |bounds: gpui::Bounds<gpui::Pixels>,
-                              _t,
-                              window: &mut Window,
-                              _cx: &mut App| {
-                            let measured =
-                                (f32::from(bounds.size.width), f32::from(bounds.size.height));
-                            if measured.0 > 0. && measured.1 > 0. {
-                                viewport_cell.set(Some(measured));
-                            }
-                            // Ctrl+滚轮缩放——capture 期窗口级拦截
-                            //（先于 uniform_list 滚动消费；横向手势不拦
-                            //——冒泡照常滚动；control||platform 归一）。
-                            window.on_mouse_event(
-                                move |event: &ScrollEvent,
-                                      phase: DispatchPhase,
-                                      _window: &mut Window,
-                                      cx: &mut App| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    if !(event.modifiers.control || event.modifiers.platform) {
-                                        return;
-                                    }
-                                    if !bounds.contains(&event.position) {
-                                        return;
-                                    }
-                                    let (dx, dy) = match event.delta {
-                                        ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
-                                        ScrollDelta::Lines(l) => {
-                                            (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _window, _cx| bounds,
+                            move |bounds: gpui::Bounds<gpui::Pixels>,
+                                  _t,
+                                  window: &mut Window,
+                                  _cx: &mut App| {
+                                let measured =
+                                    (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                                if measured.0 > 0. && measured.1 > 0. {
+                                    viewport_cell.set(Some(measured));
+                                }
+                                // #186：测量→下一帧通知（PDF 探针同款——paint
+                                // 不能借用期改实体；refresh_viewport 轮询拍收口
+                                // 是第二保险，此处让 render 立即跟上：新视口
+                                // 下一帧即被 submit_visible 消费）。
+                                window.on_next_frame(move |_, cx| {
+                                    let _ = notify_entity.update(cx, |_, cx| cx.notify());
+                                });
+                                // Ctrl+滚轮缩放——capture 期窗口级拦截
+                                //（先于 uniform_list 滚动消费；横向手势不拦
+                                //——冒泡照常滚动；control||platform 归一）。
+                                window.on_mouse_event(
+                                    move |event: &ScrollEvent,
+                                          phase: DispatchPhase,
+                                          _window: &mut Window,
+                                          cx: &mut App| {
+                                        if phase != DispatchPhase::Capture {
+                                            return;
                                         }
-                                    };
-                                    if dy.abs() < dx.abs() {
-                                        return; // 横向手势不缩放——冒泡照旧。
-                                    }
-                                    let steps = dy / WHEEL_LINE_PX;
-                                    let _ = zoom_entity.update(cx, |view, cx| {
-                                        view.zoom_wheel(steps, cx);
-                                    });
-                                    cx.stop_propagation();
-                                },
-                            );
-                        },
-                    )),
+                                        if !(event.modifiers.control || event.modifiers.platform) {
+                                            return;
+                                        }
+                                        if !bounds.contains(&event.position) {
+                                            return;
+                                        }
+                                        let (dx, dy) = match event.delta {
+                                            ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
+                                            ScrollDelta::Lines(l) => {
+                                                (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
+                                            }
+                                        };
+                                        if dy.abs() < dx.abs() {
+                                            return; // 横向手势不缩放——冒泡照旧。
+                                        }
+                                        let steps = dy / WHEEL_LINE_PX;
+                                        let _ = zoom_entity.update(cx, |view, cx| {
+                                            view.zoom_wheel(steps, cx);
+                                        });
+                                        cx.stop_propagation();
+                                    },
+                                );
+                            },
+                        )
+                        .size_full(),
+                    ),
             )
             .into_any_element()
     }
@@ -1344,6 +1438,137 @@ mod tests {
         view.read_with(cx, |v, _| {
             assert_eq!(v.doc_size, Some((11906, 20168)), "几何必须更新");
             assert_eq!(v.cache_stats_for_test().1, 0, "几何变化 → 全量失效");
+        });
+    }
+
+    /// #186 回归（真机根因——探针写 Cell 后无收口）：**不手工塞
+    /// viewport_size**——视图经真实 window 绘制（根级探针 canvas paint
+    /// 写 Cell），`refresh_viewport` 在轮询拍收口：视口进位 + 可见
+    /// 条带全部派单（pending 非空）。锁「测量→派单」闭环由探针/轮询
+    /// 驱动，交互不再前置。
+    #[gpui::test]
+    fn viewport_probe_to_submit_closed_by_poll_tick(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-186-{}.docx", std::process::id()));
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        // 只注入 Ready + 几何 + 哑会话——viewport_size 保持 (0,0)（真机
+        // 首帧口径）。open_rx 取走：禁真实打开链（不存在的路径会让后台
+        // 线程回 Failed 覆盖注入态——真链由 docx_lok_session::real_runtime_*
+        // 与 bad_path_lands_in_failed_boot 分别锁定，本测试只锁显示链）。
+        view.update(cx, |v, _| {
+            v.doc_size = Some((11906, 16838));
+            v.boot = Boot::Ready;
+            v.open_rx = None;
+            v.session = Some(DocxLokSession::dummy_for_test(std::path::Path::new(
+                "dummy.docx",
+            )));
+        });
+        struct Host(gpui::Entity<DocxPagesView>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div().size_full().child(self.0.clone())
+            }
+        }
+        let window = cx.open_window(gpui::size(px(1024.), px(600.)), {
+            let view = view.clone();
+            move |_, _| Host(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        // 首帧绘制：render（viewport_size=(0,0)——submit 空）+ 探针
+        // canvas paint 写 Cell（真实测量路径——无手工赋值）。绘两帧：
+        // 探针 bounds 在 layout 后一帧才定（与真实帧循环同构）。
+        visual.update(|window, app| window.draw(app).clear(app));
+        visual.update(|window, app| window.draw(app).clear(app));
+        // 轮询拍收口（#186 修复面）：drain 内 refresh_viewport 读
+        // Cell → 视口进位 → submit_visible 派单可见条带。
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.viewport_size.0 > 0. && v.viewport_size.1 > 0.,
+                "探针测量进位 viewport_size（真机根因：Ready 后视口 0x0）: {:?}",
+                v.viewport_size
+            );
+            assert_eq!(v.viewport_seen, v.viewport_size, "变化检测基线同步");
+            assert!(
+                !v.pending.is_empty(),
+                "可见条带必须派单（真机日志无 tile 返回 = 从未派单）: pending={:?}",
+                v.pending.len()
+            );
+        });
+        // 幂等：视口稳定后重复拍不再重派（零额外渲染——变化才 notify）。
+        let pending_before = view.read_with(cx, |v, _| v.pending.len());
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.pending.len(),
+                pending_before,
+                "视口稳定拍不重派（同键去重）"
+            );
+        });
+    }
+
+    /// #186 看门狗：Ready 且视口在位但长时间无 tile 进账 → 一次全量
+    /// 重派；重派后仍无进账 → 在途条带转失败（不无限「渲染中」）。
+    /// 视口经探针路径（同上测试），失败路径不手工注入 pending 键。
+    #[gpui::test]
+    fn watchdog_repends_once_then_fails_bands(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-wd-{}.docx", std::process::id()));
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        // 同上：禁真实打开链（open_rx 取走）+ 哑会话——本测试锁看门狗态机。
+        view.update(cx, |v, _| {
+            v.doc_size = Some((11906, 16838));
+            v.boot = Boot::Ready;
+            v.open_rx = None;
+            v.session = Some(DocxLokSession::dummy_for_test(std::path::Path::new(
+                "dummy.docx",
+            )));
+        });
+        struct Host(gpui::Entity<DocxPagesView>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div().size_full().child(self.0.clone())
+            }
+        }
+        let window = cx.open_window(gpui::size(px(1024.), px(600.)), {
+            let view = view.clone();
+            move |_, _| Host(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, app| window.draw(app).clear(app));
+        // 探针收口拍（派单发生）。
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        let dispatched = view.read_with(cx, |v, _| v.pending.len());
+        assert!(dispatched > 0, "首拍派单发生");
+        // 无 tile 进账的连续拍 → 第一次看门狗触发：全量重派（pending 清
+        // 空后立即补——数量恢复）。
+        for _ in 0..WATCHDOG_TICKS {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+        }
+        view.read_with(cx, |v, _| {
+            assert!(v.watchdog_retried, "看门狗重派已触发（仅一次）");
+            assert!(
+                v.pending.len() >= dispatched,
+                "重派补回可见条带（数量不降）"
+            );
+        });
+        // 重派后仍无进账 → 第二轮看门狗：在途转失败（诚实失败面）。
+        for _ in 0..WATCHDOG_TICKS {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+        }
+        view.read_with(cx, |v, _| {
+            assert!(v.pending.is_empty(), "第二轮：在途清空（转失败）");
+            assert!(
+                !v.failed.is_empty(),
+                "条带呈现失败态（不无限渲染中）: failed={}",
+                v.failed.len()
+            );
         });
     }
 }
