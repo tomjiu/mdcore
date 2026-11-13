@@ -101,8 +101,14 @@ fn decode_err(filter: &str, reason: &str) -> PdeError {
 /// returned as decoded data」。未知/未实现滤镜返回 typed 错误（登记
 /// 面：LZW 归后续批次，DCT/JPX/CCITT 归引擎挂接层——不在内容流层
 /// 重造）。
+/// 单滤镜解码。
+///
+/// # 安全面（#180 复验收口，2026-11-13 Lead 二轮）
+///
+/// 与 [`decode_filters`] 同款：旧版 `usize::MAX` 裸奔 → 现走
+/// [`DECODE_HARD_LIMIT`] 硬顶。有界面 [`decode_filter_bounded`]。
 pub fn decode_filter(filter: &[u8], data: &[u8]) -> Result<Vec<u8>, PdeError> {
-    decode_filter_bounded(filter, data, usize::MAX)
+    decode_filter_bounded(filter, data, DECODE_HARD_LIMIT)
 }
 
 /// 单滤镜解码（#180 有界面——输出预算 = 解码输出字节上限）。
@@ -143,9 +149,16 @@ pub fn decode_filter_bounded(
 
 /// 滤镜链解码（`/Filter [/AHx /Fl]`——按序解码；单滤镜同走）。
 ///
-/// 兼容面（无预算）；有界面走 [`decode_filters_bounded`]（#180）。
+/// # 安全面（#180 复验收口，2026-11-13 Lead 二轮）
+///
+/// 旧版此函数转发 `usize::MAX`——**无预算裸奔**（Lead 复验指出的
+/// 未收口面）。现为**硬顶同款**：链式每层输出 ≤
+/// [`DECODE_HARD_LIMIT`]（与 [`decode_image_data`] 的全局硬顶同值同
+/// 语义——无调用方几何信息的兜底上限）。**正确用法仍是
+/// [`decode_filters_bounded`]**（调用方持 attrs 几何面时精度更高）；
+/// 本函数仅承诺「不再无上限」，不承诺几何精度。
 pub fn decode_filters(filters: &[Vec<u8>], data: &[u8]) -> Result<Vec<u8>, PdeError> {
-    decode_filters_bounded(filters, data, usize::MAX)
+    decode_filters_bounded(filters, data, DECODE_HARD_LIMIT)
 }
 
 /// 滤镜链解码（#180 有界面——**每层输出** ≤ budget：中间层同受约束
@@ -283,10 +296,16 @@ fn reject_unsupported_predictor(img: &PdeImage) -> Result<(), PdeError> {
 }
 
 /// ASCIIHexDecode（`>` 终结；空白忽略；奇数位补零——PDF 规范宽容面，
-/// Acrobat 同容错）。无预算兼容面（2 倍膨胀上限天然安全——输入 2 字节
-/// 产 1 字节输出）。
+/// Acrobat 同容错）。
+///
+/// # 安全面（#180 复验收口，2026-11-13 Lead 二轮）
+///
+/// 膨胀率固定 0.5×（输入 2 字节产 1 字节——天然有界，注释原判成立）；
+/// 为与其他旧 API 收口纪律一致，同走 [`DECODE_HARD_LIMIT`] 硬顶
+/// （对 AHx 是冗余防护——`usize::MAX` 也不会超，但「旧 API 一律不
+/// 裸奔」的统一纪律优于逐 API 例外论证）。
 pub fn ascii_hex_decode(data: &[u8]) -> Result<Vec<u8>, PdeError> {
-    ascii_hex_decode_bounded(data, usize::MAX)
+    ascii_hex_decode_bounded(data, DECODE_HARD_LIMIT)
 }
 
 /// ASCIIHexDecode（#180 有界面）。
@@ -331,9 +350,13 @@ pub fn ascii_hex_decode_bounded(data: &[u8], budget: usize) -> Result<Vec<u8>, P
 
 /// ASCII85Decode（PDF 变体：`z` = 00000 四零组；`~>` 终结；空白忽略）。
 ///
-/// 无预算兼容面；有界面走 [`ascii85_decode_bounded`]（#180）。
+/// # 安全面（#180 复验收口，2026-11-13 Lead 二轮）
+///
+/// 旧版 `usize::MAX` 裸奔 → 现走 [`DECODE_HARD_LIMIT`] 硬顶
+/// （A85 膨胀率 ~4:1，硬顶足以拦截炸弹面）。有界面
+/// [`ascii85_decode_bounded`]。
 pub fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>, PdeError> {
-    ascii85_decode_bounded(data, usize::MAX)
+    ascii85_decode_bounded(data, DECODE_HARD_LIMIT)
 }
 
 /// 五字符组值折叠（u64 中间量——#180 修复核心）。
@@ -422,9 +445,14 @@ fn a85_budget_err(at: usize, budget: usize) -> PdeError {
 }
 
 /// RunLengthDecode（PDF 变体：0-127 = 后随 length+1 字节字面；128 =
-/// EOD；129-255 = 下一字节重复 257-length 次）。无预算兼容面。
+/// EOD；129-255 = 下一字节重复 257-length 次）。
+///
+/// # 安全面（#180 复验收口，2026-11-13 Lead 二轮）
+///
+/// 旧版 `usize::MAX` 裸奔 → 现走 [`DECODE_HARD_LIMIT`] 硬顶
+/// （RL 重复段最大膨胀 128×——无上限可放大到 GB 级）。
 pub fn run_length_decode(data: &[u8]) -> Result<Vec<u8>, PdeError> {
-    run_length_decode_bounded(data, usize::MAX)
+    run_length_decode_bounded(data, DECODE_HARD_LIMIT)
 }
 
 /// RunLengthDecode（#180 有界面——重复段是膨胀点：2 输入字节最多产
