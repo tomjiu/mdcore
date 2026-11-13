@@ -659,30 +659,51 @@ pub fn run(
     })
 }
 
-/// SelectAll + getTextSelection：重试直到选取覆盖全部期望标记
-/// （Writer 表格内首个 SelectAll 只选单元格——实测行为）。
+/// SelectAll + getTextSelection：重试直到选取覆盖全部期望标记。
+///
+/// **为什么要轮询而不是「uno 后立刻读」**（2026-11-12 Windows 实测）：
+/// `LibreOfficeKitDocument::postUnoCommand` 是**异步投递**——命令只是进
+/// LO 的 event queue，由内核自己的主线程（非 unipoll 模式下由 LO 内部
+/// 线程跑 `soffice_main`）稍后执行。若投递后立刻 `getTextSelection`，
+/// 读到的仍是旧选区（实测连续 4 次都拿到空串，误判成「SelectAll 无效」）。
+/// 因此每轮投递后轮询选区，直到覆盖期望标记或预算用尽。
+///
+/// Writer 表格内首个 SelectAll 只选单元格、第 2 次选表、第 3 次才全文
+/// （实测行为），轮询本身也覆盖了这个级联。
 fn select_all_full_text(
     doc: &DocHandle,
     replacement_body: &str,
     replacement_cell: &str,
 ) -> Result<(String, String), String> {
-    for attempt in 1..=4 {
+    // 每轮 = 投递一次 SelectAll + 若干次选区轮询（间隔 50ms，共
+    // MAX_POLLS 次）。命令幂等，多投递几次只会让级联更快推进。
+    const ROUNDS: usize = 6;
+    const POLLS: usize = 20;
+    let mut last_len = 0usize;
+    for round in 1..=ROUNDS {
         doc.uno_query(".uno:SelectAll", None)
-            .map_err(|e| format!("SelectAll(#{attempt}) 失败：{e}"))?;
-        let (_, plain) = doc
-            .text_selection("text/plain;charset=utf-8")
-            .map_err(|e| format!("getTextSelection(plain #{attempt}) 失败：{e}"))?;
-        if plain.contains(replacement_body)
-            && plain.contains(replacement_cell)
-            && plain.contains("相邻段落乙")
-        {
-            let (_, html) = doc
-                .text_selection("text/html")
-                .map_err(|e| format!("getTextSelection(html) 失败：{e}"))?;
-            return Ok((plain, html));
+            .map_err(|e| format!("SelectAll(#{round}) 失败：{e}"))?;
+        for _ in 0..POLLS {
+            std::thread::sleep(Duration::from_millis(50));
+            let (_, plain) = doc
+                .text_selection("text/plain;charset=utf-8")
+                .map_err(|e| format!("getTextSelection(plain #{round}) 失败：{e}"))?;
+            last_len = plain.len();
+            if plain.contains(replacement_body)
+                && plain.contains(replacement_cell)
+                && plain.contains("相邻段落乙")
+            {
+                let (_, html) = doc
+                    .text_selection("text/html")
+                    .map_err(|e| format!("getTextSelection(html) 失败：{e}"))?;
+                return Ok((plain, html));
+            }
         }
     }
-    Err("SelectAll 重试 4 次仍未覆盖全文（期望标记缺失）".to_string())
+    Err(format!(
+        "SelectAll 轮询 {} 轮 × {} 次仍未覆盖全文（最后一次选区 {} 字符；期望标记缺失）",
+        ROUNDS, POLLS, last_len
+    ))
 }
 
 /// 等 ready / boot-failed 事件。

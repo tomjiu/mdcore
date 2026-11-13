@@ -66,7 +66,7 @@ fn ime_commit_via_type_text_lands_and_persists() {
     let work = dir.join("work.docx");
     std::fs::copy(fixture(), &work).unwrap();
     let canon = std::fs::canonicalize(&work).unwrap();
-    let url = format!("file://{}", canon.to_string_lossy());
+    let url = mdc_lok::profile::file_url_of(&canon);
 
     let mut s = DocSession::open(None, &dir.join("s"), &url, None).expect("DocSession::open");
     let rev0 = s.revision();
@@ -94,7 +94,7 @@ fn ime_commit_via_type_text_lands_and_persists() {
     // ---- 保存重开：落盘链含定稿文本 ----
     let saved_url = {
         let dir_canon = std::fs::canonicalize(&dir).unwrap();
-        format!("file://{}", dir_canon.join("saved.docx").to_string_lossy())
+        mdc_lok::profile::file_url_of(&dir_canon.join("saved.docx"))
     };
     s.save_as(&saved_url, "docx").expect("save_as");
     let mut s2 = DocSession::open(None, &dir.join("s2"), &saved_url, None).expect("重开");
@@ -126,7 +126,7 @@ fn post_text_wire_mechanics_and_edit_semantics() {
     let work = dir.join("work.docx");
     std::fs::copy(fixture(), &work).unwrap();
     let canon = std::fs::canonicalize(&work).unwrap();
-    let url = format!("file://{}", canon.to_string_lossy());
+    let url = mdc_lok::profile::file_url_of(&canon);
 
     let mut s = DocSession::open(None, &dir.join("s"), &url, None).expect("DocSession::open");
     let rev0 = s.revision();

@@ -57,6 +57,15 @@ pub fn file_url_of(path: &Path) -> String {
         if low.starts_with(r"//?/") {
             return percent_encode_tail(&format!("file:///{}", &s[4..]), 8);
         }
+        // 盘符路径 `C:/...` 必须是三斜杠 `file:///C:/...`。【2026-11-12
+        // 实测】`file://C:/...` 会被解析成 authority="C:"、路径变 `/...`：
+        // LO 因此建不出 user installation——非 unipoll 模式下 hook_2 直接
+        // 返回 NULL 并 _exit(77)（stderr「User installation could not be
+        // completed」）；若 stderr 是不可交互的管道，该致命错误路径还会
+        // 退化成阻塞弹窗，表现为 worker 发完 hello 后永久挂起。
+        if s.len() >= 2 && s.as_bytes()[1] == b':' {
+            return percent_encode_tail(&format!("file:///{s}"), 8);
+        }
     }
     // POSIX 绝对路径：file:// + /abs/... = file:///abs/...（三斜杠）
     percent_encode_tail(&format!("file://{s}"), 7)
@@ -100,6 +109,26 @@ mod tests {
         // cfg(windows) 分支在 Linux 编译不到，规则以单测形式固定（Windows
         // 实测门未执行——如实注明）；手动驱动内部规则：
         assert_eq!(percent_encode_tail("file:///a b", 8), "file:///a%20b");
+    }
+
+    /// 【2026-11-12 实测回归】盘符路径必须三斜杠：`file://C:/...` 会被
+    /// 解析成 authority="C:"，LO 建不出 user installation（非 unipoll 下
+    /// hook_2 返回 NULL + `_exit(77)`；stderr 为管道时退化成阻塞弹窗，
+    /// worker 表现为发完 hello 后永久挂起）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_letter_uses_three_slashes() {
+        let p = PathBuf::from(r"C:\code\_reports\s1\profile");
+        assert_eq!(file_url_of(&p), "file:///C:/code/_reports/s1/profile");
+        // \\?\C:\... 前缀剥离后同样是三斜杠
+        let d = PathBuf::from(r"\\?\C:\tmp\p");
+        assert_eq!(file_url_of(&d), "file:///C:/tmp/p");
+        // UNC 保留 authority（两斜杠 + 服务器名）
+        let u = PathBuf::from(r"\\?\UNC\server\share\p");
+        assert_eq!(file_url_of(&u), "file://server/share/p");
+        // 含空格必须 percent-encode，且不得破坏三斜杠前缀
+        let s = PathBuf::from(r"C:\code\a b\profile");
+        assert_eq!(file_url_of(&s), "file:///C:/code/a%20b/profile");
     }
 
     #[test]

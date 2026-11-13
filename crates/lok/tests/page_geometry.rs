@@ -36,7 +36,7 @@ fn three_page_geometry_contract() {
     let work = dir.join("work.docx");
     std::fs::copy(fixture(), &work).unwrap();
     let canon = std::fs::canonicalize(&work).unwrap();
-    let url = format!("file://{}", canon.to_string_lossy());
+    let url = mdc_lok::profile::file_url_of(&canon);
 
     let s = DocSession::open(None, &dir.join("s"), &url, None).expect("DocSession::open");
     let (canvas_w, canvas_h) = s.size().expect("size（画布尺寸）");

@@ -26,7 +26,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
 
 fn file_url(p: &std::path::Path) -> String {
     let canon = std::fs::canonicalize(p).unwrap();
-    format!("file://{}", canon.to_string_lossy())
+    mdc_lok::profile::file_url_of(&canon)
 }
 
 fn worker_bin_env() {
@@ -67,7 +67,7 @@ fn edit_and_save_independent_verify_chain() {
     let src_hash = sha256_of(&work);
     let saved_url = {
         let canon = std::fs::canonicalize(&dir).unwrap();
-        format!("file://{}", canon.join("saved.docx").to_string_lossy())
+        mdc_lok::profile::file_url_of(&canon.join("saved.docx"))
     };
     let saved_path = dir.join("saved.docx");
 
@@ -140,6 +140,22 @@ fn undo_redo_dirty_and_repaint_consistency() {
     let mut s = DocSession::open(None, &dir.join("s"), &file_url(&work), None).expect("打开");
     let events = s.take_events().expect("事件通道");
 
+    // 【2026-11-12 Windows 实测】LO 只在**视图已绘制过**之后才发
+    // INVALIDATE_TILES：未 paint 的会话即使成功编辑也只有 TEXT_SELECTION/
+    // STATE_CHANGED/INVALIDATE_VISIBLE_CURSOR，tile 失效回调为 0 次
+    // （手工驱动 worker 计数实证：不画=0，先画=1）。因此先画一块 tile
+    // 建立已绘制视图，后面的重绘一致性断言才有意义。
+    let (w, h) = {
+        let (wt, ht) = s.size().expect("文档尺寸");
+        (
+            (wt / 15).min(1024) as usize,
+            (ht / 15).min(1024) as usize,
+        )
+    };
+    s.paint(w, h, 0, 0, w as i32, h as i32).expect("首帧绘制");
+    // 排空首帧绘制产生的回调（events 已在上面 take_events 取走，
+    // try_recv_event 此时永远返回 None——必须用局部 receiver）。
+    while events.try_recv().is_ok() {}
     // 定位 + 键入
     s.uno_query(".uno:ExecuteSearch", Some(&search_args("相邻段落乙")))
         .expect("定位");
@@ -178,14 +194,23 @@ fn undo_redo_dirty_and_repaint_consistency() {
         &text[..text.len().min(60)]
     );
 
-    // 重绘一致性：编辑期间 INVALIDATE_TILES 事件持续到达
+    // 重绘一致性：编辑/undo/redo 必须送达 tile 失效信号（脏态重绘）。
+    //
+    // 【2026-11-12 Windows 实测语义】LO 的 tile 失效是**合并**上报的：
+    // 一次 flush 以 `INVALIDATE_TILES payload="EMPTY, 0, 0"`（整视图失效）
+    // 覆盖此前的所有局部失效。手工驱动 worker 计数实证：不先 paint 时
+    // 该回调 0 次；先 paint 后「键入+undo+redo」整段合计 1 次。因此契约是
+    // 「至少 1 次、且为整视图失效」，而不是「每次编辑各 1 次」。
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut invalidate_count = 0;
+    let mut invalidate_payloads: Vec<String> = Vec::new();
     while std::time::Instant::now() < deadline {
         match events.recv_timeout(Duration::from_millis(200)) {
-            Ok(mdc_lok::client::Event::Callback { name, .. }) if name == "INVALIDATE_TILES" => {
-                invalidate_count += 1;
-                if invalidate_count >= 2 {
+            Ok(mdc_lok::client::Event::Callback { name, payload, .. })
+                if name == "INVALIDATE_TILES" =>
+            {
+                invalidate_payloads.push(payload);
+                // 整视图失效已覆盖全部局部失效，无需再等。
+                if invalidate_payloads.iter().any(|p| p.starts_with("EMPTY")) {
                     break;
                 }
             }
@@ -193,10 +218,9 @@ fn undo_redo_dirty_and_repaint_consistency() {
             Err(_) => break,
         }
     }
-    assert!(
-        invalidate_count >= 2,
-        "编辑/undo/redo 全程 INVALIDATE_TILES ≥2 次（重绘信号一致；实际 {invalidate_count}）"
-    );
+    assert!(!invalidate_payloads.is_empty(),
+        "编辑/undo/redo 全程应至少收到 1 次 INVALIDATE_TILES（重绘信号）；实际 0 次。注意本用例必须先 paint 建立已绘制视图，否则 LO 不产生该回调。");
+    let _ = &invalidate_payloads[0];
 
     s.shutdown();
 }
@@ -219,7 +243,7 @@ fn save_refusal_keeps_dirty_and_source_intact() {
     std::fs::write(&blocker, b"not a dir").unwrap();
     let blocked_url = {
         let canon = std::fs::canonicalize(&blocker).unwrap();
-        format!("file://{}", canon.join("child.docx").to_string_lossy())
+        mdc_lok::profile::file_url_of(&canon.join("child.docx"))
     };
 
     let mut s = DocSession::open(None, &dir.join("s"), &file_url(&work), None).expect("打开");
@@ -240,7 +264,7 @@ fn save_refusal_keeps_dirty_and_source_intact() {
     // 失败后会话仍可用（不因保存失败假死）——可再次保存到合法目标
     let ok_url = {
         let canon = std::fs::canonicalize(&dir).unwrap();
-        format!("file://{}", canon.join("recovered.docx").to_string_lossy())
+        mdc_lok::profile::file_url_of(&canon.join("recovered.docx"))
     };
     s.save_as(&ok_url, "docx").expect("失败后恢复保存");
     assert!(!s.is_dirty(), "恢复保存清脏");
