@@ -1,0 +1,34 @@
+start_mb=257
+item=program/classes status=KEEP_DELETED
+item=program/__pycache__ status=KEEP_DELETED
+item=program/intro.png status=KEEP_DELETED
+item=program/intro-highres.png status=KEEP_DELETED
+item=program/gdbtrace status=KEEP_DELETED
+item=program/java-set-classpath status=KEEP_DELETED
+item=program/libcalclo.so status=KEEP_DELETED
+item=program/libsclo.so status=KEEP_DELETED
+item=program/libscuilo.so status=KEEP_DELETED
+item=program/libsd*lo.so status=KEEP_DELETED
+item=program/libcuilo.so status=KEEP_DELETED
+item=program/libavmediagst.so status=KEEP_DELETED
+item=program/libOGLTranslo.so status=KEEP_DELETED
+item=program/libPresentationMinimizerlo.so status=KEEP_DELETED
+item=program/libabplo.so status=KEEP_DELETED
+item=program/libacclo.so status=KEEP_DELETED
+item=program/libanalysislo.so status=KEEP_DELETED
+item=program/libanimcorelo.so status=KEEP_DELETED
+item=program/libbiblo.so status=KEEP_DELETED
+item=program/libcached1.so status=KEEP_DELETED
+item=program/libdbalo.so status=KEEP_DELETED
+item=program/libdbaselo.so status=KEEP_DELETED
+item=program/libdbpool2.so status=KEEP_DELETED
+item=program/libdlgprovlo.so status=KEEP_DELETED
+item=program/libldapbe2lo.so status=KEEP_DELETED
+item=program/libloglo.so status=REQUIRED_ROLLBACK
+item=program/libpcrlo.so status=KEEP_DELETED
+item=program/librpt*lo.so status=KEEP_DELETED
+item=program/libswd*lo.so status=KEEP_DELETED
+item=program/libunopkgapp.so status=KEEP_DELETED
+item=program/libwpft*lo.so status=KEEP_DELETED
+item=program/libcairocanvaslo.so status=KEEP_DELETED
+end_mb=212

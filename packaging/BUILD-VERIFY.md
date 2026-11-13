@@ -51,9 +51,9 @@
 **命令**（可复现）：
 
 ```bash
-cargo build -p mdshell-native --release --locked   # 壳二进制（tao+wry+GTK3）
+cargo build --manifest-path mang-shell/Cargo.toml --release --locked  # 主线壳（GPUI 自绘）
 cd web && ./build-wasm.sh && ./build-pdf-wasm.sh && npm run build  # 完整 bundle
-cd .. && packaging/deb/build-deb.sh target/release/mdcore
+cd .. && packaging/deb/build-deb.sh mang-shell/target/release/mang-shell
 ```
 
 **产物**：`build/mdcore_0.1.0_amd64.deb`（2,516,700 B，2.4 MiB）

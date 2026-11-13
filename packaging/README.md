@@ -126,12 +126,12 @@ packaging/
     └── Info.plist.tpl   # .app bundle 元数据（文档类型 + URL scheme）
 ```
 
-## 运行时依赖（#228 后：Windows/macOS = mang-shell 主线壳，GPU 自绘渲染；Linux = mdshell-native tao+wry+GTK3，ADR-H1）
+## 运行时依赖（#228 后：三平台 = mang-shell 主线壳，GPU 自绘渲染；旧 mdshell-native 已于 2026-11 架构剪裁轮移除——零消费者死重）
 
-- **Linux**（mdshell-native 壳）：`libgtk-3-0`（>= 3.24）、
-  `libwebkit2gtk-4.1-0`、`libc6`；AppImage 由 linuxdeploy 携带运行时
-  （AppRun 设置 `WEBKIT_DISABLE_COMPOSITING_MODE=1` 兼容部分发行版
-  ——R24-d 实测后按需裁剪）。
+- **Linux**（mang-shell 壳，#319 直链集）：`libxcb1`、`libxkbcommon0`、
+  `libxkbcommon-x11-0`、`libgcc-s1`、`libc6`（readelf DT_NEEDED 实测；
+  渲染后端 Vulkan/GL 为运行时 dlopen 不进 Depends）。旧壳 GTK/WebKitGTK
+  依赖行已随 crate 移除失效（历史在档 BUILD-VERIFY §1）。
 - **Windows**（mang-shell 壳，#228 起）：GPU 自绘渲染（DirectX 后端）——**无 WebView2
   运行时依赖**（旧 tao+wry 壳的 WebView2 面已随主线壳切换移除，处置
   记录见 BUILD-VERIFY §3）；PDF 面 = `pdfium.dll`，NSIS 安装包捆载

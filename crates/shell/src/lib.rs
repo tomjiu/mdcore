@@ -7,8 +7,9 @@
 //!   crate mdc-settings（域无关，对 mdcore 零依赖）；本 crate 经
 //!   `pub use mdc_settings as settings` 保持 `mdshell::settings::*`
 //!   路径零破坏；
-//! - **不含** WebView / 窗口管理——原生后端在 crates/shell-native
-//!   （tao + wry + GTK3，ADR-H1 定谳：Slint 因 GPL 证与 ADR-C1 排除；需 webkit2gtk-4.1 系统库，沙箱不可编译，不入 workspace）。
+//! - **不含** WebView / 窗口管理——原生壳主线为 mang-shell（GPUI 自绘，
+//!   独立 workspace）；旧 GTK 后端 crates/shell-native 已于 2026-11
+//!   架构剪裁轮移除（零消费者死重，历史见 git 与 gates/）。
 //!
 //! 契约（`Host` trait）是原生胶水与 headless 测试的公共面：原生壳实现
 //! `Host::surface()` 把 dist/ 装进 wry；headless 测试实现验证同一套

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/mdcore", "crates/mdcore-wasm", "crates/formula", "crates/pdf-wasm", "crates/shell", "crates/shell-native", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf", "crates/lok"]
-default-members = ["crates/mdcore", "crates/shell", "crates/shell-native", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf", "crates/lok"]
+members = ["crates/mdcore", "crates/mdcore-wasm", "crates/formula", "crates/pdf-wasm", "crates/shell", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf", "crates/lok"]
+default-members = ["crates/mdcore", "crates/shell", "crates/pdf", "crates/settings", "crates/office", "crates/office-io", "crates/evidence", "crates/workbench", "crates/collab", "crates/canvas", "crates/mdbridge", "crates/relay", "crates/overlay", "crates/overlay-pdf", "crates/lok"]
 
 # R24-c 版本单源：全部 crate 经 version.workspace 继承此值（禁止
 # crate 内独立声明版本——r24_packaging.rs 跨 crate 一致性锁背书）。
@@ -27,9 +27,10 @@ serde_json = "1.0.151"
 # 其余零依赖：无运行时、无框架。Core 语义不依赖任何一项——serde 仅出现在
 # 序列化边界，tree/op 本身可脱离 serde 编译（见 lib.rs feature 说明）。
 #
-# R10 增补：crates/shell = 宿主契约层（headless 可验证，零 GUI 依赖）；
-# crates/shell-native = tao+wry+GTK3 胶水蓝图（ADR-H1；随附零依赖可编译/可测试，
-# 原生依赖启用后需 webkit2gtk-4.1 系统库——见该 crate 文档）。
+# R10 增补：crates/shell = 宿主契约层（headless 可验证，零 GUI 依赖）。
+# （crates/shell-native——tao+wry+GTK3 旧壳——已于 2026-11 架构剪裁轮
+# 移除：mang-shell（GPUI 自绘，#228 换代）为唯一产品壳后零消费者，
+# #331 在档判 GTK 插件 ~20MB 死重；历史形态见 git 历史与 gates/。）
 #
 # office-impl T1 增补：crates/office（mdc-office）= Office 域引擎侧基础
 # 设施（第一模块 sanitize = 敌意输出面消毒五面）。纯 std 零三方依赖，

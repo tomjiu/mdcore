@@ -73,15 +73,16 @@ jobs:
           cargo fmt --version
           cargo fmt --all -- --check
 
-      - name: cargo check (workspace, excluding GTK-only shell)
-        # mdshell-native 依赖 GTK3/WebKitGTK，Windows 上无实体 -> 排除。
+      - name: cargo check (workspace, all crates)
+        # 旧壳 mdshell-native（GTK3/WebKitGTK）已于 2026-11 架构剪裁轮
+        # 移除（零消费者死重，#331 在档）——Windows 面不再需要排除项。
         # 其余全部 crate 必须能编译：这是 Windows 平台的编译契约。
-        run: cargo check --workspace --all-targets --exclude mdshell-native
+        run: cargo check --workspace --all-targets
 
       - name: cargo check wasm target
         run: cargo check -p mdcore-wasm --target wasm32-unknown-unknown
 
-      - name: Report excluded crate
+      - name: Report coverage
         if: always()
         run: |
           echo '### Windows CI 覆盖范围' >> $env:GITHUB_STEP_SUMMARY
@@ -90,4 +91,3 @@ jobs:
           echo '|---|---|' >> $env:GITHUB_STEP_SUMMARY
           echo '| 引擎核心 crate | 编译覆盖 |' >> $env:GITHUB_STEP_SUMMARY
           echo '| wasm target | 编译覆盖 |' >> $env:GITHUB_STEP_SUMMARY
-          echo '| mdshell-native (GTK) | **不覆盖**（Windows 无 GTK 依赖实体） |' >> $env:GITHUB_STEP_SUMMARY

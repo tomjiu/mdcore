@@ -112,7 +112,8 @@ gate_verdict 字段）。
 - 宿主加载物 = `dist/`（自包含，`file://` 或自定义协议均可，wasm 走
   `import.meta.url` 相对解析）。
 - 宿主最小面：窗口/标题/文件对话框；**大文档注入改走
-  `window.__inject(md)`（待实现，见 crates/shell-native 蓝图对接点 2），
+  `window.__inject(md)`（历史蓝图对接点，旧宿主壳已剪裁——现状
+  mang-shell 直走 GPUI 渲染，无 WebView 注入面），
   替代 URL 参数**；渐进打开宿主侧契约 = `crates/shell` 的
   `open_document_progressive` + `OpenProgress` 事件（进度条输入）。
 - 渐进打开实测（W7）：1MB 8 段 TTI 153.2ms vs 全量 360.7ms；ingest

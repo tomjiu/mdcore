@@ -1,0 +1,20 @@
+{
+  "generated": "2026-11-12",
+  "method": "static-3-face",
+  "findings": [
+    {
+      "crate": "mdc-lok",
+      "dir": "/home/z/my-project/mdcore/crates/lok",
+      "unused": [
+        "flate2"
+      ]
+    },
+    {
+      "crate": "mang-shell",
+      "dir": "/home/z/my-project/mdcore/mang-shell",
+      "unused": [
+        "anyhow"
+      ]
+    }
+  ]
+}
