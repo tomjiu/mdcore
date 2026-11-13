@@ -542,6 +542,14 @@ impl WorkerState {
                 f(self.doc, kit_callback, tx_boxed as *const _ as *mut c_void);
             }
         }
+        // #115 比对缺口 #8 落地：首屏布局落定（LOK-03）——load 后立刻
+        // Repaginate，后续 paint 不吃半布局态（ely-lok worker.rs:341
+        // `doc.post_uno(".uno:Repaginate", None)?` 同构）。**偏离声明**：
+        // Ely `?` 硬失败（其产品只开 Writer 族）；本 worker 还加载
+        // PDF/Calc 等非 Writer 文档，Repaginate 可能不支持——**best
+        // effort**：失败不挂 load（文档已开），响应带 `repaginated` 标志
+        // 供宿主观测。
+        let repaginated = self.op_uno(".uno:Repaginate", None, false).is_ok();
         let doc_type = self.doc_type_raw();
         let parts = self.doc_parts_raw();
         Ok(json!({
@@ -549,6 +557,7 @@ impl WorkerState {
             "doc_type": doc_type,
             "doc_type_name": format!("{:?}", DocType::from_raw(doc_type)),
             "parts": parts,
+            "repaginated": repaginated,
         }))
     }
 
@@ -734,8 +743,29 @@ impl WorkerState {
         }))
     }
 
+    /// 关闭类加速键卫（ely-lok input.rs `CLOSING` 同构）：Ctrl(Mod1)+W/Q/F4
+    /// 的 key_code 直发内核会**关内核自己的帧**（worker 视角 = 文档凭空
+    /// 消失、后续 paint 全黑）——窗口关闭/退出归宿主，内核无权自杀。
+    /// key_code 布局（vcl KeyCode）：修饰位 Mod1=0x2000，键值低 12 位
+    /// （0x0fff）——W=0x216(534) / Q=0x303(771) / F4=0x210(528)。
+    const CLOSING_KEY_CODES: [i32; 3] = [534, 771, 528];
+    const KEY_MOD1: i32 = 0x2000;
+    const KEY_CODE_MASK: i32 = 0x0fff;
+
     /// postKeyEvent（KEYINPUT+KEYUP 成对，自动替换选区——标准编辑语义）。
     fn op_post_key(&mut self, ch: i32, key_code: i32) -> DispatchResult {
+        // #115 比对缺口 #7 落地：关闭类加速键前置卫（拒发不发内核）。
+        if key_code & Self::KEY_MOD1 != 0
+            && Self::CLOSING_KEY_CODES.contains(&(key_code & Self::KEY_CODE_MASK))
+        {
+            return Err((
+                codes::BAD_REQUEST,
+                format!(
+                    "post_key key_code={key_code} 是关闭类加速键（Ctrl+W/Q/F4）——\
+                     会关内核自己的帧；窗口关闭/退出归宿主，请走宿主侧命令"
+                ),
+            ));
+        }
         unsafe {
             self.doc_guard(abi::doc_offsets::POST_KEY_EVENT, "postKeyEvent")?;
             let f = (*self.doc_class)
@@ -861,6 +891,14 @@ impl WorkerState {
         Ok(v)
     }
 
+    /// save 选项白名单（#115 比对缺口 #9；ely-lok save.rs 同构）：
+    /// `""`（默认）/ `TakeOwnership`（接管被锁文件）/ `TakeOwnership,
+    /// TerminateEditing`（另加终止编辑态）。裸透传会把 CSV/PDF **过滤器
+    /// 参数**误当所有权语义送进内核——白名单收口（未知选项 BAD_REQUEST）。
+    /// Ely 另有 `Snapshot` 档与 Password 追加——前者是其快照探测内部
+    /// 机制、后者依赖其密码表，均不移植（登记于 PR）。
+    const SAVE_OPTIONS: [&str; 3] = ["", "TakeOwnership", "TakeOwnership,TerminateEditing"];
+
     /// saveAs（格式如 "docx"；失败附 kit getError 原文，**不清宿主脏位**——
     /// 脏位语义在宿主侧，本 op 只如实报成败）。
     fn op_save_as(
@@ -869,6 +907,17 @@ impl WorkerState {
         format: &str,
         filter_options: Option<&str>,
     ) -> DispatchResult {
+        if let Some(o) = filter_options {
+            if !Self::SAVE_OPTIONS.contains(&o) {
+                return Err((
+                    codes::BAD_REQUEST,
+                    format!(
+                        "未知 save 选项 {o:?}（允许：\"\"、\"TakeOwnership\"、\
+                         \"TakeOwnership,TerminateEditing\"）"
+                    ),
+                ));
+            }
+        }
         unsafe {
             self.doc_guard(abi::doc_offsets::SAVE_AS, "saveAs")?;
             crate::save_guard::check(&self.loaded_url, url)
