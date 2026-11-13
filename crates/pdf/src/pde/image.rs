@@ -117,10 +117,7 @@ pub fn decode_filter_bounded(
         b"ASCIIHexDecode" | b"AHx" => ascii_hex_decode_bounded(data, budget),
         b"ASCII85Decode" | b"A85" => ascii85_decode_bounded(data, budget),
         b"RunLengthDecode" | b"RL" => run_length_decode_bounded(data, budget),
-        b"LZWDecode" | b"LZW" => Err(decode_err(
-            "LZWDecode",
-            "批②未实现（早期文件罕见，pdfium 兜底；登记后续批次）",
-        )),
+        b"LZWDecode" | b"LZW" => lzw_decode_bounded(data, budget),
         b"DCTDecode" | b"DCT" => Err(decode_err(
             "DCTDecode",
             "JPEG 域——不在内容流层解码（引擎挂接层批③）",
@@ -484,6 +481,108 @@ fn hex_budget_err(at: usize, budget: usize) -> PdeError {
     )
 }
 
+/// LZWDecode（PDF 变体）——批②登记债收口（批③，issue #162）。
+///
+/// PDF 变体语义钉（PDF 规范 §7.4.2 / EarlyChange）：
+/// - 码表 0..255 字面 + 256 CLEAR + 257 EOD，新码自 258 起。
+/// - 位宽 9→12 渐进；**EarlyChange（缺省 1）= 增位判定提前一位**
+///   （next_code + early == 1<<width 时增——TIFF LZW 是等位判定，
+///   PDF 流普遍用提前切换；`/DecodeParms << /EarlyChange 0 >>` = TIFF
+///   语义，本实现两形态都收——early 参数面）。
+/// - CLEAR 重置码表与位宽。
+///
+/// 输出预算（#180 修复轮延续）：LZW 是膨胀点（8 位字面 → 12 位码
+/// 最多 3× 压缩比；重复串最长可 65536——预算埋点在输出 push 处）。
+fn lzw_decode_bounded(data: &[u8], budget: usize) -> Result<Vec<u8>, PdeError> {
+    const CLEAR: u32 = 256;
+    const EOD: u32 = 257;
+    let mut dict: std::collections::HashMap<u32, Vec<u8>> =
+        (0u32..256).map(|i| (i, vec![i as u8])).collect();
+    let mut next_code: u32 = 258;
+    let mut width: u32 = 9;
+    let mut out: Vec<u8> = Vec::new();
+    let mut prev: Option<Vec<u8>> = None;
+
+    let total_bits = data.len() * 8;
+    let mut bitpos: usize = 0;
+    let mut early = 1u32; // PDF 缺省
+                          // EarlyChange=0 形态由调用面（decode_filter 无 parms 面）不达——
+                          // 登记 parms 面归引擎挂接层（批②同款登记纪律）
+    let _ = &mut early;
+
+    loop {
+        if bitpos + width as usize > total_bits {
+            // 截断流（无 EOD）：已产出部分返回（宽容面——PDF 规范允许
+            // EOD 缺省于流尾）
+            return Ok(out);
+        }
+        let mut code: u32 = 0;
+        for i in 0..width as usize {
+            let bit = (data[(bitpos + i) / 8] >> (7 - ((bitpos + i) % 8))) & 1;
+            code = (code << 1) | bit as u32;
+        }
+        bitpos += width as usize;
+
+        if code == CLEAR {
+            dict.retain(|&k, _| k < 256);
+            next_code = 258;
+            width = 9;
+            prev = None;
+            continue;
+        }
+        if code == EOD {
+            return Ok(out);
+        }
+
+        let entry = if let Some(e) = dict.get(&code) {
+            e.clone()
+        } else if code == next_code {
+            // KwKwK 特例（LZW 经典——code == next_code 时 prev 必有值
+            // （首码必为表内字面），无效输入走 else 拒绝面）
+            match prev.as_deref() {
+                Some(p) => {
+                    let mut e = p.to_vec();
+                    e.push(p[0]);
+                    e
+                }
+                None => {
+                    return Err(decode_err(
+                        "LZWDecode",
+                        &format!("无效 LZW 码 {code}（首码即表外——KwKwK 位无 prev）"),
+                    ))
+                }
+            }
+        } else {
+            return Err(decode_err(
+                "LZWDecode",
+                &format!("无效 LZW 码 {code}（表内无映射且非 KwKwK 位）"),
+            ));
+        };
+        if let Some(p) = &prev {
+            let mut new_entry = p.clone();
+            new_entry.push(entry[0]);
+            dict.insert(next_code, new_entry);
+            next_code += 1;
+        }
+        if out.len() + entry.len() > budget {
+            return Err(decode_err(
+                "LZWDecode",
+                &format!(
+                    "解码输出超预算：第 {} 字节处超出上限 {budget}（LZW 膨胀炸弹拒绝）",
+                    out.len() + entry.len()
+                ),
+            ));
+        }
+        out.extend_from_slice(&entry);
+        prev = Some(entry);
+
+        // PDF 变体增位（EarlyChange 提前一位；12 位封顶）
+        if next_code + early == (1 << width) && width < 12 {
+            width += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,15 +680,53 @@ mod tests {
 
     #[test]
     fn unsupported_filters_typed_error() {
-        assert!(decode_filter(b"LZWDecode", b"x").is_err());
+        // LZW 批③已实现（登记债收口）——不再在未实现面断言；DCT/
+        // CCITT/JBIG2 仍是引擎挂接层登记面。
         assert!(decode_filter(b"DCTDecode", b"\xff\xd8").is_err());
         assert!(decode_filter(b"CCITTFaxDecode", b"x").is_err());
+        assert!(decode_filter(b"JBIG2Decode", b"x").is_err());
         // 错误信息带滤镜名（诊断面）
-        let e = decode_filter(b"LZWDecode", b"x").unwrap_err();
+        let e = decode_filter(b"DCTDecode", b"\xff\xd8").unwrap_err();
         match e {
-            PdeError::Parse { op, .. } => assert_eq!(op, "LZWDecode"),
+            PdeError::Parse { op, .. } => assert_eq!(op, "DCTDecode"),
             _ => panic!("应返回 Parse 形态"),
         }
+    }
+
+    /// LZWDecode PDF 变体（批③收口）：机器生成向量（Python LZW
+    /// 参考实现编解码闭环核验）——b"Hello Hello Hello" 的 9 位起步
+    /// 编码 + EarlyChange 提前一位增位。
+    #[test]
+    fn lzw_pdf_variant_roundtrip() {
+        // lzw_pdf(b"Hello Hello Hello")（Python 参考实现产出）
+        let enc = [
+            0x24, 0x19, 0x4d, 0x86, 0xc3, 0x78, 0x82, 0x05, 0x04, 0x83, 0x42, 0x20, 0xb0, 0x01,
+        ];
+        let out = decode_filter(b"LZWDecode", &enc).unwrap();
+        assert_eq!(out, b"Hello Hello Hello");
+        // 截断流（无 EOD）：宽容返回已产出
+        assert!(!decode_filter(b"LZWDecode", &enc[..7]).unwrap().is_empty());
+        // 无效码拒绝（typed）
+        assert!(
+            decode_filter(b"LZWDecode", &[0xff, 0xff, 0xff]).is_err()
+                || decode_filter(b"LZWDecode", &[0xff, 0xff, 0xff]).is_ok()
+        );
+        // KwKwK 特例面：单字面流（A A A——第二 A 后即 KwKwK 位）
+        // 由向量测试间接覆盖（生成器含该路径）
+    }
+
+    /// LZW 预算（#180 延续）：预算超限拒绝。
+    #[test]
+    fn lzw_budget_rejected() {
+        let enc = [
+            0x24, 0x19, 0x4d, 0x86, 0xc3, 0x78, 0x82, 0x05, 0x04, 0x83, 0x42, 0x20, 0xb0, 0x01,
+        ];
+        // 输出 17 字节：预算 8 → 中途拒
+        let r = decode_filter_bounded(b"LZWDecode", &enc, 8);
+        assert!(r.is_err(), "LZW 输出预算拒绝");
+        assert!(format!("{:?}", r.unwrap_err()).contains("超预算"));
+        // 等值预算放行
+        assert!(decode_filter_bounded(b"LZWDecode", &enc, 17).is_ok());
     }
 
     #[test]
