@@ -2303,11 +2303,12 @@ mod g1_find_replace_tests {
         assert!(!b.is_modified(), "撤批量 = 回保存点（单点编辑在保存点内）");
     }
 
-    #[test]
-    fn replace_batch_thousand_matches_under_100ms() {
-        // #91 G1 原验收线保持 100ms；#547 方案 B 用三个独立、等价样本
-        // 排除单次调度抖动。构建与匹配不计时，每轮真实替换及撤销均验证。
-        // 不复用已经修改的 Buffer 或旧 edits，避免后续样本变成空操作。
+    /// #174/#547：千处批量替换性能采样——三个独立、等价样本取最优
+    ///（排除单次调度抖动；样本等价性是 #547 的成果，分档重构原样
+    /// 保留）。构建与匹配不计时，每轮真实替换及撤销均功能验证；
+    /// 不复用已经修改的 Buffer 或旧 edits，避免后续样本变成空操作。
+    /// 返回 `(replace_samples, undo_samples)`——门禁由分档包装断言。
+    fn thousand_replace_perf_samples() -> (Vec<std::time::Duration>, Vec<std::time::Duration>) {
         let source = (0..1000)
             .map(|i| format!("第{i}行 foo 内容"))
             .collect::<Vec<_>>()
@@ -2347,8 +2348,43 @@ mod g1_find_replace_tests {
             println!("perf(千处批量替换，样本{sample}) = {elapsed:?}");
             println!("perf(千处批量撤销，样本{sample}) = {undo_elapsed:?}");
         }
+        (replace_samples, undo_samples)
+    }
+
+    /// #174 默认档（负载容忍线 300ms）——全量 `cargo test --lib`
+    /// 常驻。#91 G1 原 100ms 线在并行满载套件（383+ 例同跑 + 编译
+    /// 负载并存的真机环境）下贴线抖动（单跑全过、全量偶发——见
+    /// #174 实测）；本档抓 **10 倍级退化**（rope/映射路径回归），
+    /// 微优化级回归归严格档。替换/撤销语义由本模块功能用例锁定，
+    /// 不靠时长门禁。
+    #[test]
+    fn replace_batch_thousand_matches_under_300ms() {
+        let (replace_samples, undo_samples) = thousand_replace_perf_samples();
         let best = *replace_samples.iter().min().expect("固定三个独立样本");
-        println!("perf(千处批量替换) = {replace_samples:?}; best = {best:?}（原验收线<100ms）");
+        println!("perf(千处批量替换) = {replace_samples:?}; best = {best:?}（默认档<300ms）");
+        println!("perf(千处批量撤销) = {undo_samples:?}");
+        assert!(
+            best < std::time::Duration::from_millis(300),
+            "千处批量替换超默认档（负载容忍线 300ms）：best={best:?}, samples={replace_samples:?}"
+        );
+    }
+
+    /// #174 严格档（#91 G1 原验收线 100ms）——`#[ignore]` 只在无负载
+    /// 环境手动跑：
+    ///
+    /// ```text
+    /// cargo test -p mang-shell --lib -- --ignored replace_batch_thousand_matches_strict
+    /// ```
+    ///
+    /// 适用场景：性能专项/发版前空载基线（无并行套件、无编译负载）。
+    /// 两档差异即 #174 的分档语义：默认档防退化量级，严格档保微优化
+    /// 基线。
+    #[test]
+    #[ignore = "#174：100ms 线在并行负载下贴线抖动——无负载环境手动跑（--ignored）"]
+    fn replace_batch_thousand_matches_strict_100ms() {
+        let (replace_samples, undo_samples) = thousand_replace_perf_samples();
+        let best = *replace_samples.iter().min().expect("固定三个独立样本");
+        println!("perf(千处批量替换) = {replace_samples:?}; best = {best:?}（严格档<100ms）");
         println!("perf(千处批量撤销) = {undo_samples:?}");
         assert!(
             best < std::time::Duration::from_millis(100),
