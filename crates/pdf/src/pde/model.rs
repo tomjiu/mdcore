@@ -268,6 +268,72 @@ impl ColorSpec {
             values: ColorValues::Nums(vec![v]),
         }
     }
+
+    /// `PDEColorSpaceGetNumComps`（批③）——色彩空间的分量数。
+    ///
+    /// Adobe："Calculates the number of components in a color space"
+    ///——`scn` 操作数校验面（分量数对不上 = 操作数错）。设备空间
+    /// 四件 + 1.3 六空间直读；资源名（/CS0）走 [`ResourceDict`] 的
+    /// `/ColorSpace` 表（表驱动面归资源层）；Pattern = None（Adobe
+    /// 官方「supports all PDF version 1.3 color spaces **except the
+    /// Pattern color space**」——`scn` 的 Pattern 变体分量面归
+    /// PDEPattern 批④）。
+    pub fn num_comps(&self) -> Option<usize> {
+        space_num_comps(&self.space)
+    }
+}
+
+/// 空间名 → 分量数（批③覆盖面：1.3 六空间 + 设备四件；Indexed 的
+/// 分量数 = base 空间的分量数——由 `IndexedColorSpace::num_comps` 承载）。
+fn space_num_comps(space: &[u8]) -> Option<usize> {
+    match space {
+        b"DeviceGray" | b"G" => Some(1),
+        b"DeviceRGB" | b"RGB" => Some(3),
+        b"DeviceCMYK" | b"CMYK" => Some(4),
+        b"CalGray" => Some(1),
+        b"CalRGB" => Some(3),
+        b"Lab" => Some(3),
+        b"ICCBased" => Some(3), // ICC 流的 /N（1/3/4）——批③保形直读缺省 3，N≠3 归引擎面
+        b"Separation" | b"DeviceN" => Some(1), // tint 分量近似面（DeviceN 多分量归后续）
+        b"Pattern" => None,     // Adobe 官方边界——Pattern 不进批③
+        _ => None,              // 资源名（/CS0 等）——表驱动，归 ResourceDict 面
+    }
+}
+
+/// Indexed 色彩空间（批③——`PDEColorSpaceGetBase/GetHiVal/GetCTable`
+/// 三件套）。
+///
+/// PDF 形态：`[/Indexed /DeviceRGB 7 <lookup 表>]`。Adobe 语义钉：
+/// **hiVal + 1 = 实际表项数**（"the actual number of entries is
+/// hiVal + 1"——冗余检查面：lookup 字节数 < (hiVal+1)×base 分量数 =
+/// 损坏表，typed 错误语义由调用方承载）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedColorSpace {
+    /// base 空间名（`GetBase`——"helper routine for indexed color
+    /// spaces"）。
+    pub base: Vec<u8>,
+    /// 最高索引（`GetHiVal`——0..=255）。
+    pub hi_val: u8,
+    /// lookup 表（原始字节——`GetCTable`"component information for an
+    /// indexed color space"）。
+    pub lookup: Vec<u8>,
+}
+
+impl IndexedColorSpace {
+    /// `GetBaseNumComps`——base 空间分量数（Indexed 本身是单分量
+    /// 索引空间——`scn` 的操作数 = 1，但**查表值**是 base 分量数）。
+    pub fn base_num_comps(&self) -> Option<usize> {
+        space_num_comps(&self.base)
+    }
+
+    /// **hiVal + 1 冗余检查**（Adobe 语义钉）：lookup 字节数是否足够
+    /// 覆盖 (hi_val+1) × base 分量数（设备空间 base 缩写名同收）。
+    pub fn lookup_is_consistent(&self) -> bool {
+        match self.base_num_comps() {
+            Some(n) => self.lookup.len() >= (self.hi_val as usize + 1) * n,
+            None => true, // base 未知（资源名）——表检查降级
+        }
+    }
 }
 
 /// 裁剪态（Adobe PDEClip 的批①单路径形态：一条 W/W* 路径；
@@ -402,6 +468,298 @@ impl PdeText {
         let at = index.min(self.runs.len());
         self.runs.insert(at, run);
     }
+
+    // ===== 批③编辑深面（issue #162——Adobe kPDETextChar 双寻址） =====
+
+    /// run 的字符计数（`PDETextRunGetNumChars`；与字节区分：多字节
+    /// 字体下 chars = bytes / num_code_bytes——本层无字体上下文时
+    /// 按单字节即字节数；**语义钉**：调用方持
+    /// [`crate::pde::font::PdeFont`] 时应先 `num_code_bytes` 切片）。
+    pub fn run_num_chars(&self, i: usize) -> Option<usize> {
+        self.runs.get(i).map(|r| run_bytes(r).len())
+    }
+
+    /// `PDETextGetNumChars`——全 run 字符累加。
+    pub fn num_chars(&self) -> usize {
+        self.runs.iter().map(|r| run_bytes(r).len()).sum()
+    }
+
+    /// `PDETextRunGetCharOffset`——run 首字符的全局字符偏移（前序
+    /// runs 累加）。
+    pub fn run_char_offset(&self, i: usize) -> Option<usize> {
+        if i >= self.runs.len() {
+            return None;
+        }
+        Some(
+            self.runs[..i]
+                .iter()
+                .map(|r| run_bytes(r).len())
+                .sum::<usize>(),
+        )
+    }
+
+    /// `PDETextGetRunForChar`（"Gets the index of the text run that
+    /// contains the nth character in a text object"）。
+    pub fn run_for_char(&self, char_index: usize) -> Option<usize> {
+        let mut acc = 0usize;
+        for (i, r) in self.runs.iter().enumerate() {
+            let n = run_bytes(r).len();
+            if char_index < acc + n {
+                return Some(i);
+            }
+            acc += n;
+        }
+        None // 越界
+    }
+
+    /// `PDETextReplaceChars`——**语义钉**：字符数守恒（Adobe 原文
+    /// "does not change the number of characters in the text object;
+    /// extra characters are ignored"）。
+    ///
+    /// `char_index` 为**全局字符偏移**（kPDETextChar 面）；跨 run 逐
+    /// 段替换。`replacement` 更长 = 尾部截断（多余忽略）；更短 = 只
+    /// 替换前 `replacement.len()` 字符（短侧对称宽容——其余原样）。
+    pub fn replace_chars(&mut self, char_index: usize, replacement: &[u8]) {
+        let mut ci = char_index;
+        let mut rem = replacement;
+        while !rem.is_empty() {
+            let run = match self.run_for_char(ci) {
+                Some(r) => r,
+                None => break,
+            };
+            let off = ci - self.run_char_offset(run).unwrap_or(0);
+            let run_len = run_bytes(&self.runs[run]).len();
+            let n = rem.len().min(run_len - off);
+            if n == 0 {
+                break;
+            }
+            rewrite_run_bytes(&mut self.runs[run], off, &rem[..n]);
+            ci += n;
+            rem = &rem[n..];
+        }
+    }
+
+    /// `PDETextSplitRunAt`——**语义钉**：`split_loc` 为**全局字符索引**
+    ///（Adobe 原文 "relative to the text object"——非 run 局部索引）。
+    ///
+    /// 边界判读（Adobe 原文 "The first text run is from character index
+    /// 0 **up to splitLoc**. The second text run is **from splitLoc + 1**
+    /// to the end"）：首 run **含** splitLoc 位字符（「up to」含判读 +
+    /// 次 run 从 splitLoc+1 起——无字符丢失的自洽解释；splitLoc 字符
+    /// 丢失的其他判读与「Run 不无故吞字」矛盾，弃）。
+    ///
+    /// 两 run 继承同一 state/text_matrix（仅断 run 边界）。无操作面：
+    /// `split_loc == 0`、`split_loc >= num_chars()`、splitLoc 为 run 尾
+    /// 字符（次 run 空——无边界可断）。
+    pub fn split_run_at(&mut self, split_loc: usize) {
+        if split_loc == 0 || split_loc >= self.num_chars() {
+            return;
+        }
+        let run = match self.run_for_char(split_loc) {
+            Some(r) => r,
+            None => return,
+        };
+        let off = split_loc - self.run_char_offset(run).unwrap_or(0);
+        // 切点 = off + 1（首段含 splitLoc 位字符）。
+        let cut = off + 1;
+        if cut >= run_bytes(&self.runs[run]).len() {
+            return; // splitLoc 为 run 尾字符——无边界可断
+        }
+        let (a, b) = split_run_show_bytes(&self.runs[run], cut);
+        let state = self.runs[run].state.clone();
+        let matrix = self.runs[run].text_matrix;
+        self.runs[run].shows = a;
+        let next = TextRun {
+            state,
+            text_matrix: matrix,
+            shows: b,
+        };
+        self.runs.insert(run + 1, next);
+    }
+
+    /// `PDETextRemove`（kPDETextRun 形态）：run 索引删除 `count` 个。
+    pub fn remove_runs(&mut self, index: usize, count: usize) {
+        if index >= self.runs.len() {
+            return;
+        }
+        let end = (index + count).min(self.runs.len());
+        self.runs.drain(index..end);
+    }
+
+    /// `PDETextRemove`（kPDETextChar 形态）：全局字符区间删除
+    /// `[char_index, char_index + count)`。跨 run 逐段裁剪；清空的
+    /// run 移除。
+    ///
+    /// **坐标语义钉**：`char_index`/`count` 是**调用时**坐标（Adobe
+    /// (flags, index, count) 同语义）。删除过程中序列收缩，后续段的
+    /// 定位必须按**原始坐标**推算——先对全部 run 一次性计算各自删除
+    /// 段（原始坐标），再统一应用（边删边查会把已收缩序列当原坐标
+    /// 解释，区间错位——批③实现期踩坑，机器模拟暴露）。
+    pub fn remove_chars(&mut self, char_index: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let start = char_index.min(self.num_chars());
+        let end = (char_index + count).min(self.num_chars());
+        if start >= end {
+            return;
+        }
+        // 第一遍：原始坐标下的每 run 删除段 [(run, off, take)]
+        let cuts: Vec<(usize, usize, usize)> = {
+            let mut c = Vec::new();
+            let mut run_off = 0usize; // 当前 run 首字符的全局偏移
+            for (i, r) in self.runs.iter().enumerate() {
+                let rl = run_bytes(r).len();
+                if run_off + rl <= start {
+                    run_off += rl;
+                    continue; // 全在删除区间前
+                }
+                if run_off >= end {
+                    break; // 全在删除区间后
+                }
+                let off = start.max(run_off) - run_off;
+                let take = (end - start.max(run_off)).min(rl - off);
+                c.push((i, off, take));
+                run_off += rl;
+            }
+            c
+        };
+        // 第二遍：倒序应用（run 索引不因前段删除错位）
+        for &(run, off, take) in cuts.iter().rev() {
+            delete_run_bytes(&mut self.runs[run], off, take);
+            if run_bytes(&self.runs[run]).is_empty() {
+                self.runs.remove(run);
+            }
+        }
+    }
+
+    // ===== 批③度量面（issue #162——PDEFont 度量 × 矩阵换算） =====
+
+    /// `PDETextGetAdvance`（run 面）："The advance width is the amount
+    /// by which the current point advances when the character is
+    /// drawn"——run 内字符宽度累加（字符空间）。
+    ///
+    /// `font` 供 `width_of`（1000 EM → 字符空间 = × font_size/1000 ×
+    /// h_scale/100 + Tc；Tw 只作用于单字节编码的字形码 32——PDF
+    /// §5.2.2 多字节编码下 word spacing 不适用）。`None` = 无字体
+    /// 上下文 → 返回 None（诚实降级——批①文本 BBox 登记的同一偏差
+    /// 面，本方法不猜）。
+    pub fn run_advance(&self, i: usize, font: Option<&crate::pde::font::PdeFont>) -> Option<f32> {
+        let run = self.runs.get(i)?;
+        let f = font?;
+        let st = &run.state;
+        let single = f.num_code_bytes(&run_bytes(run)) == 1;
+        let mut adv = 0.0f32;
+        for &code in &run_bytes(run) {
+            let w1000 = f.width_of(code as u32);
+            adv += w1000 * st.size / 1000.0 * st.h_scale / 100.0 + st.char_spacing;
+            if single && code == 32 {
+                adv += st.word_spacing;
+            }
+        }
+        Some(adv)
+    }
+
+    /// `PDETextGetBBox`（run 面）——批①登记偏差的闭合路径：字体
+    /// ascent/descent（基线系）+ run 宽度，经 text_matrix × ctm 落到
+    /// 页面空间。
+    ///
+    /// **近似面诚实登记**：Ascent/Descent 是全字形域上界（Adobe
+    /// `PDETextGetQuad` 的 per-glyph 面更精确——per-glyph 需逐字
+    /// 宽度换算，批③以 run 级 BBox 承载 + 本注释登记差异）。
+    pub fn run_bbox(&self, i: usize, font: Option<&crate::pde::font::PdeFont>) -> Option<Rect> {
+        let run = self.runs.get(i)?;
+        let f = font?;
+        let asc = f.attrs.ascent.unwrap_or(0.0);
+        let desc = f.attrs.descent.unwrap_or(0.0);
+        let st = &run.state;
+        let adv = self.run_advance(i, font)?;
+        // 字符空间盒（基线原点 → 右端；Ts 基线抬升。descent 存绝对值
+        // ——基线**下方**偏移取负）。
+        let corners_cs = [
+            (0.0, st.rise),
+            (adv, st.rise),
+            (0.0, asc * st.size / 1000.0 + st.rise),
+            (adv, st.rise - desc * st.size / 1000.0),
+        ];
+        // 文本空间 → 用户空间（Tm）→ 页面空间（CTM）
+        let m = mat_mul(run.text_matrix, self.gstate.ctm);
+        let pts = corners_cs
+            .iter()
+            .map(|&(x, y)| mat_apply(m, Point { x, y }))
+            .collect::<Vec<_>>();
+        rect_from_points(&pts)
+    }
+}
+
+// ---- run 字节面辅助（show 串的字节级寻址——跨 Str/Kern 串行） ----
+
+/// run 的显示字节拼接（Str 段全串；Kern 不占字符位）。
+fn run_bytes(run: &TextRun) -> Vec<u8> {
+    run.shows
+        .iter()
+        .filter_map(|s| match s {
+            ShowOp::Str(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// 重写 run 的字节串 `off..off+n` 段为 `new`（重装为单 Str——批③
+/// 编辑面的统一重装语义：编辑后 run 的字节串是权威形态）。
+fn rewrite_run_bytes(run: &mut TextRun, off: usize, new: &[u8]) {
+    let bytes = run_bytes(run);
+    let off = off.min(bytes.len());
+    let mut out = bytes[..off].to_vec();
+    out.extend_from_slice(new);
+    out.extend_from_slice(&bytes[(off + new.len()).min(bytes.len())..]);
+    run.shows = vec![ShowOp::Str(out)];
+}
+
+/// 删除 run 字节串 `off..off+n` 段。
+fn delete_run_bytes(run: &mut TextRun, off: usize, n: usize) {
+    let bytes = run_bytes(run);
+    let off = off.min(bytes.len());
+    let end = (off + n).min(bytes.len());
+    let mut out = bytes[..off].to_vec();
+    out.extend_from_slice(&bytes[end..]);
+    run.shows = vec![ShowOp::Str(out)];
+}
+
+/// run 拆分面：保留 Str/Kern 混合原序（split 后两 run 的 shows 各自
+/// 收纳界前/界后的 op——Kern 归属按游标位置）。
+fn split_run_show_bytes(run: &TextRun, at: usize) -> (Vec<ShowOp>, Vec<ShowOp>) {
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    let mut cursor = 0usize;
+    let mut filled = false; // 游标过界后 op 全进 b
+    for op in &run.shows {
+        match op {
+            ShowOp::Kern(k) => {
+                if filled {
+                    b.push(ShowOp::Kern(*k));
+                } else {
+                    a.push(ShowOp::Kern(*k));
+                }
+            }
+            ShowOp::Str(s) => {
+                if filled {
+                    b.push(ShowOp::Str(s.clone()));
+                } else if cursor + s.len() <= at {
+                    a.push(ShowOp::Str(s.clone()));
+                    cursor += s.len();
+                } else {
+                    // 跨界 str：切
+                    let l = at - cursor;
+                    a.push(ShowOp::Str(s[..l].to_vec()));
+                    b.push(ShowOp::Str(s[l..].to_vec()));
+                    filled = true;
+                }
+            }
+        }
+    }
+    (a, b)
 }
 
 /// PDEPath 元素（构造段序列 + 绘制算子；`clipped` = 该路径同时被
@@ -556,6 +914,33 @@ impl PdeElement {
             _ => None,
         }
     }
+
+    /// `PDEElementIsAtPoint`（命中测试——选区编辑的产品闭环面）。
+    ///
+    /// **语义钉**：Container/Place（无 gstate 的非图形元素）与无 BBox
+    /// 面 = None→false（Adobe `GetClip` 同款边界：这两类「should not
+    /// be expected to return valid results」）。
+    pub fn is_at_point(&self, x: f32, y: f32) -> bool {
+        match self.bbox() {
+            Some(r) => x >= r.x0() && x <= r.x1() && y >= r.y0() && y <= r.y1(),
+            None => false,
+        }
+    }
+
+    /// `PDEElementIsAtRect`（"Tests whether any **part** of a rectangle
+    /// is on the element"——相交判定的 hit 面）。
+    pub fn is_at_rect(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+        match self.bbox() {
+            Some(r) => x0 <= r.x1() && x1 >= r.x0() && y0 <= r.y1() && y1 >= r.y0(),
+            None => false,
+        }
+    }
+
+    /// `PDEElementCopy`（"Makes a copy of an element"——撤销栈/剪贴板
+    /// 的基元操作）。
+    pub fn deep_copy(&self) -> PdeElement {
+        self.clone()
+    }
 }
 
 /// 路径段顶点集合 → 轴对齐包围盒（控制点计入——上界盒，Adobe BBox
@@ -687,5 +1072,167 @@ impl PdeContent {
     /// 形态；克隆成本可接受，PDE 层编辑流典型量级 < 数百元素）。
     pub fn iter_elems(&self) -> impl Iterator<Item = &PdeElement> {
         self.elements.iter()
+    }
+}
+
+#[cfg(test)]
+mod batch3_tests {
+    use super::*;
+
+    fn run(text: &[u8]) -> TextRun {
+        TextRun {
+            state: TextState::default(),
+            text_matrix: IDENTITY,
+            shows: vec![ShowOp::Str(text.to_vec())],
+        }
+    }
+
+    fn text3(a: &[u8], b: &[u8], c: &[u8]) -> PdeText {
+        PdeText {
+            gstate: GState::default(),
+            runs: vec![run(a), run(b), run(c)],
+        }
+    }
+
+    /// 三方法闭环：RunGetCharOffset / GetRunForChar / GetNumChars
+    ///（语义锚 1.1——run→char 双向换算）。
+    #[test]
+    fn char_addressing_roundtrip() {
+        let t = text3(b"AB", b"CDE", b"FGHI");
+        assert_eq!(t.num_runs(), 3);
+        assert_eq!(t.num_chars(), 9);
+        // offset 面
+        assert_eq!(t.run_char_offset(0), Some(0));
+        assert_eq!(t.run_char_offset(1), Some(2));
+        assert_eq!(t.run_char_offset(2), Some(5));
+        assert_eq!(t.run_char_offset(3), None); // 越界
+                                                // run_for_char 面
+        assert_eq!(t.run_for_char(0), Some(0));
+        assert_eq!(t.run_for_char(1), Some(0));
+        assert_eq!(t.run_for_char(2), Some(1));
+        assert_eq!(t.run_for_char(4), Some(1));
+        assert_eq!(t.run_for_char(5), Some(2));
+        assert_eq!(t.run_for_char(8), Some(2));
+        assert_eq!(t.run_for_char(9), None); // 越界
+                                             // run_num_chars
+        assert_eq!(t.run_num_chars(1), Some(3));
+    }
+
+    /// ReplaceChars 语义钉：字符数守恒（多余忽略——Adobe 原文）。
+    #[test]
+    fn replace_chars_count_conservation() {
+        let mut t = text3(b"AB", b"CDE", b"FGHI");
+        let before = t.num_chars();
+        // 等长替换（跨 run：全局 1..4 换 xyz）
+        t.replace_chars(1, b"xyz");
+        assert_eq!(t.num_chars(), before, "等长：守恒");
+        assert_eq!(t.run_text(0).unwrap(), b"Ax".to_vec());
+        assert_eq!(t.run_text(1).unwrap(), b"yzE".to_vec());
+        // 长替换：多余忽略（尾截断）
+        let mut t2 = text3(b"AB", b"CDE", b"");
+        t2.replace_chars(0, b"WXYZ12345");
+        assert_eq!(t2.num_chars(), 5, "长替换：多余忽略");
+        assert_eq!(t2.run_text(0).unwrap(), b"WX".to_vec());
+        assert_eq!(t2.run_text(1).unwrap(), b"YZ1".to_vec());
+        // 短替换：前 n 字符替换（短侧对称宽容）
+        let mut t3 = text3(b"AB", b"C", b"");
+        t3.replace_chars(0, b"Q");
+        assert_eq!(t3.run_text(0).unwrap(), b"QB".to_vec());
+        assert_eq!(t3.num_chars(), 3, "短替换：其余原样");
+    }
+
+    /// SplitRunAt 语义钉：split_loc = **全局字符索引**（非 run 局部）。
+    #[test]
+    fn split_run_at_global_semantics() {
+        let mut t = text3(b"AB", b"CDE", b"");
+        // 全局索引 3 = run1 的 "C" 之后（run 局部索引会理解为 run1 内 3 →
+        // 越界无操作——反例判别面）
+        t.split_run_at(3);
+        assert_eq!(t.num_runs(), 4, "全局 3 落在 run1 内部：断成 AB/CD/E");
+        assert_eq!(t.run_text(0).unwrap(), b"AB".to_vec());
+        assert_eq!(t.run_text(1).unwrap(), b"CD".to_vec());
+        assert_eq!(t.run_text(2).unwrap(), b"E".to_vec());
+        assert_eq!(t.run_text(3).unwrap(), b"".to_vec());
+        // state/matrix 继承
+        assert_eq!(t.runs[1].state, t.runs[2].state);
+        // 边界无操作面：全局 0 / 全局尾；run 尾字符
+        let mut t2 = text3(b"AB", b"CDE", b"");
+        t2.split_run_at(0); // 全局首
+        assert_eq!(t2.num_runs(), 3);
+        t2.split_run_at(5); // 全局尾后
+        assert_eq!(t2.num_runs(), 3);
+        // run 尾字符（splitLoc=4 = run1 的 "E" 位）：cut=run_len → 无操作
+        t2.split_run_at(4);
+        assert_eq!(t2.num_runs(), 3);
+        // run 首字符（splitLoc=2 = run1 的 "C" 位）：cut=1 → 切 C|DE
+        t2.split_run_at(2);
+        assert_eq!(t2.num_runs(), 4, "splitLoc 含首段：run1 切成 C|DE");
+        assert_eq!(t2.run_text(1).unwrap(), b"C".to_vec());
+        assert_eq!(t2.run_text(2).unwrap(), b"DE".to_vec());
+    }
+
+    /// Remove 双形态：run 删 / char 全局区间删。
+    #[test]
+    fn remove_runs_and_chars() {
+        // run 形态
+        let mut t = text3(b"AB", b"CDE", b"FGHI");
+        t.remove_runs(1, 1);
+        assert_eq!(t.num_runs(), 2);
+        assert_eq!(t.run_text(0).unwrap(), b"AB".to_vec());
+        assert_eq!(t.run_text(1).unwrap(), b"FGHI".to_vec());
+        // char 形态：跨 run 区间（全局 1..4 → 删 BCD）
+        let mut t2 = text3(b"AB", b"CDE", b"FGHI");
+        t2.remove_chars(1, 3);
+        assert_eq!(t2.num_chars(), 6);
+        assert_eq!(t2.run_text(0).unwrap(), b"A".to_vec());
+        assert_eq!(t2.run_text(1).unwrap(), b"E".to_vec());
+        assert_eq!(t2.run_text(2).unwrap(), b"FGHI".to_vec());
+        // 整 run 清空 → run 移除
+        let mut t3 = text3(b"AB", b"CDE", b"FGHI");
+        t3.remove_chars(2, 3);
+        assert_eq!(t3.num_runs(), 2, "run1 整删");
+        assert_eq!(t3.run_text(0).unwrap(), b"AB".to_vec());
+        assert_eq!(t3.run_text(1).unwrap(), b"FGHI".to_vec());
+    }
+
+    /// Kern 位移不占字符位（run_bytes 只串 Str 段——字节寻址语义钉）。
+    #[test]
+    fn kern_not_counted_as_chars() {
+        let r = TextRun {
+            state: TextState::default(),
+            text_matrix: IDENTITY,
+            shows: vec![
+                ShowOp::Str(b"AB".to_vec()),
+                ShowOp::Kern(-120.0),
+                ShowOp::Str(b"CD".to_vec()),
+            ],
+        };
+        let t = PdeText {
+            gstate: GState::default(),
+            runs: vec![r],
+        };
+        assert_eq!(t.num_chars(), 4);
+        // Kern 跨界拆分：split 在 A|B 之间——Kern 归属后 run（游标过界）
+        let mut t2 = t.clone();
+        t2.split_run_at(1);
+        // splitLoc=1（"B" 位）含首段：首 run 含 AB（字节切点在 B 后）
+        assert_eq!(t2.run_text(0).unwrap(), b"AB".to_vec());
+        assert_eq!(t2.run_text(1).unwrap(), b"CD".to_vec());
+        // Kern 在 show 序里的位置保形（界前 Kern 归前 run）
+        let mut t3 = PdeText {
+            gstate: GState::default(),
+            runs: vec![TextRun {
+                state: TextState::default(),
+                text_matrix: IDENTITY,
+                shows: vec![
+                    ShowOp::Kern(-50.0),
+                    ShowOp::Str(b"AB".to_vec()),
+                    ShowOp::Str(b"CD".to_vec()),
+                ],
+            }],
+        };
+        t3.split_run_at(2);
+        assert_eq!(t3.runs[0].shows.len(), 3, "界前 Kern+两 Str 归前 run");
+        assert_eq!(t3.runs[1].shows.len(), 1);
     }
 }

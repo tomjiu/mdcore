@@ -29,6 +29,7 @@
 //! PDPage → PDEContent → PDEElement），写回走内容流重生成。零引擎
 //! 依赖纪律与 crate 现有 default = [] 面一致——批①不引入任何新依赖。
 
+pub mod font;
 pub mod image;
 pub mod lexer;
 pub mod model;
