@@ -176,26 +176,34 @@ fn two_sessions_concurrent_edit_and_save() {
         DocSession::open(None, &dir.join("v1"), &saved_url("a-saved.docx"), None).expect("重开 a");
     let mut v2 =
         DocSession::open(None, &dir.join("v2"), &saved_url("b-saved.docx"), None).expect("重开 b");
-    v1.uno(".uno:SelectAll", None).expect("v1 全选");
-    for _ in 0..3 {
-        let (_, t1) = v1
-            .text_selection("text/plain;charset=utf-8")
-            .expect("v1 选区");
-        if t1.contains("会话一内容") && !t1.contains("会话二内容") {
-            break;
+    // 【2026-11-13 实测】postUnoCommand 异步：`SelectAll` 返回 ≠ 选区已就位。
+    // 旧写法「派发后立即读」在最后一轮派发后直接读，会拿到未落定的中间态——
+    // 本测试跑全量时曾读成 `"会话一内"`（少最后一字，非串号），属 #160 同源
+    // 缺陷。改为「单次派发 + 轮询等待」，与 smoke::select_all_full_text 同构。
+    fn settled_selection(s: &mut DocSession, want: &str, reject: &str, tag: &str) -> String {
+        let mut last = String::new();
+        for _round in 0..6 {
+            s.uno(".uno:SelectAll", None).expect("全选");
+            for _ in 0..20 {
+                let (_, t) = s
+                    .text_selection("text/plain;charset=utf-8")
+                    .expect("选区");
+                if t.contains(want) && !t.contains(reject) {
+                    return t;
+                }
+                last = t;
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        v1.uno(".uno:SelectAll", None).expect("v1 全选重试");
+        panic!("{tag}：轮询 6×20 后仍未落定（实际：{last:?}）");
     }
-    let (_, t1) = v1.text_selection("text/plain;charset=utf-8").unwrap();
+
+    let t1 = settled_selection(&mut v1, "会话一内容", "会话二内容", "会话 1 产物只含自己的编辑");
     assert!(
         t1.contains("会话一内容") && !t1.contains("会话二内容"),
         "会话 1 产物只含自己的编辑（隔离；实际：{t1:?}）"
     );
-    let (_, t2) = {
-        v2.uno(".uno:SelectAll", None).expect("v2 全选");
-        v2.text_selection("text/plain;charset=utf-8")
-            .expect("v2 选区")
-    };
+    let t2 = settled_selection(&mut v2, "会话二内容", "会话一内容", "会话 2 产物只含自己的编辑");
     assert!(
         t2.contains("会话二内容") && !t2.contains("会话一内容"),
         "会话 2 产物只含自己的编辑（隔离；实际：{t2:?}）"
