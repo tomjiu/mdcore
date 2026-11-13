@@ -1,23 +1,21 @@
 //! 编辑缓冲区 —— 纯逻辑文本模型（#68 阶段 1.2 文本编辑能力的地基；
-//! r42 阶段 A 换芯：存储层 Zed `text::Buffer`（rope + 锚点 + O(log n)））。
+//! #163 换芯：mdcore::Core 为唯一文档真源，Zed text::Buffer 退役）。
 //!
-//! ## r42 阶段 A 换芯说明（#68 Lead 定调：抄设计，用干净 crate）
+//! ## #163 换芯说明（主从裁决：mdcore = 真源，GPUI = 视图）
 //!
-//! - **存储层**：`text::Buffer`（Zed 编辑器同款——rope 持文 + 事务历史 +
-//!   锚点基座）。编辑走 `inner.edit([(offset_range, text)])` 单点，
-//!   O(log n)——替换前实现（`Vec<String>` 逐行 drain/insert，O(n)）。
-//! - **语义层外壳**：光标/选区/粘性列/undo-redo 四元组/查找全部保持
-//!   r39 语义不变——41 个既有单测逐一照抄零改写（公开 API 语义即契约）。
-//!   text::Buffer 内建的 undo 基础设施不用（外壳四元组与既有测试/光标
-//!   语义一一锚定；锚点能力在 inner 上保留，阶段 C 多光标取用）。
-//! - **坐标语义**：对外 `Point { line, col }` 的 `col` 仍按 **char 索引**
-//!   （CJK 列语义不变）；rope 层坐标（byte 列）由外壳双向换算，调用方
-//!   无感。`col` 换算需行文本（O(行长)）——行文本每次调用即时取
-//!   （`row_text`），不缓存；50 万字场景的可见行操作 O(行长) 量级
-//!   （阶段 B display_map 落地前的边界登记，见 PR 说明）。
-//! - **行尾语义**：`\r\n` 原样存取（`new_normalized` 直通，不经
-//!   `Buffer::new` 的 normalize——mang-shell 行语义只按 `\n` 划行，
-//!   `\r` 属行内容，与 r39 `split('\n')` 语义逐位一致）。
+//! - **语义层（唯一真源）**：树/Op/History/StableID/选区/字数全部在
+//!   `mdcore::Core`（经 [`super::md_bridge::MdBridge`] 持有）。undo/redo
+//!   = 核历史（1s 合并窗，验收 2）；块身份/revision/事件流同源。
+//! - **存储层（显示投影）**：ropey Rope 持原文（含空行/`\r`）——CM6
+//!   之于 web 的同构角色：视图缓存，非文档真源。快路径（单块原位
+//!   op）+ 兜底（sync_from_markdown 差分）双路维护「核树≡解析」不变量。
+//! - **交互层外壳**：光标/选区/粘性列/查找保持既有语义——公开 API
+//!   与 41 项测试契约不动（undo 合并窗语义按 #163 裁决变更为核同源）。
+//! - **坐标系**：对外 `Point { line, col }` 的 `col` 仍按 **char 索引**
+//!   （CJK 列语义不变）；投影 char offset 由桥层 ropey 直算。
+//! - **行尾语义**：`\r\n` 原样存取（投影面逐位保真；行内孤立 `\r`
+//!   使行映射失配 → 桥自动降级兜底路径，正确性不受影响）。
+//! - **许可证面**：Zed `text`/`rope`（GPL，10,912 LOC）随本次换芯下线。
 //!
 //! ## 坐标语义（r39 原文保持）
 //!
@@ -30,25 +28,24 @@
 //! ## 编辑原语
 //!
 //! 所有文本变更收敛到 [`Buffer::replace_range`] 单点（内部走
-//! [`Buffer::apply_core`] → `inner.edit`）：删除 `[start, end)` 再插入
-//! `text`（可含 `\n` 拆行）。
+//! [`super::md_bridge::MdBridge::edit`]：快路径 op / 兜底 sync）：删除
+//! `[start, end)` 再插入 `text`（可含 `\n` 拆行）。
 //!
-//! undo/redo 以四元组 `(start, end_del, old_text, new_text)` 记录：
-//! redo 方向 = `[start, end_del)` 的 `old` 换成 `new`；undo 方向 = 把
-//! `new` 的当前占位换回 `old`（占位末点由 `end_after_insert` 重算，
-//! 不依赖 `end_del`）。栈全空 ⇔ 内容等于初始（每步可逆）——
-//! `is_modified` 由此判定，无需快照比对。
+//! undo/redo = mdcore History（合并窗：同为文本类 View 事务 1s 内并入
+//! 末条；docx 面（挂钩子时）合并窗置 0 保持逐编辑粒度——
+//! EditHook/UndoHook 的 history_id 1:1 契约）。单编辑条目的投影回放
+//! = 四元组占位换回（与 r39 语义逐位等价）。
 //!
 //! ## 选区
 //!
 //! `anchor`（Shift 移动落下的锚点）与 `cursor`（头）构成选区；
 //! 排序后 `[start, end)`。无 Shift 的移动清锚。编辑命令先消费选区。
-
+//! 光标/选区每变更经桥同步为 mdcore Selection（块锚点——
+//! anchor.rs 消费面，#163 验收 5）。
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use text as zed_text;
+use super::md_bridge::MdBridge;
 
 /// 文本坐标：`line` 从 0 起，`col` 为行内 **char** 索引。
 /// #111：`Serialize` derive（doc_events 事件载荷直出 `{"line":n,"col":n}`
@@ -112,62 +109,43 @@ impl IndentUnit {
     }
 }
 
-/// 一次可逆编辑（四元组）：
-/// - redo 方向：`[start, end_del)` 的 `old_text` 替换为 `new_text`
-/// - undo 方向：`new_text` 在 `start` 处的当前占位（由 `end_after_insert`
-///   重算）替换回 `old_text`——undo 不读 `end_del`。
+/// #163：undo 栈条目的手势几何伴记（Buffer 侧镜像核 History 条目）。
 #[derive(Clone, Debug)]
-struct Edit {
-    history_id: u64,
+struct EntryMeta {
+    /// 编辑期 id（Buffer revision 口径——docx 桥映射恢复键）。
+    id: u64,
+    /// 手势起点（undo 光标落点）。
     start: Point,
-    end_del: Point,
+    /// 手势被替换域终点（pre 编辑坐标）。
+    end: Point,
+    /// 手势后光标（redo 光标落点）。
+    cursor_after: Point,
+    /// 插入文本换行数（redo 的 fence inserted_lines）。
+    t_nl: usize,
+    /// 被删文本换行数（undo 的 fence inserted_lines）。
+    o_nl: usize,
+    /// 条目内编辑数（#205 fence 判据：单编辑 = Single 几何，多编辑
+    /// （批量/合并窗吸收的多点编辑）= Full——保守正确）。
+    n_edits: usize,
+    /// 单编辑条目的被替换文本（四元组回放面——undo 投影回放的
+    /// 精确原文；多编辑条目为空串，走 op 翻译路径）。
     old_text: String,
-    new_text: String,
+    /// 单编辑条目的插入文本（redo 投影回放面）。
+    text: String,
 }
 
-/// G1 批量子编辑：字节偏移双坐标域（Point 坐标在批内其它子编辑改动
-/// 行数后会漂移——撤销/重放不能跨批用 Point；两域均在
-/// [`Buffer::replace_batch`] 时一次算定）。
+/// G1 批量子编辑（#163 换芯：投影 char 域 + Point——undo/redo 由核
+/// History 驱动，不再需要撤销/重放专用坐标域；old_text 保留供钩子
+/// 意图与摘要）。
 #[derive(Clone, Debug)]
 struct BatchEdit {
     history_id: u64,
-    /// 原始文档坐标起点（批首光标/汇报用——撤销后文档即原始态，
-    /// 该 Point 恒有效）。
+    /// 原始文档坐标起点（批首光标/汇报用）。
     start: Point,
-    /// 原始文档删除域 `[z_start, z_end_del)`（字节 offset——重放用：
-    /// 批的 undo 使文档回原始态，LIFO 序下此域恒有效）。
-    z_del: (usize, usize),
-    /// 应用后占位域 `[z_start + shift, z_start + shift + new_len)`
-    ///（字节 offset——撤销用：当前文档即批量应用后的状态）。
-    z_applied: (usize, usize),
+    /// 原始文档删除域（投影 char offset——pre 状态一次算定）。
+    c_del: (usize, usize),
     old_text: String,
     new_text: String,
-}
-
-/// undo 栈条目（G1 查找替换）：单点编辑或**一批**多点编辑（一次
-/// 批量替换 = 一个栈条目——Ctrl+Z 一次整批回滚；批内子编辑互不
-/// 重叠、按文档序存储）。
-#[derive(Clone, Debug)]
-enum Undoable {
-    Single(Edit),
-    Batch(Vec<BatchEdit>),
-}
-
-impl Undoable {
-    fn history_id(&self) -> u64 {
-        match self {
-            Self::Single(edit) => edit.history_id,
-            Self::Batch(edits) => edits.first().expect("history batch is nonempty").history_id,
-        }
-    }
-
-    /// 批量条目的子编辑数（单点为 1）。
-    fn edit_count(&self) -> usize {
-        match self {
-            Undoable::Single(_) => 1,
-            Undoable::Batch(v) => v.len(),
-        }
-    }
 }
 
 /// 词字符判定（`word_jump` 与双击选词 [`super::mouse::word_range_at`] 共用
@@ -193,31 +171,29 @@ pub(crate) fn char_to_byte_pub(s: &str, col: usize) -> usize {
     char_to_byte(s, col)
 }
 
-/// 外壳 BufferId 序列（本地无协同——id 唯一性只为 text 层语义完整；
-/// `BufferId::new` 对非零恒 Ok，`expect` 消息写明）。
-fn next_buffer_id() -> zed_text::BufferId {
-    static SEQ: AtomicU64 = AtomicU64::new(1);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    zed_text::BufferId::new(n).expect("BufferId::new 对非零 id 恒 Ok")
-}
-
 /// 纯逻辑编辑缓冲区。
 pub struct Buffer {
-    /// 存储层：Zed text::Buffer（rope 持文 + 锚点 + 事务）。
-    /// 外壳不消费其 undo 历史（语义层四元组自管）；每次 `apply_core`
-    /// 的 edit 会同步落入 inner 的 history（无害堆积，见头注释）。
-    inner: zed_text::Buffer,
+    /// #163 换芯桥：mdcore::Core（唯一真源）+ ropey 投影 + 行↔块映射。
+    bridge: MdBridge,
     cursor: Point,
     /// Shift 选区锚点（无选区为 `None`）。
     anchor: Option<Point>,
     /// 上下移动的期望列粘性（被短行 clamp 时记忆原列）。
     desired_col: Option<usize>,
-    undo_stack: Vec<Undoable>,
-    redo_stack: Vec<Undoable>,
-    /// 保存点对应的 undo 栈深度（`mark_saved` 快照）。
+    /// 保存点对应的核 undo 栈深度（`mark_saved` 快照）。
     /// 修改判定 = 当前深度 != 保存点深度——undo 到底即回初始态（redo
-    /// 栈非空不代表内容偏离初始）。
+    /// 栈非空不代表内容偏离初始）。与 r39 语义逐位一致（深度口径）。
     saved_depth: usize,
+    /// UndoHook 的 history_id 镜像 + 手势几何伴记：核 undo 栈每条目
+    /// 对应一条 EntryMeta（id/起点/终点/后光标/双侧换行数/编辑数/
+    /// 四元组文本）。undo/redo 的光标与 #205 fence 记账全部由此推导
+    /// ——与旧四元组语义逐位对齐（合并条目记首编辑几何）。
+    entry_ids: Vec<EntryMeta>,
+    /// redo 镜像（同 entry_ids；mark_saved 清空与核同源）。
+    redo_ids: Vec<EntryMeta>,
+    /// #163：合并窗缺省（settings undo_coalesce_ms；挂 docx 钩子时
+    /// 置 0 保持逐编辑粒度——钩子摘除后恢复）。
+    default_coalesce_ms: u64,
     /// 文档版本号（#111 订阅模式）：每次变更事务 +1（replace_range /
     /// replace_batch / undo / redo——`mark_saved` 不算变更）。事件消费方
     /// 靠它检测乱序与丢事件。初始 0。
@@ -243,7 +219,7 @@ pub struct Buffer {
     /// **变更之后**通报（`TextChanged`——宿主据此重映射块表 + 节流回写）。
     /// 钩子只在 Buffer 单点入口（[`Buffer::replace_range`] /
     /// [`Buffer::replace_batch`]）处触发，undo/redo 不触发（撤销回放走的
-    /// 是 apply_core——撤销「物理上」必须生效，语义由引擎 pending 层
+    /// 是桥层投影编辑——撤销「物理上」必须生效，语义由核历史层
     /// 重新落账承担）。
     edit_hook: Option<Box<dyn EditHook>>,
     /// #115：撤销/重做通知（宿主据此同步行归属映射；None = 纯文本面）。
@@ -258,18 +234,18 @@ pub struct Buffer {
 }
 
 impl Clone for Buffer {
-    /// 深拷贝经 `inner.branch()`（text 层同构快照——克隆体与源共享
-    /// 历史，编辑互不影响；`text::Buffer` 未派生 Clone，branch 是
-    /// 上游提供的唯一全量复制路径）。
+    /// #163：深拷贝经 `Core::clone`（完整快照：树 + 历史栈 + revision
+    /// 全量复制——对照旧 `inner.branch()` 共享历史，本实现是更强语义）。
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.branch(),
+            bridge: self.bridge.clone(),
             cursor: self.cursor,
             anchor: self.anchor,
             desired_col: self.desired_col,
-            undo_stack: self.undo_stack.clone(),
-            redo_stack: self.redo_stack.clone(),
             saved_depth: self.saved_depth,
+            entry_ids: self.entry_ids.clone(),
+            redo_ids: self.redo_ids.clone(),
+            default_coalesce_ms: self.default_coalesce_ms,
             revision: self.revision,
             pending: Vec::new(),
             pending_base: None,
@@ -408,32 +384,6 @@ pub struct RejectNotice {
     pub line: usize,
 }
 
-/// 撤销/重做涉及的行数变化量（`redo` = 方向）。
-///
-/// 撤销：把 `new_text` 换回 `old_text` → 行数变化 = old − new；
-/// 重做：把 `old_text` 换回 `new_text` → 行数变化 = new − old。
-fn history_delta_lines(entry: &Undoable, redo: bool) -> i64 {
-    let (old_lines, new_lines) = match entry {
-        Undoable::Single(e) => (
-            e.old_text.matches('\n').count() as i64,
-            e.new_text.matches('\n').count() as i64,
-        ),
-        Undoable::Batch(rs) => (
-            rs.iter()
-                .map(|r| r.old_text.matches('\n').count() as i64)
-                .sum(),
-            rs.iter()
-                .map(|r| r.new_text.matches('\n').count() as i64)
-                .sum(),
-        ),
-    };
-    if redo {
-        new_lines - old_lines
-    } else {
-        old_lines - new_lines
-    }
-}
-
 impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
@@ -454,22 +404,15 @@ impl Buffer {
     /// 经 `new_normalized` 直通——不走 `Buffer::new` 的 `\r\n`→`\n`
     /// normalize（mang-shell 行语义中 `\r` 属行内容，roundtrip 逐位保真）。
     pub fn from_plain_text(text: &str) -> Self {
-        let ending = zed_text::LineEnding::detect(text);
-        let rope = zed_text::Rope::from(text);
-        let inner = zed_text::Buffer::new_normalized(
-            zed_text::ReplicaId::LOCAL,
-            next_buffer_id(),
-            ending,
-            rope,
-        );
         Self {
-            inner,
+            bridge: MdBridge::new(text),
             cursor: Point::default(),
             anchor: None,
             desired_col: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
             saved_depth: 0,
+            entry_ids: Vec::new(),
+            redo_ids: Vec::new(),
+            default_coalesce_ms: mdcore::history::COALESCE_MS,
             revision: 0,
             pending: Vec::new(),
             pending_base: None,
@@ -482,7 +425,7 @@ impl Buffer {
 
     /// 序列化为纯文本（`\r\n` 等行尾原样——与构造逐位互逆）。
     pub fn to_plain_text(&self) -> String {
-        self.snap().text()
+        self.bridge.to_plain_text()
     }
 
     // ---------------------------------------------------------------------------
@@ -491,13 +434,13 @@ impl Buffer {
 
     /// 行数。
     pub fn line_count(&self) -> usize {
-        self.snap().max_point().row as usize + 1
+        self.bridge.line_count()
     }
 
     /// 指定行内容（越界返回空串——渲染层免判）。
     /// 返回 `String`（rope 无行借用面）；行长场景的分配开销见头注释。
     pub fn line(&self, line: usize) -> String {
-        self.row_text(line as u32)
+        self.bridge.line(line)
     }
 
     /// 指定行 char 数。
@@ -529,9 +472,22 @@ impl Buffer {
         }
     }
 
-    /// 全文 char 总数（可见字符 + 换行；状态栏字数——CJK 逐字语义天然成立）。
+    /// 全文 char 总数（可见字符 + 换行；CJK 逐字语义天然成立）。
+    /// #163：标书口径字数另见 [`Buffer::word_count`]（mdcore 单一真源）。
     pub fn char_count(&self) -> usize {
-        self.to_plain_text().chars().count()
+        self.bridge.char_count()
+    }
+
+    /// #163（验收 4）：标书口径字数（mdcore word_count——汉字数 +
+    /// 西文词数的单一真源；此前 B 轨 char_count 自算口径绕开了它）。
+    pub fn word_count(&self) -> mdcore::word_count::WordCount {
+        self.bridge.word_count()
+    }
+
+    /// #163：核 revision（字数缓存的守卫键——视图面 revision 另见
+    /// [`Buffer::revision`]）。
+    pub fn core_revision(&self) -> u64 {
+        self.bridge.core().revision()
     }
 
     /// `[start, end)` 范围文本（跨行以 `\n` 连接；两点自动排序）。
@@ -564,14 +520,15 @@ impl Buffer {
 
     /// 是否相对最近保存点已修改（当前 undo 深度 != 保存点深度）。
     pub fn is_modified(&self) -> bool {
-        self.undo_stack.len() != self.saved_depth
+        self.bridge.is_modified(self.saved_depth)
     }
 
     /// 显式落盘：记录保存点深度（redo 历史随之清空——保存点之后
     /// 不跨保存点 undo，与多数编辑器一致）。
     pub fn mark_saved(&mut self) {
-        self.saved_depth = self.undo_stack.len();
-        self.redo_stack.clear();
+        self.saved_depth = self.bridge.undo_depth();
+        self.bridge.mark_saved();
+        self.redo_ids.clear();
     }
 
     // ---------------------------------------------------------------------------
@@ -582,6 +539,7 @@ impl Buffer {
     /// 设置撤销/重做通知（#115：docx 映射随撤销同步）。
     pub fn set_undo_hook(&mut self, hook: Option<Box<dyn UndoHook>>) {
         self.undo_hook = hook;
+        self.refresh_coalesce_window();
     }
 
     pub fn take_edit_hook(&mut self) -> Option<Box<dyn EditHook>> {
@@ -602,6 +560,33 @@ impl Buffer {
 
     pub fn set_edit_hook(&mut self, hook: Option<Box<dyn EditHook>>) {
         self.edit_hook = hook;
+        self.refresh_coalesce_window();
+    }
+
+    /// #163：合并窗裁决——docx 面（任一钩子在）置 0（逐编辑粒度，
+    /// EditHook/UndoHook 的 history_id 1:1 契约不破）；纯 md 面恢复
+    /// 设置值（缺省 1s——验收 2 的核同源合并窗）。
+    fn refresh_coalesce_window(&mut self) {
+        let ms = if self.edit_hook.is_some() || self.undo_hook.is_some() {
+            0
+        } else {
+            self.default_coalesce_ms
+        };
+        self.bridge.set_coalesce_ms(ms);
+    }
+
+    /// #163（验收 8）：合并窗设置（settings `undo_coalesce_ms` → 引擎；
+    /// docx 面挂钩期间暂存，摘钩后生效）。
+    pub fn set_coalesce_ms(&mut self, ms: u64) {
+        self.default_coalesce_ms = ms;
+        self.refresh_coalesce_window();
+    }
+
+    /// #163：命令边界破组——下一次编辑必开新 undo 条目（命令级手势
+    /// 分界：查找替换逐条替换等「显式命令」各自成步，不并入此前击键
+    /// 的合并窗；与批量路径（桥内置破组）同语义）。
+    pub fn break_undo_group(&mut self) {
+        self.bridge.break_coalesce();
     }
 
     // -----------------------------------------------------------------------
@@ -609,12 +594,25 @@ impl Buffer {
     // -----------------------------------------------------------------------
 
     /// #205：记账一次单区间变更（replace_range / undo / redo 的单点
-    /// 回放路径）。**必须在 `apply_core` 之前调**（pre_lines 取编辑前
+    /// 回放路径）。**必须在桥层编辑之前调**（pre_lines 取编辑前
     /// 行数）。已有未收割窗口时升级 Full——连续多次单区间编辑的合并
     /// 几何不可靠（多光标逐光标编辑等），回退全量（现状行为，语义
     /// 恒等）。
     fn note_fence_single(&mut self, line: usize, inserted_lines: usize) {
         let pre_lines = self.line_count();
+        self.fence_dirty = match self.fence_dirty {
+            FenceDirty::Clean => FenceDirty::Single {
+                line,
+                inserted_lines,
+                pre_lines,
+            },
+            _ => FenceDirty::Full,
+        };
+    }
+
+    /// #205：undo/redo 路径的记账（pre_lines 由伴记反推——此时文档
+    /// 已是变更后状态，不能重取行数）。
+    fn note_fence_single_pre(&mut self, line: usize, inserted_lines: usize, pre_lines: usize) {
         self.fence_dirty = match self.fence_dirty {
             FenceDirty::Clean => FenceDirty::Single {
                 line,
@@ -683,10 +681,13 @@ impl Buffer {
             });
             return false;
         }
-        // #205：脏行记账（钩子已放行、变更必然发生；apply_core 前取
-        // 编辑前行数）。
+        // #205：脏行记账（钩子已放行、变更必然发生；编辑前取行数）。
         self.note_fence_single(start.line, text_lines);
-        let cursor = self.apply_core(start, end, text);
+        // #163 换芯：桥单点（快路径 op / 兜底 sync——核为真源先行，
+        // 拒绝则投影不动、返回 false 与钩子拒改同面）。
+        if !self.bridge.edit(start, end, text) {
+            return false;
+        }
         // #111 订阅模式：precise 记录（end = 变更前被替换域终点；
         // start == end 即纯插入）。note 在版本递增**前**——基线 =
         // 变更前版本（revision_before 语义）。
@@ -697,14 +698,26 @@ impl Buffer {
             text.to_string(),
         ));
         self.revision += 1;
-        self.undo_stack.push(Undoable::Single(Edit {
-            history_id: self.revision,
-            start,
-            end_del: end,
-            old_text,
-            new_text: text.to_string(),
-        }));
-        self.redo_stack.clear();
+        // #163：核事件收割（防队列堆积）+ 条目镜像维护（合并入既有
+        // 条目时仅累计编辑数——fence 判据）。
+        if self.bridge.take_view_entry_created() {
+            let cursor = self.end_after_insert(&start, text);
+            self.entry_ids.push(EntryMeta {
+                id: self.revision,
+                start,
+                end,
+                cursor_after: cursor,
+                t_nl: text.matches('\n').count(),
+                o_nl: old_text.matches('\n').count(),
+                n_edits: 1,
+                old_text: old_text.clone(),
+                text: text.to_string(),
+            });
+            self.redo_ids.clear();
+        } else if let Some(last) = self.entry_ids.last_mut() {
+            last.n_edits += 1;
+        }
+        let cursor = self.end_after_insert(&start, text);
         self.anchor = None;
         self.desired_col = None;
         self.cursor = cursor;
@@ -730,8 +743,8 @@ impl Buffer {
     ///
     /// 实现口径（#91 G1 验收：全部替换 = **一次**批量编辑，不是循环
     /// 单点替换）：全部坐标先行换算（文档未动、Point 恒有效），
-    /// 交给 `inner.edit` **单事务**一次应用（zed text 层多区间一次
-    /// 消费——1000 处批量替换实测数十 ms 量级）。
+    /// 交桥层单点（全快路径 = 核一次 `apply_ops` 单条目；否则一次
+    /// `sync_from_markdown` 兜底——一撤销步语义保持）。
     ///
     /// 契约：`edits` 各替换互不重叠（debug_assert；重复调用方保证——
     /// 查找替换消费方已做非重叠过滤）。返回应用数（空入参 = 0 无操作）。
@@ -744,33 +757,27 @@ impl Buffer {
         ordered.sort_by_key(|(s, _, _)| *s);
         // 先行换算：old_text 捕获 + 双坐标域（原始/应用后）一次算定。
         let mut records: Vec<BatchEdit> = Vec::with_capacity(ordered.len());
-        let mut rope_edits: Vec<(Range<usize>, String)> = Vec::with_capacity(ordered.len());
         // #111：pending 预留容量（千处批量 = 千条记录——避免均摊扩容
         // 的重复分配；perf 线 <100ms 贴线环境下的微优化）。
         self.pending.reserve(ordered.len());
-        let mut shift: i64 = 0; // 前序子编辑的净字节位移
         // #111 订阅模式：每点位一条 precise 记录（start/end = 变更前
         // 域，坐标在文档未动时先行换算——恒有效），随 records 同循环
         // 构建避免二次迭代（一次事务版本只 +1 在事务尾）。
+        // #163：投影 char 域（pre 状态一次算定——桥 batch 消费）。
         for (start, end, new_text) in ordered {
             let old_text = self.range_text(&(start..end));
-            let z_start = self.point_to_zoffset(start);
-            let z_end_del = self.point_to_zoffset(end);
-            let applied_start = (z_start as i64 + shift) as usize;
-            let applied_end = applied_start + new_text.len();
-            shift += new_text.len() as i64 - old_text.len() as i64;
+            let c_start = self.bridge.point_to_coff(start);
+            let c_end_del = self.bridge.point_to_coff(end);
             debug_assert!(
                 records
                     .last()
-                    .is_none_or(|prev: &BatchEdit| prev.z_del.1 <= z_start),
+                    .is_none_or(|prev: &BatchEdit| prev.c_del.1 <= c_start),
                 "replace_batch: 子编辑互不重叠（调用方契约）"
             );
-            rope_edits.push((z_start..z_end_del, new_text.clone()));
             records.push(BatchEdit {
                 history_id: self.revision + 1,
                 start,
-                z_del: (z_start, z_end_del),
-                z_applied: (applied_start, applied_end),
+                c_del: (c_start, c_end_del),
                 old_text,
                 new_text,
             });
@@ -842,21 +849,54 @@ impl Buffer {
         // 必然发生）。
         self.note_fence_full();
         let n = records.len();
+        // #163 换芯：桥批量单点（全快路径 = 核一次 `apply_ops` 单条目；
+        /// 否则一次 `sync_from_markdown` 兜底——一撤销步语义保持；
+        /// 拒绝 = 整批不生效，返回 0）。
+        let batch_pts: Vec<(Point, Point, String)> = records
+            .iter()
+            .map(|r| {
+                let end = self.end_after_insert_pub(&r.start, &r.old_text);
+                (r.start, end, r.new_text.clone())
+            })
+            .collect();
+        if !self.bridge.edit_batch(&batch_pts) {
+            return 0;
+        }
         // #111：一次批量事务版本只 +1（点位级记录已在构建循环内入队）。
         self.revision += 1;
-        // 单事务批量应用（O(批) 次坐标换算 + 1 次事务——非 1000 次事务）。
-        let _ops = self.inner.edit(rope_edits);
-        // 光标：批尾占位尾（字节 offset → 当前列；Point 直算在多行替换
-        // 下会漂移——统一走 zoffset 换算）。
-        let tail_end = records.last().expect("非空已判").z_applied.1;
-        self.cursor = self.zoffset_to_point(tail_end);
+        // 批量恒新条目（桥内 break_coalesce 前置——「击键 800ms 内全部
+        // 替换」不并入击键条目，undo 粒度语义分叉防护）。
+        self.bridge.drain_events();
+        // 光标：批尾占位尾（Point 直算 = z_applied 尾的等价算术位）。
+        let last_rec = records.last().expect("非空已判");
+        let cursor_after = self.end_after_insert(&last_rec.start, &last_rec.new_text);
+        self.entry_ids.push(EntryMeta {
+            id: self.revision,
+            start: records.first().map(|r| r.start).unwrap_or(self.cursor),
+            end: records
+                .last()
+                .map(|r| self.end_after_insert(&r.start, &r.old_text))
+                .unwrap_or(self.cursor),
+            cursor_after,
+            t_nl: records
+                .iter()
+                .map(|r| r.new_text.matches('\n').count())
+                .sum(),
+            o_nl: records
+                .iter()
+                .map(|r| r.old_text.matches('\n').count())
+                .sum(),
+            n_edits: records.len(),
+            old_text: String::new(),
+            text: String::new(),
+        });
+        self.redo_ids.clear();
+        self.cursor = cursor_after;
         let first_start = records.first().map(|r| r.start).unwrap_or(self.cursor);
         let inserted_lines: usize = records
             .iter()
             .map(|r| r.new_text.matches('\n').count())
             .sum();
-        self.undo_stack.push(Undoable::Batch(records));
-        self.redo_stack.clear();
         self.anchor = None;
         self.desired_col = None;
         self.clamp_cursor();
@@ -956,64 +996,51 @@ impl Buffer {
     // undo / redo
     // ---------------------------------------------------------------------------
 
-    /// 撤销一步；返回是否发生撤销。
+    /// 撤销一步（#163：mdcore History 驱动——合并窗语义与核同源）；
+    /// 返回是否发生撤销。
     pub fn undo(&mut self) -> bool {
-        let Some(entry) = self.undo_stack.pop() else {
+        let Some(meta) = self.entry_ids.pop() else {
             return false;
         };
-        // #111：版本递增挪到 note 之后——note 首条定格基线 = 撤销前版本。
-        // #115：撤销前告知宿主（行数变化量——宿主调整映射行数）。
-        let delta = history_delta_lines(&entry, false);
+        // #163：单编辑条目走**四元组回放**（投影 = 占位换回原文——与
+        // 旧 r39 语义逐位等价：空行/\r/行几何全部按原文复原，不经
+        // 序列化重建）；多编辑条目走 op 翻译（类 a/a2/b）。
+        let replay =
+            (meta.n_edits == 1).then(|| (meta.start, meta.cursor_after, meta.old_text.clone()));
+        let Some(outcome) = self.bridge.undo_replay(meta.start, meta.end, replay) else {
+            // 栈镜像失配（理论不可达）——压回保形。
+            self.entry_ids.push(meta);
+            return false;
+        };
+        let delta = outcome.delta_lines;
         if let Some(h) = self.undo_hook.as_mut() {
-            let _ = h.before_history_at(false, delta, entry.history_id());
+            let _ = h.before_history_at(false, delta, meta.id);
         }
-        match entry {
-            Undoable::Single(edit) => {
-                // 逆方向：把 new_text 的当前占位换回 old_text。
-                let end_new = self.end_after_insert(&edit.start, &edit.new_text);
-                // #205：单点回放也是单区间替换（undo 的「插入文本」
-                // 是 old_text）——apply_core 前记账。
-                self.note_fence_single(edit.start.line, edit.old_text.matches('\n').count());
-                // #111：单条撤销可精确记录（撤销前域 = new_text 占位域）。
-                self.note_change(crate::doc_events::ChangeRecord::precise(
-                    "undo",
-                    edit.start,
-                    end_new,
-                    edit.old_text.clone(),
-                ));
-                self.apply_core(edit.start, end_new, &edit.old_text);
-                // redo 方向的 Edit：old_text 恢复后的占位范围即 end_del。
-                self.redo_stack.push(Undoable::Single(Edit {
-                    history_id: edit.history_id,
-                    start: edit.start,
-                    end_del: self.end_after_insert(&edit.start, &edit.old_text),
-                    old_text: edit.old_text,
-                    new_text: edit.new_text,
-                }));
-                self.cursor = edit.start;
-            }
-            Undoable::Batch(records) => {
-                // 逆方向整批：占位域（应用后字节坐标）一次批量换回
-                // old_text——单事务；LIFO 序下该域恒指本批占位。
-                // #205：批量多区间回放——回退全量。
-                self.note_fence_full();
-                let rope_edits: Vec<(Range<usize>, String)> = records
-                    .iter()
-                    .map(|r| (r.z_applied.0..r.z_applied.1, r.old_text.clone()))
-                    .collect();
-                let _ops = self.inner.edit(rope_edits);
-                // #111：批量撤销的占位域是「应用后字节坐标」，撤销后
-                // 文档已回原始态——逐点换算会错位，给粗粒度记录
-                //（客户端 get_state 拉全量）。
-                self.note_change(crate::doc_events::ChangeRecord::coarse("undo"));
-                // 批量撤销光标落批首（文档已回原始态——原始 Point 有效）。
-                self.cursor = records.first().map(|r| r.start).unwrap_or(self.cursor);
-                self.redo_stack.push(Undoable::Batch(records));
-            }
+        self.redo_ids.push(meta.clone());
+        // #205：fence 几何从伴记推导（单编辑条目 = Single——与旧
+        // 四元组物理回放的记账语义逐位一致；多编辑条目（批量/合并
+        // 吸收的多点编辑）= Full——保守正确）。pre_lines 由当前行数
+        // 反推（桥已应用）。
+        if meta.n_edits == 1 {
+            let pre_lines =
+                (self.line_count() as i64 - (meta.o_nl as i64 - meta.t_nl as i64)) as usize;
+            self.note_fence_single_pre(meta.start.line, meta.o_nl, pre_lines);
+        } else {
+            self.note_fence_full();
+        }
+        match &outcome.precise {
+            Some((s, e, t)) => self.note_change(crate::doc_events::ChangeRecord::precise(
+                "undo",
+                *s,
+                *e,
+                t.clone(),
+            )),
+            None => self.note_change(crate::doc_events::ChangeRecord::coarse("undo")),
         }
         self.revision += 1;
         self.anchor = None;
         self.desired_col = None;
+        self.cursor = meta.start;
         self.clamp_cursor();
         let lines = self.line_count();
         if let Some(h) = self.undo_hook.as_mut() {
@@ -1022,57 +1049,42 @@ impl Buffer {
         true
     }
 
-    /// 重做一步；返回是否发生重做。
+    /// 重做一步（#163：mdcore History 驱动）；返回是否发生重做。
     pub fn redo(&mut self) -> bool {
-        let Some(entry) = self.redo_stack.pop() else {
+        let Some(meta) = self.redo_ids.pop() else {
             return false;
         };
-        // #111：版本递增挪到 note 之后（同 undo 的基线语义）。
-        let delta = history_delta_lines(&entry, true);
+        let replay = (meta.n_edits == 1).then(|| (meta.start, meta.end, meta.text.clone()));
+        let Some(outcome) = self.bridge.redo_replay(meta.cursor_after, meta.end, replay) else {
+            self.redo_ids.push(meta);
+            return false;
+        };
+        let delta = outcome.delta_lines;
         if let Some(h) = self.undo_hook.as_mut() {
-            let _ = h.before_history_at(true, delta, entry.history_id());
+            let _ = h.before_history_at(true, delta, meta.id);
         }
-        match entry {
-            Undoable::Single(edit) => {
-                // 重放方向：[start, end_del) 的 old_text 换成 new_text。
-                let new_cursor = self.end_after_insert(&edit.start, &edit.new_text);
-                // #205：单点回放也是单区间替换（redo 的「插入文本」
-                // 是 new_text）——apply_core 前记账。
-                self.note_fence_single(edit.start.line, edit.new_text.matches('\n').count());
-                // #111：单条重做可精确记录（重放前域 = end_del 旧文本域）。
-                self.note_change(crate::doc_events::ChangeRecord::precise(
-                    "redo",
-                    edit.start,
-                    edit.end_del,
-                    edit.new_text.clone(),
-                ));
-                self.apply_core(edit.start, edit.end_del, &edit.new_text);
-                self.undo_stack.push(Undoable::Single(edit));
-                self.cursor = new_cursor;
-            }
-            Undoable::Batch(records) => {
-                // 重放整批：原始删除域（原始字节坐标）一次批量换入
-                // new_text——单事务；LIFO 序下批的 undo 使文档回原始
-                // 态，该域恒有效。
-                // #205：批量多区间回放——回退全量。
-                self.note_fence_full();
-                let rope_edits: Vec<(Range<usize>, String)> = records
-                    .iter()
-                    .map(|r| (r.z_del.0..r.z_del.1, r.new_text.clone()))
-                    .collect();
-                let _ops = self.inner.edit(rope_edits);
-                // 批量重做光标落批尾占位尾（字节 offset → 当前列）。
-                let tail_end = records.last().map(|r| r.z_applied.1).unwrap_or(0);
-                self.cursor = self.zoffset_to_point(tail_end);
-                self.undo_stack.push(Undoable::Batch(records));
-                // #111：批量重做同样给粗粒度记录（同 undo 批量的坐标
-                // 错位理由）。
-                self.note_change(crate::doc_events::ChangeRecord::coarse("redo"));
-            }
+        self.entry_ids.push(meta.clone());
+        // #205：redo 的 fence 几何（同 undo 面——插入侧 = t_nl）。
+        if meta.n_edits == 1 {
+            let pre_lines =
+                (self.line_count() as i64 - (meta.t_nl as i64 - meta.o_nl as i64)) as usize;
+            self.note_fence_single_pre(meta.start.line, meta.t_nl, pre_lines);
+        } else {
+            self.note_fence_full();
+        }
+        match &outcome.precise {
+            Some((s, e, t)) => self.note_change(crate::doc_events::ChangeRecord::precise(
+                "redo",
+                *s,
+                *e,
+                t.clone(),
+            )),
+            None => self.note_change(crate::doc_events::ChangeRecord::coarse("redo")),
         }
         self.revision += 1;
         self.anchor = None;
         self.desired_col = None;
+        self.cursor = meta.cursor_after;
         self.clamp_cursor();
         let lines = self.line_count();
         if let Some(h) = self.undo_hook.as_mut() {
@@ -1106,22 +1118,7 @@ impl Buffer {
     /// 最近一条 undo 记录的子编辑数（G1 查找替换烟雾/日志面：一次
     /// 撤销手势到底还原了几处替换）。栈空 = 0。
     pub fn last_undo_batch_count(&self) -> usize {
-        self.undo_stack
-            .last()
-            .map(Undoable::edit_count)
-            .unwrap_or(0)
-    }
-
-    /// 核心变更（不落外壳栈，由调用方组装 undo/redo 语义）：
-    /// 删除 `[start, end)` 插入 `text`——单次 `inner.edit`（O(log n)）。
-    /// 返回插入文本末尾点（即新光标；纯算术，不读 inner）。
-    fn apply_core(&mut self, start: Point, end: Point, text: &str) -> Point {
-        debug_assert!(start <= end, "apply_core: start <= end（调用方已排序）");
-        let zstart = self.point_to_zoffset(start);
-        let zend = self.point_to_zoffset(end);
-        // inner 的 history 同步记录（外壳不消费；见头注释——r42 边界登记）
-        let _ops = self.inner.edit([(zstart..zend, text.to_string())]);
-        self.end_after_insert(&start, text)
+        self.bridge.core().last_undo_ops_count()
     }
 
     /// 在 `start` 插入 `text` 后的终点（undo / redo 的占位末点重算）。
@@ -1304,6 +1301,8 @@ impl Buffer {
         let last = self.line_count() - 1;
         self.anchor = Some(Point::new(0, 0));
         self.cursor = Point::new(last, self.line_len(last));
+        // #163：select_all 不经 clamp——显式同步锚点。
+        self.bridge.sync_selection(self.cursor, self.anchor);
     }
 
     /// 直接设置选区（锚点 + 光标头；查找跳转等程序化选中用）。
@@ -1317,7 +1316,7 @@ impl Buffer {
     /// 光标 clamp 到合法域（外部 set 后保证不变量）。
     fn clamp_cursor(&mut self) {
         if self.line_count() == 0 {
-            return; // inner 恒非空；防御早退（不可达分支）
+            return; // 投影恒非空；防御早退（不可达分支）
         }
         if self.cursor.line >= self.line_count() {
             self.cursor.line = self.line_count() - 1;
@@ -1326,6 +1325,9 @@ impl Buffer {
         if self.cursor.col > len {
             self.cursor.col = len;
         }
+        // #163（验收 5）：光标/选区 → mdcore Selection（块锚点落核，
+        // clamp_cursor 是全部交互变更的单点出口）。
+        self.bridge.sync_selection(self.cursor, self.anchor);
     }
 
     /// G3：行首既有缩进宽度（char 计——前导空格与 Tab 均按 1 char）。
@@ -1420,49 +1422,6 @@ impl Buffer {
     // ---------------------------------------------------------------------------
     // 内部工具（rope 坐标换算层——外壳 char 语义 <-> rope byte 列）
     // ---------------------------------------------------------------------------
-
-    /// 存储层快照（借用 inner）。
-    fn snap(&self) -> &zed_text::BufferSnapshot {
-        self.inner.snapshot()
-    }
-
-    /// 行文本（rope 按 `\n` 划行；`\r` 属行内容原样；越界空串）。
-    fn row_text(&self, row: u32) -> String {
-        if row >= self.line_count() as u32 {
-            return String::new();
-        }
-        let snap = self.snap();
-        let start = snap.point_to_offset(zed_text::Point::new(row, 0));
-        let len = snap.line_len(row) as usize;
-        if len == 0 {
-            return String::new();
-        }
-        snap.text_for_range(start..start + len).collect()
-    }
-
-    /// mang `Point`（char 列）→ rope 全文 offset（字节）。
-    /// 输入先 clamp 到文档域（外部调用可传越界点——防御性收窄，
-    /// 旧实现对越界索引直接 panic，此为语义超集）。
-    fn point_to_zoffset(&self, p: Point) -> usize {
-        let rows = self.line_count();
-        let line = p.line.min(rows.saturating_sub(1));
-        let col = p.col.min(self.line_len(line));
-        let text = self.line(line);
-        let byte_col = char_to_byte(&text, col);
-        self.snap()
-            .point_to_offset(zed_text::Point::new(line as u32, byte_col as u32))
-    }
-
-    /// rope 全文 offset（字节）→ mang `Point`（char 列）——G1 批量
-    /// 编辑光标换算（[`Buffer::replace_batch`]；字节 offset 由
-    /// 批内记录直算，逆变换走行文本 byte→char）。
-    fn zoffset_to_point(&self, z: usize) -> Point {
-        let rp = self.snap().offset_to_point(z);
-        let line = rp.row as usize;
-        let text = self.line(line);
-        let col = byte_to_char(&text, rp.column as usize);
-        Point::new(line, col)
-    }
 
     /// 两点排序（start <= end）。
     fn ordered_range(&self, r: Range<Point>) -> Range<Point> {
@@ -2005,7 +1964,7 @@ fn perf_rope_edit_find_2m_chars() {
     let p50 = samples[500];
     let p99 = samples[990];
     let t_edit_max = samples[999];
-    // ③ undo 路径（反向 apply_core，红线 <50ms/次）× 200
+    // ③ undo 路径（核逆 op + 投影回放，红线 <50ms/次）× 200
     let mut undo_samples: Vec<std::time::Duration> = Vec::with_capacity(200);
     for _ in 0..200 {
         let t = Instant::now();
@@ -2447,9 +2406,11 @@ mod rpc_extend_tests {
 
     #[test]
     fn revision_increments_per_transaction_and_marks_saved_free() {
+        // #163 合并窗语义：同窗内两个文本编辑 = 一条 undo 条目
+        //（验收 2——B 轨逐编辑条目退役；per-edit 对照见下）。
         let mut b = Buffer::from_plain_text("hello");
         assert_eq!(b.revision(), 0, "初始版本 0");
-        b.insert("x"); // 事务 1
+        b.insert("x"); // 事务 1（视图版本仍逐事务 +1）
         assert_eq!(b.revision(), 1);
         b.replace_range(p(0, 0), p(0, 1), "H"); // 事务 2
         assert_eq!(b.revision(), 2);
@@ -2457,14 +2418,30 @@ mod rpc_extend_tests {
         assert_eq!(b.revision(), 2, "mark_saved 不是内容变更——版本不动");
         assert!(b.undo());
         assert_eq!(b.revision(), 3, "undo 也是变更事务");
+        assert_eq!(b.to_plain_text(), "hello", "一条目 = 两编辑一起撤");
         assert!(b.redo());
         assert_eq!(b.revision(), 4, "redo 同理");
-        assert!(b.undo(), "redo 后 undo 栈仍有 insert 那条记录");
+        assert_eq!(b.to_plain_text(), "Hhello");
+        assert!(b.undo());
         assert_eq!(b.revision(), 5);
+        assert!(!b.undo(), "栈真空了（合并条目 = 一条）");
+        assert_eq!(b.revision(), 5, "空撤销不动版本");
+    }
+
+    #[test]
+    fn revision_per_edit_undo_when_coalesce_disabled() {
+        // #163 验收 8：合并窗 = 0（旋钮接真）→ 逐编辑条目
+        //（旧 r39 语义的显式选择面——docx 面同款）。
+        let mut b = Buffer::from_plain_text("hello");
+        b.set_coalesce_ms(0);
+        b.insert("x");
+        b.replace_range(p(0, 0), p(0, 1), "H");
+        assert_eq!(b.to_plain_text(), "Hhello");
+        assert!(b.undo(), "第二编辑独立成条");
+        assert_eq!(b.to_plain_text(), "xhello");
         assert!(b.undo(), "insert 也能撤");
-        assert_eq!(b.revision(), 6);
-        assert!(!b.undo(), "栈真空了");
-        assert_eq!(b.revision(), 6, "空撤销不动版本");
+        assert_eq!(b.to_plain_text(), "hello");
+        assert!(!b.undo());
     }
 
     #[test]

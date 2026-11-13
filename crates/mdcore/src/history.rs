@@ -22,6 +22,11 @@ use crate::op::Op;
 
 pub const COALESCE_MS: u64 = 1000;
 
+/// #163：`coalesce_ms` 的 serde 缺省（= [`COALESCE_MS`]，旧档零破坏）。
+fn default_coalesce_ms() -> u64 {
+    COALESCE_MS
+}
+
 /// 持久化 History 格式版本（#221 补充修复，承 #220）。
 ///
 /// - **v2**（当前）：`Entry.inverses` 存储序 = 组间逆序、组内保序
@@ -86,6 +91,11 @@ pub struct History {
     /// （`Default`），运行时方法不触碰此字段——它是格式标识，不是运行态。
     #[serde(default)]
     format_version: u32,
+    /// #163 合并窗宽度（ms，实例级——旧档 serde 缺省 = [`COALESCE_MS`]）。
+    /// 0 = 禁用合并（每个事务独立条目——mang-shell docx 面挂钩时使用，
+    /// 保持 EditHook/UndoHook 的 history_id 1:1 契约）。
+    #[serde(default = "default_coalesce_ms")]
+    coalesce_ms: u64,
     undo: Vec<Entry>,
     redo: Vec<Entry>,
     #[serde(default)]
@@ -122,12 +132,33 @@ pub struct BoundarySnapshot {
 
 impl History {
     pub fn should_coalesce(&self, now_ms: u64, kind: Kind, source: Source) -> bool {
-        kind == Kind::Text
+        self.coalesce_ms > 0
+            && kind == Kind::Text
             && self.last_kind == Some(Kind::Text)
             && self.last_source == Some(Source::View)
             && source == Source::View
-            && now_ms.saturating_sub(self.last_at_ms) < COALESCE_MS
+            && now_ms.saturating_sub(self.last_at_ms) < self.coalesce_ms
             && !self.undo.is_empty()
+    }
+
+    /// #163：合并窗宽度（ms；0 = 禁用合并）。
+    pub fn coalesce_ms(&self) -> u64 {
+        self.coalesce_ms
+    }
+
+    /// #163：设置合并窗宽度（ms；0 = 禁用——每个事务独立条目）。
+    /// 只影响后续合并判定，不触碰既有栈/边界。
+    pub fn set_coalesce_ms(&mut self, ms: u64) {
+        self.coalesce_ms = ms;
+    }
+
+    /// #163：强制破组——仅复位合并窗状态（下一个 View 事务必开新条目），
+    /// 不清栈。mang-shell 批量替换（replace_batch）前置调用：杜绝
+    /// 「击键 800ms 内全部替换」被合并进击键条目（undo 粒度语义分叉）。
+    /// 与 [`clear_interaction`]（清栈+复位）语义不同。
+    pub fn break_coalesce(&mut self) {
+        self.last_kind = None;
+        self.last_source = None;
     }
 
     /// 新条目入栈（清空 redo）。`inverses` 必须已按「组间逆序、组内
@@ -230,6 +261,16 @@ impl History {
         self.redo.len()
     }
 
+    /// #163：清空 redo 栈（Core::clear_redo 透传；保存点语义）。
+    pub fn redo_clear(&mut self) {
+        self.redo.clear();
+    }
+
+    /// #163：栈顶 undo 条目的 op 数（Core::last_undo_ops_count 透传）。
+    pub fn undo_last_ops_count(&self) -> usize {
+        self.undo.last().map(|e| e.ops.len()).unwrap_or(0)
+    }
+
     /// R20 内存审计：undo/redo 栈的 op 活数据估计（字节）。
     /// Entry 双持 ops + inverses，各按 op 内容字节累计。
     pub fn mem_stats(&self) -> HistoryMemStats {
@@ -315,6 +356,7 @@ impl Default for History {
     fn default() -> Self {
         Self {
             format_version: HISTORY_FORMAT_VERSION,
+            coalesce_ms: COALESCE_MS,
             undo: Vec::new(),
             redo: Vec::new(),
             last_at_ms: 0,

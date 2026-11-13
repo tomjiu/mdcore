@@ -163,52 +163,24 @@ pub struct LineHighlight {
 
 /// 围栏行形态识别：``` 或 ~~~（前导空白 ≤ 3）。
 /// 返回 (标记结束的 char 位置, 围栏字符)——非围栏行返回 `None`。
+/// 围栏行形态识别（#163 单源委托：实现 = mdcore::markdown::fence_info
+/// ——解析器与渲染面共用同一函数，围栏判定漂移消灭；语义与旧自研
+/// 逐位一致：``` 或 ~~~、≥3 字符、前导空白 ≤3；info 含围栏字符的
+/// 行（` ``` ``` `）非围栏——CommonMark 同规）。
 fn fence_marker(line: &str) -> Option<(usize, char)> {
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() && chars[i] == ' ' && i < 3 {
-        i += 1;
-    }
-    if i >= chars.len() {
-        return None;
-    }
-    let c = chars[i];
-    if c != '`' && c != '~' {
-        return None;
-    }
-    let mut count = 0;
-    let start = i;
-    while i < chars.len() && chars[i] == c {
-        i += 1;
-        count += 1;
-    }
-    if count >= 3 {
-        // 标记结束位置 = 前导空白 + 围栏字符数。
-        Some((start + count, c))
-    } else {
-        None
-    }
+    mdcore::markdown::fence_info(line).map(|f| (f.marker_end, f.fence_char))
 }
 
 /// G5：围栏开行的语言标注（`fence_marker` 已识别围栏形态的前提下，
 /// 取标记后的 info string 首词解析；非围栏行 None）。
 pub fn fence_lang_of(line: &str) -> Option<CodeLang> {
-    let (_, fence_ch) = fence_marker(line)?;
-    // info string = 围栏标记后的段（```rust 的 `rust`）；首词为语言
-    //（逗号/空格后的附加 info 忽略）。
-    let rest: String = line
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .skip_while(|c| *c == fence_ch)
-        .collect();
-    let tag = rest
-        .trim()
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .next()?;
+    // #163 单源：lang 首词提取 = mdcore::markdown::fence_info（解析器
+    // 的 CodeBlock lang 与渲染面的 CodeLang 同一字符串源）。
+    let tag = mdcore::markdown::fence_info(line)?.lang;
     if tag.is_empty() {
         return None;
     }
-    CodeLang::parse(tag)
+    CodeLang::parse(&tag)
 }
 
 /// 该行（**围栏外行首态**）是否为围栏形态行——即 [`highlight_line_ex`]

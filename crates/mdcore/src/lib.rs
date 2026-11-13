@@ -233,6 +233,27 @@ pub struct Core {
     dirty: bool,
 }
 
+/// #163：Core 深拷贝（mang-shell `Buffer::clone` 消费——克隆体是完整
+/// 快照：树 + 历史栈 + revision + 事件队列全量复制；时钟 Arc 共享）。
+/// 语义对照 Zed `text::Buffer::branch`（换芯前的克隆路径）——branch 共享
+/// 历史，本实现复制历史：对快照消费面（xlsx 网格的单元格编辑克隆等）
+/// 是更强语义，无行为回退。
+impl Clone for Core {
+    fn clone(&self) -> Self {
+        Self {
+            tree: self.tree.clone(),
+            history: self.history.clone(),
+            log: self.log.clone(),
+            revision: self.revision,
+            document_id: self.document_id,
+            selection: self.selection,
+            events: self.events.clone(),
+            clock: Arc::clone(&self.clock),
+            dirty: self.dirty,
+        }
+    }
+}
+
 impl Core {
     pub fn new() -> Self {
         Self::with_clock(Arc::new(system_ms))
@@ -298,6 +319,48 @@ impl Core {
     /// 语义不变：只换时钟源，不碰任何状态。
     pub fn set_clock(&mut self, clock: ClockFn) {
         self.clock = clock;
+    }
+
+    // -----------------------------------------------------------------------
+    // #163：宿主窄增量 API（mang-shell 换芯消费；登记于 issue #163）
+    // -----------------------------------------------------------------------
+
+    /// #163：合并窗宽度（ms；0 = 禁用合并）——透传 [`History`]。
+    pub fn coalesce_ms(&self) -> u64 {
+        self.history.coalesce_ms()
+    }
+
+    /// #163：设置合并窗宽度（ms；0 = 禁用——mang-shell docx 面
+    /// 挂 EditHook/UndoHook 时用，保持 history_id 1:1 契约）。
+    pub fn set_coalesce_ms(&mut self, ms: u64) {
+        self.history.set_coalesce_ms(ms);
+    }
+
+    /// #163：强制破组（仅合并窗复位，不清栈）——批量替换前置。
+    pub fn break_coalesce(&mut self) {
+        self.history.break_coalesce();
+    }
+
+    /// #163：undo 栈深度（宿主 is_modified 的保存点深度口径）。
+    pub fn undo_depth(&self) -> usize {
+        self.history.undo_depth()
+    }
+
+    /// #163：redo 栈深度。
+    pub fn redo_depth(&self) -> usize {
+        self.history.redo_depth()
+    }
+
+    /// #163：清空 redo 栈（宿主 mark_saved 的「保存点后不跨保存点
+    /// redo」行为保持——与既有编辑器语义零漂移）。
+    pub fn clear_redo(&mut self) {
+        self.history.redo_clear();
+    }
+
+    /// #163：栈顶 undo 条目的 op 数（宿主 last_undo_batch_count——
+    /// 「一次撤销手势还原几处编辑」）；栈空 = 0。
+    pub fn last_undo_ops_count(&self) -> usize {
+        self.history.undo_last_ops_count()
     }
 
     // ---- 检视 ----
