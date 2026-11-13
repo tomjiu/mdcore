@@ -61,7 +61,7 @@ use crate::docx_geom::{
     band_region, center_twips, content_height_px, offset_for_center_twips,
     parse_invalidate_payload, quantize_width, zoom_percent, zoom_raster_width,
 };
-use crate::editor::docx_lok_session::{DocxLokSession, SessionError, SessionReply};
+use crate::editor::docx_lok_session::{DocxLokSession, SessionError, SessionRecv, SessionReply};
 
 /// 条带位图缓存预算（字节）——LRU 逐出（512px 条带约 2MB/条常态）。
 const CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -90,6 +90,19 @@ const ZOOM_PRESETS: &[(&str, ZoomMode, &str)] = &[
     ("150%", ZoomMode::Custom(1.5), ""),
     ("200%", ZoomMode::Custom(2.0), ""),
 ];
+
+/// #179：panic 载荷 → 可读文本（`catch_unwind` 的 `Box<dyn Any +
+/// Send>` 下钻 `&str`/`String`；其余给占位——「有 panic」这一事实
+/// 本身不丢失）。
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "非字符串 panic 载荷".to_string()
+    }
+}
 
 /// BGRA（自上而下）→ `gpui::RenderImage`（字节序直配——LO Linux cairo
 /// tile 缓冲即 BGRA；`pdf_pages::rendered_page_to_image` 同款搬运）。
@@ -127,6 +140,16 @@ pub(crate) trait TileSession: Send {
     fn request_size(&self);
     /// 非阻塞收回执（16ms drain 拉取）。
     fn try_recv(&self) -> Option<SessionReply>;
+    /// #179 三分收回执：`Reply` / `Empty` / `Disconnected`——通道
+    /// 断开与暂时无消息分流（旧 `try_recv` 同貌 None——会话线程无终态
+    /// 回执退出时视图永挂，无从诊断）。默认实现 = `try_recv` 的
+    /// 二分包装（不区分断开——MockSession 语义即「通道恒活」）。
+    fn try_recv_detailed(&self) -> crate::editor::docx_lok_session::SessionRecv {
+        match self.try_recv() {
+            Some(reply) => crate::editor::docx_lok_session::SessionRecv::Reply(reply),
+            None => crate::editor::docx_lok_session::SessionRecv::Empty,
+        }
+    }
 }
 
 impl TileSession for DocxLokSession {
@@ -145,7 +168,18 @@ impl TileSession for DocxLokSession {
         Self::request_size(self);
     }
     fn try_recv(&self) -> Option<SessionReply> {
-        Self::try_recv(self)
+        // inherent `try_recv` 已被 #179 改名 `try_recv_detailed`（三分
+        // 返回）——此处若写 `Self::try_recv(self)` 会解析回本 trait 方法
+        // 自身（inherent 不存在）→ 无限递归栈溢出。显式投影三分到
+        // 二分：Disconnected 与 Empty 同为 None（二分语义）。
+        match Self::try_recv_detailed(self) {
+            crate::editor::docx_lok_session::SessionRecv::Reply(reply) => Some(reply),
+            crate::editor::docx_lok_session::SessionRecv::Empty => None,
+            crate::editor::docx_lok_session::SessionRecv::Disconnected => None,
+        }
+    }
+    fn try_recv_detailed(&self) -> crate::editor::docx_lok_session::SessionRecv {
+        Self::try_recv_detailed(self)
     }
 }
 
@@ -235,17 +269,46 @@ impl DocxPagesView {
         let focus_handle = cx.focus_handle();
         let (open_tx, open_rx) = channel();
         let thread_path = path.clone();
-        std::thread::Builder::new()
+        // #179：打开链 panic 捕获回传——线程静默死时通道只剩通用
+        // Disconnected，真实原因（panic 原文）丢失；线程创建失败
+        //（资源耗尽等）不再 `.expect` 崩 UI 线程，构造期直落
+        // `Boot::Failed`（错误面板明示）。
+        let spawned = std::thread::Builder::new()
             .name("docx-lok-open".into())
             .spawn(move || {
-                // 会话层自带线程跑打开链——本线程只等句柄回传（秒内）。
-                let _ = open_tx.send(DocxLokSession::open_blocking(&thread_path));
-            })
-            .expect("打开线程");
-        let view = Self {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    DocxLokSession::open_blocking(&thread_path)
+                }));
+                let reply = outcome.unwrap_or_else(|panic| {
+                    Err(SessionError::Spawn(format!(
+                        "打开线程 panic：{}",
+                        panic_text(&panic)
+                    )))
+                });
+                let _ = open_tx.send(reply);
+            });
+        let mut view = Self::empty(focus_handle, path, Some(open_rx));
+        if let Err(e) = spawned {
+            eprintln!("docx-pages: 打开线程创建失败：{e}");
+            view.open_rx = None;
+            view.boot = Boot::Failed {
+                stage: "spawn",
+                message: format!("打开线程创建失败：{e}"),
+            };
+        }
+        view
+    }
+
+    /// 字段单源构造（`new` 真链与 #179 受控时序测试共用）。
+    fn empty(
+        focus_handle: FocusHandle,
+        path: PathBuf,
+        open_rx: Option<Receiver<Result<DocxLokSession, SessionError>>>,
+    ) -> Self {
+        Self {
             path,
             boot: Boot::Starting,
-            open_rx: Some(open_rx),
+            open_rx,
             session: None,
             doc_size: None,
             zoom_mode: ZoomMode::FitWidth,
@@ -267,8 +330,19 @@ impl DocxPagesView {
             viewport_seen: (0., 0.),
             watchdog_ticks: 0,
             watchdog_retried: false,
-        };
-        view
+        }
+    }
+
+    /// #179 受控时序回归面：注入打开通道（无真实线程——结果与时序
+    /// 由测试驱动；聚焦句柄走真实 `App` 面，字段与 `new` 同源
+    ///（`empty`））。
+    #[cfg(test)]
+    fn new_with_open_rx_for_test(
+        cx: &mut App,
+        open_rx: Option<Receiver<Result<DocxLokSession, SessionError>>>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        Self::empty(focus_handle, PathBuf::from("test://179.docx"), open_rx)
     }
 
     /// 渲染期起表卫（首次 render 启动轮询——仅一次；终态自停，pdf
@@ -479,7 +553,11 @@ impl DocxPagesView {
     /// 双通道 drain：打开句柄回传 + 会话回执（一次 16ms 拍全消费）。
     /// 回执先集后处理（借用纪律：会话不可变借用不跨自修改）。
     fn drain(&mut self, cx: &mut Context<Self>) {
-        // ---- 1) 打开结果（一次性；take/放回避免同字段借用冲突）----
+        // ---- 1) 打开结果（一次性通道）----
+        // #179：消费即终态——Ok/Err 都不放回 `open_rx`。旧实现在
+        // `Ok(Ok(session))` 后放回，打开线程正常退出的通道关闭在
+        // 下一拍被 `Disconnected` 分支当成异常，把已就绪的 Ready 或
+        // 会话通道回传的具体失败覆盖成通用「打开线程异常退出」。
         if let Some(rx) = self.open_rx.take() {
             match rx.try_recv() {
                 Ok(Ok(session)) => {
@@ -488,7 +566,9 @@ impl DocxPagesView {
                         session.path().display()
                     );
                     self.session = Some(Box::new(session));
-                    self.open_rx = Some(rx);
+                    // rx 即弃（不放回）：一次性结果已消费，通道此后的
+                    // 正常关闭与会话状态无关（#179 根因修复点——TileSession
+                    // 化后装箱）。
                 }
                 Ok(Err(err)) => {
                     eprintln!("docx-pages: 打开失败（{}）：{}", err.stage(), err.message());
@@ -496,15 +576,27 @@ impl DocxPagesView {
                         stage: err.stage(),
                         message: err.message().to_string(),
                     };
+                    // #179：状态迁移补 notify（旧实现 417-420 缺失——
+                    // 错误面板显示时点依赖后续重绘，不能保证）。
+                    cx.notify();
                 }
                 Err(TryRecvError::Empty) => {
                     self.open_rx = Some(rx);
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.boot = Boot::Failed {
-                        stage: "spawn",
-                        message: "打开线程异常退出".into(),
-                    };
+                    // 打开线程未回传任何结果就退出。panic 已被
+                    // catch_unwind 转为 Err 回传（见 new）——走到这
+                    // = 线程被强制终止/无法创建，非「回传后正常关闭」。
+                    // 终态卫：Starting 以外不覆盖（防御——消费路径
+                    // 已不放回 rx，正常流程此处只可能是 Starting）。
+                    eprintln!("docx-pages: 打开通道断开（未收到任何结果）");
+                    if matches!(self.boot, Boot::Starting) {
+                        self.boot = Boot::Failed {
+                            stage: "spawn",
+                            message: "打开线程异常退出（未回传结果——线程被终止或无法创建）".into(),
+                        };
+                    }
+                    cx.notify();
                 }
             }
         }
@@ -523,15 +615,23 @@ impl DocxPagesView {
             return;
         };
         let mut replies = Vec::new();
-        while let Some(reply) = session.try_recv() {
-            replies.push(reply);
-            if replies.len() >= 64 {
-                break; // 单拍上限——防极端回调风暴卡帧（下一拍继续）
+        // #179：通道断开与暂时无消息分流（旧 try_recv 同貌 None——
+        // 会话线程无终态回执退出时视图永挂，无从诊断）。
+        let mut channel_alive = true;
+        while replies.len() < 64 {
+            match session.try_recv_detailed() {
+                SessionRecv::Reply(reply) => replies.push(reply),
+                SessionRecv::Empty => break,
+                SessionRecv::Disconnected => {
+                    channel_alive = false;
+                    break;
+                }
             }
         }
         let had_tile = replies
             .iter()
             .any(|r| matches!(r, SessionReply::Tile { .. }));
+        let mut terminal_seen = false;
         for reply in replies {
             match reply {
                 SessionReply::Ready {
@@ -549,6 +649,7 @@ impl DocxPagesView {
                     cx.notify();
                 }
                 SessionReply::Failed { stage, message } => {
+                    terminal_seen = true;
                     eprintln!("docx-pages: 会话失败（{stage}）：{message}");
                     self.session = None;
                     self.pending.clear();
@@ -557,6 +658,7 @@ impl DocxPagesView {
                     cx.notify();
                 }
                 SessionReply::Died { detail } => {
+                    terminal_seen = true;
                     eprintln!("docx-pages: worker 死亡：{detail}");
                     self.session = None;
                     self.pending.clear();
@@ -606,7 +708,11 @@ impl DocxPagesView {
             }
         }
 
-        // ---- 4) #186 派单看门狗（每拍收口）----
+        // ---- 4) #179 会话通道断开分流（断开且本批无终态回执 = 异常
+        // 退出，落可定位失败——正常收尾误报由 terminal_seen 卫）----
+        self.handle_session_disconnect(!channel_alive && !terminal_seen, cx);
+
+        // ---- 5) #186 派单看门狗（每拍收口）----
         // 看门狗：Ready 且视口已知但长时间无 tile 进账——一次全量重派
         // （pending 悬死/派单丢失的自愈）；重派后仍无进账则把在途条带
         // 转失败呈现（诚实失败面，不无限「渲染中」）。
@@ -698,6 +804,27 @@ impl DocxPagesView {
             }
         }
         cx.notify();
+    }
+
+    /// #179：会话通道断开且本批未含终态回执（Failed/Died）——会话
+    /// 线程异常退出（panic/被杀），与「暂时无消息」分流：落可定位
+    /// 失败 + 停轮询（session 清空），不再永挂 Starting/Ready。
+    /// 正常收尾（终态回执后线程退出）不误报——terminal_seen 卫。
+    /// `disconnected_abnormal` = 通道断开**且**本批无终态回执（#179 分流
+    /// 语义——正常收尾（终态后退出）不误报）。
+    fn handle_session_disconnect(&mut self, disconnected_abnormal: bool, cx: &mut Context<Self>) {
+        if disconnected_abnormal {
+            eprintln!("docx-pages: 会话通道断开（未收到终态回执——会话线程异常退出）");
+            self.session = None;
+            self.pending.clear();
+            if matches!(self.boot, Boot::Starting | Boot::Ready) {
+                self.boot = Boot::Failed {
+                    stage: "session",
+                    message: "会话线程异常退出（通道断开且无终态回执）".into(),
+                };
+            }
+            cx.notify();
+        }
     }
 
     /// 内核回调分派（C2 面：缓存失效/几何重查；其余登记——C3 命令态）。
@@ -1969,6 +2096,169 @@ mod tests {
             mock.requests.lock().unwrap().len(),
             after_retry,
             "失败面同键不重派"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #179：打开通道/会话通道消费语义（受控时序回归——无真实线程，
+    // `drain` 逐拍直驱；覆盖验收场景 1/2/3 与「会话通道异常断开」
+    // 补充场景。真实线程 panic 捕获链见 new 的 catch_unwind——真链
+    // 行为由 bad_path_lands_in_failed_boot 锁定）。
+    // ------------------------------------------------------------------
+
+    /// 场景 1：句柄与 Ready 同拍到达，发送端随后正常关闭——后续多拍
+    /// 最终仍是 Ready。旧实现在 `Ok(Ok(session))` 后放回 `open_rx`，
+    /// 打开线程正常退出的通道关闭在下一拍被 `Disconnected` 当成异常，
+    /// 把 Ready 覆盖成通用「打开线程异常退出」。
+    #[gpui::test]
+    fn open_handle_and_ready_same_tick_then_close_stays_ready(cx: &mut gpui::TestAppContext) {
+        let (open_tx, open_rx) = channel();
+        let (reply_tx, reply_rx) = channel();
+        reply_tx
+            .send(SessionReply::Ready {
+                width_twips: 11906,
+                height_twips: 16838,
+                kernel_sha256: "test-sha".into(),
+                elapsed_ms: 1,
+            })
+            .unwrap();
+        open_tx
+            .send(Ok(DocxLokSession::from_reply_channel_for_test(reply_rx)))
+            .unwrap();
+        drop(open_tx); // 打开线程「回传后正常退出」——通道随之关闭。
+        let view = cx.update(|app| {
+            app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, Some(open_rx)))
+        });
+        // 拍 1：句柄 + Ready 同拍。
+        view.update(cx, |v, cx| v.drain(cx));
+        assert_eq!(view.read_with(cx, |v, _| v.boot.clone()), Boot::Ready);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.doc_size),
+            Some((11906, 16838)),
+            "Ready 几何落位"
+        );
+        // 后续多拍（旧实现在此被 Disconnected 覆盖成 Failed(spawn)）。
+        for _ in 0..5 {
+            view.update(cx, |v, cx| v.drain(cx));
+        }
+        assert_eq!(
+            view.read_with(cx, |v, _| v.boot.clone()),
+            Boot::Ready,
+            "回传后的正常通道关闭不得覆盖 Ready（#179）"
+        );
+        // 会话通道仍在（reply_tx 存活）——会话不被误拆。
+        assert!(view.read_with(cx, |v, _| v.session.is_some()));
+    }
+
+    /// 场景 2：打开线程发送结果前异常退出（通道断开且无结果）——
+    /// 落 `Failed(spawn)` 且文案明确「未回传结果」，不报成正常就绪；
+    /// 多拍幂等。
+    #[gpui::test]
+    fn open_thread_exit_before_result_lands_failed_spawn(cx: &mut gpui::TestAppContext) {
+        let (open_tx, open_rx) = channel();
+        drop(open_tx); // 线程未回传任何结果即退出。
+        let view = cx.update(|app| {
+            app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, Some(open_rx)))
+        });
+        view.update(cx, |v, cx| v.drain(cx));
+        match view.read_with(cx, |v, _| v.boot.clone()) {
+            Boot::Failed { stage, message } => {
+                assert_eq!(stage, "spawn", "阶段可定位");
+                assert!(message.contains("未回传结果"), "文案可定位：{message}");
+            }
+            other => panic!("必须是 spawn 段失败：{other:?}"),
+        }
+        // 多拍幂等（不反复迁移/不假就绪）。
+        for _ in 0..3 {
+            view.update(cx, |v, cx| v.drain(cx));
+        }
+        assert!(matches!(
+            view.read_with(cx, |v, _| v.boot.clone()),
+            Boot::Failed { stage: "spawn", .. }
+        ));
+    }
+
+    /// 场景 3：句柄与真实 Failed 同拍到达，打开通道随后正常关闭——
+    /// 最初的具体失败阶段/原因保留，不被通用 spawn 文案覆盖；同拍
+    /// 断开的会话通道亦不误报 session 段（终态回执已见）。
+    #[gpui::test]
+    fn open_handle_and_concrete_failed_same_tick_preserves_stage(cx: &mut gpui::TestAppContext) {
+        let (open_tx, open_rx) = channel();
+        let (reply_tx, reply_rx) = channel();
+        reply_tx
+            .send(SessionReply::Failed {
+                stage: "load",
+                message: "documentLoadWithOptions 失败：0xC0000005".into(),
+            })
+            .unwrap();
+        open_tx
+            .send(Ok(DocxLokSession::from_reply_channel_for_test(reply_rx)))
+            .unwrap();
+        drop(open_tx);
+        drop(reply_tx); // 打开/会话双通道随后关闭。
+        let view = cx.update(|app| {
+            app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, Some(open_rx)))
+        });
+        // 拍 1：句柄 + 具体 Failed 同拍。
+        view.update(cx, |v, cx| v.drain(cx));
+        match view.read_with(cx, |v, _| v.boot.clone()) {
+            Boot::Failed { stage, message } => {
+                assert_eq!(stage, "load", "具体阶段保留");
+                assert!(
+                    message.contains("documentLoadWithOptions"),
+                    "具体原因保留：{message}"
+                );
+            }
+            other => panic!("必须是 load 段失败：{other:?}"),
+        }
+        // 拍 2+：双通道已断——具体失败不得被通用文案覆盖。
+        for _ in 0..3 {
+            view.update(cx, |v, cx| v.drain(cx));
+        }
+        match view.read_with(cx, |v, _| v.boot.clone()) {
+            Boot::Failed { stage: "load", .. } => {}
+            other => panic!("具体失败不得被覆盖：{other:?}"),
+        }
+    }
+
+    /// 补充场景：会话通道异常断开（无终态回执）——与「暂时无消息」
+    /// 分流：先证 Empty 不动状态/不拆会话，再断开 → `Failed(session)`
+    /// 可定位 + 停轮询（会话拆），不永挂 Starting。
+    #[gpui::test]
+    fn session_channel_disconnect_without_terminal_lands_failed(cx: &mut gpui::TestAppContext) {
+        let (open_tx, open_rx) = channel();
+        let (reply_tx, reply_rx) = channel();
+        open_tx
+            .send(Ok(DocxLokSession::from_reply_channel_for_test(reply_rx)))
+            .unwrap();
+        drop(open_tx);
+        let view = cx.update(|app| {
+            app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, Some(open_rx)))
+        });
+        // 拍 1：仅句柄（会话通道 Empty——「暂时无消息」不动状态）。
+        view.update(cx, |v, cx| v.drain(cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.boot.clone()),
+            Boot::Starting,
+            "Empty 不得误判"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.session.is_some()),
+            "Empty 不拆会话"
+        );
+        // 会话线程异常退出：未发终态回执即断开。
+        drop(reply_tx);
+        view.update(cx, |v, cx| v.drain(cx));
+        match view.read_with(cx, |v, _| v.boot.clone()) {
+            Boot::Failed { stage, message } => {
+                assert_eq!(stage, "session", "可定位到会话段");
+                assert!(message.contains("会话线程"), "文案可定位：{message}");
+            }
+            other => panic!("必须是 session 段失败：{other:?}"),
+        }
+        assert!(
+            view.read_with(cx, |v, _| v.session.is_none()),
+            "停轮询（会话拆）"
         );
     }
 }
