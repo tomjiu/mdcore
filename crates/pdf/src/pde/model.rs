@@ -644,17 +644,56 @@ impl PdeText {
     /// §5.2.2 多字节编码下 word spacing 不适用）。`None` = 无字体
     /// 上下文 → 返回 None（诚实降级——批①文本 BBox 登记的同一偏差
     /// 面，本方法不猜）。
+    ///
+    /// **#195 修复**：按 [`ShowOp`] 序列流式累计（不再 `run_bytes`
+    /// 拼接丢 Kern 后逐 u8 查宽）：
+    /// - `ShowOp::Str` 段按**码长**切分字符码（Type0 = 2 字节 CID、
+    ///   简单字体 = 1 字节——`num_code_bytes` 口径），逐码查
+    ///   `width_of`（复合字体查 CID 而非逐 u8 字节）；
+    /// - `ShowOp::Kern(k)`（TJ 数组数值项）按 PDF §9.4.3 直接平移
+    ///   当前点：`k × font_size/1000`（千分之一文本空间单位 →
+    ///   字符空间；符号保留——负值紧排同式）。TJ 值不受 Tz/Tc/Tw
+    ///   影响（规范语义——缩放与字距只作用于字形宽度）。
+    /// - 尾部残段（Str 长非码长整数倍）= 解析层不可信形态：**不猜**
+    ///   （丢弃残字节并返回 None——比貌似可靠的错误宽度诚实）。
     pub fn run_advance(&self, i: usize, font: Option<&crate::pde::font::PdeFont>) -> Option<f32> {
         let run = self.runs.get(i)?;
         let f = font?;
         let st = &run.state;
         let single = f.num_code_bytes(&run_bytes(run)) == 1;
+        let code_len = f.num_code_bytes(&run_bytes(run));
         let mut adv = 0.0f32;
-        for &code in &run_bytes(run) {
-            let w1000 = f.width_of(code as u32);
-            adv += w1000 * st.size / 1000.0 * st.h_scale / 100.0 + st.char_spacing;
-            if single && code == 32 {
-                adv += st.word_spacing;
+        for op in &run.shows {
+            match op {
+                ShowOp::Kern(k) => {
+                    // TJ 数组数值项：千分之一文本空间单位（不受
+                    // Tz/Tc/Tw 缩放——只乘字号换算到字符空间）。
+                    // PDF §9.4.3：正数把后续字形向**左**移（横向排
+                    // 版——紧排），即对 advance 为**负**贡献；负数
+                    // 松排为正贡献（符号取反）。
+                    adv -= k * st.size / 1000.0;
+                }
+                ShowOp::Str(bytes) => {
+                    if bytes.len() % code_len != 0 {
+                        return None; // 残字节段——不猜（#195 诚实缺能力）
+                    }
+                    for chunk in bytes.chunks_exact(code_len) {
+                        let code: u32 = if code_len == 1 {
+                            chunk[0] as u32
+                        } else if code_len == 2 {
+                            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+                        } else {
+                            // 码长 >2 的可变 CMap 形态（批③未承载）
+                            // ——明确缺能力，不猜。
+                            return None;
+                        };
+                        let w1000 = f.width_of(code);
+                        adv += w1000 * st.size / 1000.0 * st.h_scale / 100.0 + st.char_spacing;
+                        if single && code == 32 {
+                            adv += st.word_spacing;
+                        }
+                    }
+                }
             }
         }
         Some(adv)
