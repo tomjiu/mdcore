@@ -682,8 +682,23 @@ impl CollectedResources {
 
     fn collect_elem(&mut self, e: &PdeElement) {
         match e {
-            PdeElement::XObject(x) => push_dedup(&mut self.xobject, &x.name),
-            PdeElement::Shading(s) => push_dedup(&mut self.shading, &s.name),
+            // #181 重开修（Lead 复验 main d8cd5bd）：XObject/Shading 元素
+            // **自身**的 gstate 引用必须收集——parser 在 Do/sh 快照当前
+            // gstate（`/GS0 gs /CS0 cs 0.5 scn /Fm0 Do` 无 BT/q 时 gs/cs
+            // 只能附着在这两支元素上），旧代码只收 name 不走
+            // collect_gstate → 写回仍引用 /GS0 gs、/CS0 cs 而集合为空，
+            // merge_collected 删掉正文仍引用的资源（写回即坏）。
+            // 既有测试 collect_resources_roundtrip 因流含 BT/Tj（Text
+            // 分支代收）而绿灯——遮住真实路径。与 Text/Path/Image 分支
+            // 同构：元素级 gstate 是引用来源的单一真源。
+            PdeElement::XObject(x) => {
+                push_dedup(&mut self.xobject, &x.name);
+                self.collect_gstate(&x.gstate);
+            }
+            PdeElement::Shading(s) => {
+                push_dedup(&mut self.shading, &s.name);
+                self.collect_gstate(&s.gstate);
+            }
             PdeElement::Text(t) => {
                 // 字体引用：run 的文本状态逐 run 收集（同 run 合并判据
                 // 同态——Adobe PDEText 每 run 持一份 state）。
