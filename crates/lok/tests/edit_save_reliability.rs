@@ -52,6 +52,54 @@ fn search_args(q: &str) -> String {
     .to_string()
 }
 
+/// 保存前轮询到**文档内容真的含全部期望文本**再返回。
+///
+/// 【2026-11-13 实测】`type_text` 逐字符发 `post_key`，每次都有应答——
+/// 但 LO 内核把按键投进自己的事件队列**异步处理**，应答 ≠ 已落定。
+/// 实测：单元格键入「单元格新文戊」后立即 save_as，产物里只有
+/// 「单元格新文」——**少最后一字**（与 session_lifecycle 的「会话一内」同源）。
+/// 故保存前必须轮询到内容落定，否则保存会截断最后一次按键。
+fn settle_document_contains(s: &mut DocSession, needles: &[&str]) {
+    let mut last = String::new();
+    for _round in 0..6 {
+        s.uno(".uno:SelectAll", None).expect("全选以读全文");
+        for _ in 0..20 {
+            let (_, t) = s
+                .text_selection("text/plain;charset=utf-8")
+                .expect("选区");
+            if needles.iter().all(|n| t.contains(n)) {
+                return;
+            }
+            last = t;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!("编辑未落定：期望含 {needles:?}（实际：{last:?}）");
+}
+/// 定位锚点并**轮询到选区真正落在锚点上**再返回。
+///
+/// 【2026-11-13 实测】`.uno:ExecuteSearch` 与 `postUnoCommand` 同源异步——
+/// 命令返回 ≠ 选区已移动。旧写法「ExecuteSearch → 立即 type_text」会偶发
+/// 把文本打进**上一个位置**（本测试实测：单元格编辑丢失，产物缺「单元格新文戊」，
+/// 单跑 3 次 2 过 1 败）。与 #160/#169 同源，非产品缺陷。
+fn search_and_settle(s: &mut DocSession, anchor: &str) {
+    let mut last = String::new();
+    for _round in 0..6 {
+        s.uno_query(".uno:ExecuteSearch", Some(&search_args(anchor)))
+            .expect("定位锚点");
+        for _ in 0..20 {
+            let (_, sel) = s
+                .text_selection("text/plain;charset=utf-8")
+                .expect("选区");
+            if sel.contains(anchor) {
+                return;
+            }
+            last = sel;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!("ExecuteSearch 6×20 后选区仍未落在锚点 {anchor:?}（实际：{last:?}）");
+}
 /// 中文正文 + 单元格编辑 → 保存暂存产物 → **独立校验**（verify 模块，
 /// 不经 LO）→ 源文件字节不变。这是 B 线给 C 线的完整保存安全链样本。
 #[test]
@@ -74,14 +122,15 @@ fn edit_and_save_independent_verify_chain() {
     let mut s = DocSession::open(None, &dir.join("s"), &file_url(&work), None).expect("打开");
 
     // 正文编辑：定位锚点（ExecuteSearch 查询类）→ 键入替换（选区语义）
-    s.uno_query(".uno:ExecuteSearch", Some(&search_args("锚点正文句甲")))
-        .expect("定位正文锚点");
+    search_and_settle(&mut s, "锚点正文句甲");
     s.type_text("正文新句二零二六").expect("正文替换");
 
     // 单元格编辑：定位表格单元格 → 键入替换
-    s.uno_query(".uno:ExecuteSearch", Some(&search_args("表格单元格丙")))
-        .expect("定位单元格锚点");
+    search_and_settle(&mut s, "表格单元格丙");
     s.type_text("单元格新文戊").expect("单元格替换");
+
+    // 保存前必须等两处编辑都真正落定（否则最后一击被截断）。
+    settle_document_contains(&mut s, &["正文新句二零二六", "单元格新文戊"]);
 
     assert!(s.is_dirty(), "编辑后 dirty");
     let rev_before_save = s.revision();
