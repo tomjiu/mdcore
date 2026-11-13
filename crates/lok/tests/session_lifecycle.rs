@@ -164,6 +164,31 @@ fn two_sessions_concurrent_edit_and_save() {
     s2.uno(".uno:SelectAll", None).expect("s2 全选");
     s2.type_text("会话二内容").expect("s2 编辑");
 
+    // 【2026-11-13 实测·保存侧】`type_text` 逐字符发 post_key 且每次都拿到
+    // 应答，但 LO 内核按键入队**异步处理**——应答 ≠ 已应用到文档。
+    // 「键入完立即 save_as」会把**最后一次按键截断**（实测存进文件的已是
+    // `"会话一内"`，少最后一字；与 edit_save_reliability 同源）。
+    // 保存前必须轮询到内容真的落定，否则重开侧轮询永远等不到完整文本。
+    fn settle_saved(s: &mut DocSession, want: &str) {
+        let mut last = String::new();
+        for _round in 0..6 {
+            s.uno(".uno:SelectAll", None).expect("全选以读全文");
+            for _ in 0..20 {
+                let (_, t) = s
+                    .text_selection("text/plain;charset=utf-8")
+                    .expect("选区");
+                if t.contains(want) {
+                    return;
+                }
+                last = t;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        panic!("保存前编辑未落定：期望含 {want:?}（实际：{last:?}）");
+    }
+    settle_saved(&mut s1, "会话一内容");
+    settle_saved(&mut s2, "会话二内容");
+
     // 保存与重开校验（交叉断言：甲产物不含乙文本）
     s1.save_as(&saved_url("a-saved.docx"), "docx")
         .expect("s1 保存");
