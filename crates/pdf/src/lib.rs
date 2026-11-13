@@ -90,6 +90,10 @@ pub mod engine_pdfium;
 pub mod deploy_check;
 pub mod outline;
 pub mod page;
+// 最小 zlib/DEFLATE 解压（crate 级共享件——2026-11-13 自 stamp.rs
+// `flate` 模块上移，#162 PDE 批②：pde::image 的 FlateDecode 滤镜面
+// 与 stamp 的 PNG IDAT 面共用；纯 std 零依赖，不挂任何 feature 门）。
+pub mod codec;
 // #162 PDE 兼容抽象层批①（Adobe PDFEdit/PDE 产品架构参照）：对象
 // 模型 + 内容流解析/写回，零引擎依赖（default = [] 纪律不变——纯
 // Rust 内容流面，不引入新依赖）。

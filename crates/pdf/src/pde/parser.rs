@@ -229,10 +229,29 @@ impl<'a> Parser<'a> {
                 self.gcur_mut().stroke.space = name;
             }
             "sc" | "scn" => {
+                // 双形态：数值分量（色彩空间分量）或 Pattern 名字
+                // （`/P1 scn`——ColorValues::Name 承载，批②补：Pattern
+                // 引用面进 CollectedResources 的收集源）。
+                if let Some(name) = ops.iter().rev().find_map(|o| o.as_name_bytes()) {
+                    if ops.len() == 1 {
+                        let n = name.to_vec();
+                        ops.clear();
+                        self.gcur_mut().fill.values = ColorValues::Name(n);
+                        return Ok(());
+                    }
+                }
                 let vals = take_nums(ops, opname)?;
                 self.gcur_mut().fill.values = ColorValues::Nums(vals);
             }
             "SC" | "SCN" => {
+                if let Some(name) = ops.iter().rev().find_map(|o| o.as_name_bytes()) {
+                    if ops.len() == 1 {
+                        let n = name.to_vec();
+                        ops.clear();
+                        self.gcur_mut().stroke.values = ColorValues::Name(n);
+                        return Ok(());
+                    }
+                }
                 let vals = take_nums(ops, opname)?;
                 self.gcur_mut().stroke.values = ColorValues::Nums(vals);
             }
@@ -451,8 +470,16 @@ impl<'a> Parser<'a> {
                 if let Some(c) = self.clip_pending.take() {
                     g.clip = Some(c);
                 }
-                self.elements
-                    .push(PdeElement::XObject(PdeXObject { gstate: g, name }));
+                // marked-content 开启中 → 元素入容器帧（批②修正：
+                // 容器内 Do/sh 与其他元素同栈位——Adobe marked-content
+                // 分组的 display list 归属语义，pdf_pde_batch2 的
+                // container_nested_deref 锁此行为）。
+                let elem = PdeElement::XObject(PdeXObject { gstate: g, name });
+                if let Some(top) = self.containers.last_mut() {
+                    top.elements.push(elem);
+                } else {
+                    self.elements.push(elem);
+                }
             }
             "sh" => {
                 let name = take_name(ops, "sh")?;
@@ -460,8 +487,12 @@ impl<'a> Parser<'a> {
                 if let Some(c) = self.clip_pending.take() {
                     g.clip = Some(c);
                 }
-                self.elements
-                    .push(PdeElement::Shading(PdeShading { gstate: g, name }));
+                let elem = PdeElement::Shading(PdeShading { gstate: g, name });
+                if let Some(top) = self.containers.last_mut() {
+                    top.elements.push(elem);
+                } else {
+                    self.elements.push(elem);
+                }
             }
             "MP" => {
                 let tag = take_name(ops, "MP")?;
