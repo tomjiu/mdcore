@@ -46,15 +46,22 @@ fn tmp_dir(tag: &str) -> PathBuf {
     d
 }
 
+/// 路径 → file: URI（**统一走 profile::file_url_of，不得手搓**）。
+///
+/// 【2026-11-13 实测】Windows 的 canonicalize 返回 verbatim 路径 `\\?\C:\...`，
+/// 裸拼 `format!("file://{}", ...)` 得到 `file://\\?\C:/...`——两斜杠 + verbatim
+/// 前缀，LO documentLoad 直接报 `Unsupported URL ... "type detection failed"`，
+/// 本文件三个用例在 Windows 全红。`file_url_of` 已处理 verbatim 前缀、盘符
+/// 三斜杠与 UNC authority，故一律经它构造。
 fn file_url(p: &std::path::Path) -> String {
     let canon = std::fs::canonicalize(p).unwrap();
-    format!("file://{}", canon.to_string_lossy())
+    mdc_lok::profile::file_url_of(&canon)
 }
 
 /// 保存目标 URL（目标尚不存在——canonicalize 目录再拼文件名，既有模式）。
 fn target_url(dir: &std::path::Path, name: &str) -> String {
     let canon = std::fs::canonicalize(dir).unwrap();
-    format!("file://{}", canon.join(name).to_string_lossy())
+    mdc_lok::profile::file_url_of(&canon.join(name))
 }
 
 fn worker_bin_env() {
