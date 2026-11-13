@@ -776,6 +776,10 @@ impl DocxPagesView {
             ),
             Boot::Ready => ("文档已就绪".to_string(), String::new()),
         };
+        // #176：状态面板同样接焦点域（focus_active 在 Starting/Failed
+        // 态也落本视图句柄——不接则句柄游离，键事件死在合成根，
+        // #604 同款病灶；Ctrl+S 的明确提示在错误面板态同样要可达）。
+        let focus = self.focus_handle.clone();
         v_flex()
             .id("docx-pages-state")
             .debug_selector(|| "docx-pages-state".into())
@@ -784,6 +788,7 @@ impl DocxPagesView {
             .justify_center()
             .gap_2()
             .bg(colors.background)
+            .track_focus(&focus)
             .child(
                 ui::Label::new(title)
                     .size(ui::LabelSize::Large)
@@ -1015,6 +1020,11 @@ impl Render for DocxPagesView {
         .debug_selector(|| "docx-pages-list".into())
         .w_full()
         .h_full();
+        // #176：视图焦点域（focus_active 在页面态落本视图句柄——
+        // 此前从不 track_focus，句柄游离，键事件死在合成根：#50 C2
+        // 缩放键分支与 #176 键守卫实际不可达。pdf #422 / xlsx #389
+        // 同款接线，三个替换视图归一）。
+        let focus = self.focus_handle.clone();
         div()
             .id("docx-pages-root")
             .debug_selector(|| "docx-pages-root".into())
@@ -1025,6 +1035,7 @@ impl Render for DocxPagesView {
             .flex()
             .flex_col()
             .items_center()
+            .track_focus(&focus)
             .child(list)
             // #50 C2：缩放预设菜单（backdrop + 面板——在位时叠加）。
             .children(zoom_menu)
