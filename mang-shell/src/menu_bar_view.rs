@@ -27,11 +27,14 @@
 //! - 灰显（enabled=false）：`custom_entry` + `.selectable(false)`（键盘
 //!   导航跳过 + 点击无 handler——「点不到不算死按钮」，与旧实现
 //!   「enabled 才挂 on_click」同语义）；
+//! - #176：带 `disabled_reason` 的灰显行挂 ui::Tooltip 说明原因
+//!   （「明确禁用态与说明」——页面态死路的可见解释通道）；
 //! - 勾选（主题/侧栏子菜单的当前态）：`toggleable_entry`（组件原生
 //!   toggle 渲染——勾选列语义替代旧「✓」文本列）。
 
 use gpui::{App, Context, Entity, Pixels, Point, WeakEntity, Window, anchored, deferred, px};
 use ui::ContextMenu as UiContextMenu;
+use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::menu_bar::{MenuEntry, MenuItemSpec, TopMenu};
@@ -100,11 +103,15 @@ fn action_row(
     label: &str,
     shortcut: Option<&str>,
     label_color: ui::Color,
+    disabled_tooltip: Option<(&'static str, &'static str)>,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyElement + 'static {
     let label = label.to_string();
     let shortcut = shortcut.map(str::to_string);
     move |_, cx| {
-        div()
+        // 样式链先建（Div 面），再按需 `.id()` + Tooltip（#176：带原因
+        // 的灰显行需要 stateful 交互面才能挂 Tooltip——id 用
+        // MenuItemSpec.id，全菜单唯一由单测钉定）。
+        let row = div()
             .flex()
             .items_center()
             .justify_between()
@@ -117,8 +124,11 @@ fn action_row(
                     .text_size(px(11.))
                     .text_color(ui::Color::Muted.color(cx))
                     .child(s)
-            }))
-            .into_any_element()
+            }));
+        match disabled_tooltip {
+            Some((id, reason)) => row.id(id).tooltip(Tooltip::text(reason)).into_any_element(),
+            None => row.into_any_element(),
+        }
     }
 }
 
@@ -155,7 +165,7 @@ fn build_entries(
 /// 动作项构建：勾选项 → `toggleable_entry`（组件原生 toggle 渲染）；
 /// 普通项 → `custom_entry`（自绘 label + shortcut 行）。灰显统一
 /// `.selectable(false)`（toggleable 路仅主题/侧栏项——恒启用，灰显
-/// 面全在 custom 路上）。
+/// 面全在 custom 路上）。#176：灰显且带原因 → 行挂 Tooltip 说明。
 fn build_item(
     menu: UiContextMenu,
     spec: &MenuItemSpec,
@@ -182,10 +192,20 @@ fn build_item(
     } else {
         ui::Color::Muted
     };
+    // #176：页面态死路的灰显原因——(element id, 原因文案)。仅灰显项
+    // 才有（启用项 tooltip 面：本菜单无——图标条钮语系不同）。
+    let disabled_tooltip = (!spec.enabled)
+        .then(|| spec.disabled_reason.map(|reason| (spec.id, reason)))
+        .flatten();
     let action = spec.action;
     let shell = shell.clone();
     menu.custom_entry(
-        action_row(&spec.label, spec.shortcut.as_deref(), label_color),
+        action_row(
+            &spec.label,
+            spec.shortcut.as_deref(),
+            label_color,
+            disabled_tooltip,
+        ),
         move |window, cx| {
             let _ = shell.update(cx, |shell, cx| {
                 shell.activate_menu_action(action, window, cx)

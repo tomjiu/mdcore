@@ -1126,6 +1126,13 @@ impl Editor {
         self.read_only
     }
 
+    /// 查找条开合态（#176 测试面：页面视图键守卫「不派发到不可见
+    /// 编辑器」的行为证据——find 状态留在编辑器上，页面态不应被
+    /// 隐式置开）。
+    pub fn find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
     /// docx 文档属性（右栏属性面板；`None` = md 可编辑态）。
     pub fn docx_props(&self) -> Option<&DocxProps> {
         self.docx.as_ref().map(|d| &d.props)

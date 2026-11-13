@@ -42,10 +42,13 @@ pub(crate) const BAR_PADDING: Pixels = px(8.);
 
 /// 渲染图标条。`left_open`/`git_view` 决定文件树/git 钮的选中态；
 /// `settings_open` 决定设置钮的选中态（弹窗开 = 选中视觉）。
+/// `search_disabled`（#176）：docx 页面视图下搜索钮置灰 + 原因
+/// tooltip（查找是编辑器浮层，页面态编辑器不在树内——不进死路）。
 pub fn activity_bar(
     left_open: bool,
     git_view: bool,
     settings_open: bool,
+    search_disabled: bool,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -79,19 +82,31 @@ pub fn activity_bar(
         ))
         // #165：搜索钮 → Cmd::OpenFind（与 Ctrl+F 同链——Editor::run_command
         // 统一分派；无打开文档时与 Ctrl+F 同为无操作，行为一致不特殊化）。
-        .child(bar_button(
-            "act-search",
-            IconName::MagnifyingGlass,
-            false,
-            "搜索（Ctrl+F）",
-            colors.element_hover,
-            colors.element_selected,
-            cx.listener(|this, _, window, cx| {
-                if let Some(editor) = this.editor().cloned() {
-                    editor.update(cx, |ed, cx| ed.run_command(Cmd::OpenFind, window, cx));
-                }
-            }),
-        ))
+        // #176：docx 页面视图下置灰 + 原因（编辑器浮层死路不进——
+        // 同 Ctrl+F 键守卫的提示文案）。
+        .child(if search_disabled {
+            disabled_bar_button(
+                "act-search",
+                IconName::MagnifyingGlass,
+                "搜索（Ctrl+F）——页面视图暂不支持，切换到文本视图后可用",
+            )
+            .into_any_element()
+        } else {
+            bar_button(
+                "act-search",
+                IconName::MagnifyingGlass,
+                false,
+                "搜索（Ctrl+F）",
+                colors.element_hover,
+                colors.element_selected,
+                cx.listener(|this, _, window, cx| {
+                    if let Some(editor) = this.editor().cloned() {
+                        editor.update(cx, |ed, cx| ed.run_command(Cmd::OpenFind, window, cx));
+                    }
+                }),
+            )
+            .into_any_element()
+        })
         .child(div().flex_1())
         // #289-⑤：设置钮沉底（vscode 同款位置）——打开设置**弹窗**
         // （不再驱动右栏视图；右栏只归属性/来源，右缘 dock 条自管）。
@@ -139,4 +154,26 @@ pub(crate) fn bar_button(
                 .when(selected, |el| el.color(Color::Selected)),
         )
         .on_click(on_click)
+}
+
+/// #176：置灰图标按钮单元（bar_button 的禁用态——同 36×36 几何）：
+/// Muted 图标色、无 hover 反馈、无 on_click；tooltip 说明原因
+/// （「明确禁用态与说明」，非静默无反应）。a11y 面与 bar_button
+/// 同纪录（模块文档：后续 PR）。
+pub(crate) fn disabled_bar_button(
+    id: &'static str,
+    icon: IconName,
+    reason: &'static str,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .size(BUTTON_SIZE)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .tooltip(Tooltip::text(reason))
+        .child(Icon::new(icon).size(IconSize::Medium).color(Color::Muted))
 }

@@ -676,6 +676,14 @@ impl ShellApp {
                     .map(|_| tab.path.clone())
             });
         if let Some(_owned) = docx_page_owned {
+            // #176 验收②：页面态保存不再静默——明确告知只读渲染无修改可存
+            // （outcome 仍 Unmodified：关闭/退出流程消费三态语义零变化，
+            // 零写盘保证也零变化）。
+            self.show_notice(
+                "DOCX 页面视图为只读渲染，没有可保存的修改——编辑请先切换到文本视图（状态栏「切换到文本视图」）"
+                    .into(),
+                cx,
+            );
             return SaveOutcome::Unmodified;
         }
         if is_pdf {
@@ -1093,6 +1101,19 @@ impl ShellApp {
     fn active_is_docx(&self, cx: &Context<Self>) -> bool {
         self.editor()
             .is_some_and(|ed| ed.read(cx).doc_kind() == "docx")
+    }
+
+    /// #176：活动 docx 标签处于 LOK 页面视图（菜单灰显/键守卫/图标条
+    /// 共用判定）——与 `editor_area` 渲染分流同源三条件：docx 标签 +
+    /// 页面模式开关 + 页视图实体在场（实体缺位时 `editor_area` 实际
+    /// 呈现文本编辑器，非页面态——不误伤）。取 `&App`（菜单快照
+    /// `menu_context` 与键/渲染面 `Context` 双消费——Context 解引用
+    /// 到 App，双面零适配）。
+    pub(crate) fn docx_page_view_active(&self, cx: &App) -> bool {
+        self.editor()
+            .is_some_and(|ed| ed.read(cx).doc_kind() == "docx")
+            && self.docx_view_mode
+            && self.docx_pages.is_some()
     }
 
     /// 确保当前 pdf 标签的页视图实体在场（非 pdf 态 / 已在同路径实体
@@ -1679,6 +1700,9 @@ impl ShellApp {
             pdf_ocr_pending: tab.is_some_and(|t| t.editor.read(cx).pdf_ocr_pending()),
             // #306 ②：「另存为可搜索 PDF」门槛（pdf 态 + OCR 词表在位）。
             pdf_ocr_ready: tab.is_some_and(|t| t.editor.read(cx).pdf_ocr_ready()),
+            // #176：docx 页面视图在位（作用于不可见编辑器的动作置灰
+            // 依据——见 menu_bar::REASON_PAGE_*）。
+            docx_page_view: self.docx_page_view_active(cx),
             recent_files: self.recent.recent_files().to_vec(),
         }
     }
@@ -3597,6 +3621,33 @@ impl Render for ShellApp {
                         }
                     }
                 }
+
+                // #176：docx 页面视图键守卫——查找（Ctrl+F）/命令面板
+                // （Ctrl+Shift+P）是编辑器动作，页面态编辑器不在树内，
+                // 键派发不到（静默无反应 = 用户判定「假按钮」的病灶之一）。
+                // 此处接住给明确提示（pdf #422 分支同构先例——查 keymap
+                // 编辑表保持换绑跟随；命中即吞，未命中照常下沉不拦）。
+                // chord 已在上方 resolve_shell 前终结，编辑器动作无和弦
+                // 续接，pending 传 None。
+                if this.docx_page_view_active(cx) {
+                    let editor_outcome = keymap::store().resolve_editor_main(&kq, None);
+                    match editor_outcome {
+                        keymap::EditorOutcome::Matched(keymap::EditorAction::OpenFind) => {
+                            this.show_notice(
+                                "页面视图暂不支持查找——切换到文本视图后使用（状态栏「切换到文本视图」）"
+                                    .into(),
+                                cx,
+                            );
+                        }
+                        keymap::EditorOutcome::Matched(keymap::EditorAction::PaletteToggle) => {
+                            this.show_notice(
+                                "页面视图暂不支持命令面板——切换到文本视图后使用".into(),
+                                cx,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
             }))
             .child(title_bar::title_bar(&title, &menus, self.menu_bar_open, cx))
             .child(
@@ -3612,6 +3663,9 @@ impl Render for ShellApp {
                         self.left_open(cx),
                         self.git_active(cx),
                         self.settings_open,
+                        // #176：docx 页面视图下搜索钮置灰 + 原因
+                        //（编辑器浮层死路——与菜单「查找」同判定源）。
+                        self.docx_page_view_active(cx),
                         cx,
                     ))
                     .when(self.left_open(cx), |el| {
@@ -7165,6 +7219,232 @@ mod pdf_search_wiring_tests {
                 let ed = shell.tab_editor(0).unwrap().clone();
                 assert_eq!(ed.read(cx).buffer_line(0), "W0", "标签内容 = 文件内容");
                 eprintln!("ws-click: 命中 y={hit_y}（自下而上扫描首个交互行）");
+            });
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #176 方案 A：docx 页面视图动作诚实面交互测试（TestAppContext 真实键
+// 管线——验收④「断言可见结果（提示/不派发），非仅不 panic」）。
+//
+// 宿主：WiringHost 模式同 pdf_search_wiring_tests（ShellApp 必须进渲染
+// 树——Ctrl+F/Ctrl+S 走 shell-root on_key_down 真实派发路径）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod page_view_action_honesty_tests {
+    use super::*;
+
+    /// 测试宿主（ShellApp 必须进渲染树——键派发走真实管线，pdf 同款）。
+    struct WiringHost(Entity<ShellApp>);
+
+    impl gpui::Render for WiringHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.0.clone())
+        }
+    }
+
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mdc-p176-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 仓内 docx 夹具拷入临时目录（tab_workflow_tests 同款夹具源）。
+    fn write_docx_fixture(dir: &Path, name: &str) -> PathBuf {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.docx");
+        let path = dir.join(name);
+        std::fs::copy(&src, &path)
+            .expect("夹具在场（cargo test gen_smoke_docx -- --ignored 生成）");
+        path
+    }
+
+    /// 真实键击（预绘一帧 + dispatch_event——pdf_search_wiring_tests 同构）。
+    fn key_down(
+        window: &gpui::WindowHandle<WiringHost>,
+        cx: &mut gpui::TestAppContext,
+        key: &str,
+        ctrl: bool,
+    ) {
+        let any: gpui::AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘一帧");
+        cx.update_window(any, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers {
+                            control: ctrl,
+                            ..Default::default()
+                        },
+                        key: key.into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .expect("键击派发");
+    }
+
+    /// #176 验收②：页面态 Ctrl+S 有明确反馈——不再静默返回「无修改」。
+    /// 真实键管线（ShellAction::Save → save_tab → 页面态卫 → 提示横幅）；
+    /// 三态语义零变化（仍 Unmodified——关闭/退出流程消费面不破）+ 零写盘。
+    #[gpui::test]
+    fn docx_page_view_ctrl_s_gives_notice_not_silence(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("save");
+        let docx = write_docx_fixture(&dir, "save.docx");
+        let before = std::fs::read(&docx).expect("夹具读入");
+
+        // 渲染面全局件（pdf_search_wiring_tests 同款——整树键派发需要
+        // theme provider 在位）。
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+
+        let _ = window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(docx.clone(), window, cx);
+            });
+        });
+
+        // 前置：docx 缺省页面视图在位（守卫三条件齐）。
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                assert!(shell.docx_page_view_active(cx), "前置：docx 缺省页面视图");
+            });
+        });
+
+        // ① 状态面：save_tab 三态零变化（Unmodified）+ 零写盘 +
+        //    明确提示（旧实现：静默返回，无任何用户可见反馈）。
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                assert_eq!(
+                    shell.save_tab(0, cx),
+                    SaveOutcome::Unmodified,
+                    "三态语义零变化（关闭/退出流程消费面不破）"
+                );
+                assert_eq!(std::fs::read(&docx).unwrap(), before, "零写盘保持");
+                let msg = shell.notice_board.message().map(str::to_owned);
+                assert!(
+                    msg.as_deref().is_some_and(|m| m.contains("页面视图")),
+                    "save_tab 页面态须给提示（不静默）：{msg:?}"
+                );
+            });
+        });
+
+        // ② 键面：真实 Ctrl+S 管线 → 新提示（Lead 复验收口要求：先清
+        //    旧提示再派键——旧测试 save_tab 先生成提示后查「提示仍在」，
+        //    不能证明快捷键真正触发了路径。此处清空后按键，断言**新增**
+        //    通知（ShellAction::Save 同链派发——菜单/键位/命令面板三
+        //    入口同一单点））。
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, _| {
+                shell.notice_board.clear();
+                assert!(
+                    shell.notice_board.message().is_none(),
+                    "派键前清空提示（前置——排除 save_tab 旧通知干扰）"
+                );
+            });
+        });
+        key_down(&window, cx, "s", true);
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, _| {
+                let msg = shell.notice_board.message().map(str::to_owned);
+                assert!(
+                    msg.as_deref().is_some_and(|m| m.contains("只读渲染")),
+                    "Ctrl+S 页面态**新增**提示（清空后真实键管线触发）：{msg:?}"
+                );
+            });
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #176 验收①（键面）：页面态 Ctrl+F 不再静默无反应——给明确提示，
+    /// 且**不**派发到不可见编辑器（find 状态不被隐式置开 = 旧「假按钮」
+    /// 行为的证据性反断言）。切文本视图后 Ctrl+F 恢复真实开条（验收③
+    /// 零回归）。
+    #[gpui::test]
+    fn docx_page_view_ctrl_f_notice_then_text_view_find_works(cx: &mut gpui::TestAppContext) {
+        let dir = fixture_dir("find");
+        let docx = write_docx_fixture(&dir, "find.docx");
+
+        // 渲染面全局件（pdf_search_wiring_tests 同款——整树键派发需要
+        // theme provider 在位）。
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let shell = cx.new(|cx| ShellApp::new(None, None, window, cx));
+            slot = Some(shell.clone());
+            WiringHost(shell)
+        });
+        let shell = slot.expect("宿主构造即置");
+
+        let _ = window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_document(docx.clone(), window, cx);
+            });
+        });
+
+        // ① 页面态 Ctrl+F：提示（非静默）+ 编辑器 find 不被隐式置开
+        //    （旧死路把查找条开在不可见编辑器上——状态脏但用户看不见）。
+        key_down(&window, cx, "f", true);
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                let msg = shell.notice_board.message().map(str::to_owned);
+                assert!(
+                    msg.as_deref().is_some_and(|m| m.contains("查找")),
+                    "页面态 Ctrl+F 须给提示（不静默无反应）：{msg:?}"
+                );
+                let ed = shell.tab_editor(0).expect("docx 标签在场").clone();
+                assert!(
+                    !ed.read(cx).find_open(),
+                    "查找条不被隐式开在不可见编辑器上（不脏状态）"
+                );
+            });
+        });
+
+        // ② 切文本视图：守卫解除（页视图实体拆除——谓词与渲染分流
+        //    同源）。
+        let _ = window.update(cx, |_host, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.toggle_docx_view_mode(window, cx);
+                assert!(!shell.docx_view_mode, "切文本态成功");
+                assert!(
+                    !shell.docx_page_view_active(cx),
+                    "文本视图守卫解除（页视图实体已拆）"
+                );
+            });
+        });
+
+        // ③ 文本态 Ctrl+F：编辑器在场且聚焦——真实开条（零回归）。
+        key_down(&window, cx, "f", true);
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, cx| {
+                let ed = shell.tab_editor(0).expect("docx 标签在场").clone();
+                assert!(
+                    ed.read(cx).find_open(),
+                    "文本视图 Ctrl+F 照常开查找条（零回归）"
+                );
             });
         });
 
