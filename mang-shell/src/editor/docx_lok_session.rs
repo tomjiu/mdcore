@@ -282,6 +282,24 @@ impl DocxLokSession {
         }
     }
 
+    /// #186 测试构造器：无 worker 线程的哑会话（cmd 通道无消费者——
+    /// request_tile 只 send 不回执；reply_rx 恒空）。用于显示链回归
+    /// （视口探针→派单→看门狗态机）——真实打开链由
+    /// `docx_lok_session::real_runtime_*` 与 bad_path 面锁定。
+    #[cfg(test)]
+    pub fn dummy_for_test(path: &Path) -> Self {
+        use std::sync::mpsc::channel;
+        let (cmd_tx, _cmd_rx) = channel::<SessionCmd>();
+        let (_reply_tx, reply_rx) = channel::<SessionReply>();
+        Self {
+            path: path.to_path_buf(),
+            session_dir: std::env::temp_dir(),
+            cmd_tx,
+            reply_rx,
+            closed: false,
+        }
+    }
+
     /// 主动关闭（幂等；Drop 同径）。
     pub fn request_close(&mut self) {
         if !self.closed {
