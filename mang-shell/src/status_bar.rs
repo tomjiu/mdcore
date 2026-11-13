@@ -20,7 +20,7 @@
 //! | 编码 | 源文件字节（md 态——容器格式无编码语义） | 读不到/判不出 |
 //! | 换行符 | 源文件字节扫描（md 态） | 无换行 |
 
-use gpui::{ClickEvent, Context, Entity, Pixels, Window, px};
+use gpui::{App, ClickEvent, Context, Entity, Pixels, Window, px};
 use ui::prelude::*;
 use ui::{Label, LabelSize};
 
@@ -32,23 +32,34 @@ use crate::status_info;
 /// 状态栏高度（px）。
 pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
 
-/// 渲染状态栏。`editor`：打开的编辑器实体（`None` = 无文档就绪态）；
-/// `workspace`：工作区根（F2——`None` = 未打开）；`pdf_view_mode`：
-/// #289-④ pdf 页面视图开关态（仅 pdf 标签活跃时消费——切换钮挂
-/// 右侧信息区）；`xlsx_grid_view_mode`：#389 阶段 1 xlsx 网格视图
-/// 开关态（仅 xlsx 标签活跃时消费——网格/文本切换钮，pdf 先例同构）；
-/// `docx_view_mode`：#50 C1 docx LOK 页面视图开关态（仅 docx 标签活
-/// 跃时消费——页面/文本切换钮）。
-pub fn status_bar(
+/// 状态栏文案只读面（#47 A5 剩余缺口：状态栏真实文案**运行时证据**的
+/// 断言面——`outline_panel::row_labels` 先例同构：内容证据不依赖像素
+/// 断言（像素级文本呈现归 #554）。[`status_bar`] 渲染与
+/// [`status_bar_labels`] **同源**——本结构锁「渲染消费的计算面」。
+#[derive(Debug, Default)]
+pub(crate) struct StatusBarLabels {
+    /// 左段文档串（文档态：文件名 + 修改标记 + 行,列 + 页码 + 字数；
+    /// 无文档：就绪提示语）。
+    pub left: String,
+    /// 工作区段（`Some` = 「  ·  工作区 …」整段；未打开 `None`）。
+    pub workspace: Option<String>,
+    /// 选中字数段（#188——无/空选区 `None` 不占位）。
+    pub selection: Option<String>,
+    /// git 分支段（#188——非 git 仓库 `None`；`Some` 带前导空格）。
+    pub branch: Option<String>,
+    /// 编码段（#188——仅 md 态可判；容器格式无字节级语义 `None`）。
+    pub encoding: Option<String>,
+    /// 换行符段（#188——仅 md 态可判 `None`）。
+    pub eol: Option<String>,
+}
+
+/// 状态栏文案计算面（渲染零逻辑的单一事实源）。
+pub(crate) fn status_bar_labels(
     editor: Option<&Entity<Editor>>,
     workspace: Option<std::path::PathBuf>,
-    pdf_view_mode: bool,
-    xlsx_grid_view_mode: bool,
-    docx_view_mode: bool,
     pdf_page_label: Option<String>,
-    cx: &mut Context<ShellApp>,
-) -> impl IntoElement {
-    let colors = cx.theme().colors().clone();
+    cx: &App,
+) -> StatusBarLabels {
     let workspace_label = workspace
         .as_deref()
         .map(workspace_display)
@@ -134,21 +145,48 @@ pub fn status_bar(
             )
         }
         None => "就绪 —— Ctrl+O 打开文件 · Ctrl+K Ctrl+O 打开文件夹".to_string(),
+    };
+    StatusBarLabels {
+        left,
+        workspace: workspace_label,
+        selection: selection_label,
+        branch: branch_label,
+        encoding: encoding_label,
+        eol: eol_label,
     }
-    .to_string();
-    let left = match workspace_label {
-        Some(ws) => format!("{left}{ws}"),
-        None => left,
+}
+
+/// 渲染状态栏。`editor`：打开的编辑器实体（`None` = 无文档就绪态）；
+/// `workspace`：工作区根（F2——`None` = 未打开）；`pdf_view_mode`：
+/// #289-④ pdf 页面视图开关态（仅 pdf 标签活跃时消费——切换钮挂
+/// 右侧信息区）；`xlsx_grid_view_mode`：#389 阶段 1 xlsx 网格视图
+/// 开关态（仅 xlsx 标签活跃时消费——网格/文本切换钮，pdf 先例同构）；
+/// `docx_view_mode`：#50 C1 docx LOK 页面视图开关态（仅 docx 标签活
+/// 跃时消费——页面/文本切换钮）。
+pub fn status_bar(
+    editor: Option<&Entity<Editor>>,
+    workspace: Option<std::path::PathBuf>,
+    pdf_view_mode: bool,
+    xlsx_grid_view_mode: bool,
+    docx_view_mode: bool,
+    pdf_page_label: Option<String>,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let colors = cx.theme().colors().clone();
+    // #47 A5：文案计算面单一事实源（渲染零逻辑——运行时证据测试直接
+    // 断言 [`status_bar_labels`]，与本渲染同源）。
+    let labels = status_bar_labels(editor, workspace, pdf_page_label, cx);
+    let left = {
+        let mut left = labels.left;
+        if let Some(ws) = &labels.workspace {
+            left.push_str(ws);
+        }
+        // #188：选区串在左段尾部（与字数同族——文档内容面）。
+        if let Some(sel) = &labels.selection {
+            left.push_str(&format!("  ·  {sel}"));
+        }
+        left
     };
-    // #188：选区串在左段尾部（与字数同族——文档内容面）。
-    let left = match selection_label {
-        Some(sel) => format!("{left}  ·  {sel}"),
-        None => left,
-    };
-    // #178：锁定行拒改提示（独立 Error 色标签——不走左段文本拼接；
-    // 有拒改才渲染，无拒改不占位）。数据链：Buffer 拒改点 →
-    // Editor::after_edit 收割 → locked_notice ——此前只有 stderr
-    // 留痕，GUI 用户敲字无反应（#178 本修）。
     let locked_notice = editor.and_then(|ed| ed.read(cx).locked_notice().cloned());
     // #289-④：pdf 标签 → 页面/文本视图切换钮（右侧信息区，git 分支
     // 前——文档形态面）。非 pdf 态不占位。
@@ -255,7 +293,7 @@ pub fn status_bar(
                     )
                 })
                 // #188：git 分支（如  main）——非 git 目录不占位。
-                .when_some(branch_label, |el, branch| {
+                .when_some(labels.branch, |el, branch| {
                     el.child(
                         Label::new(branch)
                             .size(LabelSize::XSmall)
@@ -263,7 +301,7 @@ pub fn status_bar(
                     )
                 })
                 // #188：文件编码（UTF-8 / GBK / …）——判不出不占位。
-                .when_some(encoding_label, |el, enc| {
+                .when_some(labels.encoding, |el, enc| {
                     el.child(
                         Label::new(enc)
                             .size(LabelSize::XSmall)
@@ -271,7 +309,7 @@ pub fn status_bar(
                     )
                 })
                 // #188：换行符（LF / CRLF / 混合换行）——无换行不占位。
-                .when_some(eol_label, |el, eol| {
+                .when_some(labels.eol, |el, eol| {
                     el.child(
                         Label::new(eol)
                             .size(LabelSize::XSmall)
