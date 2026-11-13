@@ -175,6 +175,19 @@ enum SessionCmd {
     Close,
 }
 
+/// #179：会话回执通道三分面（[`DocxLokSession::try_recv_detailed`]）。
+#[derive(Debug)]
+pub enum SessionRecv {
+    /// 一条回执。
+    Reply(SessionReply),
+    /// 暂时无消息（16ms 拍内正常态）。
+    Empty,
+    /// 通道断开（会话线程已退出）。若此前未见 `Failed`/`Died` 终态
+    /// 回执 = 会话线程异常退出（panic/被杀）——消费方据此落可定位
+    /// 失败，不再与「暂时无消息」同貌。
+    Disconnected,
+}
+
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// DOCX LOK 会话句柄（宿主侧；线程演员包装）。
@@ -272,13 +285,14 @@ impl DocxLokSession {
         let _ = self.cmd_tx.send(SessionCmd::Size);
     }
 
-    /// 非阻塞收回执（宿主 16ms 轮询 drain）。
-    pub fn try_recv(&self) -> Option<SessionReply> {
+    /// #179：三分面收回执——通道断开与「暂时无消息」分流。旧
+    /// `try_recv` 两者同貌返回 `None`：会话线程异常退出（无终态回执）
+    /// 的通道断开无从诊断，视图永挂 Starting/Ready。
+    pub fn try_recv_detailed(&self) -> SessionRecv {
         match self.reply_rx.try_recv() {
-            Ok(reply) => Some(reply),
-            Err(TryRecvError::Empty) => None,
-            // 会话线程已退出（Died/Close 终态后通道拆）——宿主停轮询。
-            Err(TryRecvError::Disconnected) => None,
+            Ok(reply) => SessionRecv::Reply(reply),
+            Err(TryRecvError::Empty) => SessionRecv::Empty,
+            Err(TryRecvError::Disconnected) => SessionRecv::Disconnected,
         }
     }
 
@@ -305,6 +319,20 @@ impl DocxLokSession {
         if !self.closed {
             self.closed = true;
             let _ = self.cmd_tx.send(SessionCmd::Close);
+        }
+    }
+
+    /// #179 受控时序测试面：由现成回执通道构造（会话线程缺位——回执
+    /// 由测试驱动；命令通道接收端即弃，`request_*` 静默无操作）。仅
+    /// 测试编译可见。
+    #[cfg(test)]
+    pub fn from_reply_channel_for_test(reply_rx: Receiver<SessionReply>) -> Self {
+        Self {
+            path: PathBuf::from("test://179-controlled-timing.docx"),
+            session_dir: std::env::temp_dir().join("mdc-docx-lok-test"),
+            cmd_tx: channel::<SessionCmd>().0,
+            reply_rx,
+            closed: false,
         }
     }
 }
@@ -746,12 +774,12 @@ mod tests {
         let mut open_error: Option<(String, String)> = None;
         let deadline = Instant::now() + Duration::from_secs(180);
         while ready.is_none() && open_error.is_none() && Instant::now() < deadline {
-            if let Some(SessionReply::Ready {
+            if let SessionRecv::Reply(SessionReply::Ready {
                 width_twips,
                 height_twips,
                 kernel_sha256,
                 elapsed_ms,
-            }) = session.try_recv()
+            }) = session.try_recv_detailed()
             {
                 assert!(width_twips > 0 && height_twips > 0, "文档尺寸必须非零");
                 assert!(!kernel_sha256.is_empty(), "内核指纹必须留痕");
@@ -761,10 +789,12 @@ mod tests {
                 );
                 ready = Some((width_twips, height_twips));
             }
-            if let Some(SessionReply::Failed { stage, message }) = session.try_recv() {
+            if let SessionRecv::Reply(SessionReply::Failed { stage, message }) =
+                session.try_recv_detailed()
+            {
                 open_error = Some((stage.to_string(), message));
             }
-            if let Some(SessionReply::Died { detail }) = session.try_recv() {
+            if let SessionRecv::Reply(SessionReply::Died { detail }) = session.try_recv_detailed() {
                 open_error = Some(("died".into(), detail));
             }
             std::thread::sleep(Duration::from_millis(16));
@@ -778,8 +808,8 @@ mod tests {
         let mut tile = None;
         let deadline = Instant::now() + Duration::from_secs(60);
         while tile.is_none() && Instant::now() < deadline {
-            match session.try_recv() {
-                Some(SessionReply::Tile {
+            match session.try_recv_detailed() {
+                SessionRecv::Reply(SessionReply::Tile {
                     seq: s,
                     width,
                     height,
@@ -797,11 +827,15 @@ mod tests {
                     );
                     tile = Some(stats);
                 }
-                Some(SessionReply::Failed { stage, message }) => {
+                SessionRecv::Reply(SessionReply::Failed { stage, message }) => {
                     panic!("tile 失败（{stage}）：{message}");
                 }
-                Some(SessionReply::Died { detail }) => panic!("worker 死亡：{detail}"),
-                _ => {}
+                SessionRecv::Reply(SessionReply::Died { detail }) => {
+                    panic!("worker 死亡：{detail}");
+                }
+                // 其余回执（Ready/Size/Callback——此阶段迟到者）与通道
+                // 两态：机械跳过，下一拍继续。
+                SessionRecv::Reply(_) | SessionRecv::Empty | SessionRecv::Disconnected => {}
             }
             std::thread::sleep(Duration::from_millis(16));
         }
@@ -812,8 +846,8 @@ mod tests {
         let mut seen_callbacks: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         while size_reply.is_none() && Instant::now() < deadline {
-            match session.try_recv() {
-                Some(SessionReply::Size {
+            match session.try_recv_detailed() {
+                SessionRecv::Reply(SessionReply::Size {
                     width_twips,
                     height_twips,
                 }) => {
@@ -824,7 +858,7 @@ mod tests {
                     );
                     size_reply = Some((width_twips, height_twips));
                 }
-                Some(SessionReply::Callback { name, payload }) => {
+                SessionRecv::Reply(SessionReply::Callback { name, payload }) => {
                     // 证据登记（打印原文）——只读打开是否有自发回调
                     //（INVALIDATE_TILES/DOCUMENT_SIZE_CHANGED）属内核行为面，
                     // 不作硬断言；C2 视图层消费链在单测面锁定。
@@ -833,11 +867,14 @@ mod tests {
                         seen_callbacks.push(name);
                     }
                 }
-                Some(SessionReply::Failed { stage, message }) => {
+                SessionRecv::Reply(SessionReply::Failed { stage, message }) => {
                     panic!("size 重查失败（{stage}）：{message}");
                 }
-                Some(SessionReply::Died { detail }) => panic!("worker 死亡：{detail}"),
-                _ => {}
+                SessionRecv::Reply(SessionReply::Died { detail }) => {
+                    panic!("worker 死亡：{detail}");
+                }
+                // 其余回执（Ready/Tile 迟到者）与通道两态：机械跳过。
+                SessionRecv::Reply(_) | SessionRecv::Empty | SessionRecv::Disconnected => {}
             }
             std::thread::sleep(Duration::from_millis(16));
         }
