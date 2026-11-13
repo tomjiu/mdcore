@@ -26,6 +26,14 @@
 //!   几何更新 + 全量逐出 + 滚动钳制。
 //! - **视口真尺寸**：C1 的每带覆盖 canvas 记录的是条带尺寸，C2 改
 //!   根级探针（pdf 同款）——可见窗口推导用真视口高。
+//! - **首帧派单链（#186）**：根级探针 paint 量得视口 → `on_next_
+//!   frame` 自排一帧消费（pdf_pages 同款纪律）——Ready 后无任何
+//!   输入/回调也必须开始派单（缺此通知 = 条带永远「渲染中」）；
+//!   视口变更（缩放/窗口调整）同径再消费。在途 tile 超时（15s）
+//!   重派一次，再超转失败面——无进展不无限「渲染中」。
+//! - **会话面 seam（#186）**：`TileSession` trait 收拢 tile 派单/几何
+//!   重查/回执拉取——生产 `DocxLokSession`，测试注桩（真实窗口
+//!   绘制链回归，不依赖 LO 运行时、不手工塞 viewport_size）。
 //!
 //! **边界（如实）**：只读渲染（键鼠输入 C3、保存 C4）；跳页待 B 线
 //! 页面几何 op（#49 已登记）。内核缺失/装载失败 → 明确错误面板 +
@@ -37,7 +45,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, DispatchPhase, FocusHandle, Focusable, ImageSource,
@@ -59,8 +67,14 @@ use crate::editor::docx_lok_session::{DocxLokSession, SessionError, SessionReply
 const CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// 回执轮询周期（16ms——pdf_pages `POLL_INTERVAL` 同款）。
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
-/// #186 派单看门狗拍数（≈2 秒无 tile 进账 → 一次全量重派；再 2 秒
-/// → 在途条带转失败——「无进展时明确失败/重试，不无限渲染中」）。
+/// #186 tile 在途超时（无进展不无限「渲染中」——超时清出在途，未过
+/// 尝试上限由下一拍 `submit_visible` 重派；较全局看门狗精确到键——
+/// 单带悬死不被其余回执掩盖）。
+const TILE_PENDING_TIMEOUT: Duration = Duration::from_secs(15);
+/// #186 同键最大尝试数（首次 + 重派 1 次；再超时 → 失败面明示）。
+const TILE_MAX_ATTEMPTS: u32 = 2;
+/// #186 派单看门狗拍数（≈2 秒无任何 tile 进账 → 一次全量重派兜底——
+/// 与每键超时并存：键级超时管单带悬死，全局看门狗管整链零回执）。
 const WATCHDOG_TICKS: u32 = 125;
 /// 滚轮缩放步进倍率（每「行」——pdf `PDF_ZOOM_WHEEL_STEP` 同值）。
 const DOCX_ZOOM_WHEEL_STEP: f32 = 1.1;
@@ -88,6 +102,51 @@ fn bgra_to_image(bgra: &[u8], width: usize, height: usize) -> Option<gpui::Rende
         Frame::new(buffer),
         1,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// 会话面（#186 显示链测试 seam）
+// ---------------------------------------------------------------------------
+
+/// 会话面：tile 派单/几何重查/回执拉取。生产 = [`DocxLokSession`]（线程
+/// 演员包装，`open_blocking` 真链）；测试注桩（tests 模块 `MockSession`）
+/// ——真实窗口绘制链回归不依赖 LO 运行时、不手工塞 viewport_size。
+pub(crate) trait TileSession: Send {
+    /// 提交 tile 渲染（画布 px + 区域 twips——`DocSession::paint` 契约）。
+    /// 返回对账 seq（回执 `SessionReply::Tile` 对号入座）。
+    fn request_tile(
+        &self,
+        canvas_w: usize,
+        canvas_h: usize,
+        tile_x: i32,
+        tile_y: i32,
+        tile_w: i32,
+        tile_h: i32,
+    ) -> u64;
+    /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机）。
+    fn request_size(&self);
+    /// 非阻塞收回执（16ms drain 拉取）。
+    fn try_recv(&self) -> Option<SessionReply>;
+}
+
+impl TileSession for DocxLokSession {
+    fn request_tile(
+        &self,
+        canvas_w: usize,
+        canvas_h: usize,
+        tile_x: i32,
+        tile_y: i32,
+        tile_w: i32,
+        tile_h: i32,
+    ) -> u64 {
+        Self::request_tile(self, canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h)
+    }
+    fn request_size(&self) {
+        Self::request_size(self);
+    }
+    fn try_recv(&self) -> Option<SessionReply> {
+        Self::try_recv(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +187,8 @@ pub struct DocxPagesView {
     boot: Boot,
     /// 打开线程回传通道（会话句柄/打开错误；终态置 None）。
     open_rx: Option<Receiver<Result<DocxLokSession, SessionError>>>,
-    session: Option<DocxLokSession>,
+    /// 会话（TileSession 面持有——生产 DocxLokSession；测试注桩）。
+    session: Option<Box<dyn TileSession>>,
     /// 文档几何（twips——Ready 后有效）。
     doc_size: Option<(i64, i64)>,
     /// 缩放档（C2——pdf #421 同构；默认适宽 = v1 行为零变化）。
@@ -142,8 +202,11 @@ pub struct DocxPagesView {
     /// LRU 序（队首冷——逐出依据）。
     cache_order: VecDeque<(u32, u32)>,
     cache_bytes: usize,
-    /// 派单在途（seq → 条带键——回执 seq 对账）。
-    pending: HashMap<u64, (u32, u32)>,
+    /// 派单在途（seq → (条带键, 派单时刻)——回执 seq 对账 + 超时巡检）。
+    pending: HashMap<u64, ((u32, u32), Instant)>,
+    /// 同键尝试计数（超时重派次数——过 `TILE_MAX_ATTEMPTS` 转失败面；
+    /// 失效/换尺寸/回执成功即清零）。
+    attempts: HashMap<(u32, u32), u32>,
     /// 单次失败登记（同键不重派——诚实失败面；失效/换档即清）。
     failed: HashSet<(u32, u32)>,
     polling: bool,
@@ -192,6 +255,7 @@ impl DocxPagesView {
             cache_order: VecDeque::new(),
             cache_bytes: 0,
             pending: HashMap::new(),
+            attempts: HashMap::new(),
             failed: HashSet::new(),
             // 轮询循环在首次 render 起表（Context 语义——App 面无法
             // spawn 实体任务；渲染即驱动，pdf_pages 同源纪律）。
@@ -423,7 +487,7 @@ impl DocxPagesView {
                         "docx-pages: 会话句柄就绪（{}）——等待 load/Ready…",
                         session.path().display()
                     );
-                    self.session = Some(session);
+                    self.session = Some(Box::new(session));
                     self.open_rx = Some(rx);
                 }
                 Ok(Err(err)) => {
@@ -444,6 +508,10 @@ impl DocxPagesView {
                 }
             }
         }
+
+        // ---- 1.5) 在途超时巡检（#186：无进展不无限「渲染中」——键级
+        // 超时清出在途并计次，未过尝试上限由下一拍 submit_visible 重派）----
+        self.expire_stale_pending(cx);
 
         // ---- 2) 视口探针收口（#186——置于会话检查前：Ready 但会话尚未
         // 建立的窗口期同样需要视口进位，且无会话时 submit_visible 自身
@@ -484,6 +552,7 @@ impl DocxPagesView {
                     eprintln!("docx-pages: 会话失败（{stage}）：{message}");
                     self.session = None;
                     self.pending.clear();
+                    self.attempts.clear();
                     self.boot = Boot::Failed { stage, message };
                     cx.notify();
                 }
@@ -491,6 +560,7 @@ impl DocxPagesView {
                     eprintln!("docx-pages: worker 死亡：{detail}");
                     self.session = None;
                     self.pending.clear();
+                    self.attempts.clear();
                     self.boot = Boot::Failed {
                         stage: "died",
                         message: detail,
@@ -506,9 +576,10 @@ impl DocxPagesView {
                     stats,
                     elapsed_ms,
                 } => {
-                    let Some(key) = self.pending.remove(&seq) else {
+                    let Some((key, _)) = self.pending.remove(&seq) else {
                         continue; // 迟到 tile（失效/换代竞态）——机械丢弃。
                     };
+                    self.attempts.remove(&key);
                     eprintln!(
                         "docx-pages: tile band={} w={} {width}x{height}px sha={sha256} \
                          paint_ms={elapsed_ms} non_white={:.4} colored={:.4}",
@@ -563,7 +634,8 @@ impl DocxPagesView {
                         "docx-pages: #186 看门狗——重派后仍无 tile 进账，在途条带\
                          转失败（不无限渲染中）"
                     );
-                    let bands: Vec<(u32, u32)> = self.pending.values().copied().collect();
+                    let bands: Vec<(u32, u32)> =
+                        self.pending.values().map(|(key, _)| *key).collect();
                     self.pending.clear();
                     for key in bands {
                         self.failed.insert(key);
@@ -585,6 +657,47 @@ impl DocxPagesView {
                 cx.notify();
             }
         }
+    }
+
+    /// 在途超时巡检（#186：每 16ms 拍随 drain）。超时条目离在途：未过
+    /// 尝试上限 → 下一帧 `submit_visible` 重派（本巡检 notify 驱动那一
+    /// 帧）；过限 → 失败面（占位框明示「渲染失败」——invalidate/换档
+    /// 换光栅宽可重试）。巡检后到的迟到 tile 对不上号——机械丢弃。
+    fn expire_stale_pending(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let expired: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, at))| now.duration_since(*at) >= TILE_PENDING_TIMEOUT)
+            .map(|(seq, _)| *seq)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for seq in expired {
+            let Some((key, _)) = self.pending.remove(&seq) else {
+                continue;
+            };
+            let attempts = self.attempts.entry(key).or_insert(0);
+            *attempts += 1;
+            if *attempts >= TILE_MAX_ATTEMPTS {
+                eprintln!(
+                    "docx-pages: tile band={} rw={} 重派后仍 {}s 无回执——转失败面",
+                    key.0,
+                    key.1,
+                    TILE_PENDING_TIMEOUT.as_secs()
+                );
+                self.failed.insert(key);
+            } else {
+                eprintln!(
+                    "docx-pages: tile band={} rw={} 在途 {}s 无回执——清出在途待重派",
+                    key.0,
+                    key.1,
+                    TILE_PENDING_TIMEOUT.as_secs()
+                );
+            }
+        }
+        cx.notify();
     }
 
     /// 内核回调分派（C2 面：缓存失效/几何重查；其余登记——C3 命令态）。
@@ -644,7 +757,9 @@ impl DocxPagesView {
                 self.cache_order.retain(|(band, _)| !range.contains(band));
                 self.cache_bytes = self.cache_costs.values().sum();
                 self.failed.retain(|(band, _)| !range.contains(band));
-                self.pending.retain(|_, (band, _)| !range.contains(band));
+                self.pending
+                    .retain(|_, ((band, _), _)| !range.contains(band));
+                self.attempts.retain(|(band, _), _| !range.contains(band));
                 n
             }
         }
@@ -658,6 +773,7 @@ impl DocxPagesView {
         self.cache_order.clear();
         self.cache_bytes = 0;
         self.pending.clear();
+        self.attempts.clear();
         self.failed.clear();
     }
 
@@ -759,7 +875,7 @@ impl DocxPagesView {
             let key = (band as u32, rw);
             if self.cache.contains_key(&key)
                 || self.failed.contains(&key)
-                || self.pending.values().any(|k| *k == key)
+                || self.pending.values().any(|(k, _)| *k == key)
             {
                 continue;
             }
@@ -767,10 +883,12 @@ impl DocxPagesView {
                 todo.push((key, geom));
             }
         }
-        // 相 2（会话借用 + pending 写入——字段不相交）。
+        // 相 2（会话借用 + pending 写入——字段不相交）。派单一批一条
+        // 汇总日志（#186 同次可追踪证据：视口/偏移/光栅宽/带区间/在途）。
         if !todo.is_empty()
             && let Some(session) = &self.session
         {
+            let mut dispatched = 0usize;
             for (key, geom) in todo {
                 let seq = session.request_tile(
                     geom.canvas_w as usize,
@@ -780,8 +898,14 @@ impl DocxPagesView {
                     geom.tile_w,
                     geom.tile_h,
                 );
-                self.pending.insert(seq, key);
+                self.pending.insert(seq, (key, Instant::now()));
+                dispatched += 1;
             }
+            eprintln!(
+                "docx-pages: 派单 +{dispatched}（视口 {vw:.0}x{vh:.0} 偏移 y={offset_y:.0} \
+                 rw={rw} band {first}..{last}）→ 在途共 {}",
+                self.pending.len()
+            );
         }
     }
 
@@ -813,8 +937,16 @@ impl DocxPagesView {
                 .into_any_element(),
             None => {
                 let failed = self.failed.contains(&key);
+                // 在途已派单时长（无进展可见——#186：不无限「渲染中」；
+                // 超时面见 expire_stale_pending）。
+                let pending_secs = self
+                    .pending
+                    .values()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, at)| at.elapsed().as_secs());
                 div()
                     .id(gpui::SharedString::from(format!("docx-band-pending-{idx}")))
+                    .debug_selector(move || format!("docx-band-pending-{idx}"))
                     .w(px(slot_w))
                     .h(px(slot_h))
                     .flex_none()
@@ -826,7 +958,13 @@ impl DocxPagesView {
                     .justify_center()
                     .child(
                         ui::Label::new(if failed {
-                            format!("条带 {band_no} 渲染失败")
+                            format!(
+                                "条带 {band_no} 渲染失败（{}s×{} 无回执）",
+                                TILE_PENDING_TIMEOUT.as_secs(),
+                                TILE_MAX_ATTEMPTS
+                            )
+                        } else if let Some(secs) = pending_secs {
+                            format!("条带 {band_no} 渲染中…（已 {secs}s）")
                         } else {
                             format!("条带 {band_no} 渲染中…")
                         })
@@ -1068,7 +1206,7 @@ impl Render for DocxPagesView {
         let entity = cx.entity().downgrade();
         let viewport_cell = self.viewport.clone();
         let zoom_entity = entity.clone();
-        let notify_entity = entity.clone();
+        let probe_entity = entity.clone();
         let (vw, _) = self.viewport_size;
         let rw = self.raster_width(if vw > 0. { vw } else { 256. });
         let count = band_count(w_tw, h_tw, rw);
@@ -1114,8 +1252,9 @@ impl Render for DocxPagesView {
             .child(zoom_chip)
             // 根级视口探针：透明、绝对铺满——paint 期回写真视口尺寸
             //（C1 的每带探针记录的是条带尺寸，可见窗口推导被矮化——
-            // 本批改根级口径）+ Ctrl+滚轮 capture 期拦截（缩放——
-            // 止冒泡防列表滚动，pdf #421 同款）。
+            // 本批改根级口径）+ 量得变更即自排一帧（#186：Ready 后
+            // 无输入也必须派单——pdf_pages 同款纪律）+ Ctrl+滚轮
+            // capture 期拦截（缩放——止冒泡防列表滚动，pdf #421 同款）。
             .child(
                 div()
                     .id("docx-viewport-probe")
@@ -1124,6 +1263,10 @@ impl Render for DocxPagesView {
                     .inset_0()
                     .size_full()
                     .child(
+                        // canvas 显式满尺寸：`Style::default()` 的块级子元素
+                        // height:auto 会塌成 0（测试窗实测 800×0——#186 定位
+                        // 线索「canvas 未显式设置尺寸」证实）。显式 size_full
+                        // 确定性铺满探针 div——全平台一致，不赌平台布局差异。
                         gpui::canvas(
                             move |bounds, _window, _cx| bounds,
                             move |bounds: gpui::Bounds<gpui::Pixels>,
@@ -1132,16 +1275,25 @@ impl Render for DocxPagesView {
                                   _cx: &mut App| {
                                 let measured =
                                     (f32::from(bounds.size.width), f32::from(bounds.size.height));
-                                if measured.0 > 0. && measured.1 > 0. {
+                                if measured.0 > 0.
+                                    && measured.1 > 0.
+                                    && viewport_cell.get() != Some(measured)
+                                {
                                     viewport_cell.set(Some(measured));
+                                    eprintln!(
+                                        "docx-pages: viewport 探针 {:.0}x{:.0}px（变更——下一帧消费）",
+                                        measured.0, measured.1
+                                    );
+                                    // Paint 不能更新被借用的视图——量得的视口
+                                    // 要到下一帧才进 submit_visible 派单，必须
+                                    // 自排一帧后续帧（pdf_pages 同款纪律）；
+                                    // 缺此通知 = #186：Ready 后永不派单，
+                                    // 条带永远「渲染中」。refresh_viewport
+                                    // 轮询拍收口是第二保险（不依赖帧时机）。
+                                    window.on_next_frame(move |_, cx| {
+                                        let _ = probe_entity.update(cx, |_, cx| cx.notify());
+                                    });
                                 }
-                                // #186：测量→下一帧通知（PDF 探针同款——paint
-                                // 不能借用期改实体；refresh_viewport 轮询拍收口
-                                // 是第二保险，此处让 render 立即跟上：新视口
-                                // 下一帧即被 submit_visible 消费）。
-                                window.on_next_frame(move |_, cx| {
-                                    let _ = notify_entity.update(cx, |_, cx| cx.notify());
-                                });
                                 // Ctrl+滚轮缩放——capture 期窗口级拦截
                                 //（先于 uniform_list 滚动消费；横向手势不拦
                                 //——冒泡照常滚动；control||platform 归一）。
@@ -1153,14 +1305,17 @@ impl Render for DocxPagesView {
                                         if phase != DispatchPhase::Capture {
                                             return;
                                         }
-                                        if !(event.modifiers.control || event.modifiers.platform) {
+                                        if !(event.modifiers.control || event.modifiers.platform)
+                                        {
                                             return;
                                         }
                                         if !bounds.contains(&event.position) {
                                             return;
                                         }
                                         let (dx, dy) = match event.delta {
-                                            ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
+                                            ScrollDelta::Pixels(p) => {
+                                                (p.x.as_f32(), p.y.as_f32())
+                                            }
                                             ScrollDelta::Lines(l) => {
                                                 (l.x * WHEEL_LINE_PX, l.y * WHEEL_LINE_PX)
                                             }
@@ -1202,6 +1357,7 @@ fn band_wrapper(slot: AnyElement, idx: usize) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::docx_lok_session::TileStats;
 
     /// Boot 判据：内核缺失阶段名（宿主回流口径）。
     #[test]
@@ -1300,7 +1456,8 @@ mod tests {
         });
         let path = std::env::temp_dir().join(format!("mdc-docx-zoom-{}.docx", std::process::id()));
         let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
-        // 直接注入 Ready 态 + A4 几何 + 视口（视图态机面——真链由
+        // 直接注入 Ready 态 + A4 几何 + 视口（视图态机面——显示链真窗口
+        // 回归见 cold_start_renders_tiles_via_real_probe；LO 真链由
         // docx_lok_session::real_runtime_* 锁定）。
         view.update(cx, |v, _| {
             v.doc_size = Some((11906, 16838));
@@ -1372,7 +1529,8 @@ mod tests {
                 v.cache_insert((band, 512), img(), 16);
             }
             v.failed.insert((1, 1024));
-            v.pending.insert(999, (2, 1024));
+            v.pending
+                .insert(999, ((2, 1024), std::time::Instant::now()));
         });
         // 条带 1 区域的 twips 矩形（1024px 档 A4：条带 0 ≈ [0, 5907)）。
         view.update(cx, |v, cx| {
@@ -1391,7 +1549,7 @@ mod tests {
                 "失败登记随失效清除（可重试）"
             );
             assert!(
-                v.pending.values().any(|k| *k == (2, 1024)),
+                v.pending.values().any(|(k, _)| *k == (2, 1024)),
                 "条带 2 不在矩形内——在途保留"
             );
         });
@@ -1441,134 +1599,376 @@ mod tests {
         });
     }
 
-    /// #186 回归（真机根因——探针写 Cell 后无收口）：**不手工塞
-    /// viewport_size**——视图经真实 window 绘制（根级探针 canvas paint
-    /// 写 Cell），`refresh_viewport` 在轮询拍收口：视口进位 + 可见
-    /// 条带全部派单（pending 非空）。锁「测量→派单」闭环由探针/轮询
-    /// 驱动，交互不再前置。
-    #[gpui::test]
-    fn viewport_probe_to_submit_closed_by_poll_tick(cx: &mut gpui::TestAppContext) {
-        cx.update(|app| {
-            theme::init(theme::LoadThemes::JustBase, app);
-            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
-        });
-        let path = std::env::temp_dir().join(format!("mdc-docx-186-{}.docx", std::process::id()));
-        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
-        // 只注入 Ready + 几何 + 哑会话——viewport_size 保持 (0,0)（真机
-        // 首帧口径）。open_rx 取走：禁真实打开链（不存在的路径会让后台
-        // 线程回 Failed 覆盖注入态——真链由 docx_lok_session::real_runtime_*
-        // 与 bad_path_lands_in_failed_boot 分别锁定，本测试只锁显示链）。
-        view.update(cx, |v, _| {
-            v.doc_size = Some((11906, 16838));
-            v.boot = Boot::Ready;
-            v.open_rx = None;
-            v.session = Some(DocxLokSession::dummy_for_test(std::path::Path::new(
-                "dummy.docx",
-            )));
-        });
-        struct Host(gpui::Entity<DocxPagesView>);
-        impl gpui::Render for Host {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-                gpui::div().size_full().child(self.0.clone())
+    // -----------------------------------------------------------------
+    // #186：C2 显示链真实窗口回归（探针测量 → 自排帧 → 派单 → 回执
+    // 缓存 → 位图入树；MockSession 注桩——不手工塞 viewport_size、
+    // 不依赖 LO 运行时）
+    // -----------------------------------------------------------------
+
+    /// 派单参数记录（canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h）。
+    type TileRequest = (usize, usize, i32, i32, i32, i32);
+
+    /// #186 测试注桩会话（TileSession seam）：记录派单参数（对账 seq
+    /// = 记录序）；预置回执队列逐条弹出；`auto_reply` = 派单即回 2×2
+    /// tile（全绿路径）。Arc 字段共享——clone 后状态同源。
+    #[derive(Clone)]
+    struct MockSession {
+        requests: Arc<std::sync::Mutex<Vec<TileRequest>>>,
+        replies: Arc<std::sync::Mutex<VecDeque<SessionReply>>>,
+        auto_reply: bool,
+    }
+
+    impl MockSession {
+        fn new(auto_reply: bool) -> Self {
+            Self {
+                requests: Arc::default(),
+                replies: Arc::default(),
+                auto_reply,
             }
         }
-        let window = cx.open_window(gpui::size(px(1024.), px(600.)), {
-            let view = view.clone();
-            move |_, _| Host(view)
-        });
-        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
-        // 首帧绘制：render（viewport_size=(0,0)——submit 空）+ 探针
-        // canvas paint 写 Cell（真实测量路径——无手工赋值）。绘两帧：
-        // 探针 bounds 在 layout 后一帧才定（与真实帧循环同构）。
-        visual.update(|window, app| window.draw(app).clear(app));
-        visual.update(|window, app| window.draw(app).clear(app));
-        // 轮询拍收口（#186 修复面）：drain 内 refresh_viewport 读
-        // Cell → 视口进位 → submit_visible 派单可见条带。
-        view.update(cx, |v, cx| v.drain_for_test(cx));
-        view.read_with(cx, |v, _| {
-            assert!(
-                v.viewport_size.0 > 0. && v.viewport_size.1 > 0.,
-                "探针测量进位 viewport_size（真机根因：Ready 后视口 0x0）: {:?}",
-                v.viewport_size
-            );
-            assert_eq!(v.viewport_seen, v.viewport_size, "变化检测基线同步");
-            assert!(
-                !v.pending.is_empty(),
-                "可见条带必须派单（真机日志无 tile 返回 = 从未派单）: pending={:?}",
-                v.pending.len()
-            );
-        });
-        // 幂等：视口稳定后重复拍不再重派（零额外渲染——变化才 notify）。
-        let pending_before = view.read_with(cx, |v, _| v.pending.len());
-        view.update(cx, |v, cx| v.drain_for_test(cx));
-        view.read_with(cx, |v, _| {
-            assert_eq!(
-                v.pending.len(),
-                pending_before,
-                "视口稳定拍不重派（同键去重）"
-            );
+    }
+
+    impl TileSession for MockSession {
+        fn request_tile(
+            &self,
+            canvas_w: usize,
+            canvas_h: usize,
+            tile_x: i32,
+            tile_y: i32,
+            tile_w: i32,
+            tile_h: i32,
+        ) -> u64 {
+            let mut reqs = self.requests.lock().unwrap();
+            reqs.push((canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h));
+            let seq = reqs.len() as u64;
+            if self.auto_reply {
+                self.replies.lock().unwrap().push_back(SessionReply::Tile {
+                    seq,
+                    width: 2,
+                    height: 2,
+                    bgra: Arc::new(vec![0u8; 16]),
+                    sha256: "mock".into(),
+                    stats: TileStats {
+                        unique_colors: 1,
+                        non_white_ratio: 0.5,
+                        colored_ratio: 0.5,
+                    },
+                    elapsed_ms: 1,
+                });
+            }
+            seq
+        }
+        fn request_size(&self) {}
+        fn try_recv(&self) -> Option<SessionReply> {
+            self.replies.lock().unwrap().pop_front()
+        }
+    }
+
+    /// 测试宿主（视图满窗——探针量得真实窗口尺寸）。
+    struct ChainHost(gpui::Entity<DocxPagesView>);
+
+    impl gpui::Render for ChainHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// 注桩：清打开通道（真实 open 线程对不存在路径快速失败——本组
+    /// 测试聚焦显示链，不与 Starting→Failed 竞态）；mock 会话接管
+    /// 派单/回执。Ready 经 mock 回执驱动（冷启动真实转换面）。
+    fn inject_mock(
+        view: &gpui::Entity<DocxPagesView>,
+        cx: &mut gpui::TestAppContext,
+        mock: &MockSession,
+    ) {
+        view.update(cx, |v, _| {
+            v.open_rx = None;
+            v.session = Some(Box::new(mock.clone()));
         });
     }
 
-    /// #186 看门狗：Ready 且视口在位但长时间无 tile 进账 → 一次全量
-    /// 重派；重派后仍无进账 → 在途条带转失败（不无限「渲染中」）。
-    /// 视口经探针路径（同上测试），失败路径不手工注入 pending 键。
+    /// 泵到首笔派单（冷链：mock Ready 回执 → Ready 树（探针入树）→
+    /// paint 量得视口 → 自排帧 → submit_visible 真派单）。返回首笔
+    /// 派单后的总派单数。
+    fn pump_until_dispatched(
+        cx: &mut gpui::TestAppContext,
+        visual: &mut gpui::VisualTestContext,
+        view: &gpui::Entity<DocxPagesView>,
+        mock: &MockSession,
+    ) -> usize {
+        // 帧 1：起表（轮询循环首次 render 起表——App 面无法 spawn）。
+        visual.update(|window, app| window.draw(app).clear(app));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(cx, |v, _| matches!(v.boot(), Boot::Ready)) {
+                break;
+            }
+        }
+        assert!(
+            view.read_with(cx, |v, _| matches!(v.boot(), Boot::Ready)),
+            "mock Ready 回执必须到达（冷启动转换面）"
+        );
+        // 帧 2：Ready 树入树——本帧 submit_visible 仍无量得视口（守卫
+        // 早退）；探针 paint 量得真实窗口尺寸并自排一帧。
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            view.read_with(cx, |v, _| v
+                .viewport
+                .get()
+                .is_some_and(|(w, h)| w > 0. && h > 0.)),
+            "真实 layout/paint 必须量得非空 docx 视口（canvas 无尺寸假说在此否证/证实）"
+        );
+        assert!(
+            visual.update(|window, app| window.simulate_next_frame(app)) > 0,
+            "首帧量得视口必须自排后续帧——等输入才派单 = #186 条带永远「渲染中」"
+        );
+        // 帧 3：submit_visible 消费视口 → 真派单。
+        visual.update(|window, app| window.draw(app).clear(app));
+        let n = mock.requests.lock().unwrap().len();
+        assert!(n > 0, "Ready + 量得视口后必须已派单（零输入驱动）");
+        n
+    }
+
+    /// #186 核心：真实窗口冷启动全链——Starting →（mock Ready 回执）
+    /// → Ready 树（探针入树）→ paint 量得视口 → on_next_frame 自排
+    /// → submit_visible 真派单（FitWidth 光栅宽 = 量化视口）→（mock
+    /// tile 回执）→ 缓存命中 → 位图入真实渲染树（占位框让位）。全
+    /// 程零输入事件、零手工 viewport 注入；稳态不自排帧（无永久动
+    /// 画环）。
     #[gpui::test]
-    fn watchdog_repends_once_then_fails_bands(cx: &mut gpui::TestAppContext) {
+    fn cold_start_renders_tiles_via_real_probe(cx: &mut gpui::TestAppContext) {
         cx.update(|app| {
             theme::init(theme::LoadThemes::JustBase, app);
             theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
         });
-        let path = std::env::temp_dir().join(format!("mdc-docx-wd-{}.docx", std::process::id()));
+        let path = std::env::temp_dir().join(format!("mdc-docx-chain-{}.docx", std::process::id()));
+        let mock = MockSession::new(true);
         let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
-        // 同上：禁真实打开链（open_rx 取走）+ 哑会话——本测试锁看门狗态机。
-        view.update(cx, |v, _| {
-            v.doc_size = Some((11906, 16838));
-            v.boot = Boot::Ready;
-            v.open_rx = None;
-            v.session = Some(DocxLokSession::dummy_for_test(std::path::Path::new(
-                "dummy.docx",
-            )));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
         });
-        struct Host(gpui::Entity<DocxPagesView>);
-        impl gpui::Render for Host {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-                gpui::div().size_full().child(self.0.clone())
-            }
-        }
-        let window = cx.open_window(gpui::size(px(1024.), px(600.)), {
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
             let view = view.clone();
-            move |_, _| Host(view)
+            move |_, _| ChainHost(view)
         });
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let n0 = pump_until_dispatched(cx, &mut visual, &view, &mock);
+        // 派单口径：FitWidth 光栅宽 = 量化(视口 800)（真探针读数，非手工值）。
+        let first_rw = mock.requests.lock().unwrap()[0].0;
+        assert_eq!(
+            first_rw,
+            quantize_width(800) as usize,
+            "首笔派单光栅宽必须走真探针口径（FitWidth = 量化视口宽）"
+        );
+        // 泵轮询：auto tile 回执 → 缓存命中。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0) {
+                break;
+            }
+        }
+        assert!(
+            view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0),
+            "mock tile 回执必须入缓存（在途 {}笔，已派 {}笔）",
+            view.read_with(cx, |v, _| v.pending_for_test()),
+            n0
+        );
+        // 帧 4：位图入真实渲染树（占位框让位）。
         visual.update(|window, app| window.draw(app).clear(app));
-        // 探针收口拍（派单发生）。
-        view.update(cx, |v, cx| v.drain_for_test(cx));
-        let dispatched = view.read_with(cx, |v, _| v.pending.len());
-        assert!(dispatched > 0, "首拍派单发生");
-        // 无 tile 进账的连续拍 → 第一次看门狗触发：全量重派（pending 清
-        // 空后立即补——数量恢复）。
-        for _ in 0..WATCHDOG_TICKS {
-            view.update(cx, |v, cx| v.drain_for_test(cx));
-        }
-        view.read_with(cx, |v, _| {
-            assert!(v.watchdog_retried, "看门狗重派已触发（仅一次）");
-            assert!(
-                v.pending.len() >= dispatched,
-                "重派补回可见条带（数量不降）"
-            );
+        let band = visual
+            .debug_bounds("docx-visible-band-0")
+            .expect("缓存命中的条带必须进入真实渲染树");
+        assert!(
+            band.size.width > px(100.) && band.size.height > px(100.),
+            "条带槽必须占可见尺寸（512px 条带满宽）"
+        );
+        assert!(
+            visual.debug_bounds("docx-band-pending-0").is_none(),
+            "缓存命中后占位框必须让位给位图"
+        );
+        // 稳态：视口不变 → 不再自排帧（无永久动画环）。
+        assert_eq!(
+            visual.update(|window, app| window.simulate_next_frame(app)),
+            0,
+            "视口不变不得形成常驻动画环"
+        );
+    }
+
+    /// #186：窗口调整 → 探针重量（变更守卫）→ 自排帧 → 新视口口径
+    /// 再派单（800×600 → 1000×700：光栅宽 832 → 1024）。验收面
+    /// 「窗口调整后能首屏派单」。
+    #[gpui::test]
+    fn resize_remeasures_and_redispatches(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
         });
-        // 重派后仍无进账 → 第二轮看门狗：在途转失败（诚实失败面）。
-        for _ in 0..WATCHDOG_TICKS {
-            view.update(cx, |v, cx| v.drain_for_test(cx));
-        }
-        view.read_with(cx, |v, _| {
-            assert!(v.pending.is_empty(), "第二轮：在途清空（转失败）");
-            assert!(
-                !v.failed.is_empty(),
-                "条带呈现失败态（不无限渲染中）: failed={}",
-                v.failed.len()
-            );
+        let path =
+            std::env::temp_dir().join(format!("mdc-docx-resize-{}.docx", std::process::id()));
+        let mock = MockSession::new(false); // 无回执——聚焦再派单口径
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
         });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let n0 = pump_until_dispatched(cx, &mut visual, &view, &mock);
+        // 窗口调整（模拟平台 resize 回调）。
+        visual.simulate_resize(gpui::size(px(1000.), px(700.)));
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert!(
+            view.read_with(cx, |v, _| v.viewport.get() == Some((1000., 700.))),
+            "resize 后探针必须重量新视口（变更守卫更新 Cell）"
+        );
+        assert!(
+            visual.update(|window, app| window.simulate_next_frame(app)) > 0,
+            "视口变更必须自排后续帧（消费新口径）"
+        );
+        visual.update(|window, app| window.draw(app).clear(app));
+        let reqs = mock.requests.lock().unwrap().clone();
+        assert!(
+            reqs.len() > n0,
+            "新视口必须触发再派单（旧键在途/缓存不计入 todo——新光栅宽新键）"
+        );
+        assert_eq!(
+            reqs.last().unwrap().0,
+            quantize_width(1000) as usize,
+            "再派单光栅宽 = 量化(新视口 1000)"
+        );
+    }
+
+    /// #186：缩放换档 → 新光栅宽键域再派单（热启动面；1200 宽窗口
+    /// FitWidth 1216 ≠ ActualSize 832——口径可区分）。验收面「缩放后
+    /// 能首屏派单」。
+    #[gpui::test]
+    fn zoom_change_redispatches_new_raster(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path =
+            std::env::temp_dir().join(format!("mdc-docx-zoomrd-{}.docx", std::process::id()));
+        let mock = MockSession::new(false);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(1200.), px(800.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let n0 = pump_until_dispatched(cx, &mut visual, &view, &mock);
+        assert_eq!(
+            mock.requests.lock().unwrap()[0].0,
+            quantize_width(1200) as usize,
+            "1200 宽窗口 FitWidth 光栅宽 = 量化(1200)"
+        );
+        // Ctrl+1 实际大小（视口命令键域同源入口）。
+        view.update(cx, |v, cx| {
+            assert!(v.dispatch_zoom_key("1", true, false, cx));
+        });
+        visual.update(|window, app| window.draw(app).clear(app));
+        let reqs = mock.requests.lock().unwrap().clone();
+        assert!(reqs.len() > n0, "换档后必须再派单（新光栅宽新键域）");
+        assert_eq!(
+            reqs.last().unwrap().0,
+            quantize_width((11906 / 15) as u32) as usize,
+            "实际大小光栅宽 = 量化(文档名义宽 793)"
+        );
+    }
+
+    /// #186：在途超时——重派一次，再超转失败面（不无限「渲染中」）。
+    /// 回拨派单时刻（真实 Instant）绕开 15s 等待；drain 直驱巡检。
+    #[gpui::test]
+    fn pending_timeout_redispatches_then_fails(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-tmo-{}.docx", std::process::id()));
+        let mock = MockSession::new(false); // 永不回执——卡在途面
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let n0 = pump_until_dispatched(cx, &mut visual, &view, &mock);
+        // 回拨：全部在途条目判超时 → drain 巡检（未过限——清出待重派）。
+        // 注：drain 的 notify 会触发测试窗自动重绘——重派在返回前即发生，
+        // 可观测面取确定性状态（attempts/failed/派单计数），不赌在途瞬时值。
+        view.update(cx, |v, _| {
+            for (_, at) in v.pending.values_mut() {
+                *at = Instant::now() - TILE_PENDING_TIMEOUT - Duration::from_secs(1);
+            }
+        });
+        view.update(cx, |v, cx| v.drain(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.attempts.len(), n0, "全部可见带登记尝试（{n0} 笔）");
+            assert!(
+                v.attempts.values().all(|a| *a == 1),
+                "首次超时 = 尝试 1（重派机会，不转失败）"
+            );
+            assert_eq!(v.failed_for_test(), 0, "首次超时不转失败");
+        });
+        // 重派发生（自动重绘或显式帧任一驱动）。
+        visual.update(|window, app| window.draw(app).clear(app));
+        let after_retry = mock.requests.lock().unwrap().len();
+        assert!(
+            after_retry > n0,
+            "超时后必须重派（首次 {n0} 笔 → 重派后 {after_retry} 笔）"
+        );
+        // 再回拨 + drain：过限 → 失败面（同键不再派）。
+        view.update(cx, |v, _| {
+            for (_, at) in v.pending.values_mut() {
+                *at = Instant::now() - TILE_PENDING_TIMEOUT - Duration::from_secs(1);
+            }
+        });
+        view.update(cx, |v, cx| v.drain(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.failed_for_test(),
+                n0,
+                "二次超时必须转失败面（不无限「渲染中」）"
+            );
+            assert!(v.attempts.values().all(|a| *a == 2), "尝试计数到上限 2");
+        });
+        visual.update(|window, app| window.draw(app).clear(app));
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            after_retry,
+            "失败面同键不重派"
+        );
     }
 }
