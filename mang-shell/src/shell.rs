@@ -532,6 +532,30 @@ impl ShellApp {
         }
         // #120：左栏渲染宽同步到恢复后的激活面板记忆宽。
         this.sync_left_width_to_active(cx);
+        // #175：启动 FILE 路径的页面视图接线——三 ensure 与
+        // `open_document_tab` 尾部同源同序（此前仅标签路径调用：双击
+        // 文件/命令行直给文件时 docx/pdf/xlsx 主显示面静默缺失，用户
+        // 拿到文本投影态 = 「打开没渲染」真机症状；产品意图「打开即
+        // 页面视图」——`docx_view_mode` 等缺省 true——在启动路径兑现）。
+        this.ensure_pdf_pages(cx);
+        this.ensure_docx_pages(cx);
+        this.ensure_xlsx_grid(cx);
+        // 主显示面为页视图/网格时焦点改落视图实体（焦点路由单源
+        // `focus_active`——编辑器不在渲染树，句柄游离则键事件死在
+        // 合成根，#422/#604 同源病灶）。
+        this.focus_active(window, cx);
+        // #175 证据面：启动路径接线结果（真机双击验收的 stderr 断言
+        // 行——与标签路径的 "docx-pages: ready" 互补，区分两条打开
+        // 通道；空启动不打印）。
+        if let Some(tab) = this.tabs.first() {
+            eprintln!(
+                "startup: page-view wiring kind={} docx_pages={} pdf_pages={} xlsx_grid={}",
+                tab.editor.read(cx).doc_kind(),
+                this.docx_pages.is_some(),
+                this.pdf_pages.is_some(),
+                this.xlsx_grid.is_some(),
+            );
+        }
         this
     }
 
@@ -4260,6 +4284,87 @@ mod tab_workflow_tests {
     fn open(shell: &Entity<ShellApp>, cx: &mut Context<ShellHost>, path: PathBuf) {
         shell.update(cx, |shell, cx| {
             shell.open_document_tab(path, cx);
+        });
+    }
+
+    /// #175：启动 FILE 路径构造（main.rs 初始文档同款——`document::
+    /// open_editor` → `ShellApp::new(Some(editor))`；区别于
+    /// `shell_window` 的空态构造与 `open` 的标签路径）。
+    fn startup_shell_window(
+        cx: &mut gpui::TestAppContext,
+        path: PathBuf,
+    ) -> (Entity<ShellApp>, gpui::WindowHandle<ShellHost>) {
+        let mut slot: Option<Entity<ShellApp>> = None;
+        let window = cx.add_window(|window, cx| {
+            let editor = match document::open_editor(&path, cx) {
+                document::OpenOutcome::Opened(ed) => ed,
+                document::OpenOutcome::Unsupported { message, .. } => {
+                    panic!("夹具类型必须支持（{}）：{message}", path.display())
+                }
+                document::OpenOutcome::Failed { message, .. } => {
+                    panic!("夹具必须可打开（{}）：{message}", path.display())
+                }
+            };
+            let shell = cx.new(|cx| ShellApp::new(Some(editor), None, window, cx));
+            slot = Some(shell.clone());
+            ShellHost(shell)
+        });
+        (slot.expect("宿主构造即置"), window)
+    }
+
+    /// #175：启动 FILE 路径的页面视图接线——`ShellApp::new(Some(
+    /// editor))` 即建对应主显示面（此前仅 `open_document_tab` 标签
+    /// 路径调用三 ensure：双击/命令行直给文件静默落文本投影态 =
+    /// 「打开没渲染」真机症状）。三格式各验一例 + md 零行为变化。
+    /// 实体存在性即接线断言（打开链在视图内异步——Ready/Failed 属
+    /// 内核链面；真机双击 worker 进程/DPI 两档/同次运行日志属 #48
+    /// 验收面，不在单测范围）。
+    #[gpui::test]
+    fn startup_file_path_wires_page_views(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let dir = fixture_dir("startup-wire");
+
+        // ① docx 启动 → LOK 页面视图实体在场（#175 旧实现恒 None）。
+        let docx = write_docx_fixture(&dir, "startup.docx");
+        let (shell, _window) = startup_shell_window(cx, docx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tab_count(), 1, "启动标签在场");
+            assert!(
+                shell.docx_pages.is_some(),
+                "启动路径 docx → 页面视图实体（#175）"
+            );
+            assert!(
+                shell.pdf_pages.is_none() && shell.xlsx_grid.is_none(),
+                "非 pdf/xlsx 不建对应实体"
+            );
+        });
+
+        // ② pdf 启动 → 页视图实体在场（同一漏接线面——一并确认）。
+        let pdf_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.pdf");
+        let pdf = dir.join("startup.pdf");
+        std::fs::copy(&pdf_src, &pdf).expect("pdf 夹具在场");
+        let (shell, _window) = startup_shell_window(cx, pdf);
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.pdf_pages.is_some(), "启动路径 pdf → 页视图实体");
+            assert!(
+                shell.docx_pages.is_none() && shell.xlsx_grid.is_none(),
+                "非 docx/xlsx 不建对应实体"
+            );
+        });
+
+        // ③ md 启动 → 零行为变化（不建任何视图实体）。
+        let md = write_md(&dir, "startup.md", "# 启动\n");
+        let (shell, _window) = startup_shell_window(cx, md);
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.docx_pages.is_none()
+                    && shell.pdf_pages.is_none()
+                    && shell.xlsx_grid.is_none(),
+                "md 启动不建视图实体（零回归）"
+            );
         });
     }
 
