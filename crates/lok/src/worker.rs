@@ -134,7 +134,7 @@ impl WorkerBoot {
 
 /// worker 主入口（bin 调用）。
 ///
-/// `fake` = Some(mode) 时走协议自测分发（无 LOK；mode ∈ echo|hang|die），
+/// `fake` = Some(mode) 时走协议自测分发（无 LOK；mode ∈ echo|hang|die|cross），
 /// 供 client/protocol 集成测试在无运行时环境恒跑。
 pub fn worker_main(boot: Option<WorkerBoot>, fake: Option<&str>) -> ! {
     // 环境卫生（双侧：宿主 spawn 时也设过；幂等）
@@ -1643,6 +1643,10 @@ fn fake_dispatch_loop(mode: &str, tx: &Sender<ToWriter>, protocol_fd: std::fs::F
         let id = protocol::req_u64(&v, "id").unwrap_or(0);
         let op = protocol::req_str(&v, "op").unwrap_or_default();
         let answer: Value = match (mode, op.as_str()) {
+            // #49 错号夹具（ely-ipc crossed-worker 同构）：任何请求都答
+            // **错号**（id+1000）——宿主 reader_loop 必须把错号应答判为
+            // 一等协议错误（判死 + 串号诊断），不得静默丢弃挂起方。
+            ("cross", _) => protocol::ok_frame(id.wrapping_add(1000), json!({"crossed": true})),
             (_, "ping") => protocol::ok_frame(id, json!({"pong": true})),
             ("edit-fails-after-first", "post_key") => {
                 edits += 1;
