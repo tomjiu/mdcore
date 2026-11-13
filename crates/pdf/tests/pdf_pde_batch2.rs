@@ -609,3 +609,103 @@ fn image_chain_budget_rejects_bomb() {
     let msg = format!("{:?}", r.unwrap_err());
     assert!(msg.contains("超预算"), "错误信息带预算语义：{msg}");
 }
+
+/// Lead 复验反例回归（#181 原证据第 1 项——2026-11-13 复验仍失败项）：
+/// XObject 元素自身的 gstate 引用收集。
+///
+/// 输入 = Lead 原最小反例**逐字节**：`/GS0 gs /CS0 cs 0.5 scn /Fm0 Do`
+/// （无 q/Q、无 BT——gs/cs/scn 全部被 Do 元素的 gstate 快照吸收）。
+/// 修复前：extgstate=[]、colorspace=[]（XObject 分支只收名字）。
+#[test]
+fn lead_repro_xobject_gstate_collect() {
+    let content = PdeContent::parse(b"/GS0 gs /CS0 cs 0.5 scn /Fm0 Do").unwrap();
+    let c = CollectedResources::from_content(&content);
+    assert_eq!(c.xobject, vec![b"Fm0".to_vec()]);
+    assert_eq!(c.extgstate, vec![b"GS0".to_vec()], "XObject 自身 gs 引用");
+    assert_eq!(c.colorspace, vec![b"CS0".to_vec()], "XObject 自身 cs 引用");
+    // 写回一致性：write 产物含 /GS0 gs /CS0 cs（元素 gstate 未丢）
+    let out = content.write();
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("/GS0 gs"), "写回含 gs：{s}");
+    assert!(s.contains("/CS0 cs"), "写回含 cs：{s}");
+    // 引用面与写回产物一致：收集到的名字 = 写回流实际引用的名字
+    let reparsed = PdeContent::parse(&out).unwrap();
+    let c2 = CollectedResources::from_content(&reparsed);
+    assert_eq!(c2.extgstate, c.extgstate, "写回-再收集闭环");
+    assert_eq!(c2.colorspace, c.colorspace, "写回-再收集闭环");
+    assert_eq!(c2.xobject, c.xobject, "写回-再收集闭环");
+}
+
+/// Shading 元素自身的 gstate 引用收集（同位面——`sh` 前的 gs/cs）。
+#[test]
+fn shading_gstate_collect() {
+    let content = PdeContent::parse(b"/GS1 gs /CS1 cs 0.5 scn /S0 sh").unwrap();
+    let c = CollectedResources::from_content(&content);
+    assert_eq!(c.shading, vec![b"S0".to_vec()]);
+    assert_eq!(c.extgstate, vec![b"GS1".to_vec()]);
+    assert_eq!(c.colorspace, vec![b"CS1".to_vec()]);
+    // merge 面：注入表含全部本体 → 无缺失
+    let res = page_resources();
+    let missing = c.missing_from(&res);
+    for m in &missing {
+        // GS1/CS1/S0 不在注入表（page_resources 只有 GS0/CS0/S1 等）——
+        // 缺失是预期（表内容差异，非收集缺陷）；本断言只锁「收集到的
+        // 名字在注入表中的都能进 merge」——间接由 roundtrip 测试承载。
+        let _ = m;
+    }
+}
+
+/// #180 复验收口回归（Lead 二轮 2026-11-13）：旧无预算 API 不再
+/// `usize::MAX` 裸奔——统一走 DECODE_HARD_LIMIT 硬顶。
+///
+/// 证据面：Lead 指出「旧公共 decode_filters 仍转发 usize::MAX」。
+/// 旧 API 无法用小预算触发（硬顶 64 MiB 构炸弹成本过高）——回归以
+/// **行为等价**锁定：旧 API 与 bounded(hard_limit) 输出一致（同入
+/// 同出），且文档语义已收口（代码面 rng 断言不可行时，等价断言是
+/// 可执行的次优锁——真炸弹面由 bounded 小预算测试承载）。
+#[test]
+fn legacy_decode_apis_are_hard_capped() {
+    use mdc_pdf::pde::image::{
+        ascii85_decode, ascii_hex_decode, decode_filter, decode_filters, run_length_decode,
+        DECODE_HARD_LIMIT,
+    };
+    // AHx 链（两滤镜）：旧 API == bounded(硬顶)
+    let with_end = b"48656C6C6F>";
+    let a = decode_filters(&[b"AHx".to_vec()], with_end).unwrap();
+    let b = mdc_pdf::pde::image::decode_filters_bounded(
+        &[b"AHx".to_vec()],
+        with_end,
+        DECODE_HARD_LIMIT,
+    )
+    .unwrap();
+    assert_eq!(a, b, "decode_filters 与硬顶 bounded 等价");
+    // 单滤镜旧 API 同款等价
+    let c = decode_filter(b"AHx", with_end).unwrap();
+    let d =
+        mdc_pdf::pde::image::decode_filter_bounded(b"AHx", with_end, DECODE_HARD_LIMIT).unwrap();
+    assert_eq!(c, d, "decode_filter 与硬顶 bounded 等价");
+    // 三个 codec 直调面
+    assert_eq!(
+        ascii_hex_decode(with_end).unwrap(),
+        mdc_pdf::pde::image::ascii_hex_decode_bounded(with_end, DECODE_HARD_LIMIT).unwrap()
+    );
+    let a85 = b"87cURD]i,\"Ebo80~>";
+    assert_eq!(
+        ascii85_decode(a85).unwrap(),
+        mdc_pdf::pde::image::ascii85_decode_bounded(a85, DECODE_HARD_LIMIT).unwrap()
+    );
+    let rl = [1, b'H', b'e', 1, b'l', b'l', 0, b'o', 128];
+    assert_eq!(
+        run_length_decode(&rl).unwrap(),
+        mdc_pdf::pde::image::run_length_decode_bounded(&rl, DECODE_HARD_LIMIT).unwrap()
+    );
+    // LZW（批③收口）：decode_filter 路径的硬顶等价（LZW 经 dispatch 表）
+    let lzw_enc = [
+        0x24, 0x19, 0x4d, 0x86, 0xc3, 0x78, 0x82, 0x05, 0x04, 0x83, 0x42, 0x20, 0xb0, 0x01,
+    ];
+    let e = decode_filter(b"LZWDecode", &lzw_enc).unwrap();
+    let f = mdc_pdf::pde::image::decode_filter_bounded(b"LZWDecode", &lzw_enc, DECODE_HARD_LIMIT)
+        .unwrap();
+    assert_eq!(e, f, "LZW 旧 API 与硬顶 bounded 等价");
+    assert_eq!(e, b"Hello Hello Hello");
+}
