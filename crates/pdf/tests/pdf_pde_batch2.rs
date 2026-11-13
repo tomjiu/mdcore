@@ -26,7 +26,7 @@ use mdc_pdf::pde::image::{decode_image_data, image_attr_num, image_filters};
 use mdc_pdf::pde::model::*;
 use mdc_pdf::pde::resources::{
     deref_xobject, resolve_content, resolve_xobject_element, CollectedResources, ResValue,
-    ResourceDict, FORM_DEPTH_LIMIT,
+    ResourceDict, XObjectKind, FORM_DEPTH_LIMIT,
 };
 
 /// 构造 form XObject 流资源：内容流 + Matrix/BBox。
@@ -437,4 +437,175 @@ fn form_keeps_name_reference() {
     .write();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("/Fm0 Do"), "写回应含 /Fm0 Do：{s}");
+}
+
+// ===== #180/#181/#182 修复轮验收（round143 双向验收面：反例全灭） =====
+
+/// #181：同一容器里两个 Form——解引用产物**全部**返回（旧实现只回
+/// 第一个，第二个 form 的编辑/写回材料整体丢失——Lead 反例）。
+#[test]
+fn container_double_form_all_kinds() {
+    let root = ResValue::Dict(vec![(
+        b"XObject".to_vec(),
+        ResValue::Dict(vec![
+            (
+                b"FmA".to_vec(),
+                form_stream(b"0 0 1 rg 0 0 10 10 re f", None, None),
+            ),
+            (
+                b"FmB".to_vec(),
+                form_stream(b"0 1 0 rg 0 0 20 20 re f", None, None),
+            ),
+        ]),
+    )]);
+    let res = ResourceDict::from_res_value(&root);
+    let content = PdeContent::parse(b"/P0 BDC q /FmA Do Q q /FmB Do Q EMC").unwrap();
+    let (resolved, kinds) = resolve_content(&content, &res).unwrap();
+    // 修复面：容器内 2 个 Do → kinds 全收（旧实现只回第一个）
+    assert_eq!(kinds.len(), 2, "同一容器两个 Form 必须都返回");
+    // 两个 kind 都是 Form 且 content 各自独立
+    assert!(kinds.iter().all(|k| matches!(k, XObjectKind::Form { .. })));
+    // 容器内元素仍为名字引用形态（写回 Do 原样）
+    match resolved.elem(0).unwrap() {
+        PdeElement::Container(c) => {
+            let xos: Vec<&Vec<u8>> = c
+                .content
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    PdeElement::XObject(x) => Some(&x.name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(xos, vec![&b"FmA".to_vec(), &b"FmB".to_vec()]);
+        }
+        _ => panic!("应为 Container"),
+    }
+}
+
+/// #181：named image 的 `/Decode [1 0]`（灰度反色）全量透传进 attrs
+/// （旧实现五项白名单——Decode 丢失，写回后图像颜色静默反转）。
+#[test]
+fn named_image_decode_array_passthrough() {
+    let stream = ResValue::Stream {
+        dict: vec![
+            (b"Type".to_vec(), ResValue::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), ResValue::Name(b"Image".to_vec())),
+            (b"Width".to_vec(), ResValue::Int(2)),
+            (b"Height".to_vec(), ResValue::Int(1)),
+            (b"BitsPerComponent".to_vec(), ResValue::Int(8)),
+            (
+                b"ColorSpace".to_vec(),
+                ResValue::Name(b"DeviceGray".to_vec()),
+            ),
+            // 反色表：0→255（Decode [1 0]——灰度分量反转）
+            (
+                b"Decode".to_vec(),
+                ResValue::Array(vec![ResValue::Int(1), ResValue::Int(0)]),
+            ),
+            // 顺带验证其他键同收（Interpolate）
+            (b"Interpolate".to_vec(), ResValue::Bool(true)),
+        ],
+        data: vec![0x10, 0x80],
+    };
+    let root = ResValue::Dict(vec![(
+        b"XObject".to_vec(),
+        ResValue::Dict(vec![(b"Im9".to_vec(), stream)]),
+    )]);
+    let res = ResourceDict::from_res_value(&root);
+    let content = PdeContent::parse(b"q /Im9 Do Q").unwrap();
+    let (resolved, _) = resolve_content(&content, &res).unwrap();
+    match resolved.elem(0).unwrap() {
+        PdeElement::Image(img) => {
+            // Decode 反色表透传（数组形态保留）
+            let decode = img.attrs.iter().find(|(k, _)| k == b"Decode");
+            let (k, v) = decode.expect("Decode 必须透传进 attrs");
+            assert_eq!(k, b"Decode");
+            match v {
+                Operand::Array(items) => {
+                    assert_eq!(items, &vec![Operand::Int(1), Operand::Int(0)]);
+                }
+                _ => panic!("Decode 应为数组形态"),
+            }
+            // Interpolate 同收
+            assert!(
+                img.attrs.iter().any(|(k, _)| k == b"Interpolate"),
+                "非白名单键全量透传"
+            );
+            // 基础五项仍在（缩写键）
+            assert!(image_attr_num(img, b"Width") == Some(2));
+        }
+        _ => panic!("应为 Image 形态"),
+    }
+}
+
+/// #181：form 递归 content 的引用收集（`from_content_with_forms`）——
+/// Lead 实测：Do 进 form，form 内部引用 GS0/CS0/F0，页级收集全空，
+/// 写回资源表丢引用。
+#[test]
+fn form_inner_refs_collected() {
+    // form 内部：gs GS0 + cs CS0 + Tf F0
+    let inner = b"/GS0 gs /CS0 cs 0.5 scn /F0 12 Tf BT 5 5 Td (Hi) Tj ET";
+    let root = ResValue::Dict(vec![(
+        b"XObject".to_vec(),
+        ResValue::Dict(vec![(b"Fm0".to_vec(), form_stream(inner, None, None))]),
+    )]);
+    let res = ResourceDict::from_res_value(&root);
+    let content = PdeContent::parse(b"q /Fm0 Do Q").unwrap();
+    let (_resolved, kinds) = resolve_content(&content, &res).unwrap();
+    assert_eq!(kinds.len(), 1);
+
+    // 旧收集面：页级只有 Fm0——form 内部引用不可见（Lead 反例）
+    let page_only = CollectedResources::from_content(&content);
+    assert!(page_only.extgstate.is_empty());
+    assert!(page_only.colorspace.is_empty());
+    assert!(page_only.font.is_empty());
+
+    // #181 修复面：from_content_with_forms 收 form 内部引用
+    let with_forms = CollectedResources::from_content_with_forms(&content, &kinds);
+    assert!(
+        with_forms.extgstate.iter().any(|n| n == b"GS0"),
+        "form 内部 gs 引用必须收集：{:?}",
+        with_forms.extgstate
+    );
+    assert!(
+        with_forms.colorspace.iter().any(|n| n == b"CS0"),
+        "form 内部 cs 引用必须收集：{:?}",
+        with_forms.colorspace
+    );
+    assert!(
+        with_forms.font.iter().any(|n| n == b"F0"),
+        "form 内部 Tf 引用必须收集：{:?}",
+        with_forms.font
+    );
+    // Do 名字（Fm0）双收（页级 + form 收集入口的页级遍历）
+    assert!(with_forms.xobject.iter().any(|n| n == b"Fm0"));
+}
+
+/// #180 集成面：链式解码预算（image 数据面入口）。
+///
+/// Lead 反例形态：11 字节输入三层链膨胀 47,662 倍。等价最小炸弹：
+/// A85 z 组（4 倍/字节）+ 小预算 → 拒绝。
+#[test]
+fn image_chain_budget_rejects_bomb() {
+    let mut attrs = vec![
+        (b"W".to_vec(), Operand::Int(4)),
+        (b"H".to_vec(), Operand::Int(4)),
+        (b"BPC".to_vec(), Operand::Int(8)),
+        (b"CS".to_vec(), Operand::Name(b"DeviceGray".to_vec())),
+        (b"F".to_vec(), Operand::Name(b"A85".to_vec())),
+    ];
+    // z×5000 + EOD：5002 输入 → 20000 输出；几何预算 4×4×8bpc/8+1 = 17
+    let data: Vec<u8> = vec![b'z'; 5000];
+    let mut enc = data;
+    enc.extend_from_slice(b"~>");
+    let img = PdeImage {
+        gstate: GState::default(),
+        attrs: std::mem::take(&mut attrs),
+        data: enc,
+    };
+    let r = decode_image_data(&img);
+    assert!(r.is_err(), "z 组炸弹必须被几何预算拒绝（17 字节上限）");
+    let msg = format!("{:?}", r.unwrap_err());
+    assert!(msg.contains("超预算"), "错误信息带预算语义：{msg}");
 }
