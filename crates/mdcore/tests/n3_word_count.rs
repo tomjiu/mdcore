@@ -229,17 +229,36 @@ fn n3_acceptance_400k_vs_python_reference() {
             .arg(&py_out)
             .output()
     };
-    let output = match run("python3") {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            run("python").expect("python3 与 python 均不可用——验收依赖 Python 参考实现")
+    // 【2026-11-13 实测】Windows 上 `python3` 常解析到 Microsoft Store 的
+    // 占位别名（%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe）——它**能被
+    // spawn**（返回 Ok），但执行返回 9009 且 **stdout/stderr 全空**。旧写法以
+    // 「spawn 成功」判定可用，于是永远走不到 `python` 兜底，最终只报一句
+    // 「count_ref.py 执行失败：」（后面什么都没有）——看起来像本机缺 Python，
+    // 实际 Python 完全可用（`python --version` 正常）。
+    //
+    // 判据改为「**真正执行成功**」：按候选顺序跑，取第一个成功的；全部失败才
+    // panic，并带每个候选的退出码与 stderr，便于区分「缺 Python」与「脚本报错」。
+    let mut failures: Vec<String> = Vec::new();
+    let mut success = false;
+    for bin in ["python3", "python"] {
+        match run(bin) {
+            Ok(o) if o.status.success() => {
+                success = true;
+                break;
+            }
+            Ok(o) => failures.push(format!(
+                "{bin}: 退出 {:?}，stdout={:?}，stderr={:?}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )),
+            Err(e) => failures.push(format!("{bin}: 无法启动（{e}）")),
         }
-        Err(e) => panic!("启动 python3 失败：{e}"),
-    };
+    }
     assert!(
-        output.status.success(),
-        "count_ref.py 执行失败：{}",
-        String::from_utf8_lossy(&output.stderr)
+        success,
+        "count_ref.py 在 python3/python 均未成功执行（Python 参考实现不可用）：\n{}",
+        failures.join("\n")
     );
 
     let rust: serde_json::Value = serde_json::from_str(&rust_json).expect("rust JSON 解析");
