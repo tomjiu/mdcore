@@ -7243,15 +7243,27 @@ mod page_view_action_honesty_tests {
             });
         });
 
-        // ② 键面：真实 Ctrl+S 管线 → 同一提示（ShellAction::Save 同链
-        //    派发——菜单/键位/命令面板三入口同一单点）。
+        // ② 键面：真实 Ctrl+S 管线 → 新提示（Lead 复验收口要求：先清
+        //    旧提示再派键——旧测试 save_tab 先生成提示后查「提示仍在」，
+        //    不能证明快捷键真正触发了路径。此处清空后按键，断言**新增**
+        //    通知（ShellAction::Save 同链派发——菜单/键位/命令面板三
+        //    入口同一单点））。
+        let _ = window.update(cx, |_host, _window, cx| {
+            shell.update(cx, |shell, _| {
+                shell.notice_board.clear();
+                assert!(
+                    shell.notice_board.message().is_none(),
+                    "派键前清空提示（前置——排除 save_tab 旧通知干扰）"
+                );
+            });
+        });
         key_down(&window, cx, "s", true);
         let _ = window.update(cx, |_host, _window, cx| {
             shell.update(cx, |shell, _| {
                 let msg = shell.notice_board.message().map(str::to_owned);
                 assert!(
                     msg.as_deref().is_some_and(|m| m.contains("只读渲染")),
-                    "Ctrl+S 页面态提示落位（真实键管线）：{msg:?}"
+                    "Ctrl+S 页面态**新增**提示（清空后真实键管线触发）：{msg:?}"
                 );
             });
         });

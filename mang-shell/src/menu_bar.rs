@@ -348,32 +348,36 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                 MenuEntry::item("edit-undo", "撤销")
                     .shortcut_for("undo")
                     .act(MenuAction::EditorCmd(Cmd::Undo))
-                    .with_enabled(writable)
-                    // #176：页面态下文本编辑器不在树内——read_only 灰显
-                    // 本就在，补原因说明（不静默）。
+                    // #176 Lead 补齐：菜单禁用以**当前显示面**为准——
+                    // 页面态下文本编辑器不在树内（其 read_only/选区不可
+                    // 作为页面态可用性判据），作用于 Editor 的动作一律
+                    // 禁用 + 原因（不进死路）。
+                    .with_enabled(writable && !ctx.docx_page_view)
                     .with_page_reason(ctx, REASON_PAGE_EDIT),
                 // dispatch_key 的 redo 实际绑定是 Ctrl+Shift+Z（z if
                 // ctrl && shift 臂）与 Ctrl+Y 双臂——标签取前者。
                 MenuEntry::item("edit-redo", "重做")
                     .shortcut_for("redo")
                     .act(MenuAction::EditorCmd(Cmd::Redo))
-                    .with_enabled(writable)
+                    .with_enabled(writable && !ctx.docx_page_view)
                     .with_page_reason(ctx, REASON_PAGE_EDIT),
                 MenuEntry::Separator,
                 MenuEntry::item("edit-cut", "剪切")
                     .shortcut_for("cut")
                     .act(MenuAction::Cut)
-                    .with_enabled(writable && ctx.has_selection)
+                    .with_enabled(writable && ctx.has_selection && !ctx.docx_page_view)
                     .with_page_reason(ctx, REASON_PAGE_EDIT),
                 MenuEntry::item("edit-copy", "复制")
                     .shortcut_for("copy")
                     .act(MenuAction::Copy)
-                    .with_enabled(doc && ctx.has_selection)
+                    // 复制同判（Lead 复验：页面态隐藏选区不得启用
+                    // copy——选区判定不可跨显示面）。
+                    .with_enabled(doc && ctx.has_selection && !ctx.docx_page_view)
                     .with_page_reason(ctx, REASON_PAGE_EDIT),
                 MenuEntry::item("edit-paste", "粘贴")
                     .shortcut_for("paste")
                     .act(MenuAction::Paste)
-                    .with_enabled(writable)
+                    .with_enabled(writable && !ctx.docx_page_view)
                     .with_page_reason(ctx, REASON_PAGE_EDIT),
                 MenuEntry::Separator,
                 // #176：查找/替换/命令面板是编辑器浮层——页面态编辑器
@@ -847,6 +851,50 @@ mod tests {
         let md_menus = build_menus(&md_ctx);
         let undo = find(&md_menus[1].entries, "edit-undo").unwrap();
         assert!(undo.enabled, "md 可编辑态撤销可用（零回归）");
+    }
+
+    /// #176 Lead 补齐验收 2：**真实可编辑 DOCX 投影 + 页面模式**的
+    /// 菜单快照（read_only=false——生产 `new_docx_editable` 明设
+    /// `read_only:false`；has_selection=true——隐藏编辑器遗留选区）。
+    /// Lead 独立反例实证形态：edit-undo/redo/paste=(true, None)——
+    /// 本测试锁修复后的正确行为：编辑类全部禁用 + 带因（禁用以当前
+    /// 显示面为准，隐藏 Editor 的 read_only/选区不跨显示面生效）。
+    #[test]
+    fn editable_docx_page_view_disables_edit_actions() {
+        // 生产形态快照（Lead 复验快照同型）：
+        // has_document=true, read_only=false, docx_page_view=true,
+        // has_selection=true（隐藏文本编辑器遗留非空选区）。
+        let mut ctx = full_ctx();
+        ctx.read_only = false;
+        ctx.has_selection = true;
+        ctx.docx_page_view = true;
+        let menus = build_menus(&ctx);
+
+        // Lead 反例五项：撤销/重做/剪切/复制/粘贴——修前 undo/redo/
+        // paste 为 (true, None)（无禁用原因的启用态——真实缺陷形态）。
+        for id in [
+            "edit-undo",
+            "edit-redo",
+            "edit-cut",
+            "edit-copy",
+            "edit-paste",
+        ] {
+            let spec = find(&menus[1].entries, id).unwrap_or_else(|| panic!("{id} 缺失"));
+            assert!(
+                !spec.enabled,
+                "可编辑 docx 页面态 {id} 必须禁用（以当前显示面为准）"
+            );
+            assert_eq!(
+                spec.disabled_reason,
+                Some(REASON_PAGE_EDIT),
+                "可编辑 docx 页面态 {id} 禁用须带原因（不静默）"
+            );
+        }
+        // 对照组：shell 级动作不受影响（保存/另存为/导出/退出）。
+        for id in ["file-save", "file-save-as", "file-export-pdf", "file-quit"] {
+            let spec = find(&menus[0].entries, id).unwrap_or_else(|| panic!("{id} 缺失"));
+            assert!(spec.enabled, "shell 级动作 {id} 不受页面守卫影响");
+        }
     }
 
     /// 无选区：剪切/复制灰显（粘贴不受选区影响——右键菜单同判定源）。
