@@ -304,8 +304,7 @@ pub fn deref_xobject(
                 Some(n) => [n[0], n[1], n[2], n[3], n[4], n[5]],
                 None => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             };
-            let bbox = nums_array(lookup(b"BBox"), 4)
-                .map(|n| [n[0], n[1], n[2], n[3]]);
+            let bbox = nums_array(lookup(b"BBox"), 4).map(|n| [n[0], n[1], n[2], n[3]]);
             let resources = lookup(b"Resources").map(ResourceDict::from_res_value);
             // 递归解析（PDEFormGetContent）：form 的资源继承调用方面。
             let content = super::parser::parse_content(data)?;
@@ -370,10 +369,18 @@ pub fn deref_xobject(
 ///   「编辑 form 内部 → 写回 form 流」由调用方经 [`XObjectKind::Form`]
 ///   的 content 单独落盘）。
 /// - `PdeElement::XObject` + `/Image` → 转为 [`PdeElement::Image`] 的
-///   named 形态（attrs 承载 Width/Height/ColorSpace/BPC/Filter + 数据）。
+///   named 形态（attrs 承载图像字典**全量属性**——#181 修复：旧实现
+///   只搬 W/H/BPC/CS/F 五项白名单，`/Decode [1 0]` 反色等属性静默
+///   丢失，写回后图像颜色反转）。
 ///
 /// 返回：`(元素, Option<XObjectKind>)`——解引用产物给调用方（form 的
 /// 递归 content 需要独立写回流，不能内联进页内容流）。
+///
+/// **容器内引用面（#181 修复）**：Container 分支的递归解引用产物**全部**
+/// 返回（旧实现 `first_kind: Option` 只留第一个——同一容器里两个 Form
+/// 只回一个，第二个 form 的编辑/写回材料整体丢失）。本函数签名保持
+/// `Option`（单元素语义不变——XObject/其他元素至多产一个 kind），
+/// 容器聚合面在 [`resolve_content`]（它本来就返回 `Vec`，现在收全）。
 pub fn resolve_xobject_element(
     elem: &PdeElement,
     res: &ResourceDict,
@@ -396,17 +403,44 @@ pub fn resolve_xobject_element(
                     data,
                 } => {
                     // named image → PdeImage named 形态（attrs 面向
-                    // PDEImageAttrs 对齐）。
-                    let mut attrs: Vec<(Vec<u8>, Operand)> = vec![
-                        (b"W".to_vec(), Operand::Int(width)),
-                        (b"H".to_vec(), Operand::Int(height)),
-                        (b"BPC".to_vec(), Operand::Int(bpc)),
-                    ];
+                    // PDEImageAttrs 对齐）。#181 修复：图像字典**全量键**
+                    // 透传进 attrs（旧实现五项白名单——/Decode 反色等
+                    // 属性丢失，写回颜色静默反转）。已知几何五项用内联
+                    // 缩写键（与批①内联形态一致），其余键保持原名（
+                    // Decode/DecodeParms/Interpolate/ImageMask/Mask...）。
+                    let img_dict = match res.xobject(&x.name) {
+                        Some(ResValue::Stream { dict, .. }) => dict.clone(),
+                        _ => Vec::new(), // deref 已保证 Stream 形态——兜底空表
+                    };
+                    let mut attrs: Vec<(Vec<u8>, Operand)> = Vec::new();
+                    // 五项基础面（缩写键——与内联 image 语义对齐）
+                    attrs.push((b"W".to_vec(), Operand::Int(width)));
+                    attrs.push((b"H".to_vec(), Operand::Int(height)));
+                    attrs.push((b"BPC".to_vec(), Operand::Int(bpc)));
                     if let Some(cs) = &colorspace {
                         attrs.push((b"CS".to_vec(), resvalue_to_operand(cs)));
                     }
                     if let Some(f) = &filter {
                         attrs.push((b"F".to_vec(), resvalue_to_operand(f)));
+                    }
+                    // 其余键全量透传（原名——#181：Decode 反色/DP/I/IM
+                    // /Mask 等。Type/Subtype 结构性键跳过——形态已由
+                    // 元素类型承载）。
+                    for (k, v) in &img_dict {
+                        if matches!(
+                            k.as_slice(),
+                            b"Width"
+                                | b"Height"
+                                | b"BitsPerComponent"
+                                | b"ColorSpace"
+                                | b"Filter"
+                                | b"Type"
+                                | b"Subtype"
+                                | b"Length"
+                        ) {
+                            continue;
+                        }
+                        attrs.push((k.clone(), resvalue_to_operand(v)));
                     }
                     let img = PdeElement::Image(PdeImage {
                         gstate: x.gstate.clone(),
@@ -430,21 +464,46 @@ pub fn resolve_xobject_element(
         }
         // Container 递归面：内部元素的 XObject 引用同样解引用（form 的
         // display list 里可以再 Do form——Adobe 嵌套 form 同构）。
+        //
+        // #181 修复：递归解引用产物**全部**收集（`_vec` 内部函数——旧
+        // 实现 `first_kind: Option` 只留第一个，同一容器里两个 Form
+        // 丢一个）。本函数（Option 签名兼容面）取首个；全量面走
+        // [`resolve_content`]（它用 `_vec` 版逐元素收 Vec）。
+        PdeElement::Container(_) => {
+            let (elem, kinds) = resolve_xobject_element_vec(elem, res)?;
+            let first = kinds.into_iter().next();
+            Ok((elem, first))
+        }
+        _ => Ok((elem.clone(), None)),
+    }
+}
+
+/// [`resolve_xobject_element`] 的全量产物版（#181：容器内多 XObject
+/// 引用的解引用产物**全部**返回，容器递归深度优先原序）。
+///
+/// 公共面（Option 签名）与聚合面（Vec）的关系：单元素（XObject/其他）
+/// 至多一个 kind；容器可以 N 个。`resolve_content` 聚合走本函数。
+fn resolve_xobject_element_vec(
+    elem: &PdeElement,
+    res: &ResourceDict,
+) -> Result<(PdeElement, Vec<XObjectKind>), PdeError> {
+    match elem {
         PdeElement::Container(c) => {
             let mut inner = c.clone();
-            let mut first_kind: Option<XObjectKind> = None;
+            let mut kinds = Vec::new();
             let mut next = Vec::with_capacity(inner.content.elements.len());
             for e in inner.content.elements.drain(..) {
-                let (ne, k) = resolve_xobject_element(&e, res)?;
-                if first_kind.is_none() {
-                    first_kind = k;
-                }
+                let (ne, ks) = resolve_xobject_element_vec(&e, res)?;
+                kinds.extend(ks);
                 next.push(ne);
             }
             inner.content.elements = next;
-            Ok((PdeElement::Container(inner), first_kind))
+            Ok((PdeElement::Container(inner), kinds))
         }
-        _ => Ok((elem.clone(), None)),
+        _ => {
+            let (ne, k) = resolve_xobject_element(elem, res)?;
+            Ok((ne, k.into_iter().collect()))
+        }
     }
 }
 
@@ -482,6 +541,10 @@ fn resvalue_to_operand(v: &ResValue) -> Operand {
 /// 遍历元素树把 XObject 名字引用全部解析。form 的递归 content 在
 /// [`XObjectKind::Form`] 里返回（调用方继续对 form 的 resources 递归
 /// 调用本函数即得完整可编辑树）。
+///
+/// #181 修复：容器内**多个** XObject 引用的解引用产物全部返回（旧
+/// 实现只收容器第一个——同一容器里两个 Form 丢一个，第二个 form 的
+/// 编辑/写回材料整体丢失）。产物顺序 = 深度优先原序。
 pub fn resolve_content(
     content: &PdeContent,
     res: &ResourceDict,
@@ -489,10 +552,8 @@ pub fn resolve_content(
     let mut kinds = Vec::new();
     let mut elements = Vec::with_capacity(content.elements.len());
     for e in &content.elements {
-        let (ne, k) = resolve_xobject_element(e, res)?;
-        if let Some(kind) = k {
-            kinds.push(kind);
-        }
+        let (ne, ks) = resolve_xobject_element_vec(e, res)?;
+        kinds.extend(ks);
         elements.push(ne);
     }
     Ok((PdeContent { elements }, kinds))
@@ -558,10 +619,59 @@ impl CollectedResources {
     }
 
     /// 收集入口：元素树全量遍历（Container 递归进 content）。
+    ///
+    /// #181 修复说明：本函数只走**页级**元素树——form 递归 content 的
+    /// 引用收集走 [`from_content_with_forms`]（Lead 实测：写回引用
+    /// GS0/CS0 而收集面为空——`Do` 进 form 后 form 内部引用对页级
+    /// 收集不可见，写回资源表丢引用）。Adobe `PDEContentToCosObj` 的
+    /// 收集语义遍历整个 display list（含 form 展开）。
     pub fn from_content(content: &PdeContent) -> CollectedResources {
         let mut c = CollectedResources::new();
         c.collect_elems(&content.elements);
         c
+    }
+
+    /// 收集入口（#181 修复——form 递归 content 面）。
+    ///
+    /// `kinds` = [`resolve_content`] 的解引用产物（`Do` 名字已解析为
+    /// `XObjectKind::Form { content, resources, .. }`）。对每个 Form：
+    /// - 递归收集其 `content` 的引用（深度上限 [`FORM_DEPTH_LIMIT`]——
+    ///   与 `deref_xobject` 环引用防护同限）；
+    /// - 若 form 自带 `/Resources`，其内部引用名字按 form 自身资源表
+    ///   理解——**名字空间不合并**（form 内 `GS0` 与页级 `GS0` 可以是
+    ///   不同对象；收集面按名字去重即近似合并，语义面归引擎挂接层）。
+    /// - Image kind 无递归面（named image 无内容流引用）。
+    ///
+    /// 与 [`from_content`] 的差集就是旧丢失面：form 内部的
+    /// gs/cs/Tf/Do 引用。
+    pub fn from_content_with_forms(
+        content: &PdeContent,
+        kinds: &[XObjectKind],
+    ) -> CollectedResources {
+        let mut c = CollectedResources::new();
+        c.collect_elems(&content.elements);
+        for k in kinds {
+            c.collect_kind(k, FORM_DEPTH_LIMIT);
+        }
+        c
+    }
+
+    /// 单 kind 递归收集（depth = 剩余深度，0 = 不再进 form）。
+    fn collect_kind(&mut self, k: &XObjectKind, depth: usize) {
+        if depth == 0 {
+            return; // 环引用防护（与 deref_xobject 同限语义）
+        }
+        match k {
+            XObjectKind::Form { content, .. } => {
+                self.collect_elems(&content.elements);
+                // form 的 content 解析时元素 gstate 已吸收其引用；
+                // 嵌套 form 的 content 未经 kinds 展开——此处不再
+                // 递归解引用（调用方对嵌套 form 持续 resolve 后再收）。
+                // 注：嵌套 form 的引用经 form 内容流的 Do 名字已入
+                // collect_elems 的 XObject 名单（写回本体按注入表合并）。
+            }
+            XObjectKind::Image { .. } | XObjectKind::Ps { .. } => {}
+        }
     }
 
     fn collect_elems(&mut self, elems: &[PdeElement]) {

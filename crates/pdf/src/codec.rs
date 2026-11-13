@@ -18,7 +18,25 @@
 ///
 /// 存储块 + fixed/dynamic Huffman 全形态（PNG IDAT 与 PDF
 /// FlateDecode 滤镜共用面）。
+///
+/// # 安全面（#180 修复轮，2026-11-13）
+///
+/// - **Adler-32 校验**：尾 4 字节大端读出与输出比对——旧实现
+///   读都不读（stamp.rs 原样迁移的旧债；stamp 信任域=自家公章
+///   PNG，PDE 面解任意不可信文档流，旧债升险——#180 修复轮收口）。
+/// - **输出预算**：无预算的 zlib 解码是 DoS 放大器（11 字节输入可
+///   膨胀 47,662 倍——Lead #180 实测）。本函数默认无上限（stamp
+///   PNG IDAT 已知几何面在外层），有界面走 [`zlib_inflate_bounded`]。
 pub fn zlib_inflate(data: &[u8]) -> Result<Vec<u8>, String> {
+    zlib_inflate_bounded(data, usize::MAX)
+}
+
+/// 有预算的 zlib 解压（#180：解码输出限额面）。
+///
+/// `budget` = 输出字节上限（usize::MAX = 无限）。超预算 = Err（错误
+/// 信息含实际膨胀字节数——诊断面）。头校验 + Adler-32 校验与
+/// [`zlib_inflate`] 同门。
+pub fn zlib_inflate_bounded(data: &[u8], budget: usize) -> Result<Vec<u8>, String> {
     if data.len() < 6 {
         return Err("zlib 数据过短".into());
     }
@@ -30,8 +48,37 @@ pub fn zlib_inflate(data: &[u8]) -> Result<Vec<u8>, String> {
         return Err("zlib 头校验失败".into());
     }
     let mut out = Vec::new();
-    inflate_deflate(&data[2..data.len().saturating_sub(4)], &mut out)?;
+    inflate_deflate(&data[2..data.len() - 4], &mut out, budget)?;
+    // Adler-32 校验（#180：尾 4 字节大端与输出比对——不匹配即 Err，
+    // 不再静默接受错数据）。
+    let expect = u32::from_be_bytes([
+        data[data.len() - 4],
+        data[data.len() - 3],
+        data[data.len() - 2],
+        data[data.len() - 1],
+    ]);
+    let actual = adler32(&out);
+    if expect != actual {
+        return Err(format!(
+            "Adler-32 校验失败：期望 0x{expect:08X} 实得 0x{actual:08X}（数据损坏或截断）"
+        ));
+    }
     Ok(out)
+}
+
+/// Adler-32（RFC 1950——zlib 尾校验和）。
+///
+/// 参考实现与 Python `zlib.adler32` 逐字节核对（含 10 万字节流），
+/// 常量 65521 = 4 字节内最大素数（RFC 规定值）。
+fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &byte in data {
+        a = (a + byte as u32) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
 }
 
 struct Bits<'a> {
@@ -119,7 +166,7 @@ impl Huff {
     }
 }
 
-fn inflate_deflate(input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+fn inflate_deflate(input: &[u8], out: &mut Vec<u8>, budget: usize) -> Result<(), String> {
     let mut bits = Bits::new(input);
     loop {
         let last = bits.get(1)?;
@@ -130,6 +177,9 @@ fn inflate_deflate(input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
                 let len = (bits.get(16)?) as usize;
                 let _nlen = bits.get(16)?;
                 for _ in 0..len {
+                    if out.len() >= budget {
+                        return Err(budget_err(out.len(), budget));
+                    }
                     out.push(bits.get(8)? as u8);
                 }
             }
@@ -148,7 +198,7 @@ fn inflate_deflate(input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
                 }
                 let lit_h = Huff::new(&lit);
                 let dist_h = Huff::new(&[5u8; 30]);
-                inflate_block(&mut bits, out, &lit_h, &dist_h)?;
+                inflate_block(&mut bits, out, &lit_h, &dist_h, budget)?;
             }
             2 => {
                 let hlit = bits.get(5)? as usize + 257;
@@ -187,7 +237,7 @@ fn inflate_deflate(input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
                 }
                 let lit_h = Huff::new(&lengths[..hlit]);
                 let dist_h = Huff::new(&lengths[hlit..]);
-                inflate_block(&mut bits, out, &lit_h, &dist_h)?;
+                inflate_block(&mut bits, out, &lit_h, &dist_h, budget)?;
             }
             _ => return Err("无效 block type 3".into()),
         }
@@ -219,11 +269,17 @@ fn inflate_block(
     out: &mut Vec<u8>,
     lit: &Huff,
     dist: &Huff,
+    budget: usize,
 ) -> Result<(), String> {
     loop {
         let sym = lit.decode(bits)?;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => {
+                if out.len() >= budget {
+                    return Err(budget_err(out.len(), budget));
+                }
+                out.push(sym as u8);
+            }
             256 => break,
             257..=285 => {
                 let i = (sym - 257) as usize;
@@ -236,6 +292,9 @@ fn inflate_block(
                 if d > out.len() {
                     return Err("回溯距离超出输出".into());
                 }
+                if out.len() + len > budget {
+                    return Err(budget_err(out.len() + len, budget));
+                }
                 let start = out.len() - d;
                 for k in 0..len {
                     let b = out[start + k];
@@ -246,4 +305,67 @@ fn inflate_block(
         }
     }
     Ok(())
+}
+
+/// 预算超限错误（#180——错误信息带膨胀字节数，诊断面）。
+fn budget_err(at: usize, budget: usize) -> String {
+    format!("解码输出超预算：第 {at} 字节处超出上限 {budget}（膨胀炸弹拒绝）")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// zlib.compress(bytes(range(8))) 固定向量（Python zlib 标准产出，
+    /// adler-32 = 0x5C001D——机器生成核验）。
+    const ZLIB_RANGE8: &[u8] = &[
+        0x78, 0x9c, 0x63, 0x60, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0x07, 0x00, 0x00, 0x5c, 0x00,
+        0x1d,
+    ];
+
+    #[test]
+    fn zlib_roundtrip_range8() {
+        let out = zlib_inflate(ZLIB_RANGE8).unwrap();
+        assert_eq!(out, bytes_range8());
+    }
+
+    fn bytes_range8() -> Vec<u8> {
+        (0u8..8).collect()
+    }
+
+    /// #180 旧债收口：Adler-32 校验——篡改尾 4 字节必须 Err。
+    ///
+    /// round143 复现向量：合法流尾字节颠倒（0x005C001D → 0x018E0400），
+    /// 旧实现 Ok(10) 静默接受错数据。
+    #[test]
+    fn zlib_adler32_tamper_rejected() {
+        let mut z = ZLIB_RANGE8.to_vec();
+        z[12..16].copy_from_slice(&[0x01, 0x8e, 0x04, 0x00]); // 篡改 adler
+        let r = zlib_inflate(&z);
+        assert!(r.is_err(), "篡改 adler 必须拒绝");
+        let msg = r.unwrap_err();
+        assert!(msg.contains("Adler-32"), "错误信息含校验名：{msg}");
+    }
+
+    /// #180 预算面：合法流在超紧预算下拒绝（错误信息带膨胀字节数）。
+    #[test]
+    fn zlib_budget_rejects_early() {
+        // 合法 8 字节输出，预算 4 → 第 4 字节即拒
+        let r = zlib_inflate_bounded(ZLIB_RANGE8, 4);
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("超预算"), "错误信息带预算语义：{msg}");
+        // 预算 = 输出长度 → 通过（边界含等号——恰好放行）
+        assert!(zlib_inflate_bounded(ZLIB_RANGE8, 8).is_ok());
+    }
+
+    /// Adler-32 实现自证：与 RFC 1950 参考向量核对。
+    ///
+    /// Python zlib.adler32(b"")=1 / (b"Hello")=0x58C01F5——机器核验。
+    #[test]
+    fn adler32_known_values() {
+        assert_eq!(adler32(b""), 1);
+        assert_eq!(adler32(b"Hello"), 0x58C01F5);
+        assert_eq!(adler32(&bytes_range8()), 0x5C001D);
+    }
 }
