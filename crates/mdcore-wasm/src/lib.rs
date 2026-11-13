@@ -105,6 +105,18 @@ impl WasmCore {
             .map(|r| serde_json::json!({ "revision": r.revision }).to_string())
     }
 
+    /// #163：设置合并窗宽度（ms；0 = 禁用合并）——web 设置面
+    /// `undo_coalesce_ms` 旋钮接真的引擎入口（此前旋钮全程未接线，
+    /// 引擎恒用常量 COALESCE_MS=1000——audit/notes/23 P2-21 假旋钮闭环）。
+    pub fn set_coalesce_ms(&mut self, ms: u64) {
+        self.inner.set_coalesce_ms(ms);
+    }
+
+    /// #163：当前合并窗宽度（ms）——设置面回显/测试面断言。
+    pub fn coalesce_ms(&self) -> u64 {
+        self.inner.coalesce_ms()
+    }
+
     pub fn redo(&mut self) -> Option<String> {
         self.inner
             .redo()

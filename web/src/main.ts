@@ -1556,6 +1556,15 @@ async function main(): Promise<void> {
   // 组件重渲染的状态漂移；设置变更低频，刷新 = 诚实简单）。
   window.addEventListener('mdc-settings-changed', (ev) => {
     const d = (ev as CustomEvent<{ path: string; value: string }>).detail;
+    // #163：撤销合并窗旋钮接真——设置变更即时进引擎（此前旋钮全程
+    // 未接线，引擎恒用常量 1000ms——audit/notes/23 P2-21 假旋钮闭环）。
+    if (d.path === 'editor.undo_coalesce_ms') {
+      const ms = Number(d.value);
+      if (Number.isInteger(ms) && ms >= 1 && ms <= 10_000) {
+        window.__core?.set_coalesce_ms(BigInt(ms));
+      }
+      return;
+    }
     if (d.path !== 'appearance.language') return;
     try { localStorage.setItem(LANG_LS_KEY, String(d.value)); } catch { /* 私密模式 */ }
     location.reload();
@@ -1591,6 +1600,8 @@ async function main(): Promise<void> {
     // 存 Memory 对象引用（grow 后 buffer 更新，实时读现值）。
     window.__wasmMemory = wasmOut.memory;
     const core = new WasmCore(chunks[0]);
+    // #163：撤销合并窗旋钮接真（初始应用——宿主快照优先于缺省 1000ms）。
+    core.set_coalesce_ms(BigInt(settingsSnapshot.editor.undo_coalesce_ms));
     heapMark('core-created');
     const view = new CM6View(core, document.getElementById('editor') as HTMLElement);
     const ttiMs = performance.now() - t0; // 首段可见可交互
@@ -1630,6 +1641,8 @@ async function main(): Promise<void> {
     window.__draftRestoredTs = draft ? draft.ts : null;
     await initP;
     const core = new WasmCore(md);
+    // #163：撤销合并窗旋钮接真（初始应用——宿主快照优先于缺省 1000ms）。
+    core.set_coalesce_ms(BigInt(settingsSnapshot.editor.undo_coalesce_ms));
     const view = new CM6View(core, document.getElementById('editor') as HTMLElement);
     const loadMs = performance.now() - t0;
     window.__core = core;

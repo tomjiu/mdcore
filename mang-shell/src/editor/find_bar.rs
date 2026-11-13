@@ -440,6 +440,9 @@ impl FindState {
         }
         let q_len = self.query.chars().count();
         let end_col = (m.col + q_len).min(buffer.line_len(m.line));
+        // #163：命令边界破组——逐条替换各自成 undo 步（不并入此前
+        // 击键/替换的合并窗；「替换两次 = 撤两次」的既有语义保持）。
+        buffer.break_undo_group();
         buffer.replace_range(
             Point::new(m.line, m.col),
             Point::new(m.line, end_col),

@@ -63,6 +63,7 @@ mod docx_save_ui_tests;
 pub mod fence; // #205：fence 缓存重建（纯逻辑：FenceCursor 推进 + 增量/全量）
 pub mod find_bar;
 pub mod highlight;
+pub mod md_bridge; // #163：mdcore 换芯桥（Buffer ↔ Core：真源/投影/行映射）
 pub mod mouse;
 pub mod multi_cursor; // r42 阶段 C（#68）：多光标 + 列选择（编辑器层；Buffer 单光标契约不变）
 pub mod pdf_doc;
@@ -402,6 +403,8 @@ pub struct Editor {
     ///（编辑/undo/redo）后首读重算，纯光标移动与纯重渲零物化。
     /// RefCell：render/read 路径只有 `&self`（与 last_text_width 同款）。
     char_count_cache: RefCell<(u64, usize)>,
+    /// #163：mdcore 字数缓存（标书口径——键 = 核 revision，R-f 同款守卫）。
+    word_count_cache: RefCell<(u64, mdcore::word_count::WordCount)>,
     /// #132 任务 1：文件级代码语言（`.rs`/`.py`/`.ts` 直接打开时按该语言
     /// 识别字符串/注释——这类文件没有 md 围栏可依）。构造时按扩展名
     /// 定，内容推断兜底。
@@ -577,6 +580,7 @@ impl Editor {
             bracket_cache: BracketCache::default(),
             // #281（R-f）：字数缓存初值恒 miss（u64::MAX ≠ 0）——首读填充。
             char_count_cache: RefCell::new((u64::MAX, 0)),
+            word_count_cache: RefCell::new((u64::MAX, mdcore::word_count::WordCount::default())),
             bracket_lang,
             display_map: DisplayMap::default(),
             last_text_width: RefCell::new(None),
@@ -640,6 +644,7 @@ impl Editor {
             bracket_cache: BracketCache::default(),
             // #281（R-f）：字数缓存初值恒 miss（u64::MAX ≠ 0）——首读填充。
             char_count_cache: RefCell::new((u64::MAX, 0)),
+            word_count_cache: RefCell::new((u64::MAX, mdcore::word_count::WordCount::default())),
             bracket_lang,
             display_map: DisplayMap::default(),
             last_text_width: RefCell::new(None),
@@ -717,6 +722,7 @@ impl Editor {
             bracket_cache: BracketCache::default(),
             // #281（R-f）：字数缓存初值恒 miss（u64::MAX ≠ 0）——首读填充。
             char_count_cache: RefCell::new((u64::MAX, 0)),
+            word_count_cache: RefCell::new((u64::MAX, mdcore::word_count::WordCount::default())),
             bracket_lang,
             display_map: DisplayMap::default(),
             last_text_width: RefCell::new(None),
@@ -783,6 +789,7 @@ impl Editor {
             bracket_cache: BracketCache::default(),
             // #281（R-f）：字数缓存初值恒 miss（u64::MAX ≠ 0）——首读填充。
             char_count_cache: RefCell::new((u64::MAX, 0)),
+            word_count_cache: RefCell::new((u64::MAX, mdcore::word_count::WordCount::default())),
             bracket_lang,
             display_map: DisplayMap::default(),
             last_text_width: RefCell::new(None),
@@ -848,6 +855,7 @@ impl Editor {
             bracket_cache: BracketCache::default(),
             // #281（R-f）：字数缓存初值恒 miss（u64::MAX ≠ 0）——首读填充。
             char_count_cache: RefCell::new((u64::MAX, 0)),
+            word_count_cache: RefCell::new((u64::MAX, mdcore::word_count::WordCount::default())),
             bracket_lang,
             display_map: DisplayMap::default(),
             last_text_width: RefCell::new(None),
@@ -910,6 +918,7 @@ impl Editor {
             bracket_cache: BracketCache::default(),
             // #281（R-f）：字数缓存初值恒 miss（u64::MAX ≠ 0）——首读填充。
             char_count_cache: RefCell::new((u64::MAX, 0)),
+            word_count_cache: RefCell::new((u64::MAX, mdcore::word_count::WordCount::default())),
             bracket_lang: None,
             display_map: DisplayMap::default(),
             last_text_width: RefCell::new(None),
@@ -1043,7 +1052,25 @@ impl Editor {
         } else {
             String::new()
         };
-        format!("{} 字符{}", self.char_count(), cursors)
+        // #163（验收 4）：主显 mdcore 总字数（标书口径单一真源），
+        // 字符数为副显——B 轨 char_count 自算口径退役为辅助面。
+        format!(
+            "{} 字 · {} 字符{}",
+            self.word_count().total_words,
+            self.char_count(),
+            cursors
+        )
+    }
+
+    /// #163（验收 4）：mdcore 字数（汉字 + 西文词的标书口径——
+    /// 核树单一真源；核 revision 守卫缓存，R-f 模式）。
+    pub fn word_count(&self) -> mdcore::word_count::WordCount {
+        let rev = self.buffer.core_revision();
+        let mut cache = self.word_count_cache.borrow_mut();
+        if cache.0 != rev {
+            *cache = (rev, self.buffer.word_count());
+        }
+        cache.1
     }
 
     // ------------------------------------------------------------------
@@ -1313,14 +1340,12 @@ impl Editor {
     /// 返回是否发生撤销。#111 顺手修陈旧缓存缺陷：撤销后 now 走
     /// `after_edit`（查找匹配/围栏高亮/断点缓存同步刷新）。
     pub fn undo_edit(&mut self) -> bool {
-        let n = self.cursors.take_undo_batch();
-        let mut did = false;
-        for _ in 0..n.max(1) {
-            if !self.buffer.undo() {
-                break;
-            }
-            did = true;
-        }
+        // #163：合并窗接管批撤销协议——多光标/缩进等一次手势的 N 条
+        // 编辑由核 1s 合并窗聚为一条目，单次 undo 即撤整批（此前
+        // take_undo_batch 连撤 N 次的协议退役；慢机超窗分割 = 罕见
+        // 退化路径，多按一次 Ctrl+Z 即可）。
+        self.cursors.take_undo_batch(); // 排空旧协议残留（幂等）
+        let did = self.buffer.undo();
         self.sync_cursors_from_buffer();
         if did {
             self.after_edit();
@@ -2606,16 +2631,9 @@ impl Editor {
                     self.buffer.redo();
                 }
                 EditorAction::Undo => {
-                    // r42 阶段 C：批撤销（多点编辑一次撤整批）
-                    let n = self.cursors.take_undo_batch();
-                    if n > 1 {
-                        for _ in 0..n {
-                            if !self.buffer.undo() {
-                                break;
-                            }
-                        }
-                        self.sync_cursors_from_buffer();
-                    } else {
+                    // #163：合并窗接管批撤销（一次手势 = 一条目 = 一次撤销）。
+                    self.cursors.take_undo_batch();
+                    {
                         // G1：单光标路径——undo 栈顶若为批量记录（全部
                         // 替换），一条记录一次撤整批；证据行供烟雾/日志面。
                         let pending = self.buffer.last_undo_batch_count();
@@ -4853,19 +4871,9 @@ pub(crate) fn shape_text_width(window: &mut Window, text: &str, style: &TextStyl
 /// 标题（CommonMark）。缩进标题（代码块内 `#`）不在此判定——那是围栏
 /// 折叠的面，调用方先试围栏。
 fn heading_level_of(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
-    let mut n = 0usize;
-    while n < bytes.len() && bytes[n] == b'#' {
-        n += 1;
-    }
-    if n == 0 || n > 6 {
-        return None;
-    }
-    match bytes.get(n) {
-        None => Some(n),
-        Some(b' ') => Some(n),
-        _ => None,
-    }
+    // #163 单源委托：mdcore::markdown::heading_level（解析器与渲染面
+    // 共用——语义与旧自研逐位一致：# ×1..=6 + 行尾或空格）。
+    mdcore::markdown::heading_level(line)
 }
 
 /// 标题块区间（纯函数）：行 `line` 是 ATX 标题 → `[line, end)`，end =

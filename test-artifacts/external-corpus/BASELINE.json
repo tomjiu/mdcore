@@ -3,12 +3,12 @@
     "markdown_it": {
       "cases": 652,
       "idempotent": 652,
-      "mean_retention": 0.9922410667042569
+      "mean_retention": 0.9850294485000629
     },
     "spec": {
       "cases": 655,
       "idempotent": 655,
-      "mean_retention": 0.9922766038033214
+      "mean_retention": 0.9850980159115129
     }
   },
   "l2": {

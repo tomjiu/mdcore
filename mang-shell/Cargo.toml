@@ -75,11 +75,13 @@ menu = { path = "../third_party/zed/crates/menu" }
 # 适配器枚举与 gpui_windows DirectX 设备选择的既有 log 调用（此前无
 # logger，RUST_LOG 无效）。Apache-2.0，闭包内 crate（PROVENANCE 已录）。
 zlog = { path = "../third_party/zed/crates/zlog" }
-# r42 阶段 A（#68）：text + rope（Zed 编辑器 buffer 基座——rope 持文
-# + 锚点 + O(log n) 编辑，替换自研 Vec<String> 908 行；rope 经 text
-# 重导出消费，不单独列依赖）。GPL-3.0-or-later——记账见 PROVENANCE
-# r42 节（开源整体 GPL 无冲突；闭源时需替换）。
-text = { path = "../third_party/zed/crates/text" }
+# #163：mdcore 文档核（唯一文档真源——树/Op/History/StableID/Anchor；
+# ropey 1.6 MIT 经此入闭包，零新增三方、零新增 GPL）。换芯后 Buffer
+# 的存储/历史/字数/锚点全部由此供给；见 editor/md_bridge.rs。
+mdcore = { path = "../crates/mdcore" }
+# #163：换芯桥的投影 Rope（mdcore 闭包既有 crate 同版本——零新增
+# 三方；default-features=false = LF 划行（mang 语义），simd 保留）。
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 # #133 任务 1：canvas 画布视图依赖（path 接入，类型零泄漏面不变）
 # ——会话恢复/读模型（CanvasSession::restore/objects）+ 渲染面
 # （CanvasRendering::from_session + export_svg）+ 落盘面

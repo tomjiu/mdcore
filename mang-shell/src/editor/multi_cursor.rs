@@ -500,12 +500,11 @@ mod tests {
         c.insert_all(&mut b, "X");
         assert_eq!(b.to_plain_text(), "Xaa\nbb\nXcc");
         let n = c.take_undo_batch();
-        assert_eq!(n, 2, "批=2 点");
-        // 连撤 2 次 = 撤整批
-        for _ in 0..n {
-            assert!(b.undo());
-        }
+        assert_eq!(n, 2, "批=2 点（旧协议登记——#163 合并窗下仅作排空）");
+        // #163：合并窗接管——两点插入聚为一条目，一次 undo 撤整批
+        assert!(b.undo());
         assert_eq!(b.to_plain_text(), "aa\nbb\ncc");
+        assert!(!b.undo() || b.to_plain_text() == "aa\nbb\ncc", "至多一条目");
         assert_eq!(c.take_undo_batch(), 0, "批已消费");
     }
 
@@ -522,11 +521,11 @@ mod tests {
         let mut c = Cursors::single(p(0, 0));
         c.add_undo_batch(3);
         let n = c.take_undo_batch();
-        assert_eq!(n, 3, "外登记批 = 3 条");
-        for _ in 0..n {
-            assert!(b.undo());
-        }
+        assert_eq!(n, 3, "外登记批 = 3 条（旧协议登记——#163 合并窗下仅作排空）");
+        // #163：三条缩进编辑由合并窗聚为一条目——一次 undo 撤整批
+        assert!(b.undo());
         assert_eq!(b.to_plain_text(), "aa\nbb\ncc", "一次手势连撤整批");
+        assert!(!b.undo() || b.to_plain_text() == "aa\nbb\ncc", "至多一条目");
         assert_eq!(c.take_undo_batch(), 0, "批已消费");
     }
 
