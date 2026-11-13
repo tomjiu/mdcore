@@ -551,13 +551,22 @@ impl PdeText {
     /// #194 修复（返工 2026-11-14 扩面）：
     /// - **位置进位**（split 不得重叠）：`font = Some` → 次 run Tm
     ///   平移分量 += Tm 基线方向 × 首段 advance（度量走
-    ///   [`advance_of_shows`] 真源——Tz 全乘语义）；`font = None`
-    ///   → **拒绝**（返回 false 不拆——无度量不猜位置）。
+    ///   [`advance_of_shows`] 真源——Tz 全乘语义）：
+    ///
+    /// ```text
+    /// Tm' = Tm ⊕ (a·adv, b·adv)   // (a,b) = Tm 前两元（基线方向向量）
+    /// ```
+    ///
+    ///   `font = None`（无度量上下文）→ **明确拒绝**（返回 `false`
+    ///   不拆——「不要在没有度量信息时静默猜位置」；猜 0 进位即重
+    ///   叠，猜错值即错位——两害都不可取）。
     /// - **完整码边界**（返工新增）：`split_loc` 语义为字节索引面
     ///   （`num_chars` 仍字节口径），切点 `cut` 须落在**码边界**
     ///   （Type0 2 字节 CID 的偶数位）——非码边界的切点把 CID 切成
     ///   两半码（残码流不可度量不可写回有效字形）→ **拒绝**（false
     ///   不拆）。run 尾残码（run_bytes 长非码长整数倍）同拒。
+    /// 拆分成功返回 `true`；无操作面（`split_loc == 0`、
+    /// `>= num_chars()`、run 尾字符、度量失败）同样返回 `false`。
     pub fn split_run_at(
         &mut self,
         split_loc: usize,
@@ -585,19 +594,24 @@ impl PdeText {
         if cut % code_len != 0 {
             return false; // 切 CID 半码——拒绝（不产生残码 run）
         }
-        // 首段 advance（真源度量——切点前的截断 shows）。
+        // **同一拆分真源**（Lead 返工 2026-11-14 反例 B）：先
+        // `split_run_show_bytes` 拆出首/次两段 shows，再用**首段
+        // 同一产物**算 advance——旧「truncate_shows_to_bytes 另算
+        // 截断 shows」在 Str/Kern 边界与 split 的 Kern 归属口径分叉
+        // （truncate 弃界处 Kern、split 归首段尾）→ 进位取 truncate
+        // 口径 12 却把 Kern 留在首段 → next.Tm.e = 34.4 ≠ C 原点
+        // 32。单一拆分产物消分叉：首段（含界处 Kern）的 advance
+        // 即当前点，进位恰一次。
+        let (a, b) = split_run_show_bytes(&self.runs[run], cut);
         let head = &self.runs[run];
-        let mut head_shows = head.shows.clone();
-        truncate_shows_to_bytes(&mut head_shows, cut);
-        let Some(adv) = advance_of_shows(&head_shows, &head.state, font) else {
+        let Some(adv) = advance_of_shows(&a, &head.state, font) else {
             return false;
         };
-        let (a, b) = split_run_show_bytes(&self.runs[run], cut);
         let state = self.runs[run].state.clone();
         let matrix = self.runs[run].text_matrix;
         self.runs[run].shows = a;
-        // 进位：Tm' 平移分量 += Tm 基线方向向量 × adv（文本空间平移
-        // (adv,0) 经 Tm 线性部分）。
+        // 进位：Tm' 的平移分量 += Tm 基线方向向量 × adv
+        //（文本空间平移 (adv, 0) 经 Tm 线性部分 → 基线方向）。
         let mut m = matrix;
         m[4] += matrix[0] * adv;
         m[5] += matrix[1] * adv;
@@ -796,68 +810,146 @@ fn run_bytes(run: &TextRun) -> Vec<u8> {
         .concat()
 }
 
-/// shows 序列截断到「显示字节前 `at` 字节」（split 首段度量构造
-/// 用——跨界 Str 切分，Kern 归属游标口径与 `split_run_show_bytes`
-/// 配对；`at` 须为完整码边界位，由调用方保证）。
-fn truncate_shows_to_bytes(shows: &mut Vec<ShowOp>, at: usize) {
+/// 重写 run 的字节串 `off..off+n` 段为 `new`（**#194 修复 + Lead
+/// 第二版返工**：Kern 保留重装——字节寻址映射到 shows 序列，只替换
+/// 受影响 Str 段的字节，其余 Str 与全部 Kern 原序原值保留。旧版
+/// 展平为单 Str 会丢掉整条 TJ 流的字距——「同字替换也改变布局」
+/// 的根因）。
+///
+/// `off`/`new.len()` 是**显示字节坐标**（跨 Str 段串行——与
+/// [`run_bytes`] 同口径）。跨界重写（`off..off+n` 跨多个 Str 段）：
+/// **`new` 按各受影响 Str 的覆盖长度分片**写入对应段（Lead 返工
+/// 2026-11-14 反例 A：旧「首段吸收整个 new、删后续覆盖 Str」把
+/// `[(A) 200 (BCD)]` 同串替换成 `[(ABCD) 200]`——Kern 挪尾、
+/// B/C/D 各右移 2.4。分片后每段按原覆盖量接受 new 的对应切片，
+/// 未覆盖字节与全部 Kern 原位保留）。替换长度 ≠ 覆盖长度的段：
+/// 首受影响段吸收差额（追加吸收或尾部截断——显示字节坐标的
+/// 膨胀/收缩在首段结算，后续段按相对区间裁剪继续对齐）。
+fn rewrite_run_bytes(run: &mut TextRun, off: usize, new: &[u8]) {
+    let off = off.min(run_bytes(run).len());
+    let end = (off + new.len()).min(run_bytes(run).len());
+    let mut out: Vec<ShowOp> = Vec::with_capacity(run.shows.len());
     let mut cursor = 0usize;
-    let mut keep = 0usize; // 保留的 shows 前缀长度（元素数）
-    let mut cut_at: Option<(usize, usize)> = None; // (索引, 保留字节数)
-    for (i, op) in shows.iter().enumerate() {
+    let mut pending = new; // 尚未写入的 new 前缀（游标推进随消费收缩）
+    for op in run.shows.iter() {
         match op {
-            ShowOp::Kern(_) => {
-                if cursor < at {
-                    keep = i + 1; // 界前 Kern 保留
-                }
-            }
+            ShowOp::Kern(_) => out.push(op.clone()), // 字距原样保留（原位）
             ShowOp::Str(s) => {
-                if cursor + s.len() <= at {
-                    keep = i + 1;
-                    cursor += s.len();
-                } else if cursor < at {
-                    // 跨界 Str：切到 at（决策先记——借用释放后应用）。
-                    cut_at = Some((i, at - cursor));
-                    keep = i + 1;
-                    cursor = at;
-                } else {
-                    break; // 界后全弃
+                let seg_start = cursor;
+                let seg_end = cursor + s.len();
+                cursor = seg_end;
+                // 与 [off, end) 区间的交叠分类。
+                if seg_end <= off || seg_start >= end {
+                    out.push(op.clone()); // 区间外 Str 原样
+                    continue;
+                }
+                // 受影响段：前缀（区间前）+ new 对应分片 + 后缀（区间后）。
+                // 覆盖长度 = 该段与 [off,end) 的交叠——new 按覆盖长度
+                // 分片（每段恰好消费其覆盖量的字节，Kern 位置不动）。
+                let cover = seg_end.min(end) - seg_start.max(off);
+                let mut seg: Vec<u8> = Vec::with_capacity(s.len());
+                if seg_start < off {
+                    seg.extend_from_slice(&s[..off - seg_start]);
+                }
+                if !pending.is_empty() {
+                    // 首段可能需吸收差额（替换长度 ≠ 覆盖长度的膨胀/
+                    // 收缩在首受影响段结算——见 doc 注释）。
+                    let mut take = cover;
+                    if seg_start <= off && pending.len() > cover {
+                        // 找出后续段的总覆盖量，首段吸收余额。
+                        let rest_cover: usize = {
+                            let mut c = cursor;
+                            let mut tot = 0usize;
+                            for later in run.shows.iter().skip(out.len() + 1) {
+                                if let ShowOp::Str(ls) = later {
+                                    let ls_ = c;
+                                    let le = c + ls.len();
+                                    c = le;
+                                    if le <= off || ls_ >= end {
+                                        continue;
+                                    }
+                                    tot += le.min(end) - ls_.max(off);
+                                }
+                            }
+                            tot
+                        };
+                        if pending.len() > rest_cover + cover {
+                            take = pending.len() - rest_cover;
+                        }
+                    }
+                    let take = take.min(pending.len());
+                    seg.extend_from_slice(&pending[..take]);
+                    pending = &pending[take..];
+                }
+                if seg_end > end {
+                    seg.extend_from_slice(&s[end - seg_start..]);
+                }
+                if !seg.is_empty() {
+                    out.push(ShowOp::Str(seg));
                 }
             }
         }
     }
-    if let Some((i, l)) = cut_at {
-        let seg = match &shows[i] {
-            ShowOp::Str(s) => s[..l].to_vec(),
-            _ => unreachable!("决策位必为 Str"),
-        };
-        shows[i] = ShowOp::Str(seg);
+    // pending 仍非空 = 区间在 run 尾之后（越界宽容：追加在尾部——
+    // 与旧版 `off.min(len)` 尾写语义一致）。
+    if !pending.is_empty() {
+        out.push(ShowOp::Str(pending.to_vec()));
     }
-    shows.truncate(keep);
+    run.shows = out;
 }
 
-/// 重写 run 的字节串 `off..off+n` 段为 `new`（重装为单 Str——批③
-/// 编辑面的统一重装语义：编辑后 run 的字节串是权威形态）。
-fn rewrite_run_bytes(run: &mut TextRun, off: usize, new: &[u8]) {
-    let bytes = run_bytes(run);
-    let off = off.min(bytes.len());
-    let mut out = bytes[..off].to_vec();
-    out.extend_from_slice(new);
-    out.extend_from_slice(&bytes[(off + new.len()).min(bytes.len())..]);
-    run.shows = vec![ShowOp::Str(out)];
-}
-
-/// 删除 run 字节串 `off..off+n` 段。
+/// 删除 run 字节串 `off..off+n` 段（**#194 修复**：Kern 保留重装
+/// ——与 [`rewrite_run_bytes`] 同映射，删除即空 `new`。旧版展平
+/// 同样丢字距）。
 fn delete_run_bytes(run: &mut TextRun, off: usize, n: usize) {
-    let bytes = run_bytes(run);
-    let off = off.min(bytes.len());
-    let end = (off + n).min(bytes.len());
-    let mut out = bytes[..off].to_vec();
-    out.extend_from_slice(&bytes[end..]);
-    run.shows = vec![ShowOp::Str(out)];
+    let total = run_bytes(run).len();
+    let off = off.min(total);
+    let end = (off + n).min(total);
+    // 删除区间内的字节置空——复用重写的映射（new = 空）。
+    rewrite_run_bytes_keep_kerns_at(run, off, end);
+}
+
+/// 区间重写内核（`off..end` 置换为 `new`；`run` 的 shows 重建）。
+/// 供 [`rewrite_run_bytes`]（new 非空）与 [`delete_run_bytes`]（空
+/// new——纯裁剪）共用。
+fn rewrite_run_bytes_keep_kerns_at(run: &mut TextRun, off: usize, end: usize) {
+    let mut out: Vec<ShowOp> = Vec::with_capacity(run.shows.len());
+    let mut cursor = 0usize;
+    for op in run.shows.iter() {
+        match op {
+            ShowOp::Kern(_) => out.push(op.clone()),
+            ShowOp::Str(s) => {
+                let seg_start = cursor;
+                let seg_end = cursor + s.len();
+                cursor = seg_end;
+                if seg_end <= off || seg_start >= end {
+                    out.push(op.clone());
+                    continue;
+                }
+                let mut seg: Vec<u8> = Vec::with_capacity(s.len());
+                if seg_start < off {
+                    seg.extend_from_slice(&s[..off - seg_start]);
+                }
+                if seg_end > end {
+                    seg.extend_from_slice(&s[end - seg_start..]);
+                }
+                if !seg.is_empty() {
+                    out.push(ShowOp::Str(seg));
+                }
+            }
+        }
+    }
+    run.shows = out;
 }
 
 /// run 拆分面：保留 Str/Kern 混合原序（split 后两 run 的 shows 各自
 /// 收纳界前/界后的 op——Kern 归属按游标位置）。
+///
+/// **界处 Kern**（Lead 返工 2026-11-14 反例 B）：`filled` 置位**之
+/// 前**的 Kern 归首段尾（`[(AB) 200 (CD)]` 在 cut=2 拆分——200 在
+/// AB 与 CD 之间，随首段推进计入当前点，次段从 CD 的原点起）。
+/// 空 Str 片（跨界切分产生的 0 字节尾片）不产出——保持 shows 形态
+/// 干净（写回 `[(AB) 200 (CD)]` 拆为 `(AB) 200 Tj` + `(CD) Tj`）。
 fn split_run_show_bytes(run: &TextRun, at: usize) -> (Vec<ShowOp>, Vec<ShowOp>) {
     let mut a = Vec::new();
     let mut b = Vec::new();
@@ -869,20 +961,28 @@ fn split_run_show_bytes(run: &TextRun, at: usize) -> (Vec<ShowOp>, Vec<ShowOp>) 
                 if filled {
                     b.push(ShowOp::Kern(*k));
                 } else {
-                    a.push(ShowOp::Kern(*k));
+                    a.push(ShowOp::Kern(*k)); // 界前/界处 Kern 归首段尾
                 }
             }
             ShowOp::Str(s) => {
                 if filled {
-                    b.push(ShowOp::Str(s.clone()));
+                    if !s.is_empty() {
+                        b.push(ShowOp::Str(s.clone()));
+                    }
                 } else if cursor + s.len() <= at {
-                    a.push(ShowOp::Str(s.clone()));
+                    if !s.is_empty() {
+                        a.push(ShowOp::Str(s.clone()));
+                    }
                     cursor += s.len();
                 } else {
-                    // 跨界 str：切
+                    // 跨界 str：切（空片不产出——形态干净）。
                     let l = at - cursor;
-                    a.push(ShowOp::Str(s[..l].to_vec()));
-                    b.push(ShowOp::Str(s[l..].to_vec()));
+                    if l > 0 {
+                        a.push(ShowOp::Str(s[..l].to_vec()));
+                    }
+                    if s.len() > l {
+                        b.push(ShowOp::Str(s[l..].to_vec()));
+                    }
                     filled = true;
                 }
             }
@@ -1210,7 +1310,8 @@ mod batch3_tests {
     use crate::pde::font::PdeFont;
     use crate::pde::resources::ResValue;
 
-    /// 测试字体（全 600 宽——split 位置进位的度量源；公共 API 构造）。
+    /// 测试字体（全 600 宽 /FirstChar 0——#194 split 位置进位的度量源；
+    /// 公共 API 构造——`from_res_value` 字典路径与集成测试同口径）。
     fn courier600() -> PdeFont {
         PdeFont::from_res_value(&ResValue::Dict(vec![
             (b"Subtype".to_vec(), ResValue::Name(b"Type1".to_vec())),

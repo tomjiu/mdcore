@@ -241,8 +241,8 @@ fn split_run_at_global_face() {
     // run 局部语义会把 3 当 run1 内越界（无操作）——判别面。
     let stream = b"BT /F1 12 Tf (AB) Tj 1 0 0 1 40 20 Tm (CDE) Tj ET";
     let mut content = parse_content(stream).unwrap();
+    let split_font = PdeFont::from_res_value(&simple_type1()).unwrap();
     if let Some(PdeElement::Text(t)) = content.elements.first_mut() {
-        let split_font = PdeFont::from_res_value(&simple_type1()).unwrap();
         t.split_run_at(3, Some(&split_font));
         assert_eq!(
             t.num_runs(),
@@ -369,8 +369,11 @@ fn indexed_hival_consistency_face() {
 fn parse_edit_write_roundtrip() {
     let stream = b"BT /F1 12 Tf 1 0 0 1 10 20 Tm (Hello) Tj ET";
     let mut content = parse_content(stream).unwrap();
+    let rt_font = PdeFont::from_res_value(&simple_type1()).unwrap();
     if let Some(PdeElement::Text(t)) = content.elements.first_mut() {
         t.replace_chars(0, b"Jello"); // H→J（Adobe 编辑最经典路径）
+                                      // #194：split 带字体度量（位置进位 Tm——写回后次段不重叠）；
+                                      // 字节超出 simple_type1 宽度域走 missing 250/500 缺省（确定值非猜）。
         let rt_font = PdeFont::from_res_value(&simple_type1()).unwrap();
         t.split_run_at(2, Some(&rt_font)); // 全局 2 = "l" 位（首段含 l → Je|llo）
     }
@@ -379,8 +382,8 @@ fn parse_edit_write_roundtrip() {
     // split 全局 2（含首段）→ Jel|lo 两 run
     assert!(s.contains("(Jel)"), "写回含编辑后文本首段：{s}");
     assert!(s.contains("(lo)"), "写回含编辑后文本次段：{s}");
-    // 再解析：字符数守恒；**位置保真后**次 run Tm 已进位（首段
-    // advance）→ Adobe 合并判据（Tm 相同才合并）不再合并——两 run
+    // 再解析：字符数守恒；**#194 位置保真后**次 run Tm 已进位（首段
+    // advance）→ Adobe 合并判据（Tm 相同才合并）**不再合并**——两 run
     // 保持、各字符绘制位置与未拆分形态一致（旧「合并回单 run」断言
     // 正是次段 Tm 复制原值的重叠病灶面——返工同步为更强形态）。
     let reparsed = parse_content(&out).unwrap();
@@ -389,5 +392,13 @@ fn parse_edit_write_roundtrip() {
         assert_eq!(t.num_runs(), 2, "进位 Tm 的两 run 不再合并（位置保真）");
         assert_eq!(t.run_text(0).unwrap(), b"Jel".to_vec());
         assert_eq!(t.run_text(1).unwrap(), b"lo".to_vec());
+        // 次段进位核对：J/e/l 码值 74/101/108 均超 simple_type1 的
+        // /Widths 域（32..34）→ 走 MissingWidth 500：3×500×12/1000=18
+        // → 次 run Tm.e = 10 + 18 = 28（进位——缺省确定值非猜）。
+        let e2 = t.runs[1].text_matrix[4];
+        assert!(
+            (e2 - 28.0).abs() < 1e-3,
+            "次段 Tm.e = 10 + 3×500×12/1000 = 28（进位），实际 {e2}"
+        );
     }
 }
