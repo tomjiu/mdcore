@@ -548,33 +548,66 @@ impl PdeText {
     /// 次 run 从 splitLoc+1 起——无字符丢失的自洽解释；splitLoc 字符
     /// 丢失的其他判读与「Run 不无故吞字」矛盾，弃）。
     ///
-    /// 两 run 继承同一 state/text_matrix（仅断 run 边界）。无操作面：
-    /// `split_loc == 0`、`split_loc >= num_chars()`、splitLoc 为 run 尾
-    /// 字符（次 run 空——无边界可断）。
-    pub fn split_run_at(&mut self, split_loc: usize) {
+    /// #194 修复（返工 2026-11-14 扩面）：
+    /// - **位置进位**（split 不得重叠）：`font = Some` → 次 run Tm
+    ///   平移分量 += Tm 基线方向 × 首段 advance（度量走
+    ///   [`advance_of_shows`] 真源——Tz 全乘语义）；`font = None`
+    ///   → **拒绝**（返回 false 不拆——无度量不猜位置）。
+    /// - **完整码边界**（返工新增）：`split_loc` 语义为字节索引面
+    ///   （`num_chars` 仍字节口径），切点 `cut` 须落在**码边界**
+    ///   （Type0 2 字节 CID 的偶数位）——非码边界的切点把 CID 切成
+    ///   两半码（残码流不可度量不可写回有效字形）→ **拒绝**（false
+    ///   不拆）。run 尾残码（run_bytes 长非码长整数倍）同拒。
+    pub fn split_run_at(
+        &mut self,
+        split_loc: usize,
+        font: Option<&crate::pde::font::PdeFont>,
+    ) -> bool {
         if split_loc == 0 || split_loc >= self.num_chars() {
-            return;
+            return false;
         }
         let run = match self.run_for_char(split_loc) {
             Some(r) => r,
-            None => return,
+            None => return false,
         };
         let off = split_loc - self.run_char_offset(run).unwrap_or(0);
         // 切点 = off + 1（首段含 splitLoc 位字符）。
         let cut = off + 1;
-        if cut >= run_bytes(&self.runs[run]).len() {
-            return; // splitLoc 为 run 尾字符——无边界可断
+        let total = run_bytes(&self.runs[run]).len();
+        if cut >= total {
+            return false; // splitLoc 为 run 尾字符——无边界可断
         }
+        // 完整码边界（返工扩面）：字体未知 CMap / 残码 → 拒绝；切点
+        // 须为码长整数倍位（Type0 不得切 CID 中间）。
+        let Some(code_len) = font.and_then(|f| f.code_len_of(&run_bytes(&self.runs[run]))) else {
+            return false; // 无度量 / 未知 CMap / 残码——拒绝不猜
+        };
+        if cut % code_len != 0 {
+            return false; // 切 CID 半码——拒绝（不产生残码 run）
+        }
+        // 首段 advance（真源度量——切点前的截断 shows）。
+        let head = &self.runs[run];
+        let mut head_shows = head.shows.clone();
+        truncate_shows_to_bytes(&mut head_shows, cut);
+        let Some(adv) = advance_of_shows(&head_shows, &head.state, font) else {
+            return false;
+        };
         let (a, b) = split_run_show_bytes(&self.runs[run], cut);
         let state = self.runs[run].state.clone();
         let matrix = self.runs[run].text_matrix;
         self.runs[run].shows = a;
+        // 进位：Tm' 平移分量 += Tm 基线方向向量 × adv（文本空间平移
+        // (adv,0) 经 Tm 线性部分）。
+        let mut m = matrix;
+        m[4] += matrix[0] * adv;
+        m[5] += matrix[1] * adv;
         let next = TextRun {
             state,
-            text_matrix: matrix,
+            text_matrix: m,
             shows: b,
         };
         self.runs.insert(run + 1, next);
+        true
     }
 
     /// `PDETextRemove`（kPDETextRun 形态）：run 索引删除 `count` 个。
@@ -633,31 +666,31 @@ impl PdeText {
         }
     }
 
-    // ===== 批③度量面（issue #162——PDEFont 度量 × 矩阵换算） =====
+    // ===== 批③度量面（issue #162——PDEFont 度量 × 矩阵换换算） =====
 
     /// `PDETextGetAdvance`（run 面）："The advance width is the amount
     /// by which the current point advances when the character is
     /// drawn"——run 内字符宽度累加（字符空间）。
     ///
-    /// `font` 供 `width_of`（1000 EM → 字符空间 = × font_size/1000 ×
-    /// h_scale/100 + Tc；Tw 只作用于单字节编码的字形码 32——PDF
-    /// §5.2.2 多字节编码下 word spacing 不适用）。`None` = 无字体
-    /// 上下文 → 返回 None（诚实降级——批①文本 BBox 登记的同一偏差
-    /// 面，本方法不猜）。
+    /// `None` = 无字体上下文 / 未知 CMap（Type0 非 Identity-H、垂直
+    /// 布局）/ 残码段——**明确缺能力**（诚实降级，本方法不猜）。
+    ///
+    /// **#195 修复（返工 2026-11-14——Tz 全乘子语义）**：PDF 3200
+    /// Table 51——`Tz` 是**整体**乘子，作用于字形宽、Tc、Tw 与 TJ
+    /// 位移**每一项**：`tx = ((w0/1000)×Tf + Tc + Tw) × Tz/100`；
+    /// TJ 数值项 `−k/1000 × Tf × Tz/100`（正数左移=负贡献、负数松
+    /// 排=正贡献）。返工前「TJ 不受 Tz 影响」为错误注释与错误实现
+    /// （Lead MuPDF 实证反例：`50 Tz 2 Tc 4 Tw [(A ) 200 (B)] TJ`
+    /// 应 14.6 实得 18.4）。Tw 只作用于单字节编码的字形码 32（PDF
+    /// §5.2.2 多字节编码下不适用）。
+    ///
+    /// 度量逻辑委托 [`advance_of_shows`]——**单一真源**（split 进
+    /// 位 / BBox / 本方法共用，防重复逻辑漂移——Lead 复验指认的
+    /// 第二病灶）。
     pub fn run_advance(&self, i: usize, font: Option<&crate::pde::font::PdeFont>) -> Option<f32> {
-        let run = self.runs.get(i)?;
-        let f = font?;
-        let st = &run.state;
-        let single = f.num_code_bytes(&run_bytes(run)) == 1;
-        let mut adv = 0.0f32;
-        for &code in &run_bytes(run) {
-            let w1000 = f.width_of(code as u32);
-            adv += w1000 * st.size / 1000.0 * st.h_scale / 100.0 + st.char_spacing;
-            if single && code == 32 {
-                adv += st.word_spacing;
-            }
-        }
-        Some(adv)
+        self.runs.get(i)?;
+        let run = &self.runs[i];
+        advance_of_shows(&run.shows, &run.state, font)
     }
 
     /// `PDETextGetBBox`（run 面）——批①登记偏差的闭合路径：字体
@@ -694,6 +727,63 @@ impl PdeText {
 
 // ---- run 字节面辅助（show 串的字节级寻址——跨 Str/Kern 串行） ----
 
+/// **度量真源（#195 返工统一）**：shows 序列 → 累计 advance（字符
+/// 空间）。`run_advance` / `split_run_at` 进位 / 任何消费 advance
+/// 的面**共用本函数**（单一真源防重复逻辑漂移——Lead 复验指认的
+/// 第二病灶：helper 与公开 API 各写一份同错）。
+///
+/// 语义（PDF 3200 Table 51，**Tz 全乘子**——返工修正）：
+/// - 字形：`tx = (w0/1000 × Tf + Tc [+ Tw 若单字节码 32]) × Tz/100`
+/// - TJ 数值项（`ShowOp::Kern(k)`）：`−k/1000 × Tf × Tz/100`
+///   （正数左移=负贡献；**TJ 也乘 Tz**——旧注释「不受 Tz 影响」
+///   是错的，Lead MuPDF 反例实证）
+/// - `None`（明确缺能力，不猜）：无字体；未知 CMap（Type0 非
+///   Identity-H / 垂直 WMode 1——`num_code_bytes` 返回 None）；任一
+///   Str 段含残码（长非码长整数倍）。
+fn advance_of_shows(
+    shows: &[ShowOp],
+    st: &TextState,
+    font: Option<&crate::pde::font::PdeFont>,
+) -> Option<f32> {
+    let f = font?;
+    let tz = st.h_scale / 100.0;
+    // 码长：简单字体 1 / Identity-H 2 / 未知 CMap None（残码同时拒）。
+    let bytes: Vec<u8> = shows
+        .iter()
+        .filter_map(|s| match s {
+            ShowOp::Str(b) => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    let code_len = f.code_len_of(&bytes)?;
+    let single = code_len == 1;
+    let mut adv = 0.0f32;
+    for op in shows {
+        match op {
+            ShowOp::Kern(k) => {
+                // TJ 数值项：千分之一文本空间 → 字符空间（乘 Tf 与 Tz）。
+                adv -= k * st.size / 1000.0 * tz;
+            }
+            ShowOp::Str(b) => {
+                for chunk in b.chunks_exact(code_len) {
+                    let code: u32 = if code_len == 1 {
+                        chunk[0] as u32
+                    } else {
+                        u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+                    };
+                    let w1000 = f.width_of(code);
+                    adv += (w1000 * st.size / 1000.0 + st.char_spacing) * tz;
+                    if single && code == 32 {
+                        adv += st.word_spacing * tz; // Tw 同乘 Tz（§5.2.2 多字节不适用）
+                    }
+                }
+            }
+        }
+    }
+    Some(adv)
+}
+
 /// run 的显示字节拼接（Str 段全串；Kern 不占字符位）。
 fn run_bytes(run: &TextRun) -> Vec<u8> {
     run.shows
@@ -704,6 +794,45 @@ fn run_bytes(run: &TextRun) -> Vec<u8> {
         })
         .collect::<Vec<_>>()
         .concat()
+}
+
+/// shows 序列截断到「显示字节前 `at` 字节」（split 首段度量构造
+/// 用——跨界 Str 切分，Kern 归属游标口径与 `split_run_show_bytes`
+/// 配对；`at` 须为完整码边界位，由调用方保证）。
+fn truncate_shows_to_bytes(shows: &mut Vec<ShowOp>, at: usize) {
+    let mut cursor = 0usize;
+    let mut keep = 0usize; // 保留的 shows 前缀长度（元素数）
+    let mut cut_at: Option<(usize, usize)> = None; // (索引, 保留字节数)
+    for (i, op) in shows.iter().enumerate() {
+        match op {
+            ShowOp::Kern(_) => {
+                if cursor < at {
+                    keep = i + 1; // 界前 Kern 保留
+                }
+            }
+            ShowOp::Str(s) => {
+                if cursor + s.len() <= at {
+                    keep = i + 1;
+                    cursor += s.len();
+                } else if cursor < at {
+                    // 跨界 Str：切到 at（决策先记——借用释放后应用）。
+                    cut_at = Some((i, at - cursor));
+                    keep = i + 1;
+                    cursor = at;
+                } else {
+                    break; // 界后全弃
+                }
+            }
+        }
+    }
+    if let Some((i, l)) = cut_at {
+        let seg = match &shows[i] {
+            ShowOp::Str(s) => s[..l].to_vec(),
+            _ => unreachable!("决策位必为 Str"),
+        };
+        shows[i] = ShowOp::Str(seg);
+    }
+    shows.truncate(keep);
 }
 
 /// 重写 run 的字节串 `off..off+n` 段为 `new`（重装为单 Str——批③
@@ -1078,6 +1207,23 @@ impl PdeContent {
 #[cfg(test)]
 mod batch3_tests {
     use super::*;
+    use crate::pde::font::PdeFont;
+    use crate::pde::resources::ResValue;
+
+    /// 测试字体（全 600 宽——split 位置进位的度量源；公共 API 构造）。
+    fn courier600() -> PdeFont {
+        PdeFont::from_res_value(&ResValue::Dict(vec![
+            (b"Subtype".to_vec(), ResValue::Name(b"Type1".to_vec())),
+            (b"BaseFont".to_vec(), ResValue::Name(b"Courier".to_vec())),
+            (b"FirstChar".to_vec(), ResValue::Int(0)),
+            (b"LastChar".to_vec(), ResValue::Int(255)),
+            (
+                b"Widths".to_vec(),
+                ResValue::Array(vec![ResValue::Int(600); 256]),
+            ),
+        ]))
+        .unwrap()
+    }
 
     fn run(text: &[u8]) -> TextRun {
         TextRun {
@@ -1147,7 +1293,7 @@ mod batch3_tests {
         let mut t = text3(b"AB", b"CDE", b"");
         // 全局索引 3 = run1 的 "C" 之后（run 局部索引会理解为 run1 内 3 →
         // 越界无操作——反例判别面）
-        t.split_run_at(3);
+        t.split_run_at(3, Some(&courier600()));
         assert_eq!(t.num_runs(), 4, "全局 3 落在 run1 内部：断成 AB/CD/E");
         assert_eq!(t.run_text(0).unwrap(), b"AB".to_vec());
         assert_eq!(t.run_text(1).unwrap(), b"CD".to_vec());
@@ -1157,15 +1303,15 @@ mod batch3_tests {
         assert_eq!(t.runs[1].state, t.runs[2].state);
         // 边界无操作面：全局 0 / 全局尾；run 尾字符
         let mut t2 = text3(b"AB", b"CDE", b"");
-        t2.split_run_at(0); // 全局首
+        t2.split_run_at(0, Some(&courier600())); // 全局首
         assert_eq!(t2.num_runs(), 3);
-        t2.split_run_at(5); // 全局尾后
+        t2.split_run_at(5, Some(&courier600())); // 全局尾后
         assert_eq!(t2.num_runs(), 3);
         // run 尾字符（splitLoc=4 = run1 的 "E" 位）：cut=run_len → 无操作
-        t2.split_run_at(4);
+        t2.split_run_at(4, Some(&courier600()));
         assert_eq!(t2.num_runs(), 3);
         // run 首字符（splitLoc=2 = run1 的 "C" 位）：cut=1 → 切 C|DE
-        t2.split_run_at(2);
+        t2.split_run_at(2, Some(&courier600()));
         assert_eq!(t2.num_runs(), 4, "splitLoc 含首段：run1 切成 C|DE");
         assert_eq!(t2.run_text(1).unwrap(), b"C".to_vec());
         assert_eq!(t2.run_text(2).unwrap(), b"DE".to_vec());
@@ -1214,7 +1360,7 @@ mod batch3_tests {
         assert_eq!(t.num_chars(), 4);
         // Kern 跨界拆分：split 在 A|B 之间——Kern 归属后 run（游标过界）
         let mut t2 = t.clone();
-        t2.split_run_at(1);
+        t2.split_run_at(1, Some(&courier600()));
         // splitLoc=1（"B" 位）含首段：首 run 含 AB（字节切点在 B 后）
         assert_eq!(t2.run_text(0).unwrap(), b"AB".to_vec());
         assert_eq!(t2.run_text(1).unwrap(), b"CD".to_vec());
@@ -1231,7 +1377,7 @@ mod batch3_tests {
                 ],
             }],
         };
-        t3.split_run_at(2);
+        t3.split_run_at(2, Some(&courier600()));
         assert_eq!(t3.runs[0].shows.len(), 3, "界前 Kern+两 Str 归前 run");
         assert_eq!(t3.runs[1].shows.len(), 1);
     }

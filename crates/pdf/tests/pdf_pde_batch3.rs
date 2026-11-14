@@ -108,15 +108,42 @@ fn font_widths_and_missing_fallback() {
 #[test]
 fn font_cid_code_bytes() {
     let f = PdeFont::from_res_value(&simple_type1()).unwrap();
-    assert_eq!(f.num_code_bytes(b"A"), 1);
+    assert_eq!(f.num_code_bytes(b"A"), Some(1));
     // Type0（无 descendant——保形降级仍是 2）
     let t0 = ResValue::Dict(vec![
         (b"Subtype".to_vec(), ResValue::Name(b"Type0".to_vec())),
         (b"BaseFont".to_vec(), ResValue::Name(b"Cid".to_vec())),
     ]);
     let fc = PdeFont::from_res_value(&t0).unwrap();
-    assert_eq!(fc.num_code_bytes(b"AB"), 2);
+    // 返工（Lead 指认）：Type0 无 /Encoding = 未知 CMap → None
+    //（不再恒 2 返回错误成功值）
+    assert_eq!(fc.num_code_bytes(b"AB"), None, "缺 Encoding 拒绝不猜");
     assert!(fc.attrs.font_type.is_composite());
+    // Identity-H（横排 WMode 0）= Some(2)——支持面
+    let ih = ResValue::Dict(vec![
+        (b"Subtype".to_vec(), ResValue::Name(b"Type0".to_vec())),
+        (b"BaseFont".to_vec(), ResValue::Name(b"Cid".to_vec())),
+        (b"Encoding".to_vec(), ResValue::Name(b"Identity-H".to_vec())),
+    ]);
+    let fi = PdeFont::from_res_value(&ih).unwrap();
+    assert_eq!(fi.num_code_bytes(b"AB"), Some(2), "Identity-H 双字节");
+    // Identity-V（垂直 WMode 1）→ None（拒绝）
+    let iv = ResValue::Dict(vec![
+        (b"Subtype".to_vec(), ResValue::Name(b"Type0".to_vec())),
+        (b"Encoding".to_vec(), ResValue::Name(b"Identity-V".to_vec())),
+    ]);
+    let fv = PdeFont::from_res_value(&iv).unwrap();
+    assert_eq!(fv.num_code_bytes(b"AB"), None, "垂直布局拒绝");
+    // 预定义 CMap 名（非 Identity）→ None（CMap 表未承载不猜）
+    let gb = ResValue::Dict(vec![
+        (b"Subtype".to_vec(), ResValue::Name(b"Type0".to_vec())),
+        (
+            b"Encoding".to_vec(),
+            ResValue::Name(b"UniGB-UCS2-H".to_vec()),
+        ),
+    ]);
+    let fg = PdeFont::from_res_value(&gb).unwrap();
+    assert_eq!(fg.num_code_bytes(b"AB"), None, "未知预定义 CMap 拒绝");
     // 未知名保形
     let unk = ResValue::Dict(vec![(
         b"Subtype".to_vec(),
@@ -215,7 +242,8 @@ fn split_run_at_global_face() {
     let stream = b"BT /F1 12 Tf (AB) Tj 1 0 0 1 40 20 Tm (CDE) Tj ET";
     let mut content = parse_content(stream).unwrap();
     if let Some(PdeElement::Text(t)) = content.elements.first_mut() {
-        t.split_run_at(3);
+        let split_font = PdeFont::from_res_value(&simple_type1()).unwrap();
+        t.split_run_at(3, Some(&split_font));
         assert_eq!(
             t.num_runs(),
             3,
@@ -343,25 +371,23 @@ fn parse_edit_write_roundtrip() {
     let mut content = parse_content(stream).unwrap();
     if let Some(PdeElement::Text(t)) = content.elements.first_mut() {
         t.replace_chars(0, b"Jello"); // H→J（Adobe 编辑最经典路径）
-        t.split_run_at(2); // 全局 2 = "l" 位（首段含 l → Je|llo）
+        let rt_font = PdeFont::from_res_value(&simple_type1()).unwrap();
+        t.split_run_at(2, Some(&rt_font)); // 全局 2 = "l" 位（首段含 l → Je|llo）
     }
     let out = content.write();
     let s = String::from_utf8_lossy(&out);
     // split 全局 2（含首段）→ Jel|lo 两 run
     assert!(s.contains("(Jel)"), "写回含编辑后文本首段：{s}");
     assert!(s.contains("(lo)"), "写回含编辑后文本次段：{s}");
-    // 再解析：字符数守恒；拆分的两 run 同 state+Tm ——再解析按 Adobe
-    // 合并判据并回单 run（"PDFEdit combines text from multiple Tj
-    // operators into a single text run, when possible"——写回流的
-    // 合并语义钉）。
+    // 再解析：字符数守恒；**位置保真后**次 run Tm 已进位（首段
+    // advance）→ Adobe 合并判据（Tm 相同才合并）不再合并——两 run
+    // 保持、各字符绘制位置与未拆分形态一致（旧「合并回单 run」断言
+    // 正是次段 Tm 复制原值的重叠病灶面——返工同步为更强形态）。
     let reparsed = parse_content(&out).unwrap();
     if let Some(PdeElement::Text(t)) = reparsed.elements.first() {
         assert_eq!(t.num_chars(), 5, "字符数守恒跨写回");
-        assert_eq!(
-            t.num_runs(),
-            1,
-            "同 state+Tm 的 split 产物写回后再解析合并（Adobe 合并判据）"
-        );
-        assert_eq!(t.run_text(0).unwrap(), b"Jello".to_vec());
+        assert_eq!(t.num_runs(), 2, "进位 Tm 的两 run 不再合并（位置保真）");
+        assert_eq!(t.run_text(0).unwrap(), b"Jel".to_vec());
+        assert_eq!(t.run_text(1).unwrap(), b"lo".to_vec());
     }
 }

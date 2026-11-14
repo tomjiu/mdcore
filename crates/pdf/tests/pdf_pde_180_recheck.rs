@@ -7,9 +7,7 @@
 //!    [135, 8197, 524291]——`decode_filters_bounded` 用小 budget）
 //! 3. 有效滤镜正常解码不回归（AHx 正常路径）
 
-use mdc_pdf::pde::image::{
-    ascii85_decode, decode_filter, decode_filters, DECODE_HARD_LIMIT,
-};
+use mdc_pdf::pde::image::{ascii85_decode, decode_filter, decode_filters, DECODE_HARD_LIMIT};
 
 /// 证据 1：超 32 位组——debug 不得 panic（checked 算术）、release
 /// 不得 wrap（曾返回 Ok([8,120,14,196]) 的形态必须变 Err）。
@@ -23,17 +21,26 @@ fn ascii85_overflow_group_rejected() {
 /// 8 KiB 预算——层间放大器语义：任一层输出一超 budget 即拒）。
 #[test]
 fn rl_chain_small_budget_rejected_before_expansion() {
-    let seed: [u8; 11] = [0x81, 0x81, 0x06, 0x04, 0x02, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80];
+    let seed: [u8; 11] = [
+        0x81, 0x81, 0x06, 0x04, 0x02, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80,
+    ];
     // 前三层长度（issue 实测）：135 → 8197 → 524291
     // 小预算 8 KiB：第二层 8197 已贴线，第三层必超——必须 Err 而非
     // 实际分配 52 万字节。（8 KiB < 8197 会在更早层拒——预算 16 KiB
     // 时第二层过、第三层 524291 超即拒，更能证明「中间层同受约束」。）
     let r = mdc_pdf::pde::image::decode_filters_bounded(
-        &[b"RunLengthDecode".to_vec(), b"RunLengthDecode".to_vec(), b"RunLengthDecode".to_vec()],
+        &[
+            b"RunLengthDecode".to_vec(),
+            b"RunLengthDecode".to_vec(),
+            b"RunLengthDecode".to_vec(),
+        ],
         &seed,
         16 * 1024,
     );
-    assert!(r.is_err(), "三层 RL 链 16KiB 预算必须拒绝（第三层 524291 > 预算）");
+    assert!(
+        r.is_err(),
+        "三层 RL 链 16KiB 预算必须拒绝（第三层 524291 > 预算）"
+    );
 }
 
 /// 证据 2b：旧无界面 `decode_filters`（usize::MAX 时代裸奔面）现挂
@@ -50,7 +57,10 @@ fn legacy_decode_filters_has_hard_limit() {
     // 解出 126 字节 → 64MiB 需约 107 万段 = 2.1MB 输入）。
     // 简化：直接验「预算上限常量 ≤ 64MiB 且旧 API 转发 bounded」的
     // 组合面（上面 2a 已证 bounded 生效）+ 单段 63MiB 验证不超顶。
-    assert!(DECODE_HARD_LIMIT <= 64 * 1024 * 1024, "硬顶必须 ≤ 64MiB（不裸奔）");
+    assert!(
+        DECODE_HARD_LIMIT <= 64 * 1024 * 1024,
+        "硬顶必须 ≤ 64MiB（不裸奔）"
+    );
     // 旧 API 转发面：构造一层 RL 解出 ≈63 MiB（不超顶——必须 Ok），
     // 验证旧 API 走 bounded 且大合法输出不误伤。
     // RL 压缩段头 = 257-重复数（重复 126 → 头 0x83）；63MiB ÷ 126 ≈
