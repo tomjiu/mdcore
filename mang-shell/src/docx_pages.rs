@@ -30,7 +30,10 @@
 //!   frame` 自排一帧消费（pdf_pages 同款纪律）——Ready 后无任何
 //!   输入/回调也必须开始派单（缺此通知 = 条带永远「渲染中」）；
 //!   视口变更（缩放/窗口调整）同径再消费。在途 tile 超时（15s）
-//!   重派一次，再超转失败面——无进展不无限「渲染中」。
+//!   重派一次，再超转失败面——无进展不无限「渲染中」。#193 统一
+//!   请求级超时：看门狗只审计「覆盖缺口」（可见条带既未缓存、未
+//!   失败、也无在途——派单丢失补派一次），在途一律归键级 15s 管
+//!   辖；健康覆盖静置零动作、零日志、零 notify。
 //! - **会话面 seam（#186）**：`TileSession` trait 收拢 tile 派单/几何
 //!   重查/回执拉取——生产 `DocxLokSession`，测试注桩（真实窗口
 //!   绘制链回归，不依赖 LO 运行时、不手工塞 viewport_size）。
@@ -73,8 +76,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const TILE_PENDING_TIMEOUT: Duration = Duration::from_secs(15);
 /// #186 同键最大尝试数（首次 + 重派 1 次；再超时 → 失败面明示）。
 const TILE_MAX_ATTEMPTS: u32 = 2;
-/// #186 派单看门狗拍数（≈2 秒无任何 tile 进账 → 一次全量重派兜底——
-/// 与每键超时并存：键级超时管单带悬死，全局看门狗管整链零回执）。
+/// #193 派单看门狗拍数（≈2 秒覆盖缺口未消 → 补派一次兜底）。只管
+/// 「可见条带既未缓存、未失败、也无在途」的覆盖缺口（派单丢失自
+/// 愈——失效清理后无重派路径等）；在途请求一律归键级 15s 超时管辖，
+/// 看门狗不清在途、不标失败、不绕过 15s×2 键级策略。健康覆盖
+/// （缺口为空）= 静置零动作（#193：健康缓存静置 ≥60s 无重派/失败/
+/// notify 风暴）。
 const WATCHDOG_TICKS: u32 = 125;
 /// 滚轮缩放步进倍率（每「行」——pdf `PDF_ZOOM_WHEEL_STEP` 同值）。
 const DOCX_ZOOM_WHEEL_STEP: f32 = 1.1;
@@ -253,11 +260,12 @@ pub struct DocxPagesView {
     /// #186：视口探针已 paint 到的尺寸（`refresh_viewport` 的变化检测
     /// 基线——探针首帧写 Cell 后由轮询拍接管派单，交互不再前置）。
     viewport_seen: (f32, f32),
-    /// #186 看门狗：Ready 后经历过的轮询拍数（无 tile 进账时计数）——
-    /// 超过 [`WATCHDOG_TICKS`] 触发一次全量重派；再超则条带转失败
-    /// （不无限「渲染中」）。
+    /// #193 看门狗：Ready 后「覆盖缺口」持续拍数（缺口 = 既未缓存、
+    /// 未失败、也无在途派单的可见条带非空）——缺口为空即复位（健康
+    /// 静置零动作）；持续超 [`WATCHDOG_TICKS`] 补派一次。
     watchdog_ticks: u32,
-    /// #186 看门狗：已触发过一次重派（仅一次——诚实失败面）。
+    /// #193 看门狗：本故障周期已补派过一次（有界——补派后仍缺覆盖
+    /// 才登记失败面；缺口闭合或视口/内容代际切换时复位预算）。
     watchdog_retried: bool,
 }
 
@@ -394,6 +402,13 @@ impl DocxPagesView {
         self.failed.len()
     }
 
+    /// #193 测试面：看门狗故障周期状态（覆盖缺口持续拍数，本周期已
+    /// 补派标记）。
+    #[cfg(test)]
+    pub fn watchdog_state_for_test(&self) -> (u32, bool) {
+        (self.watchdog_ticks, self.watchdog_retried)
+    }
+
     /// #186：测试面轮询拍（真实 drain 的单拍语义——含 refresh_viewport
     /// 与看门狗收口；gpui::test 里直接驱动而无需等 16ms 定时器）。
     #[cfg(test)]
@@ -435,8 +450,11 @@ impl DocxPagesView {
     }
 
     /// 切换缩放档（滚动锚定：视口中心的内容 twips 纵坐标不变——
-    /// `docx_geom` 互逆纯函数；预设菜单点击/键位同走此口）。
+    /// `docx_geom` 互逆纯函数；预设菜单点击/键位同走此口）。换档 =
+    /// 视口代际切换——复位 #193 看门狗故障周期（新光栅宽键域重新
+    /// 获得补派预算）。
     fn set_zoom_mode(&mut self, mode: ZoomMode, cx: &mut Context<Self>) {
+        self.watchdog_cycle_reset();
         let (vw, vh) = self.viewport_size;
         let Some((w_tw, _)) = self.doc_size else {
             self.zoom_mode = mode;
@@ -628,9 +646,6 @@ impl DocxPagesView {
                 }
             }
         }
-        let had_tile = replies
-            .iter()
-            .any(|r| matches!(r, SessionReply::Tile { .. }));
         let mut terminal_seen = false;
         for reply in replies {
             match reply {
@@ -712,57 +727,130 @@ impl DocxPagesView {
         // 退出，落可定位失败——正常收尾误报由 terminal_seen 卫）----
         self.handle_session_disconnect(!channel_alive && !terminal_seen, cx);
 
-        // ---- 5) #186 派单看门狗（每拍收口）----
-        // 看门狗：Ready 且视口已知但长时间无 tile 进账——一次全量重派
-        // （pending 悬死/派单丢失的自愈）；重派后仍无进账则把在途条带
-        // 转失败呈现（诚实失败面，不无限「渲染中」）。
-        if had_tile {
-            self.watchdog_ticks = 0;
-        } else if matches!(self.boot, Boot::Ready) && self.viewport_size.0 > 0. {
-            self.watchdog_ticks = self.watchdog_ticks.saturating_add(1);
-            let known_missing =
-                !self.cache.is_empty() || !self.pending.is_empty() || !self.failed.is_empty();
-            if self.watchdog_ticks >= WATCHDOG_TICKS && known_missing {
-                if !self.watchdog_retried {
-                    eprintln!(
-                        "docx-pages: #186 看门狗——{WATCHDOG_TICKS} 拍无 tile 进账，\
-                         全量重派（pending={} cache={} failed={}）",
-                        self.pending.len(),
-                        self.cache.len(),
-                        self.failed.len()
-                    );
-                    self.pending.clear();
-                    self.watchdog_retried = true;
+        // ---- 5) #193 派单看门狗（每拍收口——统一请求级超时策略）----
+        // 键级 15s 超时（expire_stale_pending）是唯一的在途过期/重试/
+        // 失败判定权威；本看门狗只审计「覆盖缺口」：存在既未缓存、未
+        // 失败、也无在途的可见条带（失效清理后无重派路径、派单丢失
+        // 等）持续 [`WATCHDOG_TICKS`] 拍 → 补派一次（submit_visible 对
+        // 已覆盖键幂等）；补派后仍缺覆盖 → 缺带登记失败面一次。健康
+        // 覆盖（缺口为空）= 静置零动作、零日志、零 notify（#193：健
+        // 康缓存静置 ≥60s 无重派/失败/notify 风暴——旧 known_missing
+        // 把「缓存非空」当「缺货」的误判面在此根除）。任何回执不复
+        // 位计数——晚到/他键回执不能误复位新代际；缺口闭合或代际切
+        // 换（视口变更/失效/换档）才复位补派预算。
+        if matches!(self.boot, Boot::Ready) {
+            self.refresh_viewport_size_from_probe();
+            let missing = self.uncovered_visible_keys();
+            if missing.is_empty() {
+                if self.watchdog_ticks != 0 || self.watchdog_retried {
+                    // 故障周期闭合（缺口消解）——复位补派预算。
                     self.watchdog_ticks = 0;
-                    self.submit_visible(cx);
-                } else {
-                    eprintln!(
-                        "docx-pages: #186 看门狗——重派后仍无 tile 进账，在途条带\
-                         转失败（不无限渲染中）"
-                    );
-                    let bands: Vec<(u32, u32)> =
-                        self.pending.values().map(|(key, _)| *key).collect();
-                    self.pending.clear();
-                    for key in bands {
-                        self.failed.insert(key);
+                    self.watchdog_retried = false;
+                }
+            } else {
+                self.watchdog_ticks = self.watchdog_ticks.saturating_add(1);
+                if self.watchdog_ticks >= WATCHDOG_TICKS {
+                    if !self.watchdog_retried {
+                        eprintln!(
+                            "docx-pages: #193 看门狗——{WATCHDOG_TICKS} 拍覆盖缺口未消（缺 {} 带）——补派一次（pending={} cache={} failed={}）",
+                            missing.len(),
+                            self.pending.len(),
+                            self.cache.len(),
+                            self.failed.len()
+                        );
+                        self.watchdog_retried = true;
+                        self.watchdog_ticks = 0;
+                        self.submit_visible(cx);
+                    } else {
+                        eprintln!(
+                            "docx-pages: #193 看门狗——补派后仍缺覆盖，缺带登记失败面（{} 带，失效/换档可重试）",
+                            missing.len()
+                        );
+                        for key in missing {
+                            self.failed.insert(key);
+                        }
+                        self.watchdog_ticks = 0;
+                        cx.notify();
                     }
-                    cx.notify();
                 }
             }
         }
     }
 
-    /// #186：视口探针读数→派单（轮询拍接管——探针 paint 写 Cell 后由
-    /// 本方法收口，变化才 notify：视口稳定后零额外渲染）。
+    /// #193：视口探针读数→派单（轮询拍接管——探针 paint 写 Cell 后由
+    /// 本方法收口，变化才 notify：视口稳定后零额外渲染）。视口代际
+    /// 切换同时复位看门狗故障周期（新代际重新获得补派预算）。
     fn refresh_viewport(&mut self, cx: &mut Context<Self>) {
         if let Some((w, h)) = self.viewport.get() {
             if w > 0. && h > 0. && (w, h) != self.viewport_seen {
                 eprintln!("docx-pages: #186 视口探针 {w:.0}x{h:.0}px（测量→派单接管）");
                 self.viewport_seen = (w, h);
+                self.watchdog_cycle_reset();
                 self.submit_visible(cx);
                 cx.notify();
             }
         }
+    }
+
+    /// #193 看门狗故障周期复位（视口/内容代际切换：新代际重新获得补
+    /// 派预算）。晚到旧代际回执本就被 seq 对账机械丢弃——不复位、不
+    /// 污染，无需额外代际号。
+    fn watchdog_cycle_reset(&mut self) {
+        self.watchdog_ticks = 0;
+        self.watchdog_retried = false;
+    }
+
+    /// 探针读数回写视口尺寸（submit_visible 与 #193 覆盖审计共用的
+    /// 口径收口——读 Cell 写 viewport_size，零值守卫）。
+    fn refresh_viewport_size_from_probe(&mut self) {
+        if let Some((w, h)) = self.viewport.get()
+            && w > 0.
+            && h > 0.
+        {
+            self.viewport_size = (w, h);
+        }
+    }
+
+    /// 可见条带区间（`first..last`，光栅宽）——submit_visible 派单与
+    /// #193 覆盖审计共用的单一口径（滚动偏移 → 起始带，视口高 → 带
+    /// 数，±1 观测余量）。几何/视口未知 → None（无从派单/审计）。
+    fn visible_band_range(&self) -> Option<(usize, usize, u32)> {
+        let (vw, vh) = self.viewport_size;
+        if vw <= 0. || vh <= 0. {
+            return None;
+        }
+        let (w_tw, h_tw) = self.doc_size?;
+        let rw = self.raster_width(vw);
+        let count = band_count(w_tw, h_tw, rw);
+        if count == 0 {
+            return None;
+        }
+        // 滚动偏移（gpui 负向约定——取负归正；uniform_list 以首项测高，
+        // 末带偏短属固有近似——条带步进恒 BAND_PX）。
+        let offset_y = (-f32::from(self.scroll.0.borrow().base_handle.offset().y)).max(0.);
+        let first = (offset_y as usize / BAND_PX as usize).saturating_sub(1);
+        let visible_bands = (vh as usize / BAND_PX as usize + 2).max(1);
+        let last = (first + visible_bands).min(count);
+        Some((first, last, rw))
+    }
+
+    /// #193 覆盖审计：当前视口下既未缓存、未失败、也无在途派单的
+    /// 可见条带键集（空 = 健康覆盖——静置零动作；非空 = 派单链缺
+    /// 口，看门狗补派兜底）。键口径与 submit_visible 的 todo 同源
+    /// （同一区间单源），不重复派单已覆盖键。
+    fn uncovered_visible_keys(&self) -> Vec<(u32, u32)> {
+        let Some((first, last, rw)) = self.visible_band_range() else {
+            return Vec::new();
+        };
+        (first..last)
+            .filter(|band| {
+                let key = (*band as u32, rw);
+                !self.cache.contains_key(&key)
+                    && !self.failed.contains(&key)
+                    && !self.pending.values().any(|(k, _)| *k == key)
+            })
+            .map(|band| (band as u32, rw))
+            .collect()
     }
 
     /// 在途超时巡检（#186：每 16ms 拍随 drain）。超时条目离在途：未过
@@ -852,9 +940,10 @@ impl DocxPagesView {
     }
 
     /// 失效区间逐出（跨光栅宽：内容变更与缩放无关——同条带全档逐出；
-    /// 在途/失败登记同步清除——陈旧像素宁可重画不可误显）。返回逐出
-    /// 缓存条数。
+    /// 在途/失败登记同步清除——陈旧像素宁可重画不可误显）。内容代际
+    /// 切换——复位 #193 看门狗故障周期。返回逐出缓存条数。
     fn apply_invalidate(&mut self, scope: InvalScope) -> usize {
+        self.watchdog_cycle_reset();
         let Some((w_tw, h_tw)) = self.doc_size else {
             return 0;
         };
@@ -968,34 +1057,19 @@ impl DocxPagesView {
         }
     }
 
-    /// 可见条带派单（render 期调用——读根级探针上帧记录的视口）。
+    /// 可见条带派单（render 期调用——读根级探针上帧记录的视口；
+    /// 区间口径与 #193 覆盖审计同源——visible_band_range 单源）。
     fn submit_visible(&mut self, _cx: &mut Context<Self>) {
         if !matches!(self.boot, Boot::Ready) {
             return;
         }
-        if let Some((w, h)) = self.viewport.get() {
-            if w > 0. && h > 0. {
-                self.viewport_size = (w, h);
-            }
-        }
-        let (vw, vh) = self.viewport_size;
-        if vw <= 0. || vh <= 0. {
+        self.refresh_viewport_size_from_probe();
+        let Some((first, last, rw)) = self.visible_band_range() else {
             return;
-        }
+        };
         let Some((w_tw, h_tw)) = self.doc_size else {
             return;
         };
-        let rw = self.raster_width(vw);
-        let count = band_count(w_tw, h_tw, rw);
-        if count == 0 {
-            return;
-        }
-        // 滚动偏移（gpui 负向约定——取负归正；uniform_list 以首项测高，
-        // 末带偏短属固有近似——条带步进恒 BAND_PX）。
-        let offset_y = (-f32::from(self.scroll.0.borrow().base_handle.offset().y)).max(0.);
-        let first = (offset_y as usize / BAND_PX as usize).saturating_sub(1);
-        let visible_bands = (vh as usize / BAND_PX as usize + 2).max(1);
-        let last = (first + visible_bands).min(count);
         // 相 1（无会话借用）：算键集。
         let mut todo = Vec::new();
         for band in first..last {
@@ -1028,9 +1102,12 @@ impl DocxPagesView {
                 self.pending.insert(seq, (key, Instant::now()));
                 dispatched += 1;
             }
+            let offset_y = (-f32::from(self.scroll.0.borrow().base_handle.offset().y)).max(0.);
             eprintln!(
-                "docx-pages: 派单 +{dispatched}（视口 {vw:.0}x{vh:.0} 偏移 y={offset_y:.0} \
+                "docx-pages: 派单 +{dispatched}（视口 {}x{} 偏移 y={offset_y:.0} \
                  rw={rw} band {first}..{last}）→ 在途共 {}",
+                self.viewport_size.0,
+                self.viewport_size.1,
                 self.pending.len()
             );
         }
@@ -2108,6 +2185,398 @@ mod tests {
             after_retry,
             "失败面同键不重派"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #193：统一请求级超时/重试状态机（受控时间回归——健康静置、慢
+    // tile、派单丢失、真悬死、晚到回执卫生、代际复位；Linux 本地
+    // 可全绿，Windows 真机静置证据归 Lead 复验）
+    // ------------------------------------------------------------------
+
+    /// #193 核心回归：健康缓存静置（cache 非空、pending=0、failed=0）
+    /// ——≥60s 静置无重派、无失败登记、无逐拍 notify（自排帧零）。真机
+    /// 100s 3118 行 stderr（2850 行看门狗）病灶锁定：旧 known_missing
+    /// 把「缓存非空」当「缺货」，健康态每拍 log+notify；旧 else 分支
+    /// 无退出守卫 → 每拍「在途条带转失败」。
+    #[gpui::test]
+    fn healthy_cache_quiescent_no_storm(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-quiet-{}.docx", std::process::id()));
+        let mock = MockSession::new(true);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let n0 = pump_until_dispatched(cx, &mut visual, &view, &mock);
+        // 泵到全部可见带入缓存（auto tile 回执全入账——健康态到位）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(1));
+            if view.read_with(cx, |v, _| {
+                v.cache_stats_for_test().1 > 0 && v.pending_for_test() == 0
+            }) {
+                break;
+            }
+        }
+        let (_, cache_n) = view.read_with(cx, |v, _| v.cache_stats_for_test());
+        assert!(
+            cache_n > 0,
+            "前置：健康缓存必须非空（auto 回执入账，首派 {n0} 笔）"
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.pending_for_test()), 0);
+        assert_eq!(view.read_with(cx, |v, _| v.failed_for_test()), 0);
+        let requests_at_quiesce = mock.requests.lock().unwrap().len();
+        // 静置 ≥60s：测试时钟推进 64s（16ms 拍 × 4000），驱动真实轮询
+        // 循环（含定时器链全链——非直呼 drain）。
+        for _ in 0..3200 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.cache_stats_for_test().1,
+                cache_n,
+                "健康静置缓存条目不得增删"
+            );
+            assert_eq!(v.pending_for_test(), 0, "健康静置不得有新在途");
+            assert_eq!(v.failed_for_test(), 0, "健康静置不得登记失败");
+            assert_eq!(
+                v.watchdog_state_for_test(),
+                (0, false),
+                "健康覆盖：看门狗零计拍、零补派标记"
+            );
+        });
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            requests_at_quiesce,
+            "健康静置 ≥60s 不得重派（旧实现 125 拍清 pending 全量重派）"
+        );
+        // 无逐拍 notify：静置期不排任何新帧。
+        assert_eq!(
+            visual.update(|window, app| window.simulate_next_frame(app)),
+            0,
+            "静置期零自排帧——旧实现 else 分支逐拍 notify"
+        );
+    }
+
+    /// #193 统一超时策略：在途慢 tile（看门狗窗 ×2 过去、键级 15s 未
+    /// 到）不得被全局看门狗抢先清在途/标失败——旧实现 125 拍清
+    /// pending 重派、250 拍转失败，绕过 15s×2 键级策略。慢 tile 晚
+    /// 正常回执后入缓存。
+    #[gpui::test]
+    fn slow_tile_survives_watchdog_window(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-slow-{}.docx", std::process::id()));
+        let mock = MockSession::new(false); // 不自动回执——tile 「慢」
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let n0 = pump_until_dispatched(cx, &mut visual, &view, &mock);
+        let pending_n = view.read_with(cx, |v, _| v.pending_for_test());
+        assert_eq!(pending_n, n0, "前置：首派 {n0} 笔全部在途");
+        // 静置 ≈4.8s（300 拍 > 2× 看门狗窗 2s，< 键级 15s）：在途必须
+        // 原样保留——不得清在途、不得重派、不得失败。
+        for _ in 0..300 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.pending_for_test(), n0, "慢 tile 在途不得被看门狗清除");
+            assert_eq!(v.failed_for_test(), 0, "键级 15s 未到不得失败");
+            assert!(
+                v.attempts.is_empty(),
+                "键级 15s 未到不得计尝试（旧实现 2s 即抢先）"
+            );
+        });
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            n0,
+            "在途期间不得重派（旧实现 125 拍全量重派）"
+        );
+        // 慢 tile 回执（seq 对账入账）→ 缓存命中、在途清空。
+        for seq in 1..=n0 as u64 {
+            mock.replies.lock().unwrap().push_back(SessionReply::Tile {
+                seq,
+                width: 2,
+                height: 2,
+                bgra: Arc::new(vec![0u8; 16]),
+                sha256: "mock".into(),
+                stats: TileStats {
+                    unique_colors: 1,
+                    non_white_ratio: 0.5,
+                    colored_ratio: 0.5,
+                },
+                elapsed_ms: 4800,
+            });
+        }
+        for _ in 0..10 {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.cache_stats_for_test().1, n0, "慢 tile 回执必须入缓存");
+            assert_eq!(v.pending_for_test(), 0);
+            assert_eq!(v.failed_for_test(), 0);
+        });
+    }
+
+    /// #193 受控状态机（无窗口直驱 drain——不依赖渲染重派路径）：
+    /// 覆盖缺口（失效清理后无重派路径）→ 看门狗窗口后补派一次（有
+    /// 界）→ 真悬死走键级 15s×2（超时→重派→再超时→失败面）→ 失败
+    /// 后静置无限拍无重派/无失败增长（日志/notify 有界的可观测面）。
+    #[gpui::test]
+    fn dispatch_loss_and_hang_unified_strategy(cx: &mut gpui::TestAppContext) {
+        let view =
+            cx.update(|app| app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, None)));
+        let mock = MockSession::new(false); // 永不回执——悬死面
+        inject_mock(&view, cx, &mock);
+        view.update(cx, |v, _| {
+            v.doc_size = Some((11906, 16838));
+            v.boot = Boot::Ready;
+            v.viewport.set(Some((800., 600.)));
+            v.viewport_size = (800., 600.);
+            v.viewport_seen = (800., 600.); // refresh_viewport 视为无变更
+        });
+        // 拍 1..=124：覆盖缺口计拍，不派单（无渲染路径——补派归看门狗）。
+        for _ in 0..124 {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+        }
+        assert_eq!(mock.requests.lock().unwrap().len(), 0, "窗口内不得提前派单");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.watchdog_state_for_test()),
+            (124, false)
+        );
+        // 第 125 拍：补派一次（缺口闭合——在途覆盖）。
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        let n0 = mock.requests.lock().unwrap().len();
+        assert!(n0 > 0, "覆盖缺口持续 {WATCHDOG_TICKS} 拍必须补派");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.watchdog_state_for_test()),
+            (0, true),
+            "补派后计拍清零、标记已补派"
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.pending_for_test()), n0);
+        // 缺口闭合 → 后续拍静置（补派有界——不得循环重派）。
+        for _ in 0..200 {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+        }
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            n0,
+            "在途覆盖期间不得重复补派（旧实现每 125 拍全量重派）"
+        );
+        // 真悬死①：键级 15s 超时（回拨）→ 尝试 1、清出在途待重派。
+        view.update(cx, |v, _| {
+            for (_, at) in v.pending.values_mut() {
+                *at = Instant::now() - TILE_PENDING_TIMEOUT - Duration::from_secs(1);
+            }
+        });
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.attempts.values().all(|a| *a == 1),
+                "首次键级超时 = 尝试 1"
+            );
+            assert_eq!(v.failed_for_test(), 0, "首次超时不转失败");
+            assert_eq!(v.pending_for_test(), 0);
+        });
+        // 无渲染路径：缺口再现 → 看门狗窗口后补派（键级第 2 次尝试）。
+        let mut ticks = 0u32;
+        while mock.requests.lock().unwrap().len() == n0 {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+            ticks += 1;
+            assert!(ticks < 200, "悬死重派必须在看门狗窗口内发生");
+        }
+        let n1 = mock.requests.lock().unwrap().len();
+        assert_eq!(n1, n0 * 2, "第二次补派 = 键级重试（15s×2 策略）");
+        // 真悬死②：再超时 → 尝试 2 = 上限 → 失败面（诚实呈现）。
+        view.update(cx, |v, _| {
+            for (_, at) in v.pending.values_mut() {
+                *at = Instant::now() - TILE_PENDING_TIMEOUT - Duration::from_secs(1);
+            }
+        });
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.failed_for_test(), n0, "二次键级超时必须转失败面");
+            assert!(v.attempts.values().all(|a| *a == 2));
+        });
+        // 失败面静置：无限拍无重派、无失败增长（旧实现 else 分支每拍
+        // log+notify 的病灶在此锁死——失败面是稳态）。
+        for _ in 0..500 {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+        }
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            n1,
+            "失败面静置不得重派（失效/换档才可重试）"
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.failed_for_test()), n0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.watchdog_state_for_test()),
+            (0, false),
+            "失败面覆盖完整——故障周期闭合复位"
+        );
+    }
+
+    /// #193 回执卫生：晚到旧回执（seq 不在在途——换代后残留）机械
+    /// 丢弃——不入缓存、不误失败，也不得复位看门狗计拍（旧 had_tile
+    /// 把任何 Tile 回执当进账逐拍清零计数 → 新代际缺口永不补派）；
+    /// 补派后的新 seq 回执正常入账。
+    #[gpui::test]
+    fn late_receipts_neither_pollute_nor_reset(cx: &mut gpui::TestAppContext) {
+        let view =
+            cx.update(|app| app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, None)));
+        let mock = MockSession::new(false);
+        inject_mock(&view, cx, &mock);
+        view.update(cx, |v, _| {
+            v.doc_size = Some((11906, 16838));
+            v.boot = Boot::Ready;
+            v.viewport.set(Some((800., 600.)));
+            v.viewport_size = (800., 600.);
+            v.viewport_seen = (800., 600.);
+        });
+        // 看门狗补派 3 带（seq 1..=3）。
+        for _ in 0..125 {
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+        }
+        let n0 = mock.requests.lock().unwrap().len();
+        assert!(n0 > 0, "前置：缺口补派已发生");
+        // 换代：全量失效（清在途/缓存/尝试——晚到回执全部失配）。
+        view.update(cx, |v, cx| {
+            v.handle_callback("INVALIDATE_TILES", "EMPTY, EMPTY, 0, 0, 0, 0", cx)
+        });
+        // 每拍塞一笔晚到旧回执 + drain：看门狗必须照常计拍（晚到回执
+        // 不复位）——直到窗口满补派新代际。
+        let mut fired_at = None;
+        for i in 0..150 {
+            mock.replies.lock().unwrap().push_back(SessionReply::Tile {
+                seq: (i % n0 as u64) + 1, // 旧代际 seq——必然失配
+                width: 2,
+                height: 2,
+                bgra: Arc::new(vec![0u8; 16]),
+                sha256: "late".into(),
+                stats: TileStats {
+                    unique_colors: 1,
+                    non_white_ratio: 0.5,
+                    colored_ratio: 0.5,
+                },
+                elapsed_ms: 1,
+            });
+            view.update(cx, |v, cx| v.drain_for_test(cx));
+            if mock.requests.lock().unwrap().len() > n0 {
+                fired_at = Some(i);
+                break;
+            }
+        }
+        let fired_at = fired_at.expect("晚到回执不得阻止看门狗补派（旧 had_tile 病灶）");
+        assert!(
+            fired_at + 1 >= WATCHDOG_TICKS as u64,
+            "补派必须发生在完整看门狗窗口之后（第 {} 拍）",
+            fired_at + 1
+        );
+        // 晚到回执不污染：缓存仍空、失败仍空（机械丢弃，不入账）。
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.cache_stats_for_test().1, 0, "晚到回执不得入缓存");
+            assert_eq!(v.failed_for_test(), 0, "晚到回执不得误失败");
+        });
+        // 新代际回执正常入账：补派产生新 seq，推对应回执 → 入缓存。
+        let n1 = mock.requests.lock().unwrap().len();
+        for seq in (n0 as u64 + 1)..=(n1 as u64) {
+            mock.replies.lock().unwrap().push_back(SessionReply::Tile {
+                seq,
+                width: 2,
+                height: 2,
+                bgra: Arc::new(vec![0u8; 16]),
+                sha256: "new-gen".into(),
+                stats: TileStats {
+                    unique_colors: 1,
+                    non_white_ratio: 0.5,
+                    colored_ratio: 0.5,
+                },
+                elapsed_ms: 1,
+            });
+        }
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.cache_stats_for_test().1,
+                n1 - n0,
+                "新代际回执必须正常入账"
+            );
+            assert_eq!(v.pending_for_test(), 0);
+        });
+    }
+
+    /// #193 代际切换复位：视口变更（缩放/窗口调整同源路径）复位看门
+    /// 狗故障周期——新代际重新获得补派预算，且新视口口径立即派单。
+    #[gpui::test]
+    fn viewport_generation_resets_watchdog_cycle(cx: &mut gpui::TestAppContext) {
+        let view =
+            cx.update(|app| app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, None)));
+        let mock = MockSession::new(false);
+        inject_mock(&view, cx, &mock);
+        view.update(cx, |v, _| {
+            v.doc_size = Some((11906, 16838));
+            v.boot = Boot::Ready;
+            v.viewport.set(Some((800., 600.)));
+            v.viewport_size = (800., 600.);
+            v.viewport_seen = (800., 600.);
+        });
+        // 模拟故障周期中途（计拍过半、已补派）。
+        view.update(cx, |v, _| {
+            v.watchdog_ticks = WATCHDOG_TICKS - 1;
+            v.watchdog_retried = true;
+        });
+        // 视口变更（探针量得新尺寸 → refresh_viewport 变更分支收口）。
+        view.update(cx, |v, cx| {
+            v.viewport.set(Some((1000., 700.)));
+            v.drain_for_test(cx);
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.watchdog_state_for_test()),
+            (0, false),
+            "视口代际切换必须复位故障周期"
+        );
+        assert!(
+            !mock.requests.lock().unwrap().is_empty(),
+            "新视口口径必须立即派单（不等待看门狗窗口）"
+        );
+        // 补派预算已复位：新代际缺口同样享有一次补派（隐含于上——
+        // 若未复位，retried=true 会令下一窗口直接登记失败面）。
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.failed_for_test(), 0, "代际复位后不得直接登记失败面");
+        });
     }
 
     // ------------------------------------------------------------------
