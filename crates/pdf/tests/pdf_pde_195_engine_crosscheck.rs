@@ -387,3 +387,97 @@ fn engine_identity_h_cid_advances() {
 fn unused_model_helper() {
     let _ = model_char_origins;
 }
+
+// ===== 返工 2026-11-14：Tz 全乘子引擎探针（Lead MuPDF 同款方法） =====
+
+/// Lead 探针法：同流后加 `(X) Tj`——X 的原点 − 流起点 = 前流总
+/// advance（引擎实测当前点位置）。charbox 为字形墨迹盒（左沿含
+/// bearing），探针用**中点差分**（X 中点 − A 中点——Courier 等宽
+/// ink 差经 /2 压缩，实测偏差 <0.05）。
+///
+/// Lead 原例：`50 Tz 2 Tc 4 Tw [(A ) 200 (B)] TJ (X) Tj` → X−A =
+/// 14.6（MuPDF 实证；pdfium 独立同值）。
+fn probe_advance(content: &str) -> Option<f64> {
+    let dir = std::env::temp_dir().join(format!("pde195p-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let pdf = dir.join("probe.pdf");
+    assemble_pdf(pdf.to_str().unwrap(), content.as_bytes()).expect("PDF 组装");
+    let Some(boxes) = pdfium_charboxes(pdf.to_str().unwrap()) else {
+        return None; // 引擎不可用 → SKIP 通道
+    };
+    // 首字符（'A'）与末字符（'X'）中点差。
+    let first = boxes.first()?;
+    let last = boxes.last()?;
+    Some(((last.1 + last.3) / 2.0) - ((first.1 + first.3) / 2.0))
+}
+
+/// **Lead 反例原例引擎探针**：Tz50 Tc2 Tw4 TJ+200 → 14.6
+///（模型 `run_advance` 同值——真源正确性三方闭环：规范公式、
+/// MuPDF（Lead 实证）、pdfium（本测）、模型）。
+#[test]
+fn engine_probe_lead_tz_combo() {
+    let Some(x_minus_a) =
+        probe_advance("BT /F1 12 Tf 50 Tz 2 Tc 4 Tw 1 0 0 1 20 30 Tm [(A ) 200 (B)] TJ (X) Tj ET")
+    else {
+        eprintln!("SKIP: pypdfium2 不可用");
+        return;
+    };
+    assert!(
+        (x_minus_a - 14.6).abs() < 0.2,
+        "Lead 反例：X−A = 14.6（Tz 全乘），引擎实测 {x_minus_a}"
+    );
+    // 模型同值（真源对照——同流解析后 run_advance）。
+    let t = {
+        use mdc_pdf::pde::model::PdeElement;
+        use mdc_pdf::pde::parser::parse_content;
+        let mut c =
+            parse_content(b"BT /F1 12 Tf 50 Tz 2 Tc 4 Tw 1 0 0 1 20 30 Tm [(A ) 200 (B)] TJ ET")
+                .unwrap();
+        match c.elements.first_mut() {
+            Some(PdeElement::Text(t)) => {
+                let empty = PdeText {
+                    gstate: t.gstate.clone(),
+                    runs: Vec::new(),
+                };
+                std::mem::replace(t, empty)
+            }
+            _ => panic!("首元素须为 Text"),
+        }
+    };
+    let font = PdeFont::from_res_value(&ResValue::Dict(courier_res())).unwrap();
+    let adv = t.run_advance(0, Some(&font)).expect("度量须有值");
+    assert!(
+        (adv - 14.6).abs() < 1e-3,
+        "模型 advance = 引擎探针 = 14.6，模型 {adv}"
+    );
+}
+
+/// Tz=200 侧：同流 Tz 200 → X−A = 58.4（全项 ×2）。
+#[test]
+fn engine_probe_tz200() {
+    let Some(x_minus_a) =
+        probe_advance("BT /F1 12 Tf 200 Tz 2 Tc 4 Tw 1 0 0 1 20 30 Tm [(A ) 200 (B)] TJ (X) Tj ET")
+    else {
+        eprintln!("SKIP: pypdfium2 不可用");
+        return;
+    };
+    assert!(
+        (x_minus_a - 58.4).abs() < 0.4,
+        "Tz 200 全项 ×2 → 58.4，引擎实测 {x_minus_a}"
+    );
+}
+
+/// 负 TJ（松排）× Tz：`[(AB) -150 (C)]` Tz 50 Tc 2 → 14.7。
+#[test]
+fn engine_probe_negative_tj_tz() {
+    let Some(x_minus_a) =
+        probe_advance("BT /F1 12 Tf 50 Tz 2 Tc 1 0 0 1 20 30 Tm [(AB) -150 (C)] TJ (X) Tj ET")
+    else {
+        eprintln!("SKIP: pypdfium2 不可用");
+        return;
+    };
+    assert!(
+        (x_minus_a - 14.7).abs() < 0.2,
+        "负 TJ 松排 × Tz：14.7，引擎实测 {x_minus_a}"
+    );
+}

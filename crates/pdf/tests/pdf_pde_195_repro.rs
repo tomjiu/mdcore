@@ -134,7 +134,11 @@ fn tj_negative_kern() {
 #[test]
 fn type0_cid_two_byte_code_lookup() {
     let font = type0_identity_h(None);
-    assert_eq!(font.num_code_bytes(b"\x01\x02"), 2, "Type0 码长 = 2");
+    assert_eq!(
+        font.num_code_bytes(b"\x01\x02"),
+        Some(2),
+        "Identity-H 码长 = 2"
+    );
     let st = TextState {
         size: 10.0,
         ..Default::default()

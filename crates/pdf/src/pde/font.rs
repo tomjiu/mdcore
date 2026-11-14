@@ -193,17 +193,46 @@ impl PdeFont {
             .unwrap_or(250.0)
     }
 
-    /// `PDEFontGetNumCodeBytes`——多字节码长探测。
+    /// `PDEFontGetNumCodeBytes`——多字节码长探测（**返工 2026-11-14
+    /// 改 `Option<usize>` 三态**——Lead 复验：恒 2 对未知 CMap 返回
+    /// 错误成功值）。
     ///
     /// Adobe 语义："Gets the number of bytes comprising the next code
-    /// in a string of single or multi-byte character codes"。Type0 =
-    /// 2（默认两字节 CID；`/Encoding` 名带 OneByte 前缀或 Identity-H
-    /// 单字节形态属罕见变体，批③登记不展开——保守取 2）。简单字体 = 1。
-    pub fn num_code_bytes(&self, _text: &[u8]) -> usize {
+    /// in a string of single or multi-byte character codes"。
+    ///
+    /// 支持面（**明确仅 Identity-H**——度量真源的地基）：
+    /// - 简单字体（Type1/TrueType/MMType1）= `Some(1)`（单字节码）；
+    /// - Type0 + `/Encoding` = `Identity-H`（横排，WMode 0/缺省）=
+    ///   `Some(2)`（2 字节 CID 大端）；
+    /// - **其余一律 `None`**（明确缺能力，调用方不得当 2 字节 CID
+    ///   使用）：未知/预定义 CMap 名（UniGB-UCS2-H 等 2 字节流我们
+    ///   未承载其 CMap 表——码长≠CID 语义可通约，但 CMap 内容未解
+    ///   析即不可靠）、`Identity-V`（垂直——WMode 1，W 索引语义不
+    ///   同）、`/Encoding` 缺失或非名形态（CMap 流形态）。返回
+    ///   错误成功值比缺能力更糟（#195 原判）。
+    pub fn num_code_bytes(&self, _text: &[u8]) -> Option<usize> {
         if self.attrs.font_type.is_composite() {
-            2
+            // 垂直布局（WMode 1 / Identity-V）明确拒绝。
+            if self.attrs.w_mode == Some(1) {
+                return None;
+            }
+            match self.attrs.encoding.as_deref() {
+                Some(b"Identity-H") => Some(2),
+                _ => None, // 未知 CMap / 缺 Encoding / Identity-V——不猜
+            }
         } else {
-            1
+            Some(1)
+        }
+    }
+
+    /// 码长可判别的显示串（整串均为完整码——`None` = 未知 CMap/含
+    /// 残码；度量与编辑面的共用前置（#195/#194 真源统一））。
+    pub fn code_len_of(&self, text: &[u8]) -> Option<usize> {
+        let len = self.num_code_bytes(text)?;
+        if text.len() % len == 0 {
+            Some(len)
+        } else {
+            None // 残码（长非码长整数倍）——不猜
         }
     }
 
@@ -528,7 +557,7 @@ mod tests {
         assert!(!f.attrs.cant_embed);
         assert!(!f.is_embedded);
         // 简单字体单字节码
-        assert_eq!(f.num_code_bytes(b"AB"), 1);
+        assert_eq!(f.num_code_bytes(b"AB"), Some(1));
         // 完成度：widths 已就绪 / ToUnicode 缺 / 未嵌入
         let need = f.create_need_flags();
         assert!(!need.need_widths);
@@ -582,7 +611,7 @@ mod tests {
         // CID 缺条目：无 MissingWidth → PDF 规范缺省 250
         assert_eq!(f.width_of(9999), 250.0);
         // Type0 双字节码
-        assert_eq!(f.num_code_bytes(b"\x01\x02\x03"), 2);
+        assert_eq!(f.num_code_bytes(b"\x01\x02\x03"), Some(2));
         // CID 系三件套
         assert_eq!(f.attrs.registry, Some(b"Adobe".to_vec()));
         assert_eq!(f.attrs.ordering, Some(b"Japan1".to_vec()));
