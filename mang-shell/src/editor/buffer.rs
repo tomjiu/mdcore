@@ -114,6 +114,8 @@ impl IndentUnit {
 struct EntryMeta {
     /// 编辑期 id（Buffer revision 口径——docx 桥映射恢复键）。
     id: u64,
+    /// Text-only history has no corresponding semantic core undo entry.
+    projection_only: bool,
     /// 手势起点（undo 光标落点）。
     start: Point,
     /// 手势被替换域终点（pre 编辑坐标）。
@@ -520,13 +522,13 @@ impl Buffer {
 
     /// 是否相对最近保存点已修改（当前 undo 深度 != 保存点深度）。
     pub fn is_modified(&self) -> bool {
-        self.bridge.is_modified(self.saved_depth)
+        self.entry_ids.len() != self.saved_depth
     }
 
     /// 显式落盘：记录保存点深度（redo 历史随之清空——保存点之后
     /// 不跨保存点 undo，与多数编辑器一致）。
     pub fn mark_saved(&mut self) {
-        self.saved_depth = self.bridge.undo_depth();
+        self.saved_depth = self.entry_ids.len();
         self.bridge.mark_saved();
         self.redo_ids.clear();
     }
@@ -685,6 +687,7 @@ impl Buffer {
         self.note_fence_single(start.line, text_lines);
         // #163 换芯：桥单点（快路径 op / 兜底 sync——核为真源先行，
         // 拒绝则投影不动、返回 false 与钩子拒改同面）。
+        let core_revision = self.bridge.core().revision();
         if !self.bridge.edit(start, end, text) {
             return false;
         }
@@ -700,10 +703,18 @@ impl Buffer {
         self.revision += 1;
         // #163：核事件收割（防队列堆积）+ 条目镜像维护（合并入既有
         // 条目时仅累计编辑数——fence 判据）。
-        if self.bridge.take_view_entry_created() {
+        let mut projection_only = self.bridge.core().revision() == core_revision;
+        let core_entry_created = self.bridge.take_view_entry_created();
+        // Coalesced core edits keep their revision but still own a semantic
+        // history entry, so a carried-in revision is not proof of a no-op.
+        if projection_only && !core_entry_created && self.entry_ids.last().is_some() {
+            projection_only = false;
+        }
+        if core_entry_created || projection_only {
             let cursor = self.end_after_insert(&start, text);
             self.entry_ids.push(EntryMeta {
                 id: self.revision,
+                projection_only,
                 start,
                 end,
                 cursor_after: cursor,
@@ -872,6 +883,7 @@ impl Buffer {
         let cursor_after = self.end_after_insert(&last_rec.start, &last_rec.new_text);
         self.entry_ids.push(EntryMeta {
             id: self.revision,
+            projection_only: false,
             start: records.first().map(|r| r.start).unwrap_or(self.cursor),
             end: records
                 .last()
@@ -1007,7 +1019,12 @@ impl Buffer {
         // 序列化重建）；多编辑条目走 op 翻译（类 a/a2/b）。
         let replay =
             (meta.n_edits == 1).then(|| (meta.start, meta.cursor_after, meta.old_text.clone()));
-        let Some(outcome) = self.bridge.undo_replay(meta.start, meta.end, replay) else {
+        let outcome = if meta.projection_only {
+            self.bridge.replay_projection(meta.start, replay)
+        } else {
+            self.bridge.undo_replay(meta.start, meta.end, replay)
+        };
+        let Some(outcome) = outcome else {
             // 栈镜像失配（理论不可达）——压回保形。
             self.entry_ids.push(meta);
             return false;
@@ -1055,7 +1072,12 @@ impl Buffer {
             return false;
         };
         let replay = (meta.n_edits == 1).then(|| (meta.start, meta.end, meta.text.clone()));
-        let Some(outcome) = self.bridge.redo_replay(meta.cursor_after, meta.end, replay) else {
+        let outcome = if meta.projection_only {
+            self.bridge.replay_projection(meta.cursor_after, replay)
+        } else {
+            self.bridge.redo_replay(meta.cursor_after, meta.end, replay)
+        };
+        let Some(outcome) = outcome else {
             self.redo_ids.push(meta);
             return false;
         };

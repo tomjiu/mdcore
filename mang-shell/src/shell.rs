@@ -7085,7 +7085,9 @@ mod pdf_search_wiring_tests {
         // ④ 键入恢复进正文（焦点恢复的行为证据——键事件真到达编辑器）。
         // 光标在 (0,0)（无选区开查找条 + 零命中查询不动光标）——插入在
         // 行首（"xL0"）；键入真到达编辑器即焦点恢复的行为面。
-        dispatch_key_real(&window, cx, "x", Some("x"), false);
+        // Include platform text delivery after keydown; dispatch_event alone
+        // does not model WM_CHAR / native text input.
+        cx.dispatch_keystroke(window.into(), gpui::Keystroke::parse("x").unwrap());
         window
             .update(cx, |_host, _window, cx| {
                 shell.update(cx, |shell, cx| {
