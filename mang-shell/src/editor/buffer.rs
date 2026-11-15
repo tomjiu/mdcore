@@ -703,13 +703,12 @@ impl Buffer {
         self.revision += 1;
         // #163：核事件收割（防队列堆积）+ 条目镜像维护（合并入既有
         // 条目时仅累计编辑数——fence 判据）。
-        let projection_only = self.bridge.core().revision() == core_revision;
+        let mut projection_only = self.bridge.core().revision() == core_revision;
         let core_entry_created = self.bridge.take_view_entry_created();
-        if projection_only {
-            // A source edit can leave the Markdown tree unchanged (blank lines).
-            // Keep its own replay entry and prevent later text from coalescing
-            // across this boundary in the semantic history.
-            self.bridge.mark_saved();
+        // Coalesced core edits keep their revision but still own a semantic
+        // history entry, so a carried-in revision is not proof of a no-op.
+        if projection_only && !core_entry_created && self.entry_ids.last().is_some() {
+            projection_only = false;
         }
         if core_entry_created || projection_only {
             let cursor = self.end_after_insert(&start, text);
