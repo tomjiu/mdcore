@@ -572,6 +572,26 @@ impl MdBridge {
     // undo / redo（核驱动 → 投影翻译）
     // ------------------------------------------------------------------
 
+    /// Replay source-only edits without consuming an unrelated core history entry.
+    pub(crate) fn replay_projection(
+        &mut self,
+        restore: Point,
+        replay: Option<(Point, Point, String)>,
+    ) -> Option<HistoryOutcome> {
+        let (start, end, text) = replay?;
+        let pre_lines = self.line_count() as i64;
+        self.apply_proj(self.point_to_coff(start), self.point_to_coff(end), &text);
+        self.rebuild_map();
+        self.core.break_coalesce();
+        Some(HistoryOutcome {
+            cursor: Some(restore),
+            fence_single: None,
+            ops: 1,
+            precise: Some((start, end, text)),
+            delta_lines: self.line_count() as i64 - pre_lines,
+        })
+    }
+
     pub(crate) fn undo_replay(
         &mut self,
         restore: Point,

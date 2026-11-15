@@ -6099,6 +6099,47 @@ mod ime_composition_tests {
     }
 
 
+    #[gpui::test]
+    fn input_sequence_enter_undo_dirty_save(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "AB");
+        let path = std::env::temp_dir().join(format!("mang-input-enter-{}.md", std::process::id()));
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.file_path = Some(path.clone());
+                for col in [0, 1, 2] {
+                    ed.buffer.set_cursor(Point::new(0, col));
+                    ed.sync_cursors_from_buffer();
+                    ed.dispatch_key(&plain_key("enter", None), window, cx);
+                    assert_eq!(ed.buffer.line_count(), 2);
+                    assert_eq!(ed.buffer.cursor(), Point::new(1, 0));
+                    assert!(ed.is_modified());
+                    let mut undo = plain_key("z", None);
+                    undo.keystroke.modifiers.control = true;
+                    ed.dispatch_key(&undo, window, cx);
+                    assert_eq!(ed.buffer_line(0), "AB");
+                    assert_eq!(ed.buffer.line_count(), 1);
+                    assert!(!ed.is_modified());
+                    let mut redo = plain_key("y", None);
+                    redo.keystroke.modifiers.control = true;
+                    ed.dispatch_key(&redo, window, cx);
+                    assert_eq!(ed.buffer.line_count(), 2);
+                    assert!(ed.is_modified());
+                    ed.dispatch_key(&undo, window, cx);
+                }
+                ed.dispatch_key(&plain_key("enter", None), window, cx);
+                assert_eq!(ed.save(), SaveOutcome::Saved);
+                assert!(!ed.is_modified());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "AB\n");
+                // Enter on the trailing empty line, then continue typing without refocus.
+                ed.dispatch_key(&plain_key("enter", None), window, cx);
+                assert_eq!(ed.buffer.line_count(), 3);
+                ed.dispatch_key(&plain_key("x", Some("x")), window, cx);
+                ed.replace_text_in_range(None, "x", window, cx);
+                assert_eq!(ed.buffer_line(2), "x");
+            });
+        });
+        std::fs::remove_file(path).unwrap();
+    }
     /// 预编辑全链：起（ni）→ 更新（你好，带选中）→ 提交（unmark 保文）
     /// ——marked 区间（UTF16）逐态断言 + 提交后脏。
     #[gpui::test]
