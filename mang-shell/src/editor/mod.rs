@@ -23,7 +23,7 @@
 //!   [`Editor::dispatch_key`] 单点分发（修饰键语义见该函数文档）
 //! - IME（中文输入法）：`EntityInputHandler` 实现 + paint 期
 //!   `window.handle_input` 接线（X11 预编辑实测登记于 #68 阶段 7）
-//! - 可打印字符兜底：`keystroke.key_char`（无 IME 的直输路径）
+//! - 普通文本与 IME 提交统一由 `EntityInputHandler` 插入；keydown 只分发命令。
 //!
 //! ## 鼠标通路（批 2：点击定位 / 拖选 / 双击词 / 三击行 / 滚轮）
 //!
@@ -2433,6 +2433,12 @@ impl Editor {
         cx: &mut Context<Self>,
         perf_rejected: &mut bool,
     ) {
+        // Low-level listeners still receive layout/IME-preferred events when
+        // GPUI bypasses its bindings. Leave these to platform text input.
+        if event.prefer_character_input && !self.read_only {
+            self.chord_pending = None;
+            return;
+        }
         let ks = &event.keystroke;
         let ctrl = ks.modifiers.control || ks.modifiers.platform;
         let shift = ks.modifiers.shift;
@@ -2531,25 +2537,10 @@ impl Editor {
                 self.chord_pending = Some(kq);
                 return; // 原 "k" 臂语义：提前 return 不落尾部
             }
-            keymap::EditorOutcome::None => {
-                // 可打印字符（无修饰或仅 shift）：插入。
-                // key_char 为平台布局产生的实际字符（IME 未接管时的直输路径；
-                // 控制字符（含 \n/\r/tab）已被上方分支截获，此处双保险过滤）。
-                // #47 A4：IME 预编辑期（marked 在场）组合输入归输入法所有——
-                // 直插会破坏预编辑区间（marked 偏移与 buffer 内容脱钩，提交
-                // 时替换错段）。「不互相吞」：组合期键入零直插（IME 经
-                // replace_and_mark 更新预编辑），提交后直输路径恢复。
-                if !ctrl
-                    && !ks.modifiers.alt
-                    && self.marked.is_none()
-                    && let Some(c) = &ks.key_char
-                    && !c.is_empty()
-                    && c.chars().all(|ch| !ch.is_control())
-                {
-                    // r42 阶段 C：多光标多点插入
-                    self.insert_text_multi(c);
-                }
-            }
+            // Printable text belongs to the platform input callback on Windows,
+            // macOS, X11 and Wayland. Keep unbound keys bubbling to that owner
+            // and to shell shortcuts; keydown must not insert a second copy.
+            keymap::EditorOutcome::None => return,
             keymap::EditorOutcome::Matched(action) => match action {
                 // r42 阶段 C：移动统一入口 do_move（多光标同向分派）；
                 // ctrl 词跳/shift 选区在执行层参数化（原家族臂结构）。
@@ -5104,18 +5095,18 @@ impl EntityInputHandler for Editor {
         if self.read_only {
             return;
         }
-        let (s, e) = match range {
-            Some(r) => (self.utf16_to_point(r.start), self.utf16_to_point(r.end)),
-            None => match self.buffer.selection() {
-                Some(sel) => (sel.start, sel.end),
-                None => {
-                    let c = self.buffer.cursor();
-                    (c, c)
-                }
-            },
-        };
+        // Explicit replacement wins; Windows commits/cancels with None, which
+        // must replace the marked range rather than the IME caret selection.
+        if let Some(range) = range.or_else(|| self.marked.clone()) {
+            let s = self.utf16_to_point(range.start);
+            let e = self.utf16_to_point(range.end);
+            self.buffer.replace_range(s, e, text);
+            self.sync_cursors_from_buffer();
+        } else {
+            // Ordinary text retains selection and multicursor semantics.
+            self.insert_text_multi(text);
+        }
         self.marked = None;
-        self.buffer.replace_range(s, e, text);
         self.after_edit();
         cx.notify();
     }
@@ -5974,6 +5965,140 @@ mod ime_composition_tests {
         }
     }
 
+    struct InputRouteHost {
+        ed: gpui::Entity<Editor>,
+    }
+
+    impl Render for InputRouteHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let ed = self.ed.clone();
+            gpui::div()
+                .track_focus(&ed.read(cx).focus)
+                .on_key_down(move |event, window, cx| {
+                    ed.update(cx, |ed, cx| ed.dispatch_key(event, window, cx));
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn input_sequence_shell_keys_propagate(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, "AB".into(), cx)));
+        let ed_host = ed.clone();
+        let window = cx.add_window(move |window, cx| {
+            ed_host.read(cx).focus.clone().focus(window, cx);
+            InputRouteHost { ed: ed_host }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            for key in ["s", "w", "tab", "k", "o"] {
+                let mut event = plain_key(key, None);
+                event.keystroke.modifiers.control = true;
+                let result = window.dispatch_event(gpui::PlatformInput::KeyDown(event), cx);
+                assert!(result.propagate, "shell must receive Ctrl+{key}");
+            }
+            assert_eq!(ed.read(cx).buffer_line(0), "AB");
+        });
+    }
+
+    // Model the platform sequence, not only a synthetic keydown: Windows WM_CHAR
+    // and the Linux/macOS fallback deliver text after the key event.
+    #[gpui::test]
+    fn input_sequence_ascii_once(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, String::new(), cx)));
+        let ed_host = ed.clone();
+        let window = cx.add_window(move |window, cx| {
+            ed_host.read(cx).focus.clone().focus(window, cx);
+            InputRouteHost { ed: ed_host }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            for ch in ["a", "b", "c"] {
+                window.draw(cx).clear(cx);
+                let result = window
+                    .dispatch_event(gpui::PlatformInput::KeyDown(plain_key(ch, Some(ch))), cx);
+                assert!(result.propagate, "platform must deliver printable text");
+                ed.update(cx, |ed, cx| ed.replace_text_in_range(None, ch, window, cx));
+            }
+            assert_eq!(ed.read(cx).buffer_line(0), "abc");
+            assert!(ed.read(cx).is_modified());
+        });
+    }
+
+    #[gpui::test]
+    fn input_sequence_ime_none_commit(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "X");
+        let path = std::env::temp_dir().join(format!("mang-input-ime-{}.md", std::process::id()));
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.file_path = Some(path.clone());
+                ed.replace_and_mark_text_in_range(None, "zh", Some(1..1), window, cx);
+                ed.replace_text_in_range(None, "中", window, cx);
+                assert_eq!(ed.buffer_line(0), "中X");
+                assert_eq!(ed.marked, None);
+                assert_eq!(ed.buffer.cursor(), Point::new(0, 1));
+                assert_eq!(ed.save(), SaveOutcome::Saved);
+                assert!(!ed.is_modified());
+            });
+        });
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let reopened = cx.update(|cx| cx.new(|cx| Editor::new(Some(path.clone()), saved, cx)));
+        assert_eq!(cx.update(|cx| reopened.read(cx).buffer_line(0)), "中X");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn input_sequence_ime_cancel_and_explicit_range(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "😀AB");
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.buffer.set_cursor(Point::new(0, 1));
+                ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
+                ed.replace_text_in_range(None, "", window, cx);
+                assert_eq!(ed.buffer_line(0), "😀AB", "empty commit cancels preedit");
+                assert_eq!(ed.marked, None);
+                ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
+                // Explicit UTF16 replacement still takes precedence over marked.
+                ed.replace_text_in_range(Some(2..5), "中", window, cx);
+                assert_eq!(ed.buffer_line(0), "😀中B");
+                assert_eq!(ed.marked, None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn input_sequence_multicursor_callback(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "a\nb");
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.cursors.push(Point::new(1, 0), Point::new(1, 0));
+                ed.sync_buffer_from_cursors_primary();
+                ed.dispatch_key(&plain_key("x", Some("x")), window, cx);
+                ed.replace_text_in_range(None, "x", window, cx);
+                assert_eq!(ed.buffer_line(0), "xa");
+                assert_eq!(ed.buffer_line(1), "xb");
+                assert_eq!(ed.cursors.len(), 2);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn input_sequence_character_preference_preserves_selection(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "AB");
+        window.update(cx, |_host, window, cx| {
+            ed.update(cx, |ed, cx| {
+                ed.buffer.set_cursor(Point::new(0, 1));
+                ed.sync_cursors_from_buffer();
+                // AltGr/layout text must win over a coincident Ctrl+A binding.
+                let mut event = plain_key("a", Some("á"));
+                event.keystroke.modifiers.control = true;
+                event.prefer_character_input = true;
+                ed.dispatch_key(&event, window, cx);
+                ed.replace_text_in_range(None, "á", window, cx);
+                assert_eq!(ed.buffer_line(0), "AáB");
+            });
+        });
+    }
+
+
     /// 预编辑全链：起（ni）→ 更新（你好，带选中）→ 提交（unmark 保文）
     /// ——marked 区间（UTF16）逐态断言 + 提交后脏。
     #[gpui::test]
@@ -6093,6 +6218,7 @@ mod ime_composition_tests {
             ed.update(cx, |ed, cx| {
                 ed.unmark_text(window, cx);
                 ed.dispatch_key(&plain_key("h", Some("h")), window, cx);
+                ed.replace_text_in_range(None, "h", window, cx);
                 assert_eq!(
                     ed.buffer_line(0),
                     // 光标在预编辑段尾（replace_range 后 = (0,2)）——
