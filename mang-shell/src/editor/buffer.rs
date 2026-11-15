@@ -704,10 +704,11 @@ impl Buffer {
         // #163：核事件收割（防队列堆积）+ 条目镜像维护（合并入既有
         // 条目时仅累计编辑数——fence 判据）。
         let mut projection_only = self.bridge.core().revision() == core_revision;
-        let core_entry_created = self.bridge.take_view_entry_created();
-        // Coalesced core edits keep their revision but still own a semantic
-        // history entry, so a carried-in revision is not proof of a no-op.
-        if projection_only && !core_entry_created && self.entry_ids.last().is_some() {
+        let (core_entry_created, core_event_seen) = self.bridge.take_view_events();
+        // A Markdown no-op produces **no** core View event at all; a coalesced
+        // core edit produces an event without a new entry. Only the former is
+        // projection-only, so check for the event rather than the revision.
+        if projection_only && core_event_seen {
             projection_only = false;
         }
         if core_entry_created || projection_only {

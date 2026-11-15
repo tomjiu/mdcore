@@ -1171,13 +1171,25 @@ impl MdBridge {
     /// （合并入既有条目 = false——Buffer 侧 entry_ids 镜像只在新条目时
     /// 增补）。队列必须随每次编辑收割（防事件堆积）。
     pub(crate) fn take_view_entry_created(&mut self) -> bool {
+        self.take_view_events().0
+    }
+
+    /// Harvest the core event queue once and report both signals Buffer needs:
+    /// whether a *new* View entry appeared, and whether the core recorded **any**
+    /// View event at all (a coalesced edit changes no revision and creates no new
+    /// entry, yet it is still a real core edit — unlike a Markdown no-op).
+    pub(crate) fn take_view_events(&mut self) -> (bool, bool) {
         let mut created = false;
+        let mut any = false;
         for e in self.core.take_events() {
-            if e.meta.source == mdcore::history::Source::View && !e.meta.coalesced {
-                created = true;
+            if e.meta.source == mdcore::history::Source::View {
+                any = true;
+                if !e.meta.coalesced {
+                    created = true;
+                }
             }
         }
-        created
+        (created, any)
     }
 
     /// #163：纯收割（批量路径——恒新条目由调用方自行记账）。
