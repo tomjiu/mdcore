@@ -423,6 +423,7 @@ pub enum ShellAction {
     PrevTab,
     /// Ctrl+W 关闭当前标签（`close_active_tab`）。
     CloseTab,
+    ReopenClosedTab,
     /// #386 Ctrl+S 保存（Shell `save_tab` 分流——pdf 批注增量落盘/
     /// 编辑器三态；编辑器层 E30 已移除冒泡至此）。
     Save,
@@ -569,6 +570,7 @@ impl ShellAction {
             ShellAction::NextTab => "next_tab",
             ShellAction::PrevTab => "prev_tab",
             ShellAction::CloseTab => "close_tab",
+            ShellAction::ReopenClosedTab => "reopen_closed_tab",
             ShellAction::Save => "save",
             ShellAction::PromptSaveAs => "prompt_save_as",
             ShellAction::FontBigger => "font_bigger",
@@ -622,6 +624,7 @@ const SHELL_ACTION_IDS: &[ShellAction] = &[
     ShellAction::NextTab,
     ShellAction::PrevTab,
     ShellAction::CloseTab,
+    ShellAction::ReopenClosedTab,
     ShellAction::Save,
     ShellAction::PromptSaveAs,
     ShellAction::FontBigger,
@@ -832,6 +835,10 @@ fn default_shell() -> Vec<Entry> {
         ),
         // S4：Ctrl+W 关标签。
         e(Binding::Single(plain("w")), A::CloseTab),
+        e(
+            Binding::Single(KeyPattern::key("t").with(Yes, Yes, No)),
+            A::ReopenClosedTab,
+        ),
         // #386 S12：Ctrl+S 保存（编辑器 E30 已移除整键放行冒泡至此
         // ——「谁负责保存」归 Shell：pdf 标签走批注增量落盘，其余走
         // Editor 三态；失败 toast 示警不静默）。

@@ -100,8 +100,8 @@ const OCR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// F4：待确认动作（脏标签关闭 / 退出 / #166 文件树删除）。
 #[derive(Clone, Debug)]
 enum ConfirmAction {
-    /// 关闭 `idx` 标签（它有未保存修改）。
-    CloseTab { idx: usize },
+    /// `target` is authoritative; `idx` only records the original prompt position.
+    CloseTab { idx: usize, target: gpui::EntityId },
     /// 退出应用（存在未保存修改的标签）。
     Quit,
     /// #166：永久删除文件树目标（确认后不可恢复——无回收站 API，
@@ -166,6 +166,10 @@ pub struct ShellApp {
     ///（空集 = 空态）。原 `Option<Entity<Editor>>` 单例面由此取代。
     tabs: Vec<TabItem>,
     active: usize,
+    /// Snapshot of target identities + clean-only intent; cancel/failure drops the tail.
+    close_queue: std::collections::VecDeque<(gpui::EntityId, bool)>,
+    /// Session-local (20 max), file paths only; reopening always reads disk.
+    closed_tabs: Vec<PathBuf>,
     /// F2：工作区文件树（打开文件夹后呈现；记忆落盘随 settings）。
     workspace: Option<Entity<FileTree>>,
     /// F7：git 面板（工作区打开即建——非 git 目录走面板内提示态）。
@@ -259,6 +263,11 @@ pub struct ShellApp {
     /// None = 未打开）。键盘导航/焦点/ARIA/dismiss 由组件自带；动作
     /// 派发回 shell 的 activate_context_menu_item（id 派发面不变）。
     context_menu: Option<Entity<ui::ContextMenu>>,
+    context_menu_generation: u64,
+    context_menu_previous_focus: Option<FocusHandle>,
+    context_menu_focus: Option<FocusHandle>,
+    context_tab_target: Option<(gpui::EntityId, Vec<gpui::EntityId>)>,
+    context_menu_subscription: Option<gpui::Subscription>,
     /// 右键菜单展开点（触发时的窗口坐标，`anchored` 锚定用——溢出
     /// 翻转/吸附由引擎按实际尺寸处理，不再需要 shell 侧几何）。
     context_menu_pos: gpui::Point<Pixels>,
@@ -290,6 +299,7 @@ pub enum MenuOrigin {
     Editor,
     /// 文件树右键（新建/重命名/删除/在资源管理器显示）。
     FileTree,
+    Tab,
 }
 
 /// F1：提示横幅状态机（纯逻辑——代际/清除语义单测钉定）。
@@ -427,6 +437,9 @@ impl ShellApp {
                     return true;
                 }
                 shell.update(cx, |shell, cx| {
+                    shell.close_context_menu(cx);
+                    shell.close_menu_bar_internal(cx);
+                    shell.close_queue.clear();
                     eprintln!("confirm: 退出前确认（{} 个未保存）", dirty.len());
                     shell.confirm = Some(ConfirmState {
                         message: format!("有 {} 个未保存的文档", dirty.len()),
@@ -458,6 +471,8 @@ impl ShellApp {
             panel_drag: None,
             tabs,
             active: 0,
+            close_queue: Default::default(),
+            closed_tabs: Vec::new(),
             workspace,
             git_panel: None,
             outline: None,
@@ -491,6 +506,11 @@ impl ShellApp {
                 .unwrap_or_default(),
             notice_board: NoticeBoard::default(),
             context_menu: None,
+            context_menu_generation: 0,
+            context_menu_previous_focus: None,
+            context_menu_focus: None,
+            context_tab_target: None,
+            context_menu_subscription: None,
             context_menu_pos: gpui::Point::new(Pixels::ZERO, Pixels::ZERO),
             context_menu_origin: MenuOrigin::default(),
             context_menu_target: None,
@@ -1072,6 +1092,7 @@ impl ShellApp {
     /// #289-⑤：打开设置弹窗（左条设置钮 / 菜单「查看 → 设置」入口；
     /// 弹窗形态——zed「设置是独立界面不是 dock 视图」同款语义）。
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
         self.settings_open = true;
         cx.notify();
     }
@@ -1085,6 +1106,7 @@ impl ShellApp {
     /// #289-⑤：设置弹窗开合切换（左条设置钮——再点收起；与
     /// toggle_git 同构的「一键直达」语义）。
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
         self.settings_open = !self.settings_open;
         cx.notify();
     }
@@ -1483,24 +1505,77 @@ impl ShellApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.confirm.is_some() || self.settings_open {
+            return;
+        }
+        self.close_menu_bar_internal(cx);
+        let owns_focus = self
+            .context_menu_focus
+            .as_ref()
+            .is_some_and(|focus| focus.contains_focused(window, cx));
+        let previous = if owns_focus {
+            self.context_menu_previous_focus.take()
+        } else {
+            window.focused(cx)
+        };
+        if owns_focus {
+            if let Some(previous) = previous.as_ref() {
+                window.focus(previous, cx);
+            }
+        }
+        self.close_context_menu(cx);
+        self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
+        let generation = self.context_menu_generation;
+        self.context_menu_previous_focus = previous.clone();
         let shell = cx.entity().downgrade();
-        let menu = context_menu_view::build_context_menu(&items, shell, window, cx);
+        let menu =
+            context_menu_view::build_context_menu(&items, shell.clone(), generation, window, cx);
         self.context_menu = Some(menu.clone());
         self.context_menu_pos = pos;
         self.context_menu_origin = origin;
         self.context_menu_target = target;
         // DismissEvent → 状态清理（点选动作后组件自动 emit；Esc/点外部
         // 经 on_blur → Cancel → emit——两条路都归一到这里）。
-        cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
-            this.close_context_menu(cx);
-        })
-        .detach();
+        let dismiss_shell = shell.clone();
+        self.context_menu_subscription = Some(window.subscribe(
+            &menu,
+            cx,
+            move |menu, _: &gpui::DismissEvent, window, cx| {
+                let _ = dismiss_shell.update(cx, |this, cx| {
+                    if this.context_menu_generation != generation
+                        || this.context_menu.as_ref() != Some(&menu)
+                    {
+                        return;
+                    }
+                    if this.confirm.is_none()
+                        && !this.settings_open
+                        && menu.read(cx).focus_handle(cx).contains_focused(window, cx)
+                    {
+                        if let Some(previous) = previous.as_ref() {
+                            window.focus(previous, cx);
+                        }
+                    }
+                    this.close_context_menu(cx);
+                });
+            },
+        ));
         // 键盘导航需要焦点在菜单（RightClickMenu 同款：等 deferred 渲染
         // 树链入焦点域后再聚焦，避免 contains_focused 误判闪烁）。
         let focus = menu.read(cx).focus_handle(cx).clone();
+        self.context_menu_focus = Some(focus.clone());
         window.on_next_frame(move |window, _cx| {
             window.on_next_frame(move |window, cx| {
-                window.focus(&focus, cx);
+                let _ = shell.update(cx, |this, cx| {
+                    if this.context_menu_generation == generation
+                        && this.context_menu.is_some()
+                        && this.confirm.is_none()
+                        && !this.settings_open
+                        && this.menu_bar_open.is_none()
+                        && window.focused(cx) == this.context_menu_previous_focus
+                    {
+                        window.focus(&focus, cx);
+                    }
+                });
             });
         });
         cx.notify();
@@ -1509,8 +1584,13 @@ impl ShellApp {
     /// 关闭右键菜单（Esc / 点空白 / 执行完动作）。目标随菜单一起清
     ///（#166——菜单关了，目标路径不再有效）。
     pub fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        self.context_menu_subscription = None;
+        self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
+        self.context_menu_target = None;
+        self.context_tab_target = None;
+        self.context_menu_previous_focus = None;
+        self.context_menu_focus = None;
         if self.context_menu.take().is_some() {
-            self.context_menu_target = None;
             cx.notify();
         }
     }
@@ -1527,10 +1607,27 @@ impl ShellApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.context_menu.is_none() || self.confirm.is_some() || self.settings_open {
+            return;
+        }
         let origin = self.context_menu_origin;
         let target = self.context_menu_target.clone();
-        self.context_menu = None;
-        self.context_menu_target = None;
+        let tab_target = self.context_tab_target.clone();
+        let previous = self.context_menu_previous_focus.clone();
+        let menu_owned_focus = self
+            .context_menu_focus
+            .as_ref()
+            .is_some_and(|focus| focus.contains_focused(window, cx));
+        self.close_context_menu(cx);
+        if menu_owned_focus {
+            if let Some(previous) = previous.as_ref() {
+                window.focus(previous, cx);
+            }
+        }
+        if origin == MenuOrigin::Tab {
+            self.activate_tab_menu_item(id, tab_target, window, cx);
+            return;
+        }
         match (origin, id) {
             // 编辑器命令动作：统一走 run_command（键位 / 命令面板 / 图标条
             // 搜索钮同一分派路径）。#165 前经 exec_menu_command 的
@@ -1728,6 +1825,9 @@ impl ShellApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.confirm.is_some() || self.settings_open {
+            return;
+        }
         self.close_context_menu(cx);
         let menus = menu_bar::build_menus(&self.menu_context(cx));
         let Some(menu) = menus.get(idx) else {
@@ -1751,9 +1851,24 @@ impl ShellApp {
         // 键盘导航需要焦点在菜单（deferred 渲染树链入后两帧聚焦——
         // 批 1 spawn_context_menu 同款）。
         let focus = entity.read(cx).focus_handle(cx).clone();
+        let previous = window.focused(cx);
+        let shell = cx.entity().downgrade();
+        let menu_id = entity.entity_id();
         window.on_next_frame(move |window, _cx| {
             window.on_next_frame(move |window, cx| {
-                window.focus(&focus, cx);
+                let _ = shell.update(cx, |this, cx| {
+                    if this
+                        .menu_bar_entity
+                        .as_ref()
+                        .is_some_and(|menu| menu.entity_id() == menu_id)
+                        && this.context_menu.is_none()
+                        && this.confirm.is_none()
+                        && !this.settings_open
+                        && window.focused(cx) == previous
+                    {
+                        window.focus(&focus, cx);
+                    }
+                });
             });
         });
         cx.notify();
@@ -2038,6 +2153,25 @@ impl ShellApp {
     }
 
     pub fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm.is_some() || self.settings_open {
+            return;
+        }
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let target = tab.editor.entity_id();
+        self.close_context_menu(cx);
+        self.close_queue.clear();
+        self.close_queue.push_back((target, false));
+        self.drain_close_queue(window, cx);
+    }
+
+    fn request_close_tab_internal(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.tabs.len() {
             return;
         }
@@ -2049,7 +2183,10 @@ impl ShellApp {
             self.confirm = Some(ConfirmState {
                 message: format!("{name} 有未保存的修改"),
                 detail: "关闭前保存？".to_string(),
-                action: ConfirmAction::CloseTab { idx: index },
+                action: ConfirmAction::CloseTab {
+                    idx: index,
+                    target: self.tabs[index].editor.entity_id(),
+                },
                 selected: 0,
                 buttons: CONFIRM_BUTTONS.to_vec(),
             });
@@ -2071,6 +2208,14 @@ impl ShellApp {
         // #51 D4b：丢弃前快照（重开同文件回到原页原档——关标签不丢
         // 阅读位置）。
         let closed_path = self.tabs[idx].path.clone();
+        // Session-local history contains file-backed tabs only, never git previews.
+        if closed_path.is_absolute() {
+            self.closed_tabs.retain(|path| path != &closed_path);
+            self.closed_tabs.push(closed_path.clone());
+            if self.closed_tabs.len() > 20 {
+                self.closed_tabs.remove(0);
+            }
+        }
         if let Some((owned, view)) = self.pdf_pages.take() {
             if owned == closed_path {
                 let snap = view.read(cx).snapshot();
@@ -2131,19 +2276,34 @@ impl ShellApp {
             return;
         };
         match confirm.action {
-            ConfirmAction::CloseTab { idx } => match choice {
-                0 => {
-                    // 保存后关（保存失败不关——不静默丢内容）。#386：
-                    // 走 Shell 分流（pdf 批注增量落盘在此发生）；
-                    // 只 Saved/Unmodified 才关。
-                    let outcome = self.save_tab(idx, cx);
-                    if matches!(outcome, SaveOutcome::Saved | SaveOutcome::Unmodified) {
-                        self.close_tab_at(idx, window, cx);
+            ConfirmAction::CloseTab { target, .. } => {
+                let Some(idx) = self.tab_index_by_id(target) else {
+                    self.close_queue.clear();
+                    self.focus_active(window, cx);
+                    cx.notify();
+                    return;
+                };
+                match choice {
+                    0 => {
+                        // 保存后关（保存失败不关——不静默丢内容）。#386：
+                        // 走 Shell 分流（pdf 批注增量落盘在此发生）；
+                        // 只 Saved/Unmodified 才关。
+                        let outcome = self.save_tab(idx, cx);
+                        if matches!(outcome, SaveOutcome::Saved | SaveOutcome::Unmodified) {
+                            self.close_tab_at(idx, window, cx);
+                        } else {
+                            self.close_queue.clear();
+                        }
+                    }
+                    1 => self.close_tab_at(idx, window, cx),
+                    _ => {
+                        self.close_queue.clear();
                     }
                 }
-                1 => self.close_tab_at(idx, window, cx),
-                _ => {}
-            },
+                if choice < 2 {
+                    self.drain_close_queue(window, cx);
+                }
+            }
             ConfirmAction::Quit => match choice {
                 0 => {
                     // #386：逐标签走 Shell 分流（pdf 批注一并落盘；
@@ -2171,13 +2331,21 @@ impl ShellApp {
                 _ => {}
             },
         }
-        self.focus_active(window, cx);
+        if self.confirm.is_some() {
+            window.focus(&self.confirm_focus, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
         cx.notify();
     }
 
     /// 焦点归回当前活动标签的编辑器（确认框关闭后；空态回退 shell
     /// 根域——键位不聋）。
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm.is_some() {
+            window.focus(&self.confirm_focus, cx);
+            return;
+        }
         match self.tabs.get(self.active) {
             Some(tab) => {
                 // #422：页视图态 pdf 标签——焦点落页视图（编辑器不在
@@ -3420,8 +3588,7 @@ impl Render for ShellApp {
                 if this.confirm.is_some() {
                     match key.as_str() {
                         "escape" => {
-                            this.confirm = None;
-                            this.focus_active(window, cx);
+                            this.resolve_confirm(2, window, cx);
                             cx.notify();
                         }
                         "enter" => {
@@ -3536,6 +3703,10 @@ impl Render for ShellApp {
                             return;
                         }
                         // F3：Ctrl+W 关闭当前标签（F4：脏标签经确认框）。
+                        ShellAction::ReopenClosedTab => {
+                            this.reopen_closed_tab(window, cx);
+                            return;
+                        }
                         ShellAction::CloseTab => {
                             this.close_active_tab(window, cx);
                             return;
@@ -4282,6 +4453,13 @@ mod tests {
 // 宿主：ShellApp 不作根视图（render 路径的菜单/主题/资产面与本模块
 // 无关），空 div 宿主开窗只取真实 `Window`——EditorHost 同款口径。
 // ---------------------------------------------------------------------------
+#[path = "tab_menu.rs"]
+mod tab_menu;
+
+#[cfg(test)]
+#[path = "tab_menu_tests.rs"]
+mod tab_menu_tests;
+
 #[cfg(test)]
 mod tab_workflow_tests {
     use super::*;
@@ -4885,7 +5063,10 @@ mod tab_workflow_tests {
                     CONFIRM_BUTTONS.to_vec(),
                     "保存/不保存/取消三选"
                 );
-                assert!(matches!(confirm.action, ConfirmAction::CloseTab { idx: 0 }));
+                assert!(matches!(
+                    confirm.action,
+                    ConfirmAction::CloseTab { idx: 0, .. }
+                ));
                 assert_eq!(confirm.selected, 0, "默认停在保存侧");
             });
         });
@@ -5080,7 +5261,10 @@ mod tab_workflow_tests {
                     confirm.message
                 );
                 assert_eq!(confirm.buttons, CONFIRM_BUTTONS.to_vec(), "三选按钮");
-                assert!(matches!(confirm.action, ConfirmAction::CloseTab { idx: 0 }));
+                assert!(matches!(
+                    confirm.action,
+                    ConfirmAction::CloseTab { idx: 0, .. }
+                ));
                 shell.resolve_confirm(2, window, cx);
                 assert_eq!(shell.tab_count(), 1, "取消不关标签");
                 let ed = shell.tab_editor(0).unwrap().clone();
@@ -8916,7 +9100,10 @@ mod confirm_lifecycle_tests {
             shell.confirm = Some(ConfirmState {
                 message: "标签有未保存的修改".to_string(),
                 detail: "关闭前保存？".to_string(),
-                action: ConfirmAction::CloseTab { idx: 0 },
+                action: ConfirmAction::CloseTab {
+                    idx: 0,
+                    target: gpui::EntityId::from(0),
+                },
                 selected: 2,
                 buttons: CONFIRM_BUTTONS.to_vec(),
             });
@@ -9076,7 +9263,10 @@ mod confirm_lifecycle_tests {
                     .confirm
                     .as_ref()
                     .expect("dirty tab produces actual modal");
-                assert!(matches!(confirm.action, ConfirmAction::CloseTab { idx: 0 }));
+                assert!(matches!(
+                    confirm.action,
+                    ConfirmAction::CloseTab { idx: 0, .. }
+                ));
                 assert_eq!(confirm.selected, 0);
                 assert_eq!(confirm.buttons, CONFIRM_BUTTONS.to_vec());
                 assert!(
@@ -9494,7 +9684,7 @@ mod xlsx_save_close_tests {
                 shell.update(cx, |shell, cx| {
                     let confirm = shell.confirm.as_ref().expect("会话脏关闭必弹确认");
                     assert!(
-                        matches!(confirm.action, ConfirmAction::CloseTab { idx: 0 }),
+                        matches!(confirm.action, ConfirmAction::CloseTab { idx: 0, .. }),
                         "关闭确认（得 {:?}）",
                         confirm.action
                     );

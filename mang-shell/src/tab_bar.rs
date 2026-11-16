@@ -115,6 +115,7 @@ pub fn tab_bar(
     let dirty_dot_color = ui::Color::Accent.color(cx);
 
     TabBar::new("tab-bar").children(rows.iter().enumerate().map(|(idx, (label, dirty))| {
+        let target = tabs[idx].editor.entity_id();
         let is_active = idx == active;
         let last = idx + 1 == rows.len();
         // 位置语义（Tab 边框策略的输入）：首/末固定；中间按相对
@@ -131,12 +132,28 @@ pub fn tab_bar(
             TabPosition::Middle(Ordering::Greater)
         };
         Tab::new(SharedString::from(format!("tab-{idx}")))
+            .debug_selector(move || format!("tab-{idx}"))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    this.open_tab_context_menu(target, event.position, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.request_close_tab_id(target, window, cx);
+                }),
+            )
             .toggle_state(is_active)
             .position(position)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    this.activate_tab(idx, window, cx);
+                    this.activate_tab_id(target, window, cx);
                 }),
             )
             .when(*dirty, |tab| {
@@ -154,7 +171,7 @@ pub fn tab_bar(
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.request_close_tab(idx, window, cx);
+                        this.request_close_tab_id(target, window, cx);
                     }))
                     .child(ui::Icon::new(ui::IconName::Close).size(ui::IconSize::XSmall)),
             )
