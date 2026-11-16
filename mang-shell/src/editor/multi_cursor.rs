@@ -7,10 +7,9 @@
 //!   完全在编辑器层——`Cursors` 持有 `Vec<(anchor, head)>`。
 //! - **主光标** = 列表末项（Zed 惯例：最后操作/添加的光标为主）。
 //!   常态（单光标）下与 `Buffer.cursor()` 同步。
-//! - **多点编辑按文档序尾→头应用**（先行编辑不影响其后点的坐标）；
-//!   批撤销 = 连续 `undo` 本批点数（外壳四元组栈顶恰为本批）。
-//! - 多点编辑后各光标重置为**裸光标**于各插入尾部（纯算术
-//!   `end_after_insert`——与 Buffer 光标语义同一公式）。
+//! - 多点编辑捕获同一原始投影坐标，经 Buffer 批入口提交一个显式事务；
+//!   撤销/重做一次回放整批，不依赖击键合并窗。
+//! - 结果光标由原始 char offset 经整批变更右偏映射，包含此前编辑的位移。
 
 use super::buffer::{Buffer, Point};
 
@@ -115,75 +114,124 @@ impl Cursors {
     }
 
     // ------------------------------------------------------------------
-    // 多点编辑（Buffer 原语循环——按文档序尾→头；批撤销锚定）
+    // 多点编辑（同 snapshot 坐标 + 显式批事务 + 位置映射）
     // ------------------------------------------------------------------
 
-    /// 每个选区处插入 `text`（选区被替换）。各光标重置为裸光标于
-    /// 各插入尾部（`end_after_insert` 公式；相邻同点去重）。
+    /// Replace all selections in one explicit transaction. Coordinates and tails
+    /// are captured against the same original source snapshot.
     pub fn insert_all(&mut self, buffer: &mut Buffer, text: &str) {
-        let ordered = self.ordered_entries();
-        self.pending_batch = ordered.len();
-        for (s, e) in ordered.iter().rev() {
-            buffer.replace_range(*s, *e, text);
-        }
-        let mut tails: Vec<Sel> = ordered
-            .iter()
-            .map(|(s, _)| {
-                let t = buffer.end_after_insert_pub(s, text);
-                (t, t)
+        let edits = self
+            .ordered_entries()
+            .into_iter()
+            .map(|(s, e)| (s, e, text.to_string()))
+            .collect();
+        self.apply_gesture(buffer, edits);
+    }
+
+    /// Backspace uses the original snapshot, including boundary no-op cursors.
+    pub fn backspace_all(&mut self, buffer: &mut Buffer) {
+        let edits = self
+            .ordered_entries()
+            .into_iter()
+            .map(|(s, e)| {
+                let start = if s != e {
+                    s
+                } else if e.col > 0 {
+                    Point::new(e.line, e.col - 1)
+                } else if e.line > 0 {
+                    Point::new(e.line - 1, buffer.line_len(e.line - 1))
+                } else {
+                    e
+                };
+                (start, e, String::new())
             })
             .collect();
-        tails.sort_by_key(|(_, h)| *h);
-        tails.dedup_by_key(|(_, h)| *h);
-        self.sels = tails;
+        self.apply_gesture(buffer, edits);
     }
 
-    /// 每个光标处执行退格语义（选区删/行首与前行合并/删前一字符）。
-    /// 各光标重置为裸光标于各删除点（Buffer 光标=编辑起点同公式）。
-    pub fn backspace_all(&mut self, buffer: &mut Buffer) {
-        let ordered = self.ordered_entries();
-        self.pending_batch = ordered.len();
-        for (s, e) in ordered.iter().rev() {
-            if s != e {
-                buffer.replace_range(*s, *e, "");
-                continue;
-            }
-            if e.col > 0 {
-                let st = Point::new(e.line, e.col - 1);
-                buffer.replace_range(st, *e, "");
-            } else if e.line > 0 {
-                let st = Point::new(e.line - 1, buffer.line_len(e.line - 1));
-                buffer.replace_range(st, *e, "");
-            }
-        }
-        let mut heads: Vec<Sel> = ordered.iter().map(|(s, _)| (*s, *s)).collect();
-        heads.sort_by_key(|(_, h)| *h);
-        heads.dedup_by_key(|(_, h)| *h);
-        self.sels = heads;
-    }
-
-    /// 每个光标处执行前删语义（选区删/行尾与下行合并/删后一字符）。
-    /// 各光标重置为裸光标于各删除点。
+    /// Delete uses the original snapshot, including EOF no-op cursors.
     pub fn delete_all(&mut self, buffer: &mut Buffer) {
-        let ordered = self.ordered_entries();
-        self.pending_batch = ordered.len();
-        for (s, e) in ordered.iter().rev() {
-            if s != e {
-                buffer.replace_range(*s, *e, "");
+        let edits = self
+            .ordered_entries()
+            .into_iter()
+            .map(|(s, e)| {
+                let end = if s != e {
+                    e
+                } else if e.col < buffer.line_len(e.line) {
+                    Point::new(e.line, e.col + 1)
+                } else if e.line + 1 < buffer.line_count() {
+                    Point::new(e.line + 1, 0)
+                } else {
+                    e
+                };
+                (s, end, String::new())
+            })
+            .collect();
+        self.apply_gesture(buffer, edits);
+    }
+
+    fn apply_gesture(&mut self, buffer: &mut Buffer, edits: Vec<(Point, Point, String)>) {
+        // One offset domain, char rather than UTF8 bytes or UTF16 units. Deleted
+        // ranges can overlap when a collapsed cursor adjoins a selection; merge
+        // those ranges before submitting, not after partially applying them.
+        let original_tails: Vec<usize> = edits
+            .iter()
+            .map(|(s, _, _)| buffer.point_to_coff(*s))
+            .collect();
+        let mut edits = edits;
+        edits.sort_by_key(|(s, _, _)| *s);
+        let mut canonical: Vec<(Point, Point, String)> = Vec::new();
+        for (s, e, text) in edits {
+            if s == e && text.is_empty() {
                 continue;
             }
-            if e.col < buffer.line_len(e.line) {
-                let en = Point::new(e.line, e.col + 1);
-                buffer.replace_range(*e, en, "");
-            } else if e.line + 1 < buffer.line_count() {
-                let en = Point::new(e.line + 1, 0);
-                buffer.replace_range(*e, en, "");
+            if let Some((_, prev_end, prev_text)) = canonical.last_mut()
+                && s < *prev_end
+                && text.is_empty()
+                && prev_text.is_empty()
+            {
+                *prev_end = (*prev_end).max(e);
+            } else {
+                canonical.push((s, e, text));
             }
         }
-        let mut heads: Vec<Sel> = ordered.iter().map(|(s, _)| (*s, *s)).collect();
-        heads.sort_by_key(|(_, h)| *h);
-        heads.dedup_by_key(|(_, h)| *h);
-        self.sels = heads;
+        let offsets: Vec<_> = canonical
+            .iter()
+            .map(|(s, e, t)| {
+                (
+                    buffer.point_to_coff(*s),
+                    buffer.point_to_coff(*e),
+                    t.chars().count(),
+                )
+            })
+            .collect();
+        if canonical.is_empty() || buffer.replace_batch(canonical) == 0 {
+            return; // Rejection/no-op preserves document AND cursor geometry.
+        }
+        let mut tails: Vec<Sel> = original_tails
+            .into_iter()
+            .map(|old| {
+                let mut delta = 0i64;
+                let mut mapped = None;
+                for &(start, end, inserted) in &offsets {
+                    if old < start {
+                        break;
+                    }
+                    if old <= end {
+                        // Right-biased tail inside/on a replacement lands after it.
+                        mapped = Some((start as i64 + delta + inserted as i64) as usize);
+                        break;
+                    }
+                    delta += inserted as i64 - (end - start) as i64;
+                }
+                let point = buffer.coff_to_point(mapped.unwrap_or((old as i64 + delta) as usize));
+                (point, point)
+            })
+            .collect();
+        tails.sort_by_key(|(_, head)| *head);
+        tails.dedup();
+        self.sels = tails;
+        self.pending_batch = offsets.len(); // Compatibility counter, not history grouping.
     }
 
     /// 同向移动所有光标（`extend`：各锚不动扩选区；无 extend 各清锚）。
@@ -404,6 +452,80 @@ mod tests {
     // ---------------- 基础状态 ----------------
 
     #[test]
+    fn gesture_delete_maps_same_line_and_eof_noop() {
+        let mut b = Buffer::from_plain_text("abcdef");
+        b.set_coalesce_ms(0);
+        let mut c = Cursors::single(p(0, 1));
+        c.push(p(0, 4), p(0, 4));
+        c.push(p(0, 6), p(0, 6));
+        c.delete_all(&mut b);
+        assert_eq!(b.to_plain_text(), "acdf");
+        assert_eq!(
+            c.entries(),
+            &[(p(0, 1), p(0, 1)), (p(0, 3), p(0, 3)), (p(0, 4), p(0, 4))]
+        );
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "abcdef");
+        assert!(b.redo());
+        assert_eq!(b.to_plain_text(), "acdf");
+    }
+
+    #[test]
+    fn gesture_zero_coalesce_one_undo_and_redo() {
+        let mut b = Buffer::from_plain_text("abcd");
+        b.set_coalesce_ms(0);
+        let mut c = Cursors::single(p(0, 1));
+        c.push(p(0, 3), p(0, 3));
+        c.insert_all(&mut b, "中");
+        assert_eq!(b.to_plain_text(), "a中bc中d");
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "abcd");
+        assert!(!b.undo());
+        assert!(b.redo());
+        assert_eq!(b.to_plain_text(), "a中bc中d");
+        assert!(!b.redo());
+    }
+
+    #[test]
+    fn gesture_same_line_positions_use_original_snapshot() {
+        let mut b = Buffer::from_plain_text("abcdef");
+        let mut c = Cursors::single(p(0, 1));
+        c.push(p(0, 4), p(0, 4));
+        c.insert_all(&mut b, "XY");
+        assert_eq!(c.entries(), &[(p(0, 3), p(0, 3)), (p(0, 8), p(0, 8))]);
+    }
+
+    #[test]
+    fn gesture_backspace_positions_and_boundary_noop() {
+        let mut b = Buffer::from_plain_text("abcdef");
+        let mut c = Cursors::single(p(0, 0));
+        c.push(p(0, 2), p(0, 2));
+        c.push(p(0, 5), p(0, 5));
+        c.backspace_all(&mut b);
+        assert_eq!(b.to_plain_text(), "acdf");
+        assert_eq!(
+            c.entries(),
+            &[(p(0, 0), p(0, 0)), (p(0, 1), p(0, 1)), (p(0, 3), p(0, 3))]
+        );
+    }
+
+    #[test]
+    fn gesture_fences_prior_and_following_typing() {
+        let mut b = Buffer::from_plain_text("abcd");
+        b.replace_range(p(0, 0), p(0, 0), "P");
+        let mut c = Cursors::single(p(0, 1));
+        c.push(p(0, 4), p(0, 4));
+        c.insert_all(&mut b, "X");
+        b.replace_range(p(0, 0), p(0, 0), "N");
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "PXabcXd");
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "Pabcd");
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "abcd");
+    }
+
+    #[test]
     fn single_state_is_one_cursor() {
         let c = Cursors::single(p(1, 2));
         assert_eq!(c.len(), 1);
@@ -473,10 +595,14 @@ mod tests {
         // 再 (0,0..5) 替换 hello → "X\nY"+" X\nYworld"
         c.insert_all(&mut b, "X\nY");
         assert_eq!(b.to_plain_text(), "X\nY X\nYworld");
-        // 尾：end_after_insert((0,0),"X\nY")=(1,1)；end_after_insert((0,6))=(1,1)
-        // —— 两点同文本（1 换行）尾重合 → dedup 合一（len 2 → 1）
-        assert_eq!(c.len(), 1, "两尾重合（(1,1)/(1,1)）去重合一");
-        assert_eq!(c.entries()[0], (p(1, 1), p(1, 1)));
+        // The second tail includes the first selection replacement and newline.
+        // Old arithmetic falsely collapsed two distinct insertion tails.
+        assert_eq!(
+            c.len(),
+            2,
+            "distinct tails mapped from the original snapshot"
+        );
+        assert_eq!(c.entries(), &[(p(1, 1), p(1, 1)), (p(2, 1), p(2, 1))]);
     }
 
     #[test]

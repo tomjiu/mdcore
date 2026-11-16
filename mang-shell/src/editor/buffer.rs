@@ -116,6 +116,11 @@ struct EntryMeta {
     id: u64,
     /// Text-only history has no corresponding semantic core undo entry.
     projection_only: bool,
+    /// Source-state identity (not stack depth or a whole-document hash).
+    before_state: u64,
+    after_state: u64,
+    /// Exact source envelope is available, even for a multi-edit gesture.
+    exact_replay: bool,
     /// 手势起点（undo 光标落点）。
     start: Point,
     /// 手势被替换域终点（pre 编辑坐标）。
@@ -129,8 +134,8 @@ struct EntryMeta {
     /// 条目内编辑数（#205 fence 判据：单编辑 = Single 几何，多编辑
     /// （批量/合并窗吸收的多点编辑）= Full——保守正确）。
     n_edits: usize,
-    /// 单编辑条目的被替换文本（四元组回放面——undo 投影回放的
-    /// 精确原文；多编辑条目为空串，走 op 翻译路径）。
+    /// 精确 source envelope（单编辑或显式批事务）；普通击键合并条目
+    /// 无合成 envelope 时 exact_replay=false，走既有 op 翻译。
     old_text: String,
     /// 单编辑条目的插入文本（redo 投影回放面）。
     text: String,
@@ -182,10 +187,9 @@ pub struct Buffer {
     anchor: Option<Point>,
     /// 上下移动的期望列粘性（被短行 clamp 时记忆原列）。
     desired_col: Option<usize>,
-    /// 保存点对应的核 undo 栈深度（`mark_saved` 快照）。
-    /// 修改判定 = 当前深度 != 保存点深度——undo 到底即回初始态（redo
-    /// 栈非空不代表内容偏离初始）。与 r39 语义逐位一致（深度口径）。
-    saved_depth: usize,
+    /// O(1) source-state tokens; revision allocates new identities on every edit.
+    current_state: u64,
+    saved_state: u64,
     /// UndoHook 的 history_id 镜像 + 手势几何伴记：核 undo 栈每条目
     /// 对应一条 EntryMeta（id/起点/终点/后光标/双侧换行数/编辑数/
     /// 四元组文本）。undo/redo 的光标与 #205 fence 记账全部由此推导
@@ -244,7 +248,8 @@ impl Clone for Buffer {
             cursor: self.cursor,
             anchor: self.anchor,
             desired_col: self.desired_col,
-            saved_depth: self.saved_depth,
+            current_state: self.current_state,
+            saved_state: self.saved_state,
             entry_ids: self.entry_ids.clone(),
             redo_ids: self.redo_ids.clone(),
             default_coalesce_ms: self.default_coalesce_ms,
@@ -411,7 +416,8 @@ impl Buffer {
             cursor: Point::default(),
             anchor: None,
             desired_col: None,
-            saved_depth: 0,
+            current_state: 0,
+            saved_state: 0,
             entry_ids: Vec::new(),
             redo_ids: Vec::new(),
             default_coalesce_ms: mdcore::history::COALESCE_MS,
@@ -520,15 +526,16 @@ impl Buffer {
         out
     }
 
-    /// 是否相对最近保存点已修改（当前 undo 深度 != 保存点深度）。
+    /// 是否偏离保存时的 source-state 身份（同深度的新分支仍为 dirty）。
     pub fn is_modified(&self) -> bool {
-        self.entry_ids.len() != self.saved_depth
+        self.current_state != self.saved_state
     }
 
-    /// 显式落盘：记录保存点深度（redo 历史随之清空——保存点之后
-    /// 不跨保存点 undo，与多数编辑器一致）。
+    /// 显式落盘：记录 source-state 身份并 fence 后续击键；保留 undo，
+    /// 清空 redo（既有保存契约）。
     pub fn mark_saved(&mut self) {
-        self.saved_depth = self.entry_ids.len();
+        self.saved_state = self.current_state;
+        self.bridge.break_coalesce();
         self.bridge.mark_saved();
         self.redo_ids.clear();
     }
@@ -582,6 +589,14 @@ impl Buffer {
     pub fn set_coalesce_ms(&mut self, ms: u64) {
         self.default_coalesce_ms = ms;
         self.refresh_coalesce_window();
+    }
+
+    pub(crate) fn point_to_coff(&self, point: Point) -> usize {
+        self.bridge.point_to_coff(point)
+    }
+
+    pub(crate) fn coff_to_point(&self, offset: usize) -> Point {
+        self.bridge.coff_to_point_p(offset)
     }
 
     /// #163：命令边界破组——下一次编辑必开新 undo 条目（命令级手势
@@ -716,6 +731,9 @@ impl Buffer {
             self.entry_ids.push(EntryMeta {
                 id: self.revision,
                 projection_only,
+                before_state: self.current_state,
+                after_state: self.revision,
+                exact_replay: true,
                 start,
                 end,
                 cursor_after: cursor,
@@ -728,6 +746,13 @@ impl Buffer {
             self.redo_ids.clear();
         } else if let Some(last) = self.entry_ids.last_mut() {
             last.n_edits += 1;
+            last.after_state = self.revision;
+            last.exact_replay = false;
+        }
+        self.current_state = self.revision;
+        if projection_only {
+            // A source-only ledger entry must not split a coalesced Core entry.
+            self.bridge.break_coalesce();
         }
         let cursor = self.end_after_insert(&start, text);
         self.anchor = None;
@@ -758,15 +783,24 @@ impl Buffer {
     /// 交桥层单点（全快路径 = 核一次 `apply_ops` 单条目；否则一次
     /// `sync_from_markdown` 兜底——一撤销步语义保持）。
     ///
-    /// 契约：`edits` 各替换互不重叠（debug_assert；重复调用方保证——
-    /// 查找替换消费方已做非重叠过滤）。返回应用数（空入参 = 0 无操作）。
+    /// 契约：各替换互不重叠（重叠/同起点整批拒绝）；原始 snapshot 的
+    /// char 坐标排序后一次捕获。空域空文本忽略，返回实际应用点数。
     /// 光标落在文档序最后一个替换的尾部；清选区/列粘性；清 redo 栈。
     pub fn replace_batch(&mut self, edits: Vec<(Point, Point, String)>) -> usize {
         if edits.is_empty() {
             return 0;
         }
-        let mut ordered = edits;
+        let mut ordered: Vec<_> = edits
+            .into_iter()
+            .filter_map(|(s, e, text)| {
+                let Range { start, end } = self.ordered_range(s..e);
+                (start != end || !text.is_empty()).then_some((start, end, text))
+            })
+            .collect();
         ordered.sort_by_key(|(s, _, _)| *s);
+        if ordered.is_empty() {
+            return 0;
+        }
         // 先行换算：old_text 捕获 + 双坐标域（原始/应用后）一次算定。
         let mut records: Vec<BatchEdit> = Vec::with_capacity(ordered.len());
         // #111：pending 预留容量（千处批量 = 千条记录——避免均摊扩容
@@ -780,12 +814,16 @@ impl Buffer {
             let old_text = self.range_text(&(start..end));
             let c_start = self.bridge.point_to_coff(start);
             let c_end_del = self.bridge.point_to_coff(end);
-            debug_assert!(
-                records
-                    .last()
-                    .is_none_or(|prev: &BatchEdit| prev.c_del.1 <= c_start),
-                "replace_batch: 子编辑互不重叠（调用方契约）"
-            );
+            if records
+                .last()
+                .is_some_and(|prev: &BatchEdit| prev.c_del.1 > c_start || prev.c_del.0 == c_start)
+            {
+                self.last_reject = Some(RejectNotice {
+                    reason: "overlapping batch ranges".into(),
+                    line: start.line,
+                });
+                return 0;
+            }
             records.push(BatchEdit {
                 history_id: self.revision + 1,
                 start,
@@ -849,21 +887,20 @@ impl Buffer {
                 });
             }
         }
+        // Exact source envelope, including untouched blanks/CRLF between edits.
+        // Core remains the semantic history authority; this is its source companion.
+        let first = records.first().expect("nonempty batch");
+        let last = records.last().expect("nonempty batch");
+        let envelope_start = first.start;
+        let envelope_end = self.end_after_insert(&last.start, &last.old_text);
+        let old_envelope = self.range_text(&(envelope_start..envelope_end));
+        let mut applied_end = last.c_del.1 as i64;
         for r in &records {
-            self.note_change(crate::doc_events::ChangeRecord::precise(
-                "replace",
-                r.start,
-                self.end_after_insert(&r.start, &r.old_text),
-                r.new_text.clone(),
-            ));
+            applied_end += r.new_text.chars().count() as i64 - (r.c_del.1 - r.c_del.0) as i64;
         }
-        // #205：批量多区间——几何不可靠，回退全量（钩子已放行、变更
-        // 必然发生）。
-        self.note_fence_full();
         let n = records.len();
         // #163 换芯：桥批量单点（全快路径 = 核一次 `apply_ops` 单条目；
-        /// 否则一次 `sync_from_markdown` 兜底——一撤销步语义保持；
-        /// 拒绝 = 整批不生效，返回 0）。
+        // 否则一次 `sync_from_markdown` 兜底；拒绝 = 整批不生效。
         let batch_pts: Vec<(Point, Point, String)> = records
             .iter()
             .map(|r| {
@@ -874,22 +911,32 @@ impl Buffer {
         if !self.bridge.edit_batch(&batch_pts) {
             return 0;
         }
-        // #111：一次批量事务版本只 +1（点位级记录已在构建循环内入队）。
+        // Publish only after acceptance: rejection changes neither events nor fences.
+        for r in &records {
+            self.note_change(crate::doc_events::ChangeRecord::precise(
+                "replace",
+                r.start,
+                self.end_after_insert(&r.start, &r.old_text),
+                r.new_text.clone(),
+            ));
+        }
+        self.note_fence_full();
         self.revision += 1;
-        // 批量恒新条目（桥内 break_coalesce 前置——「击键 800ms 内全部
-        // 替换」不并入击键条目，undo 粒度语义分叉防护）。
-        self.bridge.drain_events();
-        // 光标：批尾占位尾（Point 直算 = z_applied 尾的等价算术位）。
-        let last_rec = records.last().expect("非空已判");
-        let cursor_after = self.end_after_insert(&last_rec.start, &last_rec.new_text);
+        let (created, semantic) = self.bridge.take_view_events();
+        debug_assert!(
+            !semantic || created,
+            "explicit batch must be a new Core entry"
+        );
+        let cursor_after = self.bridge.coff_to_point_p(applied_end as usize);
+        let new_envelope = self.range_text(&(envelope_start..cursor_after));
         self.entry_ids.push(EntryMeta {
             id: self.revision,
-            projection_only: false,
-            start: records.first().map(|r| r.start).unwrap_or(self.cursor),
-            end: records
-                .last()
-                .map(|r| self.end_after_insert(&r.start, &r.old_text))
-                .unwrap_or(self.cursor),
+            projection_only: !semantic,
+            before_state: self.current_state,
+            after_state: self.revision,
+            exact_replay: true,
+            start: envelope_start,
+            end: envelope_end,
             cursor_after,
             t_nl: records
                 .iter()
@@ -900,9 +947,10 @@ impl Buffer {
                 .map(|r| r.old_text.matches('\n').count())
                 .sum(),
             n_edits: records.len(),
-            old_text: String::new(),
-            text: String::new(),
+            old_text: old_envelope,
+            text: new_envelope,
         });
+        self.current_state = self.revision;
         self.redo_ids.clear();
         self.cursor = cursor_after;
         let first_start = records.first().map(|r| r.start).unwrap_or(self.cursor);
@@ -1018,8 +1066,9 @@ impl Buffer {
         // #163：单编辑条目走**四元组回放**（投影 = 占位换回原文——与
         // 旧 r39 语义逐位等价：空行/\r/行几何全部按原文复原，不经
         // 序列化重建）；多编辑条目走 op 翻译（类 a/a2/b）。
-        let replay =
-            (meta.n_edits == 1).then(|| (meta.start, meta.cursor_after, meta.old_text.clone()));
+        let replay = meta
+            .exact_replay
+            .then(|| (meta.start, meta.cursor_after, meta.old_text.clone()));
         let outcome = if meta.projection_only {
             self.bridge.replay_projection(meta.start, replay)
         } else {
@@ -1034,6 +1083,7 @@ impl Buffer {
         if let Some(h) = self.undo_hook.as_mut() {
             let _ = h.before_history_at(false, delta, meta.id);
         }
+        self.current_state = meta.before_state;
         self.redo_ids.push(meta.clone());
         // #205：fence 几何从伴记推导（单编辑条目 = Single——与旧
         // 四元组物理回放的记账语义逐位一致；多编辑条目（批量/合并
@@ -1046,7 +1096,9 @@ impl Buffer {
         } else {
             self.note_fence_full();
         }
-        match &outcome.precise {
+        // A multi-edit gesture remains a coarse history event; the exact source
+        // envelope is an internal replay companion, not a single user edit.
+        match &outcome.precise.as_ref().filter(|_| meta.n_edits == 1) {
             Some((s, e, t)) => self.note_change(crate::doc_events::ChangeRecord::precise(
                 "undo",
                 *s,
@@ -1072,7 +1124,9 @@ impl Buffer {
         let Some(meta) = self.redo_ids.pop() else {
             return false;
         };
-        let replay = (meta.n_edits == 1).then(|| (meta.start, meta.end, meta.text.clone()));
+        let replay = meta
+            .exact_replay
+            .then(|| (meta.start, meta.end, meta.text.clone()));
         let outcome = if meta.projection_only {
             self.bridge.replay_projection(meta.cursor_after, replay)
         } else {
@@ -1086,6 +1140,7 @@ impl Buffer {
         if let Some(h) = self.undo_hook.as_mut() {
             let _ = h.before_history_at(true, delta, meta.id);
         }
+        self.current_state = meta.after_state;
         self.entry_ids.push(meta.clone());
         // #205：redo 的 fence 几何（同 undo 面——插入侧 = t_nl）。
         if meta.n_edits == 1 {
@@ -1095,7 +1150,9 @@ impl Buffer {
         } else {
             self.note_fence_full();
         }
-        match &outcome.precise {
+        // A multi-edit gesture remains a coarse history event; the exact source
+        // envelope is an internal replay companion, not a single user edit.
+        match &outcome.precise.as_ref().filter(|_| meta.n_edits == 1) {
             Some((s, e, t)) => self.note_change(crate::doc_events::ChangeRecord::precise(
                 "redo",
                 *s,
@@ -1801,6 +1858,209 @@ mod tests {
             "ca",
             "undo 光标回编辑起点 (0,0)，新字符插在行首"
         );
+    }
+
+    fn assert_gesture_semantic_matches_source(b: &Buffer) {
+        let source = mdcore::markdown::markdown_to_tree(&b.to_plain_text());
+        assert_eq!(
+            mdcore::markdown::tree_to_markdown(&b.bridge.core().tree),
+            mdcore::markdown::tree_to_markdown(&source)
+        );
+    }
+
+    #[test]
+    fn gesture_batch_preserves_canonical_ids_and_semantic_history() {
+        let mut b = Buffer::from_plain_text("# heading\r\n\r\nbody\r\n");
+        let ids: Vec<_> = b
+            .bridge
+            .core()
+            .tree
+            .top_level()
+            .iter()
+            .map(|n| b.bridge.core().tree.node(*n).id)
+            .collect();
+        b.replace_batch(vec![
+            (Point::new(0, 3), Point::new(0, 3), "中😀".into()),
+            (Point::new(2, 1), Point::new(2, 1), "X".into()),
+        ]);
+        let after = b.to_plain_text();
+        for stage in 0..3 {
+            assert_gesture_semantic_matches_source(&b);
+            let current_ids: Vec<_> = b
+                .bridge
+                .core()
+                .tree
+                .top_level()
+                .iter()
+                .map(|n| b.bridge.core().tree.node(*n).id)
+                .collect();
+            assert_eq!(current_ids, ids);
+            if stage == 0 {
+                assert!(b.undo());
+                assert_eq!(b.to_plain_text(), "# heading\r\n\r\nbody\r\n");
+            }
+            if stage == 1 {
+                assert!(b.redo());
+                assert_eq!(b.to_plain_text(), after);
+            }
+        }
+    }
+
+    #[test]
+    fn gesture_source_only_then_typing_keeps_ledger_and_saved_identity() {
+        let mut b = Buffer::from_plain_text("ab\n\n");
+        b.replace_range(Point::new(0, 1), Point::new(0, 1), "X");
+        b.replace_batch(vec![(Point::new(2, 0), Point::new(2, 0), "\n\n".into())]);
+        let saved = b.to_plain_text();
+        b.mark_saved();
+        b.replace_range(Point::new(0, 0), Point::new(0, 0), "Q");
+        b.replace_range(Point::new(0, 1), Point::new(0, 1), "R");
+        assert!(b.is_modified());
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), saved, "ordinary typing still coalesces");
+        assert!(!b.is_modified());
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "aXb\n\n");
+        assert!(b.is_modified());
+        assert!(b.redo());
+        assert_eq!(b.to_plain_text(), saved);
+        assert!(!b.is_modified());
+        assert_gesture_semantic_matches_source(&b);
+    }
+
+    #[test]
+    fn gesture_empty_and_overlap_batches_do_not_change_state() {
+        let mut b = Buffer::from_plain_text("ab\n\n");
+        assert_eq!(
+            b.replace_batch(vec![(Point::new(2, 0), Point::new(2, 0), String::new())]),
+            0
+        );
+        assert_eq!(
+            b.replace_batch(vec![
+                (Point::new(0, 0), Point::new(0, 2), "X".into()),
+                (Point::new(0, 1), Point::new(0, 2), "Y".into()),
+            ]),
+            0
+        );
+        assert_eq!(b.to_plain_text(), "ab\n\n");
+        assert_eq!(b.revision(), 0);
+        assert!(!b.is_modified());
+        assert!(b.take_pending().0.is_empty());
+        assert!(!b.undo());
+    }
+
+    #[test]
+    fn gesture_clock_crosses_one_second_without_splitting() {
+        use super::super::multi_cursor::Cursors;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let mut b = Buffer::from_plain_text("abcd");
+        let clock = Arc::new(AtomicU64::new(0));
+        let ticks = clock.clone();
+        b.bridge
+            .set_test_clock(Arc::new(move || ticks.fetch_add(1500, Ordering::SeqCst)));
+        let mut c = Cursors::single(Point::new(0, 1));
+        c.push(Point::new(0, 3), Point::new(0, 3));
+        c.insert_all(&mut b, "X");
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "abcd");
+        assert!(!b.undo());
+        assert!(b.redo());
+        assert_eq!(b.to_plain_text(), "aXbcXd");
+    }
+
+    #[test]
+    fn gesture_late_hook_rejection_is_atomic_for_document_and_cursors() {
+        use super::super::multi_cursor::Cursors;
+        struct RejectFirstLine;
+        impl EditHook for RejectFirstLine {
+            fn before_edit(&mut self, intent: &EditIntent) -> Result<(), String> {
+                if intent.start.line == 0 {
+                    Err("locked".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn after_edit(&mut self, _: &EditSummary) {
+                panic!("rejected batch cannot notify");
+            }
+        }
+        let mut b = Buffer::from_plain_text("ab\ncd");
+        b.set_edit_hook(Some(Box::new(RejectFirstLine)));
+        let mut c = Cursors::single(Point::new(0, 1));
+        c.push(Point::new(1, 1), Point::new(1, 1));
+        let before = c.clone();
+        c.insert_all(&mut b, "X");
+        assert_eq!(b.to_plain_text(), "ab\ncd");
+        assert_eq!(c, before);
+        assert_eq!(b.revision(), 0);
+        assert!(!b.is_modified());
+        assert!(b.take_pending().0.is_empty());
+        assert_eq!(b.take_fence_dirty(), FenceDirty::Clean);
+        assert!(!b.undo());
+    }
+
+    #[test]
+    fn gesture_source_only_batch_does_not_consume_semantic_history() {
+        let mut b = Buffer::from_plain_text("ab\r\n\r\n");
+        b.set_coalesce_ms(0);
+        b.replace_range(Point::new(0, 1), Point::new(0, 1), "X");
+        let semantic = b.to_plain_text();
+        assert_eq!(
+            b.replace_batch(vec![
+                (Point::new(1, 0), Point::new(1, 0), "\n".into()),
+                (Point::new(2, 0), Point::new(2, 0), "\n".into()),
+            ]),
+            2
+        );
+        let after = b.to_plain_text();
+        assert_eq!(after, "aXb\r\n\n\r\n\n");
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), semantic);
+        assert!(b.undo());
+        assert_eq!(b.to_plain_text(), "ab\r\n\r\n");
+        assert!(b.redo());
+        assert_eq!(b.to_plain_text(), semantic);
+        assert!(b.redo());
+        assert_eq!(b.to_plain_text(), after);
+    }
+
+    #[test]
+    fn gesture_mixed_batch_exact_crlf_and_eof_roundtrip() {
+        for original in ["ab\r\n\r\ncd", "ab\r\n\r\ncd\r\n", "\n\n"] {
+            let mut b = Buffer::from_plain_text(original);
+            b.set_coalesce_ms(0);
+            let last = b.line_count() - 1;
+            let eof = Point::new(last, b.line_len(last));
+            b.replace_batch(vec![
+                (Point::new(0, 0), Point::new(0, 0), "X".into()),
+                (eof, eof, "\n\n".into()),
+            ]);
+            let after = b.to_plain_text();
+            assert!(b.undo(), "{original:?}");
+            assert_eq!(b.to_plain_text(), original);
+            assert_gesture_semantic_matches_source(&b);
+            assert!(b.redo());
+            assert_eq!(b.to_plain_text(), after);
+            assert_gesture_semantic_matches_source(&b);
+        }
+    }
+
+    #[test]
+    fn gesture_saved_identity_branch_same_depth_and_length() {
+        let mut b = Buffer::from_plain_text("ab");
+        b.set_coalesce_ms(0);
+        b.replace_batch(vec![(Point::new(0, 1), Point::new(0, 1), "X".into())]);
+        b.mark_saved();
+        assert!(!b.is_modified());
+        assert!(b.undo());
+        assert!(b.is_modified());
+        b.replace_batch(vec![(Point::new(0, 1), Point::new(0, 1), "Y".into())]);
+        assert_eq!(b.to_plain_text(), "aYb");
+        assert!(b.is_modified(), "equal depth/length is not the saved state");
+        assert!(!b.redo(), "new branch invalidates redo");
     }
 
     #[test]

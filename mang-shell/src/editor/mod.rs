@@ -1347,10 +1347,9 @@ impl Editor {
     /// 返回是否发生撤销。#111 顺手修陈旧缓存缺陷：撤销后 now 走
     /// `after_edit`（查找匹配/围栏高亮/断点缓存同步刷新）。
     pub fn undo_edit(&mut self) -> bool {
-        // #163：合并窗接管批撤销协议——多光标/缩进等一次手势的 N 条
-        // 编辑由核 1s 合并窗聚为一条目，单次 undo 即撤整批（此前
-        // take_undo_batch 连撤 N 次的协议退役；慢机超窗分割 = 罕见
-        // 退化路径，多按一次 Ctrl+Z 即可）。
+        // Multi-cursor gestures submit one explicit Buffer batch transaction;
+        // a single undo never relies on the typing coalescing clock/window.
+        // The compatibility counter is not a history grouping mechanism.
         self.cursors.take_undo_batch(); // 排空旧协议残留（幂等）
         let did = self.buffer.undo();
         self.sync_cursors_from_buffer();

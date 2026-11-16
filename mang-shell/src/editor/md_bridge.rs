@@ -187,6 +187,11 @@ impl MdBridge {
         self.proj.len_chars()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&mut self, clock: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.core.set_clock(clock);
+    }
+
     pub(crate) fn core(&self) -> &Core {
         &self.core
     }
@@ -1055,9 +1060,10 @@ impl MdBridge {
                     }
                     self.shift_block_offsets(g.block, g.line, delta);
                 }
+                self.core.break_coalesce(); // Explicit gesture also fences following typing.
                 return true;
             }
-            // 核中途拒（映射漂移 bug）——投影部分应用，兜底自愈。
+            // apply_ops rejection is atomic; no projection edits have run.
             eprintln!("md_bridge: fast_batch rejected——降级 sync 自愈");
         }
         // 兜底：投影整批降序应用 + 一次 sync（强制新条目）。
@@ -1066,6 +1072,7 @@ impl MdBridge {
             .map(|(s, e, t)| (self.point_to_coff(*s), self.point_to_coff(*e), t.clone()))
             .collect();
         coffs.sort_by_key(|(s, _, _)| *s);
+        let source_before = self.proj.clone();
         self.core.break_coalesce();
         for (cs, ce, t) in coffs.into_iter().rev() {
             self.apply_proj(cs, ce, &t);
@@ -1073,8 +1080,11 @@ impl MdBridge {
         let full = self.proj.to_string();
         if self.core.sync_from_markdown(&full).is_ok() {
             self.rebuild_map();
+            self.core.break_coalesce();
             return true;
         }
+        self.proj = source_before;
+        self.rebuild_map();
         false
     }
 
