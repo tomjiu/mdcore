@@ -62,6 +62,12 @@ pub mod docx_lok_session;
 mod docx_save_ui_tests;
 pub mod fence; // #205：fence 缓存重建（纯逻辑：FenceCursor 推进 + 增量/全量）
 pub mod find_bar;
+mod form_input;
+use form_input::{FormField, FormInput};
+#[cfg(test)]
+mod form_input_tests;
+#[cfg(test)]
+mod form_review_tests;
 pub mod highlight;
 pub mod md_bridge; // #163：mdcore 换芯桥（Buffer ↔ Core：真源/投影/行映射）
 pub mod mouse;
@@ -146,7 +152,7 @@ struct CanvasDrag;
 /// r42 阶段 E：命令面板状态。
 #[derive(Clone, Debug)]
 struct PaletteState {
-    query: String,
+    query: FormInput,
     selected: usize,
     /// #183 A-3：候选集 = 分组装配后的**扁平序**（最近使用段置顶 +
     /// 分组内最近用过靠前——与渲染的段列表同一数据源，键盘 selected
@@ -159,7 +165,7 @@ struct PaletteState {
 /// 预览目标行或越界/非法说明）。
 #[derive(Clone, Debug, Default)]
 struct GotoState {
-    input: String,
+    input: FormInput,
     hint: String,
 }
 
@@ -374,6 +380,11 @@ pub struct Editor {
     focus: FocusHandle,
     /// 查找条焦点（query 输入域）。
     find_focus: FocusHandle,
+    replacement_focus: FocusHandle,
+    palette_focus: FocusHandle,
+    goto_focus: FocusHandle,
+    form_bounds: RefCell<Vec<(FormField, Bounds<Pixels>)>>,
+    form_focus_epoch: u64,
     /// 查找条状态（`None` = 关闭）。
     find: Option<FindState>,
     /// G1：查找条关闭时的持久种子（选项/替换文本跨开关保留——
@@ -570,6 +581,11 @@ impl Editor {
             ),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replacement_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            form_bounds: RefCell::new(Vec::new()),
+            form_focus_epoch: 0,
             find: None,
             find_saved: FindState::default(),
             scroll: UniformListScrollHandle::new(),
@@ -632,6 +648,11 @@ impl Editor {
             ),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replacement_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            form_bounds: RefCell::new(Vec::new()),
+            form_focus_epoch: 0,
             find: None,
             find_saved: FindState::default(),
             scroll: UniformListScrollHandle::new(),
@@ -712,6 +733,11 @@ impl Editor {
             ),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replacement_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            form_bounds: RefCell::new(Vec::new()),
+            form_focus_epoch: 0,
             find: None,
             find_saved: FindState::default(),
             scroll: UniformListScrollHandle::new(),
@@ -778,6 +804,11 @@ impl Editor {
             ),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replacement_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            form_bounds: RefCell::new(Vec::new()),
+            form_focus_epoch: 0,
             find: None,
             find_saved: FindState::default(),
             scroll: UniformListScrollHandle::new(),
@@ -837,6 +868,11 @@ impl Editor {
             font_size: DEFAULT_FONT_SIZE,
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replacement_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            form_bounds: RefCell::new(Vec::new()),
+            form_focus_epoch: 0,
             find: None,
             find_saved: FindState::default(),
             goto: None,
@@ -906,6 +942,11 @@ impl Editor {
             ),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
+            replacement_focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            form_bounds: RefCell::new(Vec::new()),
+            form_focus_epoch: 0,
             find: None,
             find_saved: FindState::default(),
             scroll: UniformListScrollHandle::new(),
@@ -1466,7 +1507,10 @@ impl Editor {
             }
             // G2：跳转到行（导航类——只读态同样可用；键位门在
             // readonly_allows 白名单，面板入口无门也导到同一路径）。
-            Cmd::GotoLine => self.open_goto(cx),
+            Cmd::GotoLine => {
+                self.open_goto(cx);
+                self.focus_form(FormField::Goto, window, cx);
+            }
             Cmd::Save => {
                 self.save();
             }
@@ -1488,7 +1532,12 @@ impl Editor {
     /// - Enter：解析→跳转（越界 clamp 到末行 + 提示行）→关闭；
     ///   非法输入不跳、不关、提示刷新
     /// - 退格 / 可打印数字：编辑输入，实时提示预览
-    fn handle_goto_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+    fn handle_goto_key(
+        &mut self,
+        ks: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // 键语义先在输入框态上结算，产出动作；动作应用段避开
         // `self.goto` 的双重可变借用（状态更新 vs 框开关分离）。
         enum Act {
@@ -1524,28 +1573,18 @@ impl Editor {
                     Act::Nop
                 }
             },
-            "backspace" => {
-                state.input.pop();
-                state.hint = goto_hint(&state.input, count);
-                Act::Nop
-            }
             _ => {
-                // 可打印字符入框（数字为主；其余字符入框后由实时提示判非法）
-                if !ctrl
-                    && !ks.modifiers.alt
-                    && let Some(c) = &ks.key_char
-                    && !c.is_empty()
-                    && c.chars().all(|ch| !ch.is_control())
-                {
-                    state.input.push_str(c);
-                    state.hint = goto_hint(&state.input, count);
-                }
+                let mut key = ks.clone();
+                key.key_char = None;
+                state.input.key(&key);
+                state.hint = goto_hint(&state.input, count);
                 Act::Nop
             }
         };
         match act {
             Act::Jump(target, requested) => {
                 self.goto = None;
+                self.focus_document_input(window, cx);
                 self.jump_to_line(target);
                 self.sync_cursors_from_buffer();
                 // 证据行（烟雾断言通道；越界 clamp 一并如实呈现）
@@ -1559,7 +1598,10 @@ impl Editor {
                     }
                 );
             }
-            Act::Close => self.goto = None,
+            Act::Close => {
+                self.goto = None;
+                self.focus_document_input(window, cx);
+            }
             Act::Nop => {}
         }
         cx.notify();
@@ -1570,9 +1612,10 @@ impl Editor {
     fn open_goto(&mut self, cx: &mut Context<Self>) {
         let count = self.buffer.line_count();
         self.goto = Some(GotoState {
-            input: String::new(),
+            input: FormInput::default(),
             hint: goto_hint("", count),
         });
+        self.defer_form_focus(FormField::Goto, cx);
         cx.notify();
     }
 
@@ -1587,11 +1630,11 @@ impl Editor {
         let Some(pal) = self.palette.as_mut() else {
             return false;
         };
-        let ctrl = ks.modifiers.control || ks.modifiers.platform;
         let key = ks.key.to_lowercase();
         match key.as_str() {
             "escape" => {
                 self.palette = None;
+                self.focus_document_input(window, cx);
             }
             "up" => pal.selected = pal.selected.saturating_sub(1),
             "down" => {
@@ -1602,6 +1645,7 @@ impl Editor {
             "enter" => {
                 let cmd = pal.items.get(pal.selected).copied();
                 self.palette = None;
+                self.focus_document_input(window, cx);
                 if let Some(c) = cmd {
                     // #183 A-3：面板执行的命令记入最近使用（下次打开面板
                     // 顶部「最近使用」段可见——分组渲染接线的记账面）。
@@ -1609,20 +1653,10 @@ impl Editor {
                     self.exec_command(c, window, cx);
                 }
             }
-            "backspace" => {
-                pal.query.pop();
-                Self::palette_refill(pal, &self.palette_recent);
-                pal.selected = 0;
-            }
             _ => {
-                // 可打印字符入查询；其余 ctrl 组合忽略
-                if !ctrl
-                    && !ks.modifiers.alt
-                    && let Some(c) = &ks.key_char
-                    && !c.is_empty()
-                    && c.chars().all(|ch| !ch.is_control())
-                {
-                    pal.query.push_str(c);
+                let mut key = ks.clone();
+                key.key_char = None;
+                if pal.query.key(&key) {
                     Self::palette_refill(pal, &self.palette_recent);
                     pal.selected = 0;
                 }
@@ -2232,13 +2266,18 @@ impl Editor {
     pub fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = if self.palette.is_none() {
             Some(PaletteState {
-                query: String::new(),
+                query: FormInput::default(),
                 selected: 0,
                 items: Self::palette_flat_of("", &self.palette_recent),
             })
         } else {
             None
         };
+        if self.palette.is_some() {
+            self.defer_form_focus(FormField::Palette, cx);
+        } else {
+            self.defer_document_focus(cx);
+        }
         cx.notify();
     }
 
@@ -2434,7 +2473,7 @@ impl Editor {
     ) {
         // Low-level listeners still receive layout/IME-preferred events when
         // GPUI bypasses its bindings. Leave these to platform text input.
-        if event.prefer_character_input && !self.read_only {
+        if event.prefer_character_input && (!self.read_only || self.active_form(window).is_some()) {
             self.chord_pending = None;
             return;
         }
@@ -2470,10 +2509,25 @@ impl Editor {
             keymap::store().resolve_pre(keymap::Site::EditorPalette, &kq)
         {
             self.toggle_command_palette(cx);
+            if self.palette.is_some() {
+                self.focus_form(FormField::Palette, window, cx);
+            } else {
+                self.focus_document_input(window, cx);
+            }
+            cx.stop_propagation();
             return;
+        }
+        if self.active_form(window).is_some() {
+            if FormInput::is_text_key(ks) {
+                return;
+            }
+            if self.form_clipboard_key(ks, window, cx) {
+                return;
+            }
         }
         // 面板打开时：其余键位全部归面板（含 ctrl 组合——面板态屏蔽编辑键）。
         if self.palette.is_some() && self.handle_palette_key(&event.keystroke, window, cx) {
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -2487,15 +2541,18 @@ impl Editor {
             if self.goto.is_none() {
                 let count = self.buffer.line_count();
                 self.goto = Some(GotoState {
-                    input: String::new(),
+                    input: FormInput::default(),
                     hint: goto_hint("", count),
                 });
+                self.focus_form(FormField::Goto, window, cx);
+                cx.stop_propagation();
                 cx.notify();
                 return;
             }
         }
         // G2：跳行框打开时优先拦截全部键（含 ctrl 组合——面板同口径）。
-        if self.goto.is_some() && self.handle_goto_key(&event.keystroke, cx) {
+        if self.goto.is_some() && self.handle_goto_key(&event.keystroke, window, cx) {
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -3173,10 +3230,13 @@ impl Editor {
     /// G1：选项/替换文本从上次会话接续（find_saved 种子——
     /// `mem::take` 取用后由 close_find 回填）。
     fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_input_transition();
         let mut state = std::mem::take(&mut self.find_saved);
         state.open(&self.buffer);
         self.find = Some(state);
-        window.focus(&self.find_focus, cx);
+        self.palette = None;
+        self.goto = None;
+        self.focus_form(FormField::Find, window, cx);
         cx.notify();
     }
 
@@ -3184,10 +3244,13 @@ impl Editor {
     /// 只读态不达此处（dispatch 的 readonly 门禁已拦——docx/pdf 的
     /// 变更类键整段拒绝，与 Ctrl+S 同口径）。
     fn open_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_input_transition();
         let mut state = std::mem::take(&mut self.find_saved);
         state.open_replace(&self.buffer);
         self.find = Some(state);
-        window.focus(&self.find_focus, cx);
+        self.palette = None;
+        self.goto = None;
+        self.focus_form(FormField::Find, window, cx);
         eprintln!("find-replace: bar open (replace mode)");
         cx.notify();
     }
@@ -3195,15 +3258,19 @@ impl Editor {
     /// 关闭查找条：焦点回编辑区；G1 起状态存回 find_saved（选项/替换
     /// 文本跨开关保留——query 由下次 open 按选区语义重建）。
     fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_input_transition();
         if let Some(state) = self.find.take() {
             self.find_saved = state;
         }
-        window.focus(&self.focus, cx);
+        self.focus_document_input(window, cx);
         cx.notify();
     }
 
     /// 查找条按键分发（`find_focus` 聚焦时）。
     fn replace_find(&mut self, all: bool) {
+        if self.read_only {
+            return;
+        }
         // 查找替换也是正文编辑；沿用保护检查和精确批/撤销通知。
         if let Some(find) = self.find.as_mut() {
             if all {
@@ -3223,10 +3290,22 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find.is_none() {
+            return;
+        }
+        if event.prefer_character_input || FormInput::is_text_key(&event.keystroke) {
+            return;
+        }
+        cx.stop_propagation();
+        if self.form_clipboard_key(&event.keystroke, window, cx) {
+            return;
+        }
         let Some(find) = self.find.as_mut() else {
             return;
         };
-        match find.handle_key(&self.buffer, &event.keystroke) {
+        let mut ks = event.keystroke.clone();
+        ks.key_char = None;
+        match find.handle_key(&self.buffer, &ks) {
             FindKeyOutcome::Handled => {}
             FindKeyOutcome::QueryChanged => {
                 // refresh 已在 handle_key 内联完成（与测试同一语义）。
@@ -3253,7 +3332,14 @@ impl Editor {
             }
             // G1：选项/输入行切换——纯 UI 态，重绘即可。
             FindKeyOutcome::OptionsChanged => {}
-            FindKeyOutcome::FocusSwitched => {}
+            FindKeyOutcome::FocusSwitched => {
+                let f = if self.find.as_ref().unwrap().focus_is_replacement() {
+                    FormField::Replacement
+                } else {
+                    FormField::Find
+                };
+                self.focus_form(f, window, cx);
+            }
             FindKeyOutcome::Close => {
                 self.close_find(window, cx);
                 return;
@@ -3285,7 +3371,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus, cx);
+        self.focus_document_input(window, cx);
         let hit = self.hit_test(event.position, window);
         let kind = mouse::click_kind(event.click_count);
         // r42 阶段 C：Alt+拖 = 列选择（仅单击粒度启动；双/三击 Alt 忽略）
@@ -3356,7 +3442,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus, cx);
+        self.focus_document_input(window, cx);
         let hit = self.hit_test(event.position, window);
         // 落点在选区 [start, end) 内 → 保持选区；否则光标移到落点。
         let in_selection = self
@@ -3627,21 +3713,11 @@ impl Editor {
     fn render_find_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let find = self.find.as_ref();
-        let query: SharedString = find
-            .map(|f| f.query().to_string())
-            .unwrap_or_default()
-            .into();
         let label = find.map(|f| f.match_label()).unwrap_or_default();
-        let cursor_col = find.map(|f| f.cursor_col()).unwrap_or(0);
         // G1：选项/替换态。
         let replace_mode = find.is_some_and(|f| f.is_replace_mode());
-        let focus_repl = find.is_some_and(|f| f.focus_is_replacement());
         let case_on = find.is_some_and(|f| f.case_sensitive());
         let word_on = find.is_some_and(|f| f.whole_word());
-        // 输入光标 x：shape query 前缀宽度。
-        let prefix: String = query.chars().take(cursor_col).collect();
-        let text_style = find_text_style(&colors);
-        let prefix_width = shape_text_width(window, &prefix, &text_style);
 
         // G1：选项切换钮（与 Alt+C / Alt+W 同一状态源；激活态高亮）。
         let chip = |id: &'static str, text: &'static str, active: bool| {
@@ -3686,48 +3762,12 @@ impl Editor {
                                     .size(IconSize::Small)
                                     .color(ui::Color::Muted),
                             )
-                            .child(
-                                div()
-                                    .id("find-input")
-                                    .track_focus(&self.find_focus)
-                                    .on_key_down(cx.listener(Self::dispatch_find_key))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        // 点击 query 行 → 输入行焦点回 query。
-                                        if let Some(f) = this.find.as_mut() {
-                                            f.set_focus_replacement(false);
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h_full()
-                                    .relative()
-                                    .child(
-                                        div()
-                                            .id("find-input-text")
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .text_size(px(14.))
-                                            .line_height(px(20.))
-                                            .font_family(EDITOR_FONT)
-                                            .text_color(colors.text)
-                                            .child(StyledText::new(query)),
-                                    )
-                                    // 输入光标竖线（输入行在 query 时呈现）
-                                    .when(!focus_repl, |el| {
-                                        el.child(
-                                            div()
-                                                .id("find-caret")
-                                                .absolute()
-                                                .left(prefix_width)
-                                                .top(px(9.))
-                                                .w(px(2.))
-                                                .h(px(18.))
-                                                .bg(colors.text),
-                                        )
-                                    }),
-                            )
+                            .child(self.render_form_input(
+                                FormField::Find,
+                                "find-input",
+                                window,
+                                cx,
+                            ))
                             // G1：区分大小写（Alt+C 同源）。
                             .child(chip("find-case-chip", "Aa", case_on).on_click(cx.listener(
                                 |this, _, _, cx| {
@@ -3778,13 +3818,6 @@ impl Editor {
                     )
                     // G1：替换行（替换态呈现）。
                     .when(replace_mode, |rows| {
-                        let replacement: SharedString = find
-                            .map(|f| f.replacement().to_string())
-                            .unwrap_or_default()
-                            .into();
-                        let repl_col = find.map(|f| f.repl_cursor_col()).unwrap_or(0);
-                        let repl_prefix: String = replacement.chars().take(repl_col).collect();
-                        let repl_width = shape_text_width(window, &repl_prefix, &text_style);
                         rows.child(
                             h_flex()
                                 .id("replace-row")
@@ -3798,47 +3831,12 @@ impl Editor {
                                         .size(LabelSize::XSmall)
                                         .color(ui::Color::Muted),
                                 )
-                                .child(
-                                    div()
-                                        .id("replace-input")
-                                        .flex_1()
-                                        .min_w_0()
-                                        .h_full()
-                                        .relative()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            // 点击替换行 → 输入行焦点切到替换行
-                                            //（键盘仍由查找条同一焦点域承载）。
-                                            if let Some(f) = this.find.as_mut() {
-                                                f.set_focus_replacement(true);
-                                            }
-                                            window.focus(&this.find_focus, cx);
-                                            cx.notify();
-                                        }))
-                                        .child(
-                                            div()
-                                                .id("replace-input-text")
-                                                .h_full()
-                                                .flex()
-                                                .items_center()
-                                                .text_size(px(14.))
-                                                .line_height(px(20.))
-                                                .font_family(EDITOR_FONT)
-                                                .text_color(colors.text)
-                                                .child(StyledText::new(replacement)),
-                                        )
-                                        .when(focus_repl, |el| {
-                                            el.child(
-                                                div()
-                                                    .id("replace-caret")
-                                                    .absolute()
-                                                    .left(repl_width)
-                                                    .top(px(9.))
-                                                    .w(px(2.))
-                                                    .h(px(18.))
-                                                    .bg(colors.text),
-                                            )
-                                        }),
-                                )
+                                .child(self.render_form_input(
+                                    FormField::Replacement,
+                                    "replace-input",
+                                    window,
+                                    cx,
+                                ))
                                 .child(
                                     Label::new("Enter 替换 · Ctrl+Alt+Enter 全部")
                                         .size(LabelSize::XSmall)
@@ -3941,7 +3939,12 @@ impl Editor {
                                             .gap_1()
                                             .text_color(colors.text)
                                             .child(div().text_color(colors.text_accent).child("> "))
-                                            .child(div().child(format!("{}▏", pal.query))),
+                                            .child(self.render_form_input(
+                                                FormField::Palette,
+                                                "palette-input",
+                                                window,
+                                                cx,
+                                            )),
                                     )
                                     .child(palette_view::palette_list(
                                         // #183 A-3：分组渲染接活（段标题 + 条目 +
@@ -4005,7 +4008,12 @@ impl Editor {
                                             .child(
                                                 div().text_color(colors.text_accent).child("行号 "),
                                             )
-                                            .child(div().child(format!("{}▏", goto.input))),
+                                            .child(self.render_form_input(
+                                                FormField::Goto,
+                                                "goto-field",
+                                                window,
+                                                cx,
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -4217,7 +4225,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus, cx);
+        self.focus_document_input(window, cx);
         self.canvas_drag = Some(CanvasPanDrag {
             last: event.position,
         });
@@ -5040,13 +5048,37 @@ fn utf16_offset_to_point(buffer: &Buffer, mut offset: usize) -> Point {
 }
 
 impl EntityInputHandler for Editor {
+    fn set_selected_text_range(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(f) = self.active_form(window) {
+            self.form_mut(f).unwrap().select(range);
+            cx.notify();
+        }
+    }
+    fn text_length_utf16(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+        self.active_form(window)
+            .and_then(|f| self.form(f).map(FormInput::len_utf16))
+    }
+    fn accepts_text_input(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.active_form(window).is_some() || !self.read_only
+    }
+
     fn text_for_range(
         &mut self,
         range: Range<usize>,
-        _adjusted: &mut Option<Range<usize>>,
-        _window: &mut Window,
+        adjusted: &mut Option<Range<usize>>,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some(f) = self.active_form(window) {
+            let (text, r) = self.form(f)?.text_range(range);
+            *adjusted = Some(r);
+            return Some(text);
+        }
         let start = self.utf16_to_point(range.start);
         let end = self.utf16_to_point(range.end);
         Some(self.buffer.range_text(&(start..end)))
@@ -5055,9 +5087,12 @@ impl EntityInputHandler for Editor {
     fn selected_text_range(
         &mut self,
         _ignore_disabled: bool,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some(f) = self.active_form(window) {
+            return Some(self.form(f)?.selection());
+        }
         let (start, end) = match self.buffer.selection() {
             Some(r) => (r.start, r.end),
             None => {
@@ -5073,13 +5108,21 @@ impl EntityInputHandler for Editor {
 
     fn marked_text_range(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if let Some(f) = self.active_form(window) {
+            return self.form(f)?.marked.clone();
+        }
         self.marked.clone()
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(f) = self.active_form(window) {
+            self.form_mut(f).unwrap().marked = None;
+            cx.notify();
+            return;
+        }
         self.marked = None;
     }
 
@@ -5087,9 +5130,14 @@ impl EntityInputHandler for Editor {
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(f) = self.active_form(window) {
+            self.form_mut(f).unwrap().replace(range, text);
+            self.form_changed(f, cx);
+            return;
+        }
         // 只读门禁（IME 通道——键分发同口径）。
         if self.read_only {
             return;
@@ -5115,9 +5163,16 @@ impl EntityInputHandler for Editor {
         range: Option<Range<usize>>,
         new_text: &str,
         new_selected_range: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(f) = self.active_form(window) {
+            self.form_mut(f)
+                .unwrap()
+                .mark(range, new_text, new_selected_range);
+            self.form_changed(f, cx);
+            return;
+        }
         // 只读门禁（IME 预编辑通道——只读文档不接预编辑）。
         if self.read_only {
             return;
@@ -5146,11 +5201,14 @@ impl EntityInputHandler for Editor {
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         _element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(f) = self.active_form(window) {
+            return self.form_range_bounds(f, range_utf16, window);
+        }
         // IME 候选框定位（批 1 返回 None——精化登记 #68 阶段 7 Windows 验证）。
         None
     }
@@ -5161,6 +5219,9 @@ impl EntityInputHandler for Editor {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        if let Some(f) = self.active_form(window) {
+            return self.form_index_for_point(f, point, window);
+        }
         // 批 2：接鼠标 hit-test（iOS/Android 文本交互面；桌面同路径复用）。
         // 输出全文 UTF16 偏移（IME 坐标同制）。
         let p = self.hit_test(point, window);
@@ -6097,7 +6158,6 @@ mod ime_composition_tests {
         });
     }
 
-
     #[gpui::test]
     fn input_sequence_enter_undo_dirty_save(cx: &mut gpui::TestAppContext) {
         let (ed, window) = ime_window(cx, "AB");
@@ -6301,8 +6361,12 @@ mod palette_goto_interaction_tests {
         let ed =
             cx.update(|cx| cx.new(|cx| Editor::new(Some("pal.md".into()), text.to_string(), cx)));
         let ed_for_host = ed.clone();
-        let window = cx.add_window(move |_window, _cx| PalHost {
-            _ed: ed_for_host.clone(),
+        let window = cx.add_window(move |window, cx| {
+            let focus = ed_for_host.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            PalHost {
+                _ed: ed_for_host.clone(),
+            }
         });
         (ed, window)
     }
@@ -6338,7 +6402,15 @@ mod palette_goto_interaction_tests {
 
     /// 经真实分发入口派一个键（dispatch_key = 焦点路径到达的同一分发体）。
     fn press(ed: &gpui::Entity<Editor>, window: &mut Window, cx: &mut App, event: KeyDownEvent) {
-        ed.update(cx, |ed, cx| ed.dispatch_key(&event, window, cx));
+        // Legacy command lifecycle assertions remain unchanged. Text now uses the
+        // platform callback, not the removed printable-key fallback.
+        if let Some(text) = event.keystroke.key_char.as_deref() {
+            ed.update(cx, |ed, cx| {
+                ed.replace_text_in_range(None, text, window, cx)
+            });
+        } else {
+            ed.update(cx, |ed, cx| ed.dispatch_key(&event, window, cx));
+        }
     }
 
     /// 开合 + 键入过滤 + ↑↓ 选中移动 + Esc 关闭 + 重开换新（状态桥四段）。

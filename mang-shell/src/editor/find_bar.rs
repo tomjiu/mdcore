@@ -4,10 +4,10 @@
 //! 一次撤销）+ 区分大小写 / 全词匹配两选项）。
 //!
 //! 设计为 `Editor` 的内嵌状态（非独立 Entity）：编辑区与查找条是同一
-//! 视图内的两个焦点域（各自 `FocusHandle`），避免实体间回调接线。
+//! 视图内的独立字段焦点域（各自 `FocusHandle`），平台文本由隔离 FormInput 承载。
 //! 本模块只做数据与键语义；渲染在 `super::Editor`。
 //!
-//! - `query` 输入光标按 **char 索引**（与 `Buffer` col 语义一致）。
+//! - 字段选区/IME 按 UTF16 索引；兼容 cursor_col 访问器按 char 索引。
 //! - `matches` 为缓存：query 变化或文档编辑后由 `refresh` 重算
 //!   （大小写不敏感，全量重扫——批 1 规模可接受，阶段 6 大文档再增量）。
 //! - 打开时以当前选中文本初始化 query（经典编辑器行为）。
@@ -30,6 +30,7 @@
 use gpui::Keystroke;
 
 use super::buffer::{Buffer, Point};
+use super::form_input::FormInput;
 
 /// 查找历史上限（最近 N 条；VS Code 默认 50，此处取 20——面板/配置文件
 /// 都可控，够用且不膨胀 settings.json）。
@@ -39,9 +40,7 @@ pub const HISTORY_CAP: usize = 20;
 #[derive(Clone, Debug, Default)]
 pub struct FindState {
     /// 查询文本。
-    query: String,
-    /// query 输入光标（char 索引）。
-    cursor_col: usize,
+    query: FormInput,
     /// 匹配点缓存（文档序）。
     matches: Vec<Point>,
     /// 当前激活匹配下标（`matches` 空时无意义）。
@@ -49,9 +48,7 @@ pub struct FindState {
     /// G1：替换态（Ctrl+H 打开——渲染层追加替换输入行）。
     replace_mode: bool,
     /// G1：替换文本。
-    replacement: String,
-    /// G1：replacement 输入光标（char 索引）。
-    repl_cursor_col: usize,
+    replacement: FormInput,
     /// G1：替换态当前输入行（true = 替换行）。查找态恒 false。
     focus_replacement: bool,
     /// G1：区分大小写选项（跨开关持久——经典编辑器一致行为）。
@@ -99,6 +96,33 @@ pub enum FindKeyOutcome {
 }
 
 impl FindState {
+    pub(super) fn input(&self, replacement: bool) -> &FormInput {
+        if replacement {
+            &self.replacement
+        } else {
+            &self.query
+        }
+    }
+    pub(super) fn input_mut(&mut self, replacement: bool) -> &mut FormInput {
+        if replacement {
+            &mut self.replacement
+        } else {
+            &mut self.query
+        }
+    }
+    pub(super) fn input_changed(&mut self, buffer: &Buffer) {
+        if self.history_idx.is_some()
+            && self
+                .history
+                .get(self.history_idx.unwrap())
+                .map(String::as_str)
+                != Some(&self.query)
+        {
+            self.history_idx = None;
+        }
+        self.refresh(buffer);
+    }
+
     /// 打开查找条：以当前选中文本初始化 query（无选区则空），
     /// 激活匹配取光标后方最近的一个。选项/替换文本保留先前值
     /// （`FindState::default` 起手 = 全关）——跨开关持久由 Editor 层
@@ -106,11 +130,10 @@ impl FindState {
     pub fn open(&mut self, buffer: &Buffer) {
         let selected = buffer.selection_text();
         if !selected.is_empty() && !selected.contains('\n') {
-            self.query = selected;
+            self.query.set_text(&selected);
         } else {
             self.query.clear();
         }
-        self.cursor_col = self.query.chars().count();
         self.replace_mode = false;
         self.focus_replacement = false;
         self.refresh(buffer);
@@ -194,7 +217,7 @@ impl FindState {
 
     /// 输入光标（char 索引）。
     pub fn cursor_col(&self) -> usize {
-        self.cursor_col
+        self.query.cursor_col()
     }
 
     /// 匹配计数标签：`"3/17"`；空查询或零匹配 `""` 或 `"0/0"`。
@@ -234,7 +257,7 @@ impl FindState {
 
     /// G1：替换行输入光标（char 索引）。
     pub fn repl_cursor_col(&self) -> usize {
-        self.repl_cursor_col
+        self.replacement.cursor_col()
     }
 
     /// G1：当前输入行是否为替换行（渲染光标呈现行）。
@@ -331,7 +354,7 @@ impl FindState {
         }
         let next = match self.history_idx {
             None => {
-                self.history_draft = self.query.clone();
+                self.history_draft = self.query.to_string();
                 0
             }
             Some(i) => (i + 1).min(self.history.len() - 1),
@@ -369,10 +392,13 @@ impl FindState {
 
     /// 直接设定 query（历史回填/外部注入）；光标落尾、退出浏览态。
     pub fn set_query(&mut self, text: &str, buffer: &Buffer) {
-        self.query = text.to_string();
-        self.cursor_col = self.query.chars().count();
+        self.query.set_text(text);
         if self.history_idx.is_some()
-            && self.history.get(self.history_idx.unwrap()) != Some(&self.query)
+            && self
+                .history
+                .get(self.history_idx.unwrap())
+                .map(String::as_str)
+                != Some(&self.query)
         {
             // 输入被改过——浏览态下用户继续打字：退出浏览态但保留 draft。
             self.history_idx = None;
@@ -391,8 +417,7 @@ impl FindState {
     /// 同理可走此口），光标落尾；不触碰匹配计算（replacement 不参与
     /// refresh——只在替换动作时被读取）。
     pub fn set_replacement(&mut self, text: &str) {
-        self.replacement = text.to_string();
-        self.repl_cursor_col = self.replacement.chars().count();
+        self.replacement.set_text(text);
     }
 
     /// 正则模式开关状态（渲染层高亮钮）。
@@ -464,7 +489,7 @@ impl FindState {
             return 0;
         }
         let q_len = self.query.chars().count();
-        let repl = self.replacement.clone();
+        let repl = self.replacement.to_string();
         let mut edits: Vec<(Point, Point, String)> = Vec::new();
         let mut prev_line = 0usize;
         let mut prev_end_col = 0usize;
@@ -548,75 +573,15 @@ impl FindState {
             }
             return FindKeyOutcome::Handled; // 同向越界（已在目标行）不动作
         }
-        // 带修饰键（除 shift）不作为文本输入。
-        if ctrl || ks.modifiers.alt {
-            return FindKeyOutcome::Handled;
-        }
-        // 以下文本编辑键按当前输入行路由（查找态 / 查找行 = query）。
-        let (field, field_col): (&mut String, &mut usize) =
-            if self.replace_mode && self.focus_replacement {
-                (&mut self.replacement, &mut self.repl_cursor_col)
-            } else {
-                (&mut self.query, &mut self.cursor_col)
-            };
-        match ks.key.as_str() {
-            "backspace" => {
-                if *field_col > 0 {
-                    let b0 = char_byte(field, *field_col - 1);
-                    let b1 = char_byte(field, *field_col);
-                    field.replace_range(b0..b1, "");
-                    *field_col -= 1;
-                    if self.replace_mode && self.focus_replacement {
-                        FindKeyOutcome::Handled // 替换文本变化不影响匹配集
-                    } else {
-                        self.refresh(buffer);
-                        FindKeyOutcome::QueryChanged
-                    }
-                } else {
-                    FindKeyOutcome::Handled
-                }
-            }
-            "left" => {
-                *field_col = field_col.saturating_sub(1);
-                FindKeyOutcome::Handled
-            }
-            "right" => {
-                let len = field.chars().count();
-                *field_col = (*field_col + 1).min(len);
-                FindKeyOutcome::Handled
-            }
-            "home" => {
-                *field_col = 0;
-                FindKeyOutcome::Handled
-            }
-            "end" => {
-                *field_col = field.chars().count();
-                FindKeyOutcome::Handled
-            }
-            _ => {
-                // 可打印字符输入（key_char 平台布局感知；全字符非控制）。
-                if let Some(c) = &ks.key_char
-                    && !c.is_empty()
-                    && c.chars().all(|ch| !ch.is_control())
-                {
-                    let b = char_byte(field, *field_col);
-                    field.insert_str(b, c);
-                    *field_col += 1;
-                    if self.replace_mode && self.focus_replacement {
-                        return FindKeyOutcome::Handled; // 替换文本变化不影响匹配集
-                    }
-                    self.refresh(buffer);
-                    return FindKeyOutcome::QueryChanged;
-                }
-                FindKeyOutcome::Handled
-            }
+        let replacement = self.focus_is_replacement();
+        let changed = self.input_mut(replacement).key(ks);
+        if changed && !replacement {
+            self.refresh(buffer);
+            FindKeyOutcome::QueryChanged
+        } else {
+            FindKeyOutcome::Handled
         }
     }
-}
-
-/// char 索引 → 字节偏移（clamp 末尾）。
-fn char_byte(s: &str, col: usize) -> usize {
-    s.char_indices().nth(col).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 // =============================================================================
