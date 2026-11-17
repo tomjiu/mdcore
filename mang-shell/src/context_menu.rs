@@ -74,6 +74,31 @@ impl MenuItem {
     }
 }
 
+/// Tab menu has a fixed shape; navigation skips disabled entries.
+pub fn tab_menu(
+    index: usize,
+    count: usize,
+    has_clean: bool,
+    file_backed: bool,
+    relative_available: bool,
+    can_reopen: bool,
+) -> Vec<MenuItem> {
+    vec![
+        MenuItem::action("tab-close", "关闭").with_enabled(index < count),
+        MenuItem::action("tab-close-others", "关闭其他标签").with_enabled(count > 1),
+        MenuItem::action("tab-close-left", "关闭左侧标签").with_enabled(index > 0),
+        MenuItem::action("tab-close-right", "关闭右侧标签").with_enabled(index + 1 < count),
+        MenuItem::action("tab-close-clean", "关闭已保存标签").with_enabled(has_clean),
+        MenuItem::action("tab-close-all", "关闭所有标签").with_enabled(count > 0),
+        MenuItem::Separator,
+        MenuItem::action("tab-copy-path", "复制路径").with_enabled(file_backed),
+        MenuItem::action("tab-copy-relative", "复制相对路径").with_enabled(relative_available),
+        MenuItem::action("tab-reopen", "重新打开已关闭标签")
+            .with_shortcut_for("reopen_closed_tab")
+            .with_enabled(can_reopen),
+    ]
+}
+
 // ── 预置菜单 ───────────────────────────────────────────────────
 
 /// 编辑器右键菜单。

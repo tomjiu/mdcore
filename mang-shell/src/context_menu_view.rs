@@ -34,6 +34,19 @@ use ui::prelude::*;
 use crate::context_menu::MenuItem;
 use crate::shell::ShellApp;
 
+fn context_menu_disabled_reason(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "tab-close-others" => "没有其他标签",
+        "tab-close-left" => "左侧没有标签",
+        "tab-close-right" => "右侧没有标签",
+        "tab-close-clean" => "没有已保存的标签",
+        "tab-copy-path" => "此标签不是磁盘文件",
+        "tab-copy-relative" => "此文件不在当前工作区内",
+        "tab-reopen" => "当前会话没有已关闭的文件标签",
+        _ => return None,
+    })
+}
+
 /// 单个动作项的行渲染（label 左 / shortcut 右）。
 ///
 /// 颜色用语义色 `ui::Color`（渲染时从主题解析——主题切换即时跟随，
@@ -43,17 +56,26 @@ fn action_row(
     label: &str,
     shortcut: Option<&str>,
     label_color: ui::Color,
+    disabled_reason: Option<&'static str>,
 ) -> impl Fn(&mut Window, &mut App) -> gpui::AnyElement + 'static {
     let label = label.to_string();
     let shortcut = shortcut.map(str::to_string);
     move |_, cx| {
         div()
+            .id(label.clone())
+            .debug_selector({
+                let label = label.clone();
+                move || format!("context-action-{label}")
+            })
             .flex()
             .items_center()
             .justify_between()
             .gap_2()
             .w_full()
             .text_color(label_color.color(cx))
+            .when_some(disabled_reason, |row, reason| {
+                row.tooltip(ui::Tooltip::text(reason))
+            })
             .child(label.clone())
             .children(shortcut.clone().map(|s| {
                 div()
@@ -74,6 +96,7 @@ fn action_row(
 pub fn build_context_menu(
     items: &[MenuItem],
     shell: WeakEntity<ShellApp>,
+    generation: u64,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<UiContextMenu> {
@@ -109,10 +132,19 @@ pub fn build_context_menu(
                     let action_id = *id;
                     let shell = shell.clone();
                     menu.custom_entry(
-                        action_row(label, shortcut.as_deref(), label_color),
+                        action_row(
+                            label,
+                            shortcut.as_deref(),
+                            label_color,
+                            (!*enabled)
+                                .then(|| context_menu_disabled_reason(action_id))
+                                .flatten(),
+                        ),
                         move |window, cx| {
                             let _ = shell.update(cx, |shell, cx| {
-                                shell.activate_context_menu_item(action_id, window, cx)
+                                if shell.context_menu_generation() == generation {
+                                    shell.activate_context_menu_item(action_id, window, cx);
+                                }
                             });
                         },
                     )
