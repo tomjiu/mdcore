@@ -20,6 +20,14 @@
 //! `workspace`（`Option<Entity<FileTree>>`，Ctrl+K Ctrl+O 打开文件夹）——
 //! 记忆落盘随 settings（重启恢复）。
 
+#[cfg(test)]
+#[path = "home_actions_tests.rs"]
+mod home_actions_tests;
+#[path = "home_shell.rs"]
+mod home_shell;
+#[path = "home_view.rs"]
+mod home_view;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -243,6 +251,8 @@ pub struct ShellApp {
     /// shell 根焦点域（空态回退——无标签时键事件仍走 root→shell 根
     /// 冒泡路径；无此前提派发路径止于合成根节点，shell 级键位全聋）。
     root_focus: FocusHandle,
+    /// Home action identities survive renders and picker cancellation.
+    home_focus: [FocusHandle; 3],
     /// F5：最近打开（文件 20 / 工作区 10——空态引导页呈现 + 写穿透落盘）。
     recent: RecentStore,
     /// F6：主题模式（system/light/dark——Ctrl+Alt+T 循环；持久化）。
@@ -496,6 +506,11 @@ impl ShellApp {
             confirm: None,
             confirm_focus,
             root_focus,
+            home_focus: [
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
+            ],
             recent,
             theme_mode,
             base_theme,
@@ -3418,7 +3433,16 @@ impl ShellApp {
             match rx.await {
                 Ok(Ok(Some(paths))) => {
                     if let Some(path) = paths.into_iter().next() {
-                        let _ = this.update(cx, |shell, cx| shell.open_workspace(path, cx));
+                        let _ = this.update(cx, |shell, cx| {
+                            if path.is_dir() {
+                                shell.open_workspace(path, cx);
+                            } else {
+                                shell.show_notice(
+                                    format!("文件夹不存在或不可访问：{}", path.display()),
+                                    cx,
+                                );
+                            }
+                        });
                     }
                 }
                 // 用户取消——无操作。
@@ -3616,6 +3640,22 @@ impl Render for ShellApp {
                         }
                         _ => {}
                     }
+                    return;
+                }
+
+                // Home-only Tab traversal; Enter/Space are native Button clicks.
+                if this.editor().is_none() && !this.settings_open
+                    && this.menu_bar_open.is_none() && this.context_menu.is_none()
+                    && (this.root_focus.is_focused(window)
+                        || this.home_focus.iter().any(|focus| focus.is_focused(window)))
+                    && key == "tab" && !ctrl && !ks.modifiers.alt
+                {
+                    if this.root_focus.is_focused(window) {
+                        let index = if ks.modifiers.shift { 2 } else { 0 };
+                        window.focus(&this.home_focus[index], cx);
+                    } else if ks.modifiers.shift { window.focus_prev(cx); }
+                    else { window.focus_next(cx); }
+                    cx.stop_propagation();
                     return;
                 }
 
@@ -4251,6 +4291,15 @@ fn editor_area(shell: &mut ShellApp, cx: &mut Context<ShellApp>) -> impl IntoEle
                 .justify_center()
                 .gap_3()
                 .child(ui::Headline::new("mang").size(ui::HeadlineSize::Large))
+                .child({
+                    let listener =
+                        cx.listener(|shell, action: &home_view::HomeAction, window, cx| {
+                            shell.activate_home_action(*action, window, cx);
+                        });
+                    home_view::HomeView::new(&shell.home_focus, move |action, _, window, cx| {
+                        listener(&action, window, cx);
+                    })
+                })
                 .child(
                     ui::Label::new("Ctrl+O 打开文档 · Ctrl+K Ctrl+O 打开文件夹")
                         .color(ui::Color::Muted),
