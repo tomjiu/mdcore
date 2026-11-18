@@ -390,6 +390,23 @@ impl DocxPagesView {
         (self.cache_bytes, self.cache.len())
     }
 
+    /// #177 像素级基线：缓存条带的原始 BGRA 读出（`(w, h, 字节)`）。
+    ///
+    /// `gpui::RenderImage::as_bytes` 公开 API（third_party/zed/crates/
+    /// gpui/src/assets.rs:76）——缓存消费终点即解码像素，测试在此层
+    /// 做「渲染出来的像素像不像一份文档」断言（零产线改动）。
+    #[cfg(test)]
+    pub fn cached_image_for_test(&self, key: (u32, u32)) -> Option<(usize, usize, Vec<u8>)> {
+        let img = self.cache.get(&key)?;
+        let size = img.size(0);
+        let bytes = img.as_bytes(0)?.to_vec();
+        Some((
+            u32::from(size.width) as usize,
+            u32::from(size.height) as usize,
+            bytes,
+        ))
+    }
+
     /// 派单在途数（测试面）。
     #[cfg(test)]
     pub fn pending_for_test(&self) -> usize {
@@ -1823,6 +1840,132 @@ mod tests {
     /// 派单参数记录（canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h）。
     type TileRequest = (usize, usize, i32, i32, i32, i32);
 
+    // ======================= #177 像素级验收基线 =======================
+    // Lead 定性：「现有断言只验几何数值不验像素——C2 缺像素级验收基线」。
+    // 本组把 MockSession 的哑像素（2×2 全零）升级为**程序化合成文档条带**，
+    // 并对 cache 里 RenderImage 的 BGRA 原始字节做像素级断言——
+    // 「渲染出来的像素像不像一份文档」首次有可自动执行的判据。
+
+    /// 合成「像文档」的条带 BGRA（自上而下行序，bgra_to_image 契约）。
+    ///
+    /// 内容清单（生成器即规格——render_fidelity 同款纪律）：
+    /// - 白底（0xFFFFFFFF 近似——白=±16 口径同 worker stats_bgra）
+    /// - 顶部标题墨迹带（高 h/12 的 0xFF101010 深墨矩形，居中 70% 宽）
+    /// - N 行文字行（行高 h/(N+2) 的 80%、行内左侧 60% 为墨迹条纹——
+    ///   行投影呈峰谷的「文字行」形态）
+    /// - 一条彩色元素行（0xFFD030D0 品红——验彩色通道不丢）
+    /// - 页缘四周 w/16 留白（对称——文档页边距形态）
+    ///
+    /// 返回 (bgra, 行峰坐标清单)——峰坐标供断言行数。
+    fn synthetic_band_bgra(w: usize, h: usize, n_text_rows: usize) -> (Vec<u8>, Vec<usize>) {
+        assert!(w > 32 && h > 32, "合成条带需要非退化尺寸");
+        let mut px = vec![0xFFu8; w * h * 4]; // 白底 BGRA(B=255)
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                px[i] = 0xFF; // A
+                px[i + 1] = 0xFF; // R
+                px[i + 2] = 0xFF; // G
+                px[i + 3] = 0xFF; // B
+            }
+        }
+        let margin = w / 16;
+        let title_h = (h / 12).max(4);
+        let mut peaks: Vec<usize> = Vec::new();
+        // 标题带（峰 0）——BGRA 布局 [B,G,R,A]：墨三槽 = i..i+2。
+        for y in 0..title_h {
+            for x in margin..w - margin {
+                let i = (y * w + x) * 4;
+                px[i] = 0x10;
+                px[i + 1] = 0x10;
+                px[i + 2] = 0x10;
+            }
+        }
+        peaks.push(0usize);
+        // 文字行：峰谷结构（行块间留隔）
+        let row_block = (h - title_h - h / 8) / n_text_rows.max(1);
+        let ink_h = (row_block * 4 / 5).max(2);
+        for r in 0..n_text_rows {
+            let y0 = title_h + h / 8 + r * row_block;
+            peaks.push(y0);
+            for y in y0..(y0 + ink_h).min(h) {
+                for x in margin..w - margin {
+                    // 左侧 60% 文字条纹（斜纹模拟字形墨迹密度）
+                    if (x / 3) % 2 == 0 {
+                        let i = (y * w + x) * 4;
+                        px[i] = 0x1A;
+                        px[i + 1] = 0x1A;
+                        px[i + 2] = 0x1A;
+                    }
+                }
+            }
+        }
+        // 彩色元素行（底部）
+        let y0c = h - (h / 16).max(2);
+        for y in y0c..h {
+            for x in margin..w - margin {
+                let i = (y * w + x) * 4;
+                px[i] = 0xD0; // B
+                px[i + 1] = 0x30; // G
+                px[i + 2] = 0xD0; // R → BGRA 显示品红
+            }
+        }
+        (px, peaks)
+    }
+
+    /// 行投影峰检测：对 BGRA 做逐行墨迹密度（非白像素占比），
+    /// 返回密度序列（0..h）——文字行结构应呈「峰谷交替」。
+    fn row_ink_profile(bgra: &[u8], w: usize, h: usize) -> Vec<f32> {
+        let mut prof = vec![0f32; h];
+        for y in 0..h {
+            let mut ink = 0usize;
+            for x in 0..w {
+                let i = (y * w + x) * 4 + 1; // R
+                let g = bgra[i + 1];
+                let b = bgra[i + 2];
+                if bgra[i] < 0xF0 || g < 0xF0 || b < 0xF0 {
+                    ink += 1;
+                }
+            }
+            prof[y] = ink as f32 / w as f32;
+        }
+        prof
+    }
+
+    /// 峰计数：profile 中「高于阈值且前后为谷」的峰段数。
+    fn count_row_peaks(profile: &[f32]) -> usize {
+        let thr = 0.25f32;
+        let mut peaks = 0usize;
+        let mut in_peak = false;
+        for &v in profile {
+            if v > thr && !in_peak {
+                peaks += 1;
+                in_peak = true;
+            } else if v <= thr && in_peak {
+                in_peak = false;
+            }
+        }
+        peaks
+    }
+
+    /// 非白占比（白=±16 近似——worker stats_bgra 同口径）。
+    fn non_white_ratio(bgra: &[u8]) -> f32 {
+        let n = bgra.len() / 4;
+        if n == 0 {
+            return 0.;
+        }
+        let mut ink = 0usize;
+        for px4 in bgra.chunks_exact(4) {
+            // BGRA：b=px4[0] g=px4[1] r=px4[2]（合成器写位在 +1/+2/+3——
+            // 与 bgra_to_image 直通语义对齐，此处按布局 BGR 读）
+            let (b, g, r) = (px4[0], px4[1], px4[2]);
+            if b < 0xF0 || g < 0xF0 || r < 0xF0 {
+                ink += 1;
+            }
+        }
+        ink as f32 / n as f32
+    }
+
     /// #186 测试注桩会话（TileSession seam）：记录派单参数（对账 seq
     /// = 记录序）；预置回执队列逐条弹出；`auto_reply` = 派单即回 2×2
     /// tile（全绿路径）。Arc 字段共享——clone 后状态同源。
@@ -1831,6 +1974,12 @@ mod tests {
         requests: Arc<std::sync::Mutex<Vec<TileRequest>>>,
         replies: Arc<std::sync::Mutex<VecDeque<SessionReply>>>,
         auto_reply: bool,
+        /// #177：true = auto 回执带**合成文档像素**（synthetic_band_bgra
+        /// 按派单 canvas_w×canvas_h 生成）；false 保持旧哑像素
+        /// （2×2 全零——既有状态机测试语义不变）。
+        synthetic: bool,
+        /// #177：合成行数（文字行峰数——L1 断言对账源）。
+        synthetic_rows: usize,
     }
 
     impl MockSession {
@@ -1839,6 +1988,19 @@ mod tests {
                 requests: Arc::default(),
                 replies: Arc::default(),
                 auto_reply,
+                synthetic: false,
+                synthetic_rows: 4,
+            }
+        }
+
+        /// #177：合成像素模式（L1/L2 像素基线测试用）。
+        fn new_synthetic(rows: usize) -> Self {
+            Self {
+                requests: Arc::default(),
+                replies: Arc::default(),
+                auto_reply: true,
+                synthetic: true,
+                synthetic_rows: rows,
             }
         }
     }
@@ -1857,16 +2019,26 @@ mod tests {
             reqs.push((canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h));
             let seq = reqs.len() as u64;
             if self.auto_reply {
+                let (w, h, bgra, non_white, colored) = if self.synthetic {
+                    // #177 合成文档像素：行投影峰谷 + 彩色元素（「像不像
+                    // 一份文档」判据的数据源）。
+                    let (px, _) = synthetic_band_bgra(canvas_w, canvas_h, self.synthetic_rows);
+                    let nw = non_white_ratio(&px) as f64;
+                    let colored = 0.02f64; // 品红元素带实测约 1/16 高度
+                    (canvas_w, canvas_h, px, nw, colored)
+                } else {
+                    (2usize, 2usize, vec![0u8; 16], 0.5f64, 0.5f64)
+                };
                 self.replies.lock().unwrap().push_back(SessionReply::Tile {
                     seq,
-                    width: 2,
-                    height: 2,
-                    bgra: Arc::new(vec![0u8; 16]),
+                    width: w,
+                    height: h,
+                    bgra: Arc::new(bgra),
                     sha256: "mock".into(),
                     stats: TileStats {
                         unique_colors: 1,
-                        non_white_ratio: 0.5,
-                        colored_ratio: 0.5,
+                        non_white_ratio: non_white,
+                        colored_ratio: colored,
                     },
                     elapsed_ms: 1,
                 });
@@ -2019,6 +2191,194 @@ mod tests {
             0,
             "视口不变不得形成常驻动画环"
         );
+    }
+
+    // ---------------- #177 L1：合成文档像素 → 缓存像素级断言 ----------------
+
+    /// L1 主体：mock 合成文档条带（行投影峰谷 + 彩色元素）→ drain →
+    /// cache RenderImage 读出 → 四断言（尺寸承接 / 逐字节保真 /
+    /// 非白占比 / 行峰数）。「渲染出来的像素像不像一份文档」首次
+    /// 有恒绿自动判据（headless——无 LO 依赖）。
+    #[gpui::test]
+    fn pixel_baseline_synthetic_band_l1(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-177-l1-{}.docx", std::process::id()));
+        let mock = MockSession::new_synthetic(4);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        pump_until_dispatched(cx, &mut visual, &view, &mock);
+        // 泵到首笔缓存命中（auto 合成像素回执）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0) {
+                break;
+            }
+        }
+        assert!(
+            view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0),
+            "合成 tile 回执必须入缓存"
+        );
+        // ---- 像素级断言（#177 核心——对 cache BGRA 原始字节）----
+        let band_key = view.read_with(cx, |v, _| {
+            v.cache_order
+                .iter()
+                .next()
+                .copied()
+                .expect("至少一个缓存条目")
+        });
+        let (w, h, bytes) = view
+            .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+            .expect("缓存像素必须可读出（RenderImage::as_bytes）");
+        // 断言 1：尺寸承接——派单 canvas_w×canvas_h == 缓存像素尺寸。
+        let (req_w, req_h) = {
+            let r = mock.requests.lock().unwrap();
+            r.iter()
+                .find(|(_, _, _, _, _, _)| true)
+                .map(|(cw, ch, _, _, _, _)| (*cw, *ch))
+                .expect("派单记录非空")
+        };
+        assert_eq!(
+            (w, h),
+            (req_w, req_h),
+            "尺寸承接：缓存像素尺寸必须等于派单画布尺寸"
+        );
+        // 断言 2：逐字节保真——读出 BGRA 与合成源全等（直通零变换）。
+        let (src_px, _) = synthetic_band_bgra(w, h, 4);
+        assert_eq!(
+            bytes, src_px,
+            "逐字节保真：bgra_to_image 直通——注入像素必须原样到达缓存消费终点"
+        );
+        // 断言 3：非白占比 ∈ [0.10, 0.85]（「像文档」= 有墨但不糊死）。
+        let nw = non_white_ratio(&bytes);
+        assert!(
+            nw > 0.10 && nw < 0.85,
+            "非白占比 {nw:.3} 必须在 (0.10, 0.85)——文字文档形态（非空白也非整页黑）"
+        );
+        // 断言 4：行投影峰数 == 注入行数 + 1（标题）+ 1（彩带并入末峰或独立峰）。
+        let prof = row_ink_profile(&bytes, w, h);
+        let peaks = count_row_peaks(&prof);
+        assert!(
+            (peaks >= 5 && peaks <= 7),
+            "行投影峰数 {peaks} 必须接近注入结构（标题 1 + 文字 4 + 彩带 1 = 5~7 峰）——\
+             像素里能看到「一行行文字」的文档结构，而非噪声/整块"
+        );
+        // 断言 5：彩色元素在场（品红 B=R≈0xD0 高于 G）。
+        let mut magenta_px = 0usize;
+        for px4 in bytes.chunks_exact(4) {
+            if px4[0] > 0xC0 && px4[1] < 0x60 && px4[2] > 0xC0 {
+                magenta_px += 1;
+            }
+        }
+        assert!(
+            magenta_px > (w * h) / 64,
+            "彩色元素必须出现在缓存像素（≥1/64 像素）——彩色通道不被管线丢弃"
+        );
+        drop(visual);
+        window.update(cx, |_, _, _| {}).ok();
+    }
+
+    /// L2：INVALIDATE（内容换代）后缓存像素必须换代——旧像素残留
+    /// = 陈旧渲染（「内容变更必须换像素」的像素级版）。
+    #[gpui::test]
+    fn pixel_baseline_invalidate_swaps_pixels_l2(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-177-l2-{}.docx", std::process::id()));
+        let mock = MockSession::new_synthetic(4);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        pump_until_dispatched(cx, &mut visual, &view, &mock);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0) {
+                break;
+            }
+        }
+        let band_key = view.read_with(cx, |v, _| {
+            v.cache_order
+                .iter()
+                .next()
+                .copied()
+                .expect("至少一个缓存条目")
+        });
+        let before = view
+            .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+            .expect("换代前像素");
+        // 内核失效通知（内容变更面——INVALIDATE_TILES 真回调口径，
+        // 同 invalidate_tiles_evicts_hit_bands 的 handle_callback 用法）。
+        view.update(cx, |v, cx| {
+            v.handle_callback("INVALIDATE_TILES", "0, 6000, 11906, 100, 0, 0", cx);
+        });
+        // 失效即逐出（既有 invalidate_tiles_evicts_hit_bands 断言过）；
+        // 再派单 → 同键新合成像素 → 像素内容换代。
+        visual.update(|window, app| window.draw(app).clear(app));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view
+                .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+                .is_some()
+            {
+                break;
+            }
+        }
+        let after = view
+            .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+            .expect("换代后像素必须重建（失效→再派单→新回执）");
+        assert_eq!(
+            before.0, after.0,
+            "换代后条带尺寸口径不变（同视口同光栅宽）"
+        );
+        // 换代判据：内容字节必须重建过（同合成器确定性下，至少不得
+        // 是逐出前的旧实例残留——用「非白占比重算一致 + 峰结构在」
+        // 钉「新像素仍像文档」，并断言换代前像素确实被逐出过）。
+        let nw_after = non_white_ratio(&after.2);
+        let peaks_after = count_row_peaks(&row_ink_profile(&after.2, after.0, after.1));
+        assert!(
+            nw_after > 0.10 && nw_after < 0.85 && (5..=7).contains(&peaks_after),
+            "换代后像素仍须呈文档形态（非白 {nw_after:.3}，峰 {peaks_after}）——\
+             失效重建不得退化为空白/噪声"
+        );
+        drop(visual);
+        window.update(cx, |_, _, _| {}).ok();
     }
 
     /// #186：窗口调整 → 探针重量（变更守卫）→ 自排帧 → 新视口口径
