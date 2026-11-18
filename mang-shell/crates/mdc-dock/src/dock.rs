@@ -477,6 +477,35 @@ impl Dock {
     /// 落位即激活——**挤掉原槽位语义**（Q-IDE `app/dock.rs:550-567`：
     /// 拖到已占用侧 = 被拖面板成为该侧激活面板，原激活面板让位留列
     /// 可切换）。落位侧打开。返回新激活下标。
+    /// #121（批③b）：面板行为面转发——宿主 drop 收尾（placement_for
+    /// 输入）经 key 查面板 `position`/`position_is_valid`（未物化键 =
+    /// None/false——预物化意图面板不参与拖拽换侧）。
+    pub fn panel_position(&self, key: &str, cx: &App) -> Option<DockPosition> {
+        let ix = self.panel_index_for_key(key)?;
+        Some(self.entries[ix].panel().position(cx))
+    }
+
+    /// #121（批③b）：面板合法边查询（同上转发口径）。
+    pub fn panel_position_is_valid(&self, key: &str, position: DockPosition, cx: &App) -> bool {
+        self.panel_index_for_key(key)
+            .is_some_and(|ix| self.entries[ix].panel().position_is_valid(position, cx))
+    }
+
+    /// #121（批③b）：面板 `set_position` 转发（take 之前源 dock 上调用
+    /// ——面板实体仍在源 entries 时生效）。
+    pub fn set_panel_position(
+        &mut self,
+        key: &str,
+        position: DockPosition,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ix) = self.panel_index_for_key(key) else {
+            return false;
+        };
+        self.entries[ix].panel().set_position(position, cx);
+        true
+    }
+
     pub fn receive_panel(
         &mut self,
         detachment: super::drag::PanelDetachment,
