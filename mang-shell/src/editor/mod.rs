@@ -6199,6 +6199,38 @@ mod ime_composition_tests {
         });
         std::fs::remove_file(path).unwrap();
     }
+
+    /// #201：Editor 层链路——编辑发生在任何 wrap 回填之前（零帧
+    /// render_lines 的回填块从未执行）时，display_row_count 仍须立即
+    /// 反映 buffer 行数。旧 reset_wraps 空 wraps 空转 → 行表陈旧 →
+    /// uniform_list 永不派新行（真机形态：脏点亮/磁盘已写/画面无
+    /// 新增文本）。纯 DisplayMap 单测（display_map.rs）之外，这里锁
+    /// `after_edit → refresh_caches → reset_wraps` 真实编辑路径。
+    #[gpui::test]
+    fn edit_before_wrap_backfill_editor_level_row_freshness(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "AB");
+        window.update(cx, |_host, _window, cx| {
+            ed.update(cx, |ed, cx| {
+                // 前置：不调用任何渲染路径——display_map.wraps 保持空
+                //（真实形态：开文件后 0/1 帧内的自动化连打）。
+                // 查询一次行数构建 RowTable 缓存（首帧 draw 的行为）。
+                let before = ed.display_map.display_row_count(&ed.buffer);
+                assert_eq!(before, 1, "「AB」1 行");
+                // 平台文本通道插入带换行文本（IME commit 形态）：
+                // 初始光标 (0,0) 无选区 → 行首插入 → "CD\nEF\nGHAB" 3 行。
+                ed.replace_text_in_range(None, "CD\nEF\nGH", _window, cx);
+                // #201 断言：编辑后行数立即反映 buffer（旧缺陷形态
+                // = 旧表 1 行卡死——首查询构建的缓存永不刷新）
+                let after = ed.display_map.display_row_count(&ed.buffer);
+                assert_eq!(
+                    after, 3,
+                    "#201：wrap 未回填时编辑后行表必须仍新鲜（行首插 CD/EF/GH + AB = 3 行）"
+                );
+                assert_eq!(ed.buffer.line_count(), 3);
+            });
+        });
+    }
+
     /// 预编辑全链：起（ni）→ 更新（你好，带选中）→ 提交（unmark 保文）
     /// ——marked 区间（UTF16）逐态断言 + 提交后脏。
     #[gpui::test]
