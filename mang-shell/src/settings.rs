@@ -125,6 +125,39 @@ fn load_dock_layout_in(dir: &Path) -> Option<(mdc_dock::DockAreaState, bool)> {
     Some((left, right_open))
 }
 
+/// #121（批③b）：右 dock 布局落盘（`dock.right` additive 键——旧文件
+/// 缺键读取走 None 默认，`left`/`right_open` 形状不动：serde 形状冻结
+/// 纪律只加不改）。
+pub fn save_right_dock_layout(right: &mdc_dock::DockAreaState) {
+    if let Some(dir) = config_dir() {
+        save_right_dock_layout_in(&dir, right);
+    }
+}
+
+/// #121（批③b）：右 dock 布局记忆读取（无/坏/缺 = None——调用方默认）。
+pub fn load_right_dock_layout() -> Option<mdc_dock::DockAreaState> {
+    let dir = config_dir()?;
+    load_right_dock_layout_in(&dir)
+}
+
+fn save_right_dock_layout_in(dir: &Path, right: &mdc_dock::DockAreaState) {
+    let mut value = load_from(dir);
+    // dock 节点存在则 additive 合入；不存在则建骨架（right_open 用
+    // 中性 true——随后 save_dock_layout 会写真实值）。
+    if value.get("dock").is_none() {
+        value["dock"] = serde_json::json!({});
+    }
+    value["dock"]["right"] = serde_json::to_value(right).unwrap_or(serde_json::Value::Null);
+    save_to(dir, &value);
+}
+
+fn load_right_dock_layout_in(dir: &Path) -> Option<mdc_dock::DockAreaState> {
+    let value = load_from(dir);
+    let node = value.get("dock")?;
+    let right: mdc_dock::DockAreaState = serde_json::from_value(node.get("right")?.clone()).ok()?;
+    Some(right)
+}
+
 /// 记住工作区（`workspace` 键——路径以 lossy 写入，非 UTF-8 路径的
 /// 记忆为近似值[边界登记]）。
 pub fn remember_workspace(root: &Path) {

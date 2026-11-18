@@ -58,6 +58,8 @@ pub enum GitView {
 
 /// git 面板实体（宿主 ShellApp；工作区打开且是 git 仓库时创建）。
 pub struct GitPanel {
+    /// #121 批③b：面板位置（拖拽换侧——Left 起，可换 Right）。
+    position: mdc_dock::DockPosition,
     root: PathBuf,
     /// #577：bin 面钩子（open_readonly / escape）。
     hooks: GitPanelHooks,
@@ -80,6 +82,7 @@ impl GitPanel {
     /// 构造并刷新（改动 + 历史双拉）。
     pub fn new(root: PathBuf, hooks: GitPanelHooks, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
+            position: mdc_dock::DockPosition::Left,
             root,
             hooks,
             view: GitView::Changes,
@@ -492,11 +495,20 @@ impl mdc_dock::Panel for GitPanel {
     }
 
     fn position(&self) -> mdc_dock::DockPosition {
-        mdc_dock::DockPosition::Left
+        self.position
     }
 
     fn position_is_valid(&self, position: mdc_dock::DockPosition) -> bool {
-        position == mdc_dock::DockPosition::Left
+        // #121 批③b：git 面板可停靠左/右（换侧终点 = right_dock 实体）。
+        matches!(
+            position,
+            mdc_dock::DockPosition::Left | mdc_dock::DockPosition::Right
+        )
+    }
+
+    /// #121 批③b：换位落位（placement_for → Dock(pos) 后由宿主调用）。
+    fn set_position(&mut self, position: mdc_dock::DockPosition, _cx: &mut Context<Self>) {
+        self.position = position;
     }
 }
 // ---------------------------------------------------------------------------

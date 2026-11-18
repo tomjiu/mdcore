@@ -189,6 +189,12 @@ pub struct ShellApp {
     /// #120（批②）：左栏开合态（原 `left_open` 布尔退役）与 per-panel
     /// 记忆尺寸随 [`mdc_dock::DockAreaState`] 持久化（settings `dock` 节点）。
     left_dock: Entity<mdc_dock::Dock>,
+    /// #121（批③b）：右栏 dock 实体（Right 位——拖拽换侧的真实终点；
+    /// 批③a 数据面 take/receive 协议的目标宿主）。
+    right_dock: Entity<mdc_dock::Dock>,
+    /// #121（批③b）：拖拽会话当前分区（`on_drag_move` 全窗口追踪——
+    /// 覆盖层三分区高亮的数据源；`None` = 非拖拽中）。
+    drag_zone: Option<mdc_dock::DockDropZone>,
     /// #571：大纲面板实体（批 7——激活标签的键盘导航结构树；
     /// 换绑判据见 [`Self::sync_outline`]）。
     outline: Option<Entity<OutlinePanel>>,
@@ -489,6 +495,9 @@ impl ShellApp {
             // #119（mdc-dock 批①）：左栏激活协议实体；#120（批②）：
             // 布局恢复在构造尾（面板注册之后——见下）。
             left_dock: cx.new(|cx| mdc_dock::Dock::new(mdc_dock::DockPosition::Left, cx)),
+            // #121 批③b：右栏 dock（Right 位）——拖拽换侧终点。
+            right_dock: cx.new(|cx| mdc_dock::Dock::new(mdc_dock::DockPosition::Right, cx)),
+            drag_zone: None,
             settings_open: false,
             pdf_pages: None,
             pdf_thumbs: None,
@@ -564,6 +573,12 @@ impl ShellApp {
         if let Some((state, _)) = crate::settings::load_dock_layout() {
             let dock = this.left_dock.clone();
             let _ = dock.update(cx, |dock, cx| dock.restore(state, cx));
+        }
+        // #121 批③b：右 dock 布局恢复（additive "right" 键——旧文件缺键
+        // 走 None 默认，兼容）。
+        if let Some(right_state) = crate::settings::load_right_dock_layout() {
+            let dock = this.right_dock.clone();
+            let _ = dock.update(cx, |dock, cx| dock.restore(right_state, cx));
         }
         // #120：左栏渲染宽同步到恢复后的激活面板记忆宽。
         this.sync_left_width_to_active(cx);
@@ -874,6 +889,9 @@ impl ShellApp {
     fn persist_dock_layout(&self, cx: &App) {
         let state = self.left_dock.read(cx).dump();
         crate::settings::save_dock_layout(&state, self.right_open);
+        // #121 批③b：右 dock 快照同点落盘（additive 键——见 settings）。
+        let right = self.right_dock.read(cx).dump();
+        crate::settings::save_right_dock_layout(&right);
     }
 
     /// F7：git 面板实体（烟雾钩子/内部访问）。
@@ -1034,6 +1052,197 @@ impl ShellApp {
     }
 
     /// G4：手柄元素（边缘 4px 热区——col-resize 光标 + 拖拽会话）。
+    /// #121（批③b）：面板标题拖拽手柄——拖拽源（`DraggedPanel` 载荷
+    /// 携带源 dock `EntityId` + 面板键；跨实例误落校验见
+    /// [`mdc_dock::drop_is_intended`]）。挂左/右栏标题区（Ely
+    /// 「面板头部长按拖动」同构；redistributable_columns.rs 同构蓝本）。
+    fn panel_title_drag_handle(
+        &self,
+        dock: &Entity<mdc_dock::Dock>,
+        key: &'static str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let payload = mdc_dock::DraggedPanel {
+            source_dock: dock.entity_id(),
+            key,
+        };
+        div()
+            .id(SharedString::from(format!("panel-drag-{key}")))
+            .w_full()
+            .h(px(24.))
+            .flex_none()
+            .cursor(CursorStyle::Arrow)
+            .debug_selector(|| format!("panel-drag-{key}").into())
+            .on_drag(payload, move |_, _, _, cx| cx.new(|_| PanelDragGhost))
+    }
+
+    /// #121（批③b）：拖放收尾——`placement_for` 裁决 → take/receive
+    /// 协议 → 面板 `set_position` → 持久化。Center/同侧/非法 = 取消
+    /// 无动作（面板留源 dock 原位——批③a Cancel 语义）。
+    fn finish_panel_drop(
+        &mut self,
+        dragged: mdc_dock::DraggedPanel,
+        zone: mdc_dock::DockDropZone,
+        cx: &mut Context<Self>,
+    ) {
+        self.drag_zone = None;
+        // 源 dock：面板当前所在（dragged.source_dock 对应侧实体）。
+        let (source_dock, target_dock, target_pos) = (
+            if dragged.source_dock == self.left_dock.entity_id() {
+                self.left_dock.clone()
+            } else {
+                self.right_dock.clone()
+            },
+            match zone.dock_position() {
+                Some(mdc_dock::DockPosition::Left) => self.left_dock.clone(),
+                Some(mdc_dock::DockPosition::Right) => self.right_dock.clone(),
+                _ => self.right_dock.clone(),
+            },
+            zone.dock_position(),
+        );
+        // 面板偏好位 + 合法边（经 PanelHandle 动态查询——面板实体上）。
+        let panel_pos = source_dock.read(cx).panel_position(dragged.key, cx);
+        let preferred = panel_pos.unwrap_or(mdc_dock::DockPosition::Left);
+        let is_valid = |pos: mdc_dock::DockPosition| {
+            panel_pos.is_some_and(|_| {
+                source_dock
+                    .read(cx)
+                    .panel_position_is_valid(dragged.key, pos, cx)
+            })
+        };
+        let placement = mdc_dock::placement_for(zone, preferred, is_valid);
+        let mdc_dock::Placement::Dock(pos) = placement else {
+            cx.notify();
+            return; // Cancel：面板留原位（Center/非法侧/同侧）。
+        };
+        if !mdc_dock::drop_is_intended(dragged, target_dock.entity_id()) {
+            cx.notify();
+            return; // 拖回源侧 = 取消（面板本来在这边）。
+        }
+        // take → receive（落位即激活 = 挤掉原槽位语义，批③a 协议）。
+        if let Some(detachment) =
+            source_dock.update(cx, |dock, cx| dock.take_panel(dragged.key, cx))
+        {
+            target_dock.update(cx, |dock, cx| dock.receive_panel(detachment, cx));
+            // 面板换位（宿主 Panel::set_position 覆写生效）。
+            let _ = self.update_panel_position(dragged.key, pos, cx);
+            // 目标侧右栏开合态联动（Left→Right 落右栏时开右栏）。
+            if pos == mdc_dock::DockPosition::Right {
+                self.right_open = true;
+            }
+            self.persist_dock_layout(cx);
+        }
+        cx.notify();
+    }
+
+    /// #121（批③b）：面板实体 `set_position` 转发（FileTree/GitPanel/
+    /// OutlinePanel 的 Panel impl 覆写——经 Dock 实体更新）。
+    fn update_panel_position(
+        &mut self,
+        key: &str,
+        pos: mdc_dock::DockPosition,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let applied = self
+            .left_dock
+            .update(cx, |dock, cx| dock.set_panel_position(key, pos, cx))
+            || self
+                .right_dock
+                .update(cx, |dock, cx| dock.set_panel_position(key, pos, cx));
+        applied
+    }
+
+    /// #121（批③b）：拖放**感应面**——常驻透明全窗（`size_full`
+    /// absolute）。承载 `on_drag_move`（分区追踪——drag 起于
+    /// `DraggedPanel` 时 move 元素内外都回调）与 `on_drop`（MouseUp
+    /// 命中管线）。无视觉。
+    fn drag_drop_sensor(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .size_full()
+            .top_0()
+            .left_0()
+            .on_drop::<mdc_dock::DraggedPanel>(cx.listener(
+                |this, dragged: &mdc_dock::DraggedPanel, window, cx| {
+                    let zone = this.drag_zone.unwrap_or(mdc_dock::DockDropZone::Center);
+                    this.finish_panel_drop(*dragged, zone, cx);
+                    window.refresh();
+                },
+            ))
+            .on_drag_move::<mdc_dock::DraggedPanel>(cx.listener(
+                |this, event: &DragMoveEvent<mdc_dock::DraggedPanel>, window, cx| {
+                    // 窗口局部坐标域（`window.bounds()` 是屏幕全域——OS
+                    // 窗口位置非局部原点，会造成分区错位；局部口径 =
+                    // origin(0,0) + viewport_size）。
+                    let size = window.viewport_size();
+                    let bounds = gpui::Bounds::from_corners(
+                        gpui::point(gpui::px(0.), gpui::px(0.)),
+                        gpui::point(size.width, size.height),
+                    );
+                    let zone = mdc_dock::drop_zone_at(bounds, event.event.position);
+                    if this.drag_zone != Some(zone) {
+                        this.drag_zone = Some(zone);
+                        cx.notify();
+                    }
+                },
+            ))
+    }
+
+    /// #121（批③b）：拖放高亮层——三分区视觉（Q-IDE 模式；仅拖拽
+    /// 中渲染）。Center 无高亮（取消拖拽视觉）。
+    fn drag_drop_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let zone = self.drag_zone;
+        let highlight = colors.element_active;
+        let left_w = px(140.);
+        let bottom_h = px(120.);
+        div()
+            .absolute()
+            .size_full()
+            .top_0()
+            .left_0()
+            // 分区高亮（仅拖拽中——外层 .when(drag_zone.is_some())）。
+            .when(matches!(zone, Some(mdc_dock::DockDropZone::Left)), |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(left_w)
+                        .bg(highlight.opacity(0.25))
+                        .border_r_1()
+                        .border_color(highlight),
+                )
+            })
+            .when(matches!(zone, Some(mdc_dock::DockDropZone::Right)), |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(left_w)
+                        .bg(highlight.opacity(0.25))
+                        .border_l_1()
+                        .border_color(highlight),
+                )
+            })
+            .when(matches!(zone, Some(mdc_dock::DockDropZone::Bottom)), |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w_full()
+                        .h(bottom_h)
+                        .bg(highlight.opacity(0.25))
+                        .border_t_1()
+                        .border_color(highlight),
+                )
+            })
+    }
+
     fn panel_resize_handle(&self, side: PanelSide, cx: &Context<Self>) -> impl IntoElement {
         let hover_bg = cx.theme().colors().element_hover;
         div()
@@ -3887,6 +4096,12 @@ impl Render for ShellApp {
                             self.git_active(cx),
                             // G4：可拖拽宽度（域钳制 + settings 持久化）
                             self.left_width,
+                            // #121 批③b：标题拖拽手柄（激活面板键上
+                            // 挂——FileTree/GitPanel 拖拽源）。
+                            self.left_dock.read(cx).active_key().map(|key| {
+                                self.panel_title_drag_handle(&self.left_dock.clone(), key, cx)
+                                    .into_any_element()
+                            }),
                             // #571：大纲面板实体（键盘导航 + #289-④
                             // 页滚钩子在实体构造时注入）。
                             None,
@@ -3913,7 +4128,16 @@ impl Render for ShellApp {
                     // 恒在，右栏收起时是唯一入口；zed 折叠 dock 同构）。
                     // A1（#47 批次 2）：入参用有效态——窄窗让位期间呈
                     // 收起观感，点击仍切换 right_open 逻辑态。
-                    .child(right_dock::right_dock_strip(right_open_effective, cx)),
+                    .child(right_dock::right_dock_strip(right_open_effective, cx))
+                    // #121（批③b）：拖放**感应面**（常驻透明全窗——
+                    // on_drag_move 分区追踪 + on_drop 收尾；drag 激活即可
+                    // 回调（鸡生蛋修正：条件渲染会把回调连着隐藏））。
+                    .child(self.drag_drop_sensor(cx))
+                    // #121（批③b）：三分区**高亮层**（仅拖拽中——感应面
+                    // 已常驻，此处纯视觉）。
+                    .when(self.drag_zone.is_some(), |el| {
+                        el.child(self.drag_drop_overlay(cx))
+                    }),
             )
             // F1：提示横幅（状态栏上方一条——有消息时才渲染）。
             .map(|el| match self.notice_board.message() {
@@ -8293,8 +8517,8 @@ mod pdf_annot_save_tests {
 mod statusbar_view_toggle_tests {
     use super::*;
     use gpui::{
-        AnyWindowHandle, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
-        point, px,
+        AnyWindowHandle, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        PlatformInput, point, px,
     };
 
     /// 宿主：shell 进渲染树（鼠标命中测试需要整树 + 命中盒——
@@ -8636,6 +8860,237 @@ mod statusbar_view_toggle_tests {
     /// 应用 f——元素/命中盒不存在），MouseDown 命中与否即让位证据。
     fn right_hotzone_x(right_width: f32, w: f32) -> f32 {
         w - 52. - right_width - 2.
+    }
+
+    /// #121（批③b）：全量 mouse 事件派发（down/move/up 一族——探针
+    /// 面 mouse_down_at 只发 down；拖拽链需要 move>2px 激活 + up 落点）。
+    fn mouse_event_at(
+        window: &gpui::WindowHandle<StatusHost>,
+        cx: &mut gpui::TestAppContext,
+        kind: &str,
+        x: f32,
+        y: f32,
+    ) {
+        let any: AnyWindowHandle = window.clone().into();
+        let pos = point(px(x), px(y));
+        cx.update_window(any, |_, window, cx| {
+            let event = match kind {
+                "down" => PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: pos,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                "move" => PlatformInput::MouseMove(MouseMoveEvent {
+                    position: pos,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }),
+                "up" => PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: pos,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }),
+                _ => unreachable!("kind ∈ down/move/up"),
+            };
+            window.dispatch_event(event, cx);
+        })
+        .expect("mouse 事件派发");
+    }
+
+    /// #121（批③b）：真实鼠标事件链 e2e——GitPanel 左→右换侧。
+    ///
+    /// 链路：标题手柄 down → move（>2px 激活 drag 会话）→ move 步进
+    /// 右分区（x > 2/3 窗宽）→ 覆盖层 on_drop（up 命中）→
+    /// finish_panel_drop：take（左 dock 拔出）→ receive（右 dock 落位
+    /// 即激活 = 挤掉原槽位）→ set_position(Right) → persist。
+    /// 验收 1（真实鼠标事件链）+ 2/3（换侧落位 + 挤掉原槽位）+ 4
+    /// （持久化 round-trip——右 dock dump 键在场）。
+    #[gpui::test]
+    fn drag_git_panel_to_right_via_real_mouse(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = host_window_sized(cx, 1000., 600.);
+        let any: AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any, cx);
+        // 临时 git 工作区（GitPanel 物化 + 注册左 dock——与真实打开
+        // 工作区同构；git 缺席环境跳过不假绿）。
+        let ws = std::env::temp_dir().join(format!("mdc-121b-e2e-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&ws);
+        let git_ok = std::process::Command::new("git")
+            .arg("init")
+            .arg(&ws)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("SKIP（git 不可用——真实拖拽链未跑）");
+            return;
+        }
+        cx.update(|app| {
+            let shell = shell.clone();
+            app.new(|cx| {
+                let _ = &shell; // 实体已建——走 shell 方法面
+            });
+        });
+        shell.update(cx, |this, cx| {
+            this.open_workspace(ws.clone(), cx);
+        });
+        // 打开 git 面板（物化 + 左 dock 注册 + 激活）。
+        shell.update(cx, |this, cx| {
+            this.left_dock.update(cx, |dock, cx| {
+                dock.activate_key(crate::git_panel::GIT_PANEL_KEY, cx)
+            });
+        });
+        // 泵一帧 + debug_bounds 定位手柄真实几何（树内偏移自然计入——
+        // 手拍坐标不可靠的教训修正）。
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let handle_bounds = visual
+            .debug_bounds("panel-drag-git")
+            .expect("git 标题手柄真实渲染（debug_selector 观测面）");
+        let (hx, hy) = (
+            f32::from(handle_bounds.origin.x) + f32::from(handle_bounds.size.width) / 2.,
+            f32::from(handle_bounds.origin.y) + f32::from(handle_bounds.size.height) / 2.,
+        );
+
+        // GitPanel 物化校验（未物化 = 测试环境局限，如实跳过）。
+        let git_materialized = shell.read_with(cx, |this, cx| {
+            this.left_dock
+                .read(cx)
+                .panel_position(crate::git_panel::GIT_PANEL_KEY, cx)
+        });
+        let Some(before_pos) = git_materialized else {
+            eprintln!("SKIP（GitPanel 未物化（无工作区语义）——真实拖拽链未跑）");
+            return;
+        };
+        assert_eq!(
+            before_pos,
+            mdc_dock::DockPosition::Left,
+            "git 面板初始位 = 左"
+        );
+        // 真实鼠标链：down 手柄中心 → move >2px 激活 drag 会话 →
+        // move 步进右分区（x > 2/3 × 1000 = 667）。
+        mouse_event_at(&window, cx, "down", hx, hy);
+        mouse_event_at(&window, cx, "move", hx + 10., hy + 4.);
+        // move 步进到右分区（x > 2/3 × 1000 = 667）。
+        mouse_event_at(&window, cx, "move", 850., 300.);
+        // 拖拽中：drag_zone = Right（分区追踪断言——覆盖层状态面）。
+        let zone_now = shell.read_with(cx, |this, _| this.drag_zone);
+        assert_eq!(
+            zone_now,
+            Some(mdc_dock::DockDropZone::Right),
+            "右分区追踪（on_drag_move → drag_zone）"
+        );
+        // up 落点右分区 → on_drop → finish_panel_drop。
+        mouse_event_at(&window, cx, "up", 850., 300.);
+        // ---- 落位断言（验收 2/3：换侧 + 挤掉原槽位）----
+        let (left_active, right_active, right_len) = shell.read_with(cx, |this, cx| {
+            (
+                this.left_dock.read(cx).active_key(),
+                this.right_dock.read(cx).active_key(),
+                this.right_dock.read(cx).panels_len(),
+            )
+        });
+        assert_eq!(
+            right_active,
+            Some(crate::git_panel::GIT_PANEL_KEY),
+            "git 面板落右 dock 且激活（挤掉原槽位 = receive 即激活）"
+        );
+        assert_eq!(right_len, 1, "右 dock 恰收 1 面板");
+        assert_ne!(
+            left_active,
+            Some(crate::git_panel::GIT_PANEL_KEY),
+            "左 dock 不再持有 git 面板（take 拔出）"
+        );
+        // set_position 生效（面板实体位 = Right）。
+        let after_pos = shell.read_with(cx, |this, cx| {
+            this.right_dock
+                .read(cx)
+                .panel_position(crate::git_panel::GIT_PANEL_KEY, cx)
+        });
+        assert_eq!(
+            after_pos,
+            Some(mdc_dock::DockPosition::Right),
+            "set_position(Right) 生效"
+        );
+        // 右栏开合联动。
+        let right_open = shell.read_with(cx, |this, _| this.right_open);
+        assert!(right_open, "落右侧时右栏开");
+        // 拖拽终态清理。
+        let zone_after = shell.read_with(cx, |this, _| this.drag_zone);
+        assert_eq!(zone_after, None, "drop 后分区态清空");
+        // ---- 验收 4：持久化 round-trip（右 dock dump 键在场）----
+        let right_dump = shell.read_with(cx, |this, cx| this.right_dock.read(cx).dump());
+        assert!(
+            right_dump
+                .panels
+                .iter()
+                .any(|p| p.key == crate::git_panel::GIT_PANEL_KEY),
+            "右 dock dump 含 git 键（persist 面数据源）"
+        );
+        // 工作副本清理。
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// #121（批③b）：Center 分区 = Cancel（拖回中心无动作——面板留源）。
+    /// 事件链同上但 up 落中央（x/y 均在中段）。
+    #[gpui::test]
+    fn drag_center_zone_cancels(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = host_window_sized(cx, 1000., 600.);
+        let ws = std::env::temp_dir().join(format!("mdc-121b-ctr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&ws);
+        let git_ok = std::process::Command::new("git")
+            .arg("init")
+            .arg(&ws)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("SKIP（git 不可用——Center 取消链未跑）");
+            return;
+        }
+        shell.update(cx, |this, cx| {
+            this.open_workspace(ws.clone(), cx);
+        });
+        shell.update(cx, |this, cx| {
+            this.left_dock.update(cx, |dock, cx| {
+                dock.activate_key(crate::git_panel::GIT_PANEL_KEY, cx)
+            });
+        });
+        let any: AnyWindowHandle = window.clone().into();
+        cx.update_window(any, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .expect("预绘帧");
+        let git_materialized = shell.read_with(cx, |this, cx| {
+            this.left_dock
+                .read(cx)
+                .panel_position(crate::git_panel::GIT_PANEL_KEY, cx)
+        });
+        if git_materialized.is_none() {
+            eprintln!("SKIP（GitPanel 未物化——Center 取消链未跑）");
+            return;
+        }
+        // 标题 down → 激活 move → 中央 up。
+        mouse_event_at(&window, cx, "down", 100., 58.);
+        mouse_event_at(&window, cx, "move", 110., 24.);
+        mouse_event_at(&window, cx, "move", 500., 300.);
+        mouse_event_at(&window, cx, "up", 500., 300.);
+        // Cancel：面板仍在左 dock 且激活位不动。
+        let (left_has_git, right_len, zone_after) = shell.read_with(cx, |this, cx| {
+            (
+                this.left_dock
+                    .read(cx)
+                    .active_key()
+                    .is_some_and(|k| k == crate::git_panel::GIT_PANEL_KEY),
+                this.right_dock.read(cx).panels_len(),
+                this.drag_zone,
+            )
+        });
+        assert!(left_has_git, "Center = Cancel：git 面板留左 dock 激活位");
+        assert_eq!(right_len, 0, "右 dock 不收面板");
+        assert_eq!(zone_after, None, "drop 后分区态清空");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// A5（#47 批次 13）：**实际窗口宽变化**下的右 dock 渲染期让位与
