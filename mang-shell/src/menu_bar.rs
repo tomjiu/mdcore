@@ -90,6 +90,8 @@ pub struct MenuContext {
     pub left_open: bool,
     /// 左栏当前是 git 视图（侧栏子菜单勾选标记）。
     pub git_view: bool,
+    /// #109：左栏当前是项目搜索视图（侧栏子菜单勾选标记）。
+    pub search_view: bool,
     /// 活动标签是 DOCX（#307「导出为 PDF」门槛——仅 docx 形态提供）。
     pub active_is_docx: bool,
     /// 活动标签是 PDF（#307 ②「导出为 DOCX」门槛——仅 pdf 形态提供）。
@@ -180,6 +182,9 @@ pub enum MenuAction {
     ToggleFileTreePanel,
     /// 切换 git 面板（shell 既有 `toggle_git`——图标条 git 钮同链）。
     ToggleGitPanel,
+    /// #109 批②③：切换项目搜索面板（shell `toggle_search`——图标条
+    /// 搜索钮/Ctrl+Shift+F 同链）。
+    ToggleSearchPanel,
     /// 占位（无既有命令可映射——置灰项不绑动作，派发面只留证据行）。
     None,
 }
@@ -446,11 +451,13 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                         // 搜索 = 既有 Cmd::OpenFind（图标条搜索钮同链）。
                         // #176：页面态守卫同编辑菜单「查找」（同一动作
                         // 同一死路——同灰同因）。
-                        MenuEntry::item("view-side-search", "搜索")
-                            .shortcut_for("open_find")
-                            .act(MenuAction::EditorCmd(Cmd::OpenFind))
-                            .with_enabled(doc && !ctx.docx_page_view)
-                            .with_page_reason(ctx, REASON_PAGE_FIND),
+                        // #109 批②③：项目搜索面板（图标条搜索钮/
+                        // Ctrl+Shift+F 同链——面板独立于编辑器，页面视图/
+                        // 无文档可用；#176 页面态守卫随之退役）。
+                        MenuEntry::item("view-side-search", "项目搜索")
+                            .shortcut_for("project_search")
+                            .act(MenuAction::ToggleSearchPanel)
+                            .checked(ctx.left_open && ctx.search_view),
                     ],
                 ),
                 MenuEntry::Separator,
@@ -525,6 +532,7 @@ mod tests {
             theme_mode: THEME_LIGHT,
             left_open: true,
             git_view: false,
+            search_view: false,
             active_is_docx: true,
             active_is_pdf: false,
             pdf_ocr_pending: false,
@@ -547,6 +555,7 @@ mod tests {
             theme_mode: THEME_SYSTEM,
             left_open: true,
             git_view: false,
+            search_view: false,
             active_is_docx: false,
             active_is_pdf: false,
             pdf_ocr_pending: false,
@@ -626,7 +635,7 @@ mod tests {
             ("view-font-inc", "Ctrl+="),
             ("view-font-dec", "Ctrl+-"),
             ("view-font-reset", "Ctrl+0"),
-            ("view-side-search", "Ctrl+F"),
+            ("view-side-search", "Ctrl+K Ctrl+F"),
         ];
         for (id, key) in pinned {
             let spec = find(&menus[0].entries, id)
@@ -661,7 +670,6 @@ mod tests {
             ("edit-redo", Cmd::Redo),
             ("edit-find", Cmd::OpenFind),
             ("edit-replace", Cmd::OpenReplace),
-            ("view-side-search", Cmd::OpenFind),
         ];
         for (id, want) in cases {
             let spec = find(&menus[0].entries, id)
@@ -674,6 +682,12 @@ mod tests {
                 "{id} Cmd 映射漂移"
             );
         }
+        // #109 批②③：view-side-search 改挂面板族（不再 EditorCmd）。
+        let search = find(&menus[0].entries, "view-side-search")
+            .or_else(|| find(&menus[1].entries, "view-side-search"))
+            .or_else(|| find(&menus[2].entries, "view-side-search"))
+            .unwrap_or_else(|| panic!("view-side-search 缺失"));
+        assert_eq!(search.action, MenuAction::ToggleSearchPanel);
     }
 
     /// 无既有命令的项：置灰 + 不绑动作（禁用态是验收项）。
@@ -711,7 +725,6 @@ mod tests {
             "edit-find",
             "edit-replace",
             "edit-palette",
-            "view-side-search",
         ];
         for id in disabled {
             let spec = find(&menus[0].entries, id)
@@ -720,14 +733,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} 缺失"));
             assert!(!spec.enabled, "无文档时 {id} 应灰显");
         }
-        // shell 级动作不依赖文档。
-        let enabled = ["file-open", "file-open-folder", "file-quit", "help-about"];
+        // shell 级动作不依赖文档。#109 批②③：项目搜索面板亦不依赖
+        // （面板独立域——无文档可搜工作区）。
+        let enabled = [
+            "file-open",
+            "file-open-folder",
+            "file-quit",
+            "view-side-search",
+        ];
         for id in enabled {
             let spec = find(&menus[0].entries, id)
-                .or_else(|| find(&menus[3].entries, id))
+                .or_else(|| find(&menus[1].entries, id))
+                .or_else(|| find(&menus[2].entries, id))
                 .unwrap_or_else(|| panic!("{id} 缺失"));
             assert!(spec.enabled, "无文档时 {id} 仍应可用（shell 级动作）");
         }
+        // help-about 在第四菜单（帮助）——原链含 menus[3] 的用例保留。
+        let about = find(&menus[3].entries, "help-about").expect("help-about 缺失");
+        assert!(about.enabled);
     }
 
     /// 只读态（docx/pdf）：变更类灰显，浏览类（复制/查找）可用——与编辑器
@@ -790,7 +813,6 @@ mod tests {
             ("edit-find", REASON_PAGE_FIND),
             ("edit-replace", REASON_PAGE_FIND),
             ("edit-palette", REASON_PAGE_PALETTE),
-            ("view-side-search", REASON_PAGE_FIND),
         ] {
             let spec = find(&menus[1].entries, id)
                 .or_else(|| find(&menus[2].entries, id))

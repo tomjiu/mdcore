@@ -91,9 +91,14 @@ mod document;
 mod editor;
 mod file_tree;
 mod git_panel;
+// #109 批②③：项目搜索面板实体（lib.rs `pub mod search_panel;` 双根
+// 同文件复用——file_tree/git_panel 同款声明）。
+mod search_panel;
+// #109 批①：项目级搜索/替换纯逻辑层（lib 双根同款）。
 mod git_repo;
 mod outline_panel;
 mod panels;
+mod project_search;
 mod recent;
 // doc_events：文档变更事件总线（#111 订阅模式）——editor 的编辑收尾
 //（after_edit）无条件调用 publish（RPC 禁用时静默丢弃），故不做

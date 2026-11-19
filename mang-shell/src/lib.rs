@@ -175,6 +175,12 @@ pub mod file_tree;
 /// #109 P0 批①：项目级搜索/替换纯逻辑层（收集/匹配/预算/替换——批②面板后台化、批③善后）。
 pub mod project_search;
 
+/// #109 批②③：搜索面板实体（左栏 dock 均面板 + FormInput 自绘输入 +
+/// 后台扫描 search_id 失效/取消 + 120ms 轮询 + 分组渲染 + 点击跳行 +
+/// 替换链钩子——FileTreeHooks 同型 lib 树纪律）。
+#[path = "search_panel.rs"]
+pub mod search_panel;
+
 /// #577（#385 批 9）：git 面板——ShellApp 耦合经 GitPanelHooks 钩子
 /// 注入（open_readonly / escape），lib+bin 共用源码（#575 先例三次
 /// 应用）：键盘导航无头测试 CI 可见；git 纯逻辑单测（parse_porcelain/
