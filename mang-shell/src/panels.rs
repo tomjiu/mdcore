@@ -45,7 +45,7 @@ pub const RIGHT_PANEL_MAX: Pixels = px(600.);
 /// G4：面板边缘拖拽热区宽（px）。
 pub const PANEL_RESIZE_HOTZONE: Pixels = px(4.);
 /// 面板主内边距（px，Lead：主要区域 12-16px）。
-const PANEL_PADDING: Pixels = px(12.);
+pub(crate) const PANEL_PADDING: Pixels = px(12.);
 /// 面板头部下缘留白（px）。
 const HEADER_MARGIN: Pixels = px(8.);
 

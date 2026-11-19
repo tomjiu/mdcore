@@ -857,9 +857,15 @@ impl ShellApp {
     /// #119（mdc-dock 批①）：左栏当前是否 git 视图（dock 激活键裁决
     /// ——含预物化意图口径；菜单勾选/图标条选中态/渲染面共用）。
     pub fn git_active(&self, cx: &App) -> bool {
+        // #121（批④）：git 面板可能落在任一 dock（批③b 拖拽换侧）——
+        // 两 dock 合查激活态（菜单勾选/图标条选中态的统一真源）。
         self.left_dock
             .read(cx)
             .active_is(crate::git_panel::GIT_PANEL_KEY)
+            || self
+                .right_dock
+                .read(cx)
+                .active_is(crate::git_panel::GIT_PANEL_KEY)
     }
 
     /// #119：左栏视图激活单点（统一激活协议入口——图标条/菜单/快捷
@@ -1150,6 +1156,43 @@ impl ShellApp {
                 .right_dock
                 .update(cx, |dock, cx| dock.set_panel_position(key, pos, cx));
         applied
+    }
+
+    /// #121（批④）：右栏呈现面——right_dock 激活面板驱动。
+    ///
+    /// 激活 git（批③b 拖入）→ GitPanel 本体 + 标题拖拽手柄（可再拖走）；
+    /// 其余/无激活 → 旧 right_panel 兜底（outline/文档大纲——#289-⑤
+    /// 语义不变，零回归口径）。
+    fn right_dock_content(&self, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let active_key = self.right_dock.read(cx).active_key();
+        if active_key == Some(crate::git_panel::GIT_PANEL_KEY)
+            && let Some(git) = self.git_panel.as_ref()
+        {
+            let title_drag = self.right_dock.read(cx).active_key().map(|key| {
+                self.panel_title_drag_handle(&self.right_dock.clone(), key, cx)
+                    .into_any_element()
+            });
+            return v_flex()
+                .id("right-dock-content")
+                .debug_selector(|| "right-dock-content".into())
+                .w(self.right_width)
+                .flex_none()
+                .h_full()
+                .min_h_0()
+                .min_w_0()
+                .bg(colors.panel_background)
+                .p(panels::PANEL_PADDING)
+                .when_some(title_drag, |el, handle| el.child(handle))
+                .child(
+                    Label::new("源代码管理")
+                        .size(LabelSize::Small)
+                        .color(ui::Color::Muted),
+                )
+                .child(git.clone())
+                .into_any_element();
+        }
+        panels::right_panel(self.outline.as_ref(), self.right_width, cx).into_any_element()
     }
 
     /// #121（批③b）：拖放**感应面**——常驻透明全窗（`size_full`
@@ -4116,13 +4159,11 @@ impl Render for ShellApp {
                     .when(right_open_effective, |el| {
                         // G4：右栏左缘 4px 拖拽热区
                         el.child(self.panel_resize_handle(PanelSide::Right, cx))
-                            // #289-⑤：右栏单一视图——属性/来源（设置已改
-                            // 弹窗，不再占右栏位）。
-                            .child(panels::right_panel(
-                                self.outline.as_ref(),
-                                self.right_width,
-                                cx,
-                            ))
+                            // #121（批④）：右栏呈现面统一——right_dock
+                            // 激活面板本体渲染（批③b 拖入的面板真实可见）；
+                            // 无激活/未物化 → 旧 right_panel 兜底（#289-⑤
+                            // 属性/来源视图）。
+                            .child(self.right_dock_content(cx))
                     })
                     // #289-⑤：右缘 dock 条（属性/来源开关归右缘——
                     // 恒在，右栏收起时是唯一入口；zed 折叠 dock 同构）。
@@ -9090,6 +9131,90 @@ mod statusbar_view_toggle_tests {
         assert!(left_has_git, "Center = Cancel：git 面板留左 dock 激活位");
         assert_eq!(right_len, 0, "右 dock 不收面板");
         assert_eq!(zone_after, None, "drop 后分区态清空");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// #121（批④）：呈现面统一——拖 git 到右侧后右栏渲染 GitPanel 本体。
+    /// 真实鼠标链（批③b e2e 同构）+ debug_selector 观测面。
+    #[gpui::test]
+    fn drag_git_to_right_renders_panel_body(cx: &mut gpui::TestAppContext) {
+        let (shell, window) = host_window_sized(cx, 1000., 600.);
+        let any: AnyWindowHandle = window.clone().into();
+        let mut visual = gpui::VisualTestContext::from_window(any, cx);
+        let ws = std::env::temp_dir().join(format!("mdc-121b4-e2e-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&ws);
+        let git_ok = std::process::Command::new("git")
+            .arg("init")
+            .arg(&ws)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("SKIP（git 不可用——批④呈现链未跑）");
+            return;
+        }
+        shell.update(cx, |this, cx| {
+            this.open_workspace(ws.clone(), cx);
+        });
+        shell.update(cx, |this, cx| {
+            this.left_dock.update(cx, |dock, cx| {
+                dock.activate_key(crate::git_panel::GIT_PANEL_KEY, cx)
+            });
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let handle_bounds = visual
+            .debug_bounds("panel-drag-git")
+            .expect("git 标题手柄真实渲染（拖前在左栏）");
+        let (hx, hy) = (
+            f32::from(handle_bounds.origin.x) + f32::from(handle_bounds.size.width) / 2.,
+            f32::from(handle_bounds.origin.y) + f32::from(handle_bounds.size.height) / 2.,
+        );
+        // 拖前：右栏是旧视图（无 right-dock-content 选择器）。
+        assert!(
+            visual.debug_bounds("right-dock-content").is_none(),
+            "拖前右栏走旧 right_panel 兜底"
+        );
+        assert!(
+            shell.read_with(cx, |this, cx| this.git_active(cx)),
+            "拖前 git_active=true（左 dock 激活）"
+        );
+        // 真实拖拽链：down → move 激活 → 右分区 → up。
+        mouse_event_at(&window, cx, "down", hx, hy);
+        mouse_event_at(&window, cx, "move", hx + 10., hy + 4.);
+        mouse_event_at(&window, cx, "move", 850., 300.);
+        mouse_event_at(&window, cx, "up", 850., 300.);
+        // 落位后重绘（呈现面换新——drop 后 notify 已触发，泵一帧）。
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        // ---- 呈现面断言（批④核心）----
+        let body = visual
+            .debug_bounds("right-dock-content")
+            .expect("右栏呈现 right_dock 激活面板（GitPanel 本体）");
+        let body_w = f32::from(body.size.width);
+        assert!(body_w > 100., "右栏面板体宽度合理（实得 {body_w}px）");
+        // git_active 跨 dock 合查仍 true（批④修的菜单态真源）。
+        assert!(
+            shell.read_with(cx, |this, cx| this.git_active(cx)),
+            "拖后 git_active=true（right dock 激活——两 dock 合查）"
+        );
+        // 右 dock 激活 git + 手柄可再拖（呈现面手柄在场）。
+        let right_active = shell.read_with(cx, |this, cx| this.right_dock.read(cx).active_key());
+        assert_eq!(
+            right_active,
+            Some(crate::git_panel::GIT_PANEL_KEY),
+            "right dock 激活 git"
+        );
+        let handle_after = visual
+            .debug_bounds("panel-drag-git")
+            .expect("右栏标题手柄在场（可再拖回左侧）");
+        // 手柄应在右半区（回拖起点真实在场）。
+        assert!(
+            f32::from(handle_after.origin.x) > 600.,
+            "手柄已随面板到右栏（x 实得 {:.0}）",
+            f32::from(handle_after.origin.x)
+        );
+        // git_panel 实体在场（呈现的是本体非占位）。
+        let git_present = shell.read_with(cx, |this, _| this.git_panel.is_some());
+        assert!(git_present, "GitPanel 实体在场（本体呈现）");
         let _ = std::fs::remove_dir_all(&ws);
     }
 
