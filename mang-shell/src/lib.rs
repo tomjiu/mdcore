@@ -172,6 +172,9 @@ pub mod outline_panel;
 #[path = "file_tree.rs"]
 pub mod file_tree;
 
+/// #109 P0 批①：项目级搜索/替换纯逻辑层（收集/匹配/预算/替换——批②面板后台化、批③善后）。
+pub mod project_search;
+
 /// #577（#385 批 9）：git 面板——ShellApp 耦合经 GitPanelHooks 钩子
 /// 注入（open_readonly / escape），lib+bin 共用源码（#575 先例三次
 /// 应用）：键盘导航无头测试 CI 可见；git 纯逻辑单测（parse_porcelain/
