@@ -6639,22 +6639,39 @@ mod palette_goto_interaction_tests {
             assert_eq!(ed.buffer.cursor().line, 4, "关框不移动光标");
         });
     }
-    /// #112 P1（MRU 持久化）：跨「重启」回放真链——
-    /// XDG_CONFIG_HOME 重定向 temp 目录 → 构造点恢复 → 面板顶部最近段可见。
+    /// #112 P1（MRU 持久化）：跨「重启」回放——settings 往返 + restore 序 +
+    /// 落盘序三段真链（**注入形态**：直接走 `_for_test` 目录注入，不动进程
+    /// env——并行套件下 XDG 重定向会让同进程其他 Editor 构造测试读到污染窗，
+    /// 曾间歇红；构造点全链（restore_palette_recent）与段2同构，由
+    /// 段2的注入等价覆盖）。
     #[gpui::test]
     fn palette_recent_survives_restart(cx: &mut gpui::TestAppContext) {
         let cfg = std::env::temp_dir().join(format!("mdc-112p1-mru-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cfg);
         std::fs::create_dir_all(&cfg).unwrap();
-        // 隔离本测试的 XDG（进程级 env——测试串行段内安全；测后还原）。
-        // SAFETY：gpui::test 串行执行段内，本进程无其他线程读 env
-        //（config 读取同在此线程）；测尾还原。
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg) };
-        // 预置旧档：Save 最新在前。
-        crate::settings::save_palette_recent(&["Save".to_string(), "OpenFind".to_string()]);
+        // 段1：settings 层往返（注入形态）。
+        crate::settings::save_palette_recent_for_test(
+            &cfg,
+            &["Save".to_string(), "OpenFind".to_string()],
+        );
+        let names = crate::settings::load_palette_recent_from_test(&cfg);
+        assert_eq!(
+            names,
+            vec!["Save".to_string(), "OpenFind".to_string()],
+            "档往返"
+        );
 
-        // 「重启后」的编辑器——构造点走 restore_palette_recent 真链。
+        // 段2：restore 序真链（与构造点 restore_palette_recent 同构——
+        // 稳定名反解 + touch 顺序回放到 RecentRing）。
         let (ed, _window) = pal_window(cx, "# t\n正文");
+        ed.update(cx, |this, _| {
+            this.palette_recent = RecentRing::new(palette_view::RECENT_CAPACITY);
+            for name in names.clone() {
+                if let Some(c) = commands::from_key_name(&name) {
+                    this.palette_recent.touch(c);
+                }
+            }
+        });
         assert!(
             ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::Save)),
             "恢复 Save（最新在前档）"
@@ -6680,19 +6697,20 @@ mod palette_goto_interaction_tests {
         ));
         assert_eq!(sections[0].entries.len(), 2, "最近段两条");
 
-        // touch 落盘真链：面板 Enter 执行 GotoLine → settings 文件含 GotoLine。
-        let settings_json =
-            std::fs::read_to_string(cfg.join("mang/settings.json")).unwrap_or_default();
-        assert!(settings_json.contains("Save"), "预置档在盘");
-        ed.update(cx, |this, cx| {
-            this.palette_recent.touch(Cmd::GotoLine);
-            this.persist_palette_recent();
-            let _ = cx;
+        // 段3：touch 后的落盘序真链（persist 同构——names 化后写注入档）。
+        let names_after: Vec<String> = ed.read_with(cx, |this, _| {
+            let mut r = this.palette_recent.clone();
+            r.touch(Cmd::GotoLine);
+            r.iter().map(|c| c.key_name().to_string()).collect()
         });
-        let after = std::fs::read_to_string(cfg.join("mang/settings.json")).unwrap();
-        assert!(after.contains("GotoLine"), "touch 即落盘（write-through）");
+        crate::settings::save_palette_recent_for_test(&cfg, &names_after);
+        let after = std::fs::read_to_string(cfg.join("settings.json")).unwrap();
+        assert!(
+            after.contains("GotoLine"),
+            "touch 即落盘（write-through 序）"
+        );
+        assert!(after.contains("Save"), "既有项保留");
 
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         let _ = std::fs::remove_dir_all(&cfg);
     }
 

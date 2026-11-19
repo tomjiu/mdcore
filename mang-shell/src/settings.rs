@@ -156,6 +156,18 @@ pub fn load_palette_recent() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 测试形态：直接写指定目录（e2e 注入用——不动进程 env，避免并行套件
+/// 下的 XDG 污染窗；生产路径走 [`save_palette_recent`]）。
+pub fn save_palette_recent_for_test(dir: &Path, names: &[String]) {
+    std::fs::create_dir_all(dir).unwrap();
+    save_palette_recent_in(dir, names);
+}
+
+/// 测试形态：直接读指定目录（同上）。
+pub fn load_palette_recent_from_test(dir: &Path) -> Vec<String> {
+    load_palette_recent_in(dir)
+}
+
 fn save_palette_recent_in(dir: &Path, names: &[String]) {
     let mut value = load_from(dir);
     if value.get("palette").is_none() {
