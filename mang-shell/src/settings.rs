@@ -140,6 +140,47 @@ pub fn load_right_dock_layout() -> Option<mdc_dock::DockAreaState> {
     load_right_dock_layout_in(&dir)
 }
 
+/// #112 P1（MRU 持久化）：命令面板最近使用落盘（`palette.recent` 键，
+/// 值 = 命令稳定名数组——[`crate::editor::commands::Cmd::key_name`] 口径，
+/// 最新在前）。write-through：容量 4 的微 JSON，无需防抖。
+pub fn save_palette_recent(names: &[String]) {
+    if let Some(dir) = config_dir() {
+        save_palette_recent_in(&dir, names);
+    }
+}
+
+/// #112 P1：恢复最近使用（构造点消费——旧档未知名/缺键返回空，容忍前向）。
+pub fn load_palette_recent() -> Vec<String> {
+    config_dir()
+        .map(|dir| load_palette_recent_in(&dir))
+        .unwrap_or_default()
+}
+
+fn save_palette_recent_in(dir: &Path, names: &[String]) {
+    let mut value = load_from(dir);
+    if value.get("palette").is_none() {
+        value["palette"] = serde_json::json!({});
+    }
+    value["palette"]["recent"] = serde_json::json!(names);
+    save_to(dir, &value);
+}
+
+fn load_palette_recent_in(dir: &Path) -> Vec<String> {
+    value_recent_names(load_from(dir).get("palette"))
+}
+
+fn value_recent_names(palette: Option<&serde_json::Value>) -> Vec<String> {
+    palette
+        .and_then(|p| p.get("recent"))
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn save_right_dock_layout_in(dir: &Path, right: &mdc_dock::DockAreaState) {
     let mut value = load_from(dir);
     // dock 节点存在则 additive 合入；不存在则建骨架（right_open 用
@@ -513,6 +554,47 @@ mod tests {
     fn missing_settings_returns_none() {
         let dir = temp_config("missing");
         assert_eq!(remembered_workspace_in(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #112 P1：面板最近使用往返（写 → 读回 → 覆盖写 → 读回）。
+    #[test]
+    fn palette_recent_roundtrip() {
+        let dir = temp_config("palette-recent");
+        save_palette_recent_in(&dir, &["Save".to_string(), "OpenFind".to_string()]);
+        assert_eq!(
+            load_palette_recent_in(&dir),
+            vec!["Save".to_string(), "OpenFind".to_string()],
+            "首写读回"
+        );
+        save_palette_recent_in(&dir, &["Undo".to_string()]);
+        assert_eq!(
+            load_palette_recent_in(&dir),
+            vec!["Undo".to_string()],
+            "覆盖写生效（最新在前）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #112 P1：缺键/空档返回空；非字符串项过滤；既有键（theme）不被冲掉。
+    #[test]
+    fn palette_recent_missing_and_mixed_entries() {
+        let dir = temp_config("palette-mixed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(settings_path_in(&dir), r#"{ "theme": "dark" }"#).unwrap();
+        assert!(load_palette_recent_in(&dir).is_empty(), "缺键=空");
+        std::fs::write(
+            settings_path_in(&dir),
+            r#"{ "theme": "dark", "palette": { "recent": ["Save", 42, null, "Undo"] } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_palette_recent_in(&dir),
+            vec!["Save".to_string(), "Undo".to_string()],
+            "非字符串项过滤（旧档/脏档容忍）"
+        );
+        let value = load_from(&dir);
+        assert_eq!(value["theme"].as_str(), Some("dark"), "既有键保留");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -70,11 +70,13 @@ pub fn group_of(cmd: Cmd) -> Group {
 }
 
 /// 面板里的一个条目。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub cmd: Cmd,
     /// 在扁平列表中的序号（键盘上下移动用——跨段连续，不按段重置）。
     pub index: usize,
+    /// #112 P1：子序列命中下标集（面板渲染高亮；空查询/最近段=空集）。
+    pub highlights: Vec<usize>,
 }
 
 /// 面板的一段（标题 + 条目）。
@@ -135,8 +137,16 @@ impl RecentRing {
 ///   固定区反而干扰）。但最近用过的命令在同分组内**排到前面**。
 /// - 空段不产出。
 ///
-/// `results` = [`crate::editor::commands::search`] 的输出（已按匹配度排序）。
-pub fn build_sections(results: &[Cmd], recent: &RecentRing) -> Vec<Section> {
+/// `results` = [`crate::editor::commands::search_with_highlights`] 的输出
+/// （已按匹配度排序，附命中下标集）；纯 [`crate::editor::commands::search`]
+/// 输出用 [`build_sections_plain`] 包装。
+/// #112 P1：分段构建（结果附命中下标集——高亮真源随条目走）。
+/// 兼容入口 [`build_sections_plain`]（纯逻辑单测口径）。
+pub fn build_sections(
+    query: &str,
+    results: &[(Cmd, Vec<usize>)],
+    recent: &RecentRing,
+) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     let mut index = 0usize;
     // 最近段存在时，这些命令不在各自分组里重复出现——同一条命令在面板里
@@ -145,14 +155,22 @@ pub fn build_sections(results: &[Cmd], recent: &RecentRing) -> Vec<Section> {
 
     for g in Group::ORDER {
         let mut entries: Vec<Entry> = Vec::new();
-        for &c in results {
+        for &(c, ref hl) in results {
             if group_of(c) != *g {
                 continue;
             }
-            if recent_len > 0 && recent.contains(c) {
+            // 分组排除只应在 Recent 段**会插入**时（空查询）生效——
+            // 非空查询 gate 不插 Recent 段（见尾部 gate），此时不再排除，
+            // 否则最近用过的命令在关键词搜索下整条消失。
+            let recent_inserted = query.is_empty() && recent_len > 0;
+            if recent_inserted && recent.contains(c) {
                 continue;
             }
-            entries.push(Entry { cmd: c, index });
+            entries.push(Entry {
+                cmd: c,
+                index,
+                highlights: hl.clone(),
+            });
             index += 1;
         }
         if entries.is_empty() {
@@ -175,14 +193,21 @@ pub fn build_sections(results: &[Cmd], recent: &RecentRing) -> Vec<Section> {
         sections.push(Section { group: *g, entries });
     }
 
-    // 查询为空 → 最近使用段插到最前（它自身也算一种「结果」）。
-    if recent.is_empty() {
+    // 查询为空 → 最近使用段插到最前（它自身也算一种「结果」）；
+    // 查询非空 → 不插（用户在按关键词找，固定区反而干扰——文档语义
+    // 的真 gate 在此，MRU 持久化后 ring 常态非空才暴露出本注释
+    // 此前无实现）。组内「最近用过提前」不受影响。
+    if !query.is_empty() || recent.is_empty() {
         return sections;
     }
     let recent_entries: Vec<Entry> = recent
         .iter()
         .enumerate()
-        .map(|(i, cmd)| Entry { cmd, index: i })
+        .map(|(i, cmd)| Entry {
+            cmd,
+            index: i,
+            highlights: Vec::new(),
+        })
         .collect();
     // index 统一重编：Recent 在最前，占 0..n。
     let shift = recent_entries.len();
@@ -199,6 +224,13 @@ pub fn build_sections(results: &[Cmd], recent: &RecentRing) -> Vec<Section> {
         },
     );
     sections
+}
+
+/// 兼容入口：消费纯 `search()` 输出（无高亮集）——空高亮拼装后委托
+/// [`build_sections`]（纯逻辑单测与既有调用面的旧口径）。
+pub fn build_sections_plain(query: &str, results: &[Cmd], recent: &RecentRing) -> Vec<Section> {
+    let with_hl: Vec<(Cmd, Vec<usize>)> = results.iter().map(|&c| (c, Vec::new())).collect();
+    build_sections(query, &with_hl, recent)
 }
 
 /// 扁平化（键盘上下移动的遍历域；`index` 即在此列表中的下标）。
@@ -229,7 +261,7 @@ mod tests {
     fn empty_query_groups_all_commands() {
         let results = commands::search("");
         let ring = RecentRing::new(5);
-        let sections = build_sections(&results, &ring);
+        let sections = build_sections_plain("", &results, &ring);
         let flat = flatten(&sections);
         assert_eq!(flat.len(), Cmd::ALL.len(), "所有命令都应出现在分组里");
         assert!(
@@ -240,7 +272,7 @@ mod tests {
 
     #[test]
     fn sections_are_non_empty_and_ordered() {
-        let sections = build_sections(&commands::search(""), &RecentRing::new(5));
+        let sections = build_sections_plain("", &commands::search(""), &RecentRing::new(5));
         for s in &sections {
             assert!(!s.entries.is_empty(), "{:?} 段为空却产出了", s.group);
         }
@@ -257,7 +289,7 @@ mod tests {
     #[test]
     fn indices_are_contiguous_across_sections() {
         // 键盘上下移动依赖 index 跨段连续。
-        let sections = build_sections(&commands::search(""), &RecentRing::new(5));
+        let sections = build_sections_plain("", &commands::search(""), &RecentRing::new(5));
         let mut seen: Vec<usize> = Vec::new();
         for s in &sections {
             for e in &s.entries {
@@ -291,7 +323,7 @@ mod tests {
     fn recent_section_prepended_when_query_empty() {
         let mut r = RecentRing::new(3);
         r.touch(Cmd::Save);
-        let sections = build_sections(&commands::search(""), &r);
+        let sections = build_sections_plain("", &commands::search(""), &r);
         assert_eq!(sections[0].group, Group::Recent);
         assert_eq!(sections[0].entries[0].cmd, Cmd::Save);
         // 且 Save 不应在「文件」段里重复出现
@@ -307,7 +339,7 @@ mod tests {
         let mut r = RecentRing::new(3);
         r.touch(Cmd::Redo);
         r.touch(Cmd::Save);
-        let sections = build_sections(&commands::search(""), &r);
+        let sections = build_sections_plain("", &commands::search(""), &r);
         let mut all: Vec<Cmd> = Vec::new();
         for s in &sections {
             for e in &s.entries {
@@ -320,7 +352,7 @@ mod tests {
 
     #[test]
     fn no_recent_means_no_recent_section() {
-        let sections = build_sections(&commands::search(""), &RecentRing::new(3));
+        let sections = build_sections_plain("", &commands::search(""), &RecentRing::new(3));
         assert!(sections.iter().all(|s| s.group != Group::Recent));
     }
 
@@ -328,7 +360,7 @@ mod tests {
     fn flatten_matches_indices() {
         let mut r = RecentRing::new(3);
         r.touch(Cmd::Save);
-        let sections = build_sections(&commands::search(""), &r);
+        let sections = build_sections_plain("", &commands::search(""), &r);
         let flat = flatten(&sections);
         for s in &sections {
             for e in &s.entries {
