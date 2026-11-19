@@ -2986,6 +2986,19 @@ impl ShellApp {
     /// #134：工作区根目录（RPC FS 命令的沙箱边界；无工作区 = `None`
     /// ——FS 命令一律拒绝）。返回的是 FileTree 持有的原始根路径，
     /// 符号链接摊平（canonicalize）由 rpc::resolve_sandboxed 完成。
+    /// #107 D1①批②：标题栏「刷新」钮动作——文件树全树重读（外部
+    /// 改动范围未知时不猜目标：整树已缓存清单过一遍，根必命中——
+    /// TreeState::new 即读根且展开态常驻；展开态不动，不折叠用户
+    /// 已展开目录）。无工作区时无操作（无树可刷）。
+    pub fn refresh_file_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(ws) = self.workspace.as_ref().cloned() {
+            ws.update(cx, |tree, cx| {
+                tree.reload_root();
+                cx.notify();
+            });
+        }
+    }
+
     pub fn workspace_root(&self, cx: &Context<Self>) -> Option<PathBuf> {
         self.workspace
             .as_ref()

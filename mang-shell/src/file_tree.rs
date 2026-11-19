@@ -191,6 +191,18 @@ impl TreeState {
         }
     }
 
+    /// #107 D1①批②：全树刷新——重读**全部**已缓存目录清单（标题栏
+    /// 「刷新」钮语义：外部改动范围未知时不猜目标，整树过一遍）。
+    /// 未缓存目录无操作（同 reload 单目录语义）；根展开态常驻
+    /// （TreeState::new 即读根）→ 根必命中。展开态不动——刷新清单
+    /// 不折叠用户已展开的目录。
+    pub fn reload_all(&mut self) {
+        let dirs: Vec<PathBuf> = self.listings.keys().cloned().collect();
+        for dir in dirs {
+            self.listings.insert(dir.clone(), Rc::new(list_dir(&dir)));
+        }
+    }
+
     /// #166：fs 变更后重读目录清单（右键新建/重命名/删除后同步）。
     /// 目录未缓存则无操作——未展开过的目录本就无清单，展开时现读。
     pub fn reload(&mut self, dir: &Path) {
@@ -379,6 +391,12 @@ impl FileTree {
     /// 当前打开文件高亮同步（ShellApp::open_document 后调用）。
     pub fn set_active_file(&mut self, path: Option<PathBuf>) {
         self.state.set_active_file(path);
+    }
+
+    /// #107 D1①批②：全树刷新（标题栏「刷新」钮）。#595：经路径
+    /// 重绑定——整树重读后光标仍是原文件，目标不可见则清空。
+    pub fn reload_root(&mut self) {
+        self.mutate_rows_keep_cursor(|state| state.reload_all());
     }
 
     /// #166：fs 变更后重读目录清单（转发到状态机）。#595：经路径
@@ -1069,6 +1087,52 @@ mod keyboard_tests {
             selected_path(&tree, &visual),
             Some(c_md),
             "光标路径身份保持"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #107 D1①批②：标题栏「刷新」= reload_root（TreeState::reload_all）
+    /// 全树语义——多层外部改动（根层 + 深层子目录）一次全树刷新全部可见，
+    /// 且光标路径身份保持（#595 语义随 mutate_rows_keep_cursor 继承）。
+    #[gpui::test]
+    fn reload_root_after_external_multi_dir_changes(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("ft107-b2-reloadall");
+        let sub = root.join("sub");
+        let deep = sub.join("deep");
+        let (tree, mut visual) = tree_window(cx, root.clone(), Arc::default());
+        // 展开深层（deep 清单缓存就绪——多目录缓存面）。
+        tree.update(&mut visual, |t, _| t.expand_to(&deep.join("d.md")));
+        focus_and_step_to(&tree, &mut visual, &deep.join("d.md"));
+
+        // 外部进程多处改动：根层新建 + 深层子目录新建（树零感知）。
+        std::fs::write(root.join("ext-root.md"), "ext").unwrap();
+        std::fs::write(deep.join("ext-deep.md"), "ext").unwrap();
+        let before = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        let mid = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_eq!(mid, before, "外部改动树自身不可见（无轮询——同批①钉）");
+
+        // 标题栏「刷新」→ reload_root（shell.rs refresh_file_tree 同型调用）。
+        tree.update(&mut visual, |t, _| t.reload_root());
+        let after = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_eq!(after, before + 2, "全树刷新后两处新文件行均可见");
+        let paths: Vec<PathBuf> = tree
+            .read_with(&visual, |t, _| t.state.visible_rows())
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&root.join("ext-root.md")),
+            "根层新文件行可见"
+        );
+        assert!(
+            paths.contains(&deep.join("ext-deep.md")),
+            "深层新文件行可见"
+        );
+        // #595：光标身份保持——刷新后选中仍是当初的 d.md。
+        assert_eq!(
+            selected_path(&tree, &visual),
+            Some(deep.join("d.md")),
+            "全树刷新后光标路径身份保持"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

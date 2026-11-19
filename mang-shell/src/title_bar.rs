@@ -102,6 +102,15 @@ pub fn title_bar(
                     })
                 }),
         )
+        // #107 D1①批②：工作区刷新钮（外部改动后的全局感知手段——
+        // 2449 报告 D1①「菜单项 + 标题栏钮」完整定义的后半）。
+        // 无工作区时点击为无操作（refresh_file_tree 自判），不禁用
+        // 灰显——按钮常驻保持标题栏布局稳定（工作区开关不引起跳变）。
+        .child(
+            IconButton::new("tb-refresh", IconName::RefreshTitle)
+                .tooltip(Tooltip::text("刷新工作区（重读文件树）"))
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_file_tree(cx))),
+        )
         .child(
             div()
                 .id("document-info-toggle")
