@@ -140,6 +140,10 @@ pub fn file_tree_menu(is_dir: bool) -> Vec<MenuItem> {
         MenuItem::action("ft-delete", "删除").with_shortcut("Delete"),
         MenuItem::Separator,
         MenuItem::action("ft-reveal", "在资源管理器中显示"),
+        // #107 D1①：外部（非本应用）改动目录内容后的感知手段——
+        // 重读目标目录清单（目录）或父目录（文件）。此前唯一恢复
+        // 方式是重启或重新打开文件夹（2449 报告 §6 顺手缺陷）。
+        MenuItem::action("ft-refresh", "刷新"),
     ]
 }
 
@@ -208,5 +212,21 @@ mod tests {
                 }
             }
         }
+    }
+}
+// #107 D1① 先红面：刷新入口存在性判据（外部改动后用户感知手段）。
+#[test]
+fn file_tree_menu_has_refresh_entry() {
+    for is_dir in [true, false] {
+        let items = file_tree_menu(is_dir);
+        let refresh = items.iter().find_map(|i| match i {
+            MenuItem::Action { id, enabled, .. } if *id == "ft-refresh" => Some(*enabled),
+            _ => None,
+        });
+        assert!(
+            refresh.is_some(),
+            "文件树右键菜单须含「刷新」入口（#107 D1①——is_dir={is_dir}）"
+        );
+        assert_eq!(refresh, Some(true), "刷新须可用（无前置条件门）");
     }
 }

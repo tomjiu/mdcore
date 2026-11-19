@@ -1073,6 +1073,42 @@ mod keyboard_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// #107 D1①：外部改动 → 手动刷新（ft-refresh 派发 = FileTree::reload）
+    /// 的行可见性语义——外部新建文件后 reload，可见行集新增该文件行。
+    /// （shell.rs 派发只是调本方法 + notify；行为面在此钉，先例
+    /// #595 两测试同型。）
+    #[gpui::test]
+    fn reload_after_external_create_shows_new_row(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("ft107-refresh");
+        let sub = root.join("sub");
+        let new_md = sub.join("new.md");
+        let (tree, mut visual) = tree_window(cx, root.clone(), Arc::default());
+        // 展开子目录（清单缓存就绪——模拟用户浏览过）。
+        tree.update(&mut visual, |t, _| t.expand_to(&sub.join("c.md")));
+
+        let before = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        // 外部进程建文件（不经本应用任何写路径——树无感知）。
+        std::fs::write(&new_md, "external").unwrap();
+        let mid = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_eq!(mid, before, "外部改动树自身不可见（无轮询——2449 报告 M9①）");
+
+        // 用户右键「刷新」→ 派发到 reload（shell.rs ft-refresh 同型调用）。
+        tree.update(&mut visual, |t, _| t.reload(&sub));
+        let after = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_eq!(
+            after,
+            before + 1,
+            "刷新后新建文件行可见（#107 D1① 核心语义）"
+        );
+        let paths: Vec<PathBuf> = tree
+            .read_with(&visual, |t, _| t.state.visible_rows())
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert!(paths.contains(&new_md), "新文件行在可见集内");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #595 验收 2：删除更早条目（选中路径仍在）不跳；删除选中条目
     /// 或折叠其祖先（forget_subtree）→ 清空光标，Enter 不触发别的路径。
     #[gpui::test]
