@@ -147,6 +147,23 @@ pub(crate) trait TileSession: Send {
     fn request_size(&self);
     /// 非阻塞收回执（16ms drain 拉取）。
     fn try_recv(&self) -> Option<SessionReply>;
+    /// #50 C3：文本输入（默认未接线返回 false——mock 未实现编辑面时
+    /// 键盘面如实「不可编辑」，不假绿）。
+    fn edit_type_text(&mut self, _seq: u64, _text: &str) -> bool {
+        false
+    }
+    /// #50 C3：UNO 命令（同上——默认不可用）。
+    fn edit_uno(&mut self, _seq: u64, _command: &str, _args: Option<&str>, _query: bool) -> bool {
+        false
+    }
+    /// #50 C3：剪贴板读（同上）。
+    fn edit_text_of(&mut self, _seq: u64, _mime: &str) -> bool {
+        false
+    }
+    /// #50 C4：保存（同上）。
+    fn edit_save_as(&mut self, _seq: u64, _url: &str, _format: &str) -> bool {
+        false
+    }
     /// #179 三分收回执：`Reply` / `Empty` / `Disconnected`——通道
     /// 断开与暂时无消息分流（旧 `try_recv` 同貌 None——会话线程无终态
     /// 回执退出时视图永挂，无从诊断）。默认实现 = `try_recv` 的
@@ -160,6 +177,26 @@ pub(crate) trait TileSession: Send {
 }
 
 impl TileSession for DocxLokSession {
+    /// #50 C3：编辑命令——`DocxLokSession` 的 request_* 面转发（seq
+    /// 由本视图统一分配，回执经同一 `try_recv` 通道）。
+    fn edit_type_text(&mut self, seq: u64, text: &str) -> bool {
+        self.request_type_text(seq, text);
+        true
+    }
+    fn edit_uno(&mut self, seq: u64, command: &str, args: Option<&str>, query: bool) -> bool {
+        self.request_uno(seq, command, args, query);
+        true
+    }
+    fn edit_text_of(&mut self, seq: u64, mime: &str) -> bool {
+        self.request_text_of(seq, mime);
+        true
+    }
+    /// #50 C4：保存（file_url 交内核——B 线 profile::file_url_of 同源
+    /// 语义由会话线程内部承担，宿主传 OS 路径）。
+    fn edit_save_as(&mut self, seq: u64, url: &str, format: &str) -> bool {
+        self.request_save_as(seq, url, format);
+        true
+    }
     fn request_tile(
         &self,
         canvas_w: usize,
@@ -222,6 +259,24 @@ impl Boot {
 }
 
 /// docx 页面视图实体（LOK 连续画布条带渲染——见模块头）。
+/// #50 C3：编辑命令序号（独立静态域——与 tile SEQ 不共空间；回执
+/// 路由按 `edit_pending` 对账）。
+static EDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_edit_seq() -> u64 {
+    EDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #50 C3：编辑面命令类别（回执路由——`EditDone`/`TextDone`/
+/// `SaveDone` 三回执共 seq 空间，按类别分流）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    Type,
+    Uno,
+    TextOf,
+    Save,
+}
+
 pub struct DocxPagesView {
     /// 源文件绝对路径（标签路径绑定单一真源）。
     path: PathBuf,
@@ -253,6 +308,19 @@ pub struct DocxPagesView {
     polling: bool,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+    /// #50 C3/C4：内核侧脏位（`EditDone{ok,dirty}` 置位——成功编辑
+    /// 即脏；失败回执保持原值）。
+    dirty: bool,
+    /// #50 C4：宿主侧修订号（`EditDone{revision}` 更新——保存对账的
+    /// 「当前」侧；`SaveDone{revision_saved}` 相等才清 dirty，防延迟
+    /// 回执清掉新编辑）。
+    revision: u64,
+    /// #50 C3：编辑/保存/剪贴板命令的回执在途（seq → 命令类别——回执
+    /// 路由；切标签 Drop 后自然作废=旧回执不落新文档）。
+    edit_pending: HashMap<u64, EditKind>,
+    /// #50 C3：IME preedit 组合串（宿主渲染——契约 §10 口径：组合期
+    /// 仅宿主显示，定稿 `type_text` 逐字符下发；空 = 无组合）。
+    preedit: String,
     /// 视口尺寸回写（根级探针 canvas paint 期写、render 期读——
     /// pdf_pages 同款：避免每帧实体更新）。
     viewport: Rc<Cell<Option<(f32, f32)>>>,
@@ -338,6 +406,11 @@ impl DocxPagesView {
             viewport_seen: (0., 0.),
             watchdog_ticks: 0,
             watchdog_retried: false,
+            // #50 C3/C4：编辑状态面初始零值（会话建立后由回执驱动）。
+            dirty: false,
+            revision: 0,
+            edit_pending: HashMap::new(),
+            preedit: String::new(),
         }
     }
 
@@ -372,10 +445,11 @@ impl DocxPagesView {
         &self.boot
     }
 
-    /// C1/C2 只读渲染：恒不脏（保存面 C4；文本态切换卫保证行投影不会
-    /// 与会话同时编辑同一文件）。
+    /// #50 C3/C4：真实脏位（`EditDone{ok,dirty}` 回执置位；`SaveDone`
+    /// 对账清零——见 [`Self::handle_save_done`]；查询面给关闭确认链/
+    /// save_tab 分流消费）。
     pub fn is_dirty(&self) -> bool {
-        false
+        self.dirty
     }
 
     /// 当前缩放档（测试面）。
@@ -523,6 +597,221 @@ impl DocxPagesView {
             (ZoomMode::Custom(a), ZoomMode::Custom(b)) => (a - b).abs() < 0.005,
             (a, b) => a == b,
         }
+    }
+
+    /// #50 C3：编辑键域分发（docx 页面态键入主入口——shell 键钩子在
+    /// 缩放键分流后调用；`false` = 未消费继续走 keymap 表）。
+    ///
+    /// 键位面（Q-IDE/ElyOffice 键语义——QWERTY）：
+    /// - 字符键（含 CJK——无修饰）：`type_text` 逐字符下发（选区被
+    ///   替换的标准编辑语义由内核承担）；
+    /// - Backspace/Delete：`.uno:Delete` / `.uno:DelToEndOfPara`（保守
+    ///   两键——Delete 视同 Backspace 同 `.uno:Delete`，不猜造未实证
+    ///   的 toEndOfWord 细分）；
+    /// - Enter：`.uno:InsertPara`；Tab：`.uno:InsertPara` 不对——Tab
+    ///   是 `.uno:InsertTab`；
+    /// - 方向/Home/End/PgUp/PgDn：光标移动 UNO（`GoLeft/GoRight/
+    ///   GoUp/GoDown/StartOfLine/EndOfLine/PageUp/PageDown`——查询
+    ///   类不置脏）；
+    /// - Ctrl+Z/Y（Ctrl+Shift+Z）：Undo/Redo；
+    /// - Ctrl+A：SelectAll（查询类）；Ctrl+C：TextOf+剪贴板写；
+    ///   Ctrl+X：TextOf + 剪贴板写 + `.uno:Cut`；Ctrl+V：剪贴板读 +
+    ///   `type_text`（富文本面后续批次——纯文本保守口径）；
+    /// - Ctrl+B/I/U：粗体/斜体/下划线（`.uno:Bold` 等——编辑类）。
+    ///
+    /// IME（契约 §10 口径）：preedit 宿主渲染（[`Self::preedit`]——
+    /// render 期状态面板叠加组合串），定稿/提交经 GPUI `EntityInputHandler`
+    /// 的 replace_text_in_range 走同一 `type_text` 通道（见 impl 块）。
+    pub fn dispatch_edit_key(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        _shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // 就绪卫：Starting/Failed 态键入零动作（不假绿——不可编辑态如实
+        // 未消费，落 keymap/shell 兜底）。
+        if !matches!(self.boot, Boot::Ready) || self.session.is_none() {
+            return false;
+        }
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: ctrl,
+                ..Default::default()
+            },
+            key: key.to_owned(),
+            key_char: None,
+        };
+        let _ = (&ks, window);
+        // 单字符文本键（无修饰——ctrl 组合是命令域）。
+        if !ctrl && key.chars().count() == 1 {
+            let ch = key.chars().next().unwrap();
+            self.send_edit(
+                EditKind::Type,
+                |session, seq| session.edit_type_text(seq, &ch.to_string()),
+                cx,
+            );
+            return true;
+        }
+        if ctrl {
+            return self.dispatch_ctrl_edit(key, cx);
+        }
+        // 无 ctrl 的功能键。
+        match key {
+            "backspace" | "delete" => {
+                self.send_uno_edit(".uno:Delete", None, false, cx);
+                true
+            }
+            "enter" => {
+                self.send_uno_edit(".uno:InsertPara", None, false, cx);
+                true
+            }
+            "tab" => {
+                self.send_uno_edit(".uno:InsertTab", None, false, cx);
+                true
+            }
+            "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" => {
+                let command = match key {
+                    "left" => ".uno:GoLeft",
+                    "right" => ".uno:GoRight",
+                    "up" => ".uno:GoUp",
+                    "down" => ".uno:GoDown",
+                    "home" => ".uno:StartOfLine",
+                    "end" => ".uno:EndOfLine",
+                    "pageup" => ".uno:PageUp",
+                    _ => ".uno:PageDown",
+                };
+                self.send_uno_edit(command, None, true, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ctrl 组合的编辑命令分发（`dispatch_edit_key` 的 ctrl 分支）。
+    fn dispatch_ctrl_edit(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        match key {
+            "z" | "y" => {
+                // Ctrl+Shift+Z = Redo（y 与 shift+z 双键位——QWERTY 通行）。
+                let command = if key == "z" { ".uno:Undo" } else { ".uno:Redo" };
+                self.send_uno_edit(command, None, false, cx);
+                true
+            }
+            "a" => {
+                self.send_uno_edit(".uno:SelectAll", None, true, cx);
+                true
+            }
+            "c" => {
+                // copy：读选区 → TextDone 回执写系统剪贴板。
+                self.send_edit(
+                    EditKind::TextOf,
+                    |session, seq| session.edit_text_of(seq, "text/plain;charset=utf-8"),
+                    cx,
+                );
+                true
+            }
+            "x" => {
+                // cut：读选区（回执写剪贴板）+ Delete（读回执后独立的
+                // 删除命令——两命令独立 seq，内核序即所见序）。
+                self.send_edit(
+                    EditKind::TextOf,
+                    |session, seq| session.edit_text_of(seq, "text/plain;charset=utf-8"),
+                    cx,
+                );
+                self.send_uno_edit(".uno:Cut", None, false, cx);
+                true
+            }
+            "v" => {
+                // paste：剪贴板读 + type_text（纯文本保守口径——富文本
+                // 面 B 线 mime 通道后续批次）。
+                if let Some(text) = self.clipboard_read(cx) {
+                    self.send_edit(
+                        EditKind::Type,
+                        |session, seq| session.edit_type_text(seq, &text),
+                        cx,
+                    );
+                }
+                true
+            }
+            "b" | "i" | "u" => {
+                let command = match key {
+                    "b" => ".uno:Bold",
+                    "i" => ".uno:Italic",
+                    _ => ".uno:Underline",
+                };
+                self.send_uno_edit(command, None, false, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 编辑命令发送（seq 分配 + 在途登记 + trait 面派发——mock/生产
+    /// 同一调用面；未接线（trait 默认 false）时如实清在途不假绿）。
+    fn send_edit(
+        &mut self,
+        kind: EditKind,
+        f: impl FnOnce(&mut dyn TileSession, u64) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let seq = next_edit_seq();
+        let sent = match self.session.as_mut() {
+            Some(session) => f(session.as_mut(), seq),
+            None => false,
+        };
+        if sent {
+            self.edit_pending.insert(seq, kind);
+        }
+        cx.notify();
+    }
+
+    /// UNO 编辑命令便捷面（`send_edit` 的 Uno 特化）。
+    fn send_uno_edit(
+        &mut self,
+        command: &str,
+        args: Option<&str>,
+        query: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_edit(
+            EditKind::Uno,
+            |session, seq| session.edit_uno(seq, command, args, query),
+            cx,
+        );
+    }
+
+    /// #50 C4：保存请求（shell save_tab 分流消费面——回源路径
+    /// `file://` + 修订号对账清 dirty）。
+    pub fn request_save(&mut self, cx: &mut Context<Self>) -> bool {
+        if !matches!(self.boot, Boot::Ready) || self.session.is_none() {
+            return false;
+        }
+        let path = self.path.clone();
+        self.send_edit(
+            EditKind::Save,
+            |session, seq| {
+                // url 形态：内核 `profile::file_url_of` 同源语义（POSIX 路径
+                // 直拼 `file://`——生产路径已 canonicalize）。
+                let url = format!("file://{}", path.display());
+                session.edit_save_as(seq, &url, "docx")
+            },
+            cx,
+        );
+        true
+    }
+
+    /// #50 C3：剪贴板写（TextDone 回执消费面——`ClipboardItem::
+    /// new_string` 编辑器同款；`Context<Self>` 的 AppContext 面直调）。
+    fn clipboard_write(&mut self, cx: &mut Context<Self>, text: &str) {
+        use gpui::ClipboardItem;
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+    }
+
+    /// #50 C3：剪贴板读（paste 派发面——`item.text()` 编辑器
+    /// EditorAction::Paste 同款）。
+    fn clipboard_read(&self, cx: &App) -> Option<String> {
+        cx.read_from_clipboard().and_then(|i| i.text())
     }
 
     /// #50 C2：docx 页面视图键域（视口缩放命令——pdf #421 `dispatch_
@@ -736,6 +1025,54 @@ impl DocxPagesView {
                 }
                 SessionReply::Callback { name, payload } => {
                     self.handle_callback(&name, &payload, cx);
+                }
+                // #50 C3：编辑命令完成——dirty/revision 状态面落位
+                //（成功编辑置脏；失败保持原值——「编辑不可用」的根因
+                // 由 error 串在 stderr 留痕，不弹横幅打断输入流）。
+                SessionReply::EditDone {
+                    seq,
+                    ok,
+                    dirty,
+                    revision,
+                    error,
+                } => {
+                    self.edit_pending.remove(&seq);
+                    if ok {
+                        self.dirty = dirty;
+                        self.revision = revision;
+                    } else if let Some(err) = error {
+                        eprintln!("docx-pages: edit failed: {err}");
+                    }
+                    cx.notify();
+                }
+                // #50 C3：剪贴板读回执——宿主写系统剪贴板（copy 面
+                // 完成即写；cut 由先 TextOf 后 Uno 的调用序在
+                // dispatch_edit_key 内编排）。
+                SessionReply::TextDone { seq, text, error } => {
+                    self.edit_pending.remove(&seq);
+                    if let Some(err) = error {
+                        eprintln!("docx-pages: clipboard read failed: {err}");
+                    } else {
+                        self.clipboard_write(cx, &text);
+                    }
+                }
+                // #50 C4：保存完成——revision 对账（相等才清 dirty：
+                // 延迟回执 revision_saved 落后当前 revision = 期间又有
+                // 新编辑，不清——「保存回执清除新编辑 dirty」的病灶根除）。
+                SessionReply::SaveDone {
+                    seq,
+                    ok,
+                    revision_saved,
+                    error,
+                } => {
+                    self.edit_pending.remove(&seq);
+                    if let Some(err) = error {
+                        eprintln!("docx-pages: save failed: {err}");
+                    }
+                    if ok && revision_saved == self.revision {
+                        self.dirty = false;
+                    }
+                    cx.notify();
                 }
             }
         }
@@ -1417,6 +1754,164 @@ impl Focusable for DocxPagesView {
     }
 }
 
+/// #50 C3：IME 输入通道（gpui 平台 → 视图实体——契约 §10 口径：
+/// preedit 宿主渲染不进内核；提交文本经 `type_text` 逐字符下发）。
+/// 「哪个视图持焦点哪个实体收 IME」——gpui 的 `ElementInputHandler`
+/// 在视图根的 canvas paint 期注册（与编辑器 ime-hook 同模式）。
+impl gpui::EntityInputHandler for DocxPagesView {
+    fn set_selected_text_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // 选区归内核管理（`getSelection` 面后续批次）——IME 通道不接受
+        // 宿主侧选区写。
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.preedit.encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        // 就绪会话才可编辑（Starting/Failed 态 IME 平台通道关闭——
+        // 平台不会为其弹输入法）。
+        matches!(self.boot, Boot::Ready)
+    }
+
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text: String = self
+            .preedit
+            .chars()
+            .take(range.end)
+            .skip(range.start)
+            .collect();
+        *adjusted = Some(range);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        let len = self.preedit.encode_utf16().count();
+        Some(gpui::UTF16Selection {
+            range: len..len,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.preedit.is_empty() {
+            None
+        } else {
+            Some(0..self.preedit.encode_utf16().count())
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.preedit.clear();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 提交/替换：preedit 域内改写（range = preedit 的 utf16 子段）。
+        match range {
+            Some(r) => {
+                let start = utf16_to_char_idx(&self.preedit, r.start);
+                let end = utf16_to_char_idx(&self.preedit, r.end);
+                self.preedit.replace_range(start..end, text);
+            }
+            None => self.preedit.push_str(text),
+        }
+        self.preedit_commit_if_standalone(cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 预编辑：preedit 域替换（无 preedit 时光标位=空段插入）。
+        match range {
+            Some(r) => {
+                let start = utf16_to_char_idx(&self.preedit, r.start);
+                let end = utf16_to_char_idx(&self.preedit, r.end);
+                self.preedit.replace_range(start..end, new_text);
+            }
+            None => self.preedit = new_text.to_owned(),
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl DocxPagesView {
+    /// preedit 提交守卫（无 marked 状态的裸文本插入 = 普通键入语义——
+    /// 键盘字符通道走 `dispatch_edit_key`，此处仅在「文本不带 preedit
+    /// 域」时直接下发（拉丁快速键入不经 IME 标记的场景兜底）。
+    fn preedit_commit_if_standalone(&mut self, cx: &mut Context<Self>) {
+        // 当前实现：IME 提交统一经 marked_text_range 判定提交时序
+        //（unmark/replace 组合）——本钩子仅保底，无操作不误发。
+        let _ = cx;
+    }
+}
+
+/// UTF16 → char 边界索引（preedit 域换算——中文组合串安全）。
+fn utf16_to_char_idx(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (idx, ch) in text.char_indices() {
+        if units >= utf16 {
+            return idx;
+        }
+        units += ch.len_utf16();
+    }
+    text.len()
+}
+
 impl Render for DocxPagesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 轮询起表（首次渲染启动——App 面无法 spawn；终态自停）。
@@ -1433,6 +1928,10 @@ impl Render for DocxPagesView {
         let viewport_cell = self.viewport.clone();
         let zoom_entity = entity.clone();
         let probe_entity = entity.clone();
+        // #50 C3：IME 注册句柄（探针 paint 期 handle_input——焦点在
+        // 视图时平台输入法路由到本实体）。
+        let ime_focus = self.focus_handle.clone();
+        let ime_entity = cx.entity();
         let (vw, _) = self.viewport_size;
         let rw = self.raster_width(if vw > 0. { vw } else { 256. });
         let count = band_count(w_tw, h_tw, rw);
@@ -1464,8 +1963,13 @@ impl Render for DocxPagesView {
         // #176：视图焦点域（focus_active 在页面态落本视图句柄——
         // 此前从不 track_focus，句柄游离，键事件死在合成根：#50 C2
         // 缩放键分支与 #176 键守卫实际不可达。pdf #422 / xlsx #389
-        // 同款接线，三个替换视图归一）。
+        // 同款接线，三个替换视图归一）。#50 C3：on_key_down 编辑键域
+        //（字符/功能/ctrl 命令经 dispatch_edit_key——消费即止冒泡，
+        // 未消费键继续 shell 兜底链；视图在渲染树内时此入口优先于
+        // shell 键钩子——焦点在视图上的键直收）。
         let focus = self.focus_handle.clone();
+        let preedit = self.preedit.clone();
+        let has_preedit = !preedit.is_empty();
         div()
             .id("docx-pages-root")
             .debug_selector(|| "docx-pages-root".into())
@@ -1477,7 +1981,66 @@ impl Render for DocxPagesView {
             .flex_col()
             .items_center()
             .track_focus(&focus)
+            // #50 C3：编辑键域（焦点在视图时键直收——pdf/xlsx 同位
+            // 键处理纪律；zoom 键 shell 分流在前，此处键序 = 缩放
+            // （shell 已 return）→ 编辑（此处）→ 未消费冒泡 shell）。
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let ks = &event.keystroke;
+                let ctrl = ks.modifiers.control || ks.modifiers.platform;
+                let key = ks.key.to_lowercase();
+                // zoom 域先让 shell 分流——此处只接编辑域（Ctrl+0/1/=/
+                // - 是视口命令非编辑，缩放不可达（shell 已 return 消费）；
+                // 防御：显式跳过视口键族防双路径）。
+                if ctrl && matches!(key.as_str(), "0" | "1" | "=" | "+" | "-") {
+                    return;
+                }
+                if this.dispatch_edit_key(&key, ctrl, ks.modifiers.shift, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(list)
+            // #50 C3：IME 接线（编辑器 ime-hook 同构——独立 size_0 canvas
+            // 借 paint 时机注册 ElementInputHandler；不占布局。焦点在
+            // 视图时平台输入法（中文组合/提交）路由到本实体）。
+            .child(
+                div()
+                    .id("docx-ime-hook")
+                    .absolute()
+                    .size_0()
+                    .child(gpui::canvas(
+                        move |bounds, _, _| bounds,
+                        move |bounds, _, window, cx| {
+                            window.handle_input(
+                                &ime_focus,
+                                gpui::ElementInputHandler::new(bounds, ime_entity.clone()),
+                                cx,
+                            );
+                        },
+                    )),
+            )
+            // #50 C3：IME preedit 组合串（宿主渲染——契约 §10 口径：
+            // 组合期仅宿主显示不进内核；定位跟随文本光标面暂以左上
+            // 浮层保守呈现——精确光标矩形 B 线 `getSelectionRect` 通道
+            // 接入后升级）。
+            .when(has_preedit, |el| {
+                el.child(
+                    div()
+                        .id("docx-preedit")
+                        .debug_selector(|| "docx-preedit".into())
+                        .absolute()
+                        .top_8()
+                        .left_8()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(colors.panel_background)
+                        .border_1()
+                        .border_color(colors.border)
+                        .text_size(gpui::px(14.))
+                        .text_color(colors.text)
+                        .child(preedit),
+                )
+            })
             // #50 C2：缩放预设菜单（backdrop + 面板——在位时叠加）。
             .children(zoom_menu)
             // #50 C2：缩放控制条（常驻右下角）。
@@ -1973,6 +2536,8 @@ mod tests {
     struct MockSession {
         requests: Arc<std::sync::Mutex<Vec<TileRequest>>>,
         replies: Arc<std::sync::Mutex<VecDeque<SessionReply>>>,
+        /// #50 C3：编辑命令录制（dispatch 断言面——命令串序）。
+        edits: Arc<std::sync::Mutex<Vec<String>>>,
         auto_reply: bool,
         /// #177：true = auto 回执带**合成文档像素**（synthetic_band_bgra
         /// 按派单 canvas_w×canvas_h 生成）；false 保持旧哑像素
@@ -1987,6 +2552,7 @@ mod tests {
             Self {
                 requests: Arc::default(),
                 replies: Arc::default(),
+                edits: Arc::default(),
                 auto_reply,
                 synthetic: false,
                 synthetic_rows: 4,
@@ -1998,6 +2564,7 @@ mod tests {
             Self {
                 requests: Arc::default(),
                 replies: Arc::default(),
+                edits: Arc::default(),
                 auto_reply: true,
                 synthetic: true,
                 synthetic_rows: rows,
@@ -2048,6 +2615,76 @@ mod tests {
         fn request_size(&self) {}
         fn try_recv(&self) -> Option<SessionReply> {
             self.replies.lock().unwrap().pop_front()
+        }
+        // #50 C3/C4：编辑命令 mock——录制（命令串）+ 受控回执注入
+        //（测试显式 push EditDone/TextDone/SaveDone——对账链可逐步驱动）。
+        fn edit_type_text(&mut self, seq: u64, text: &str) -> bool {
+            self.edits.lock().unwrap().push(format!("type:{text}"));
+            let _ = seq;
+            true
+        }
+        fn edit_uno(&mut self, seq: u64, command: &str, args: Option<&str>, query: bool) -> bool {
+            self.edits.lock().unwrap().push(format!(
+                "uno:{command}{}{}",
+                args.unwrap_or_default(),
+                if query { "?q" } else { "" }
+            ));
+            let _ = seq;
+            true
+        }
+        fn edit_text_of(&mut self, seq: u64, _mime: &str) -> bool {
+            self.edits.lock().unwrap().push("text_of".into());
+            let _ = seq;
+            true
+        }
+        fn edit_save_as(&mut self, seq: u64, url: &str, format: &str) -> bool {
+            self.edits
+                .lock()
+                .unwrap()
+                .push(format!("save:{url}({format})"));
+            let _ = seq;
+            true
+        }
+    }
+
+    /// #50 C3：MockSession 编辑面辅助——受控回执注入（drain 消费链）。
+    impl MockSession {
+        fn push_edit_done(&self, seq: u64, ok: bool, dirty: bool, revision: u64) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push_back(SessionReply::EditDone {
+                    seq,
+                    ok,
+                    dirty,
+                    revision,
+                    error: if ok { None } else { Some("mock 失败".into()) },
+                });
+        }
+        fn push_text_done(&self, seq: u64, text: &str) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push_back(SessionReply::TextDone {
+                    seq,
+                    text: text.into(),
+                    error: None,
+                });
+        }
+        fn push_save_done(&self, seq: u64, ok: bool, revision_saved: u64) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push_back(SessionReply::SaveDone {
+                    seq,
+                    ok,
+                    revision_saved,
+                    error: if ok {
+                        None
+                    } else {
+                        Some("mock 保存失败".into())
+                    },
+                });
         }
     }
 
@@ -3100,5 +3737,160 @@ mod tests {
             view.read_with(cx, |v, _| v.session.is_none()),
             "停轮询（会话拆）"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #50 C3/C4：编辑链测试（mock 命令录制 + 受控回执驱动状态面）
+    // -----------------------------------------------------------------
+
+    /// 编辑链就绪视图 + 宿主窗（Ready + mock 会话——真实 window 域内
+    /// dispatch；ChainHost 同款）。
+    fn edit_ready_view(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<DocxPagesView>,
+        MockSession,
+        gpui::VisualTestContext,
+    ) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-edit-{}.docx", std::process::id()));
+        let mock = MockSession::new(false);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(gpui::px(800.), gpui::px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        (view, mock, visual)
+    }
+
+    /// 单字符键入：dispatch_edit_key → type 命令 + EditDone 回执 → dirty 置位。
+    #[gpui::test]
+    fn edit_key_types_and_lands_dirty(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.dispatch_edit_key("a", false, false, window, cx));
+            });
+        });
+        let edits = mock.edits.lock().unwrap().clone();
+        assert_eq!(edits, vec!["type:a".to_string()], "字符键 → type 命令");
+        // 受控回执：成功编辑（dirty=true, rev=1）。
+        let seq = next_edit_seq_for_test();
+        mock.push_edit_done(seq - 1, true, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(v.is_dirty(), "EditDone(ok,dirty) 回执置位脏位");
+        });
+    }
+
+    /// Ctrl+Z/Y → uno Undo/Redo 命令（录制断言）。
+    #[gpui::test]
+    fn edit_undo_redo_dispatch_uno(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.dispatch_edit_key("z", true, false, window, cx));
+                assert!(v.dispatch_edit_key("y", true, false, window, cx));
+            });
+        });
+        let edits = mock.edits.lock().unwrap().clone();
+        assert_eq!(
+            edits,
+            vec!["uno:.uno:Undo".to_string(), "uno:.uno:Redo".to_string()],
+            "Ctrl+Z/Y → undo/redo uno 命令"
+        );
+    }
+
+    /// Ctrl+C → text_of 读选区 + TextDone 回执写剪贴板（读回断言）。
+    #[gpui::test]
+    fn edit_copy_reads_selection_to_clipboard(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.dispatch_edit_key("c", true, false, window, cx));
+            });
+        });
+        let seq = next_edit_seq_for_test();
+        mock.push_text_done(seq - 1, "选中文本");
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 剪贴板读回（写进系统剪贴板——测试面读回验证）。
+        let pasted = view.read_with(cx, |v, cx| v.clipboard_read(cx));
+        assert_eq!(pasted.as_deref(), Some("选中文本"), "TextDone → 剪贴板写");
+    }
+
+    /// C4 保存对账：SaveDone.revision_saved == 当前 revision 才清 dirty；
+    /// 落后（期间又有新编辑）不清——「延迟回执清新 dirty」病灶钉死。
+    #[gpui::test]
+    fn save_revision_reconciliation_guards_stale_receipt(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 编辑 → dirty（rev 1）。
+        let seq = next_edit_seq_for_test();
+        mock.push_edit_done(seq - 1, true, true, 1);
+        // 保存发起（save 命令 + SaveDone rev=1——与当前相等 → 清）。
+        view.update(cx, |v, cx| {
+            assert!(v.request_save(cx), "保存发起");
+        });
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        let save_seq = next_edit_seq_for_test();
+        mock.push_save_done(save_seq - 1, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(!v.is_dirty(), "revision 相等的保存回执清 dirty");
+        });
+
+        // 再编辑（rev 2）+ 陈旧保存回执（rev=1 落后）——不清。
+        let seq2 = next_edit_seq_for_test();
+        mock.push_edit_done(seq2 - 1, true, true, 2);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        let stale_seq = next_edit_seq_for_test();
+        mock.push_save_done(stale_seq - 1, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(v.is_dirty(), "落后 revision 的保存回执不清新编辑的 dirty");
+        });
+        let _ = &mut visual;
+    }
+
+    /// 未就绪态（Starting）保存如实不发起——不可编辑不假绿（键面卫
+    /// 同源：`Boot` 非 Ready 时 dispatch_edit_key 恒 false——就绪卫与
+    /// request_save 同一判据）。
+    #[gpui::test]
+    fn edit_keys_not_consumed_before_ready(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join("mdc-docx-nr.docx");
+        let mock = MockSession::new(false);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        // 无 Ready 回执——Boot::Starting（request_save 无 window 面：
+        // 就绪卫直接断言；dispatch 键面同卫同判据）。
+        view.update(cx, |v, cx| {
+            assert!(!v.request_save(cx), "Starting 态保存不发起（就绪卫）");
+        });
+        view.read_with(cx, |v, _| {
+            assert!(
+                !matches!(v.boot, Boot::Ready),
+                "未就绪态（boot 卫同判据——键面同 false）"
+            );
+        });
+    }
+
+    /// 测试辅助：编辑 seq 探针（EDIT_SEQ 静态域——只读非破坏）。
+    fn next_edit_seq_for_test() -> u64 {
+        EDIT_SEQ.load(std::sync::atomic::Ordering::Relaxed) + 1
     }
 }

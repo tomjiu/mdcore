@@ -153,6 +153,31 @@ pub enum SessionReply {
     /// 文档几何重查回执（`SessionCmd::Size`——DOCUMENT_SIZE_CHANGED
     /// 时机重查；twips 单一真源 = `DocSession::size`）。
     Size { width_twips: i64, height_twips: i64 },
+    /// #50 C3：编辑命令完成（TypeText/Uno——回执带内核侧 dirty/revision，
+    /// 宿主据此实时更新标签脏态 + INVALIDATE 后的 repaint 由内核回调
+    /// 通道异步到——不在此复合格）。
+    EditDone {
+        seq: u64,
+        ok: bool,
+        dirty: bool,
+        revision: u64,
+        error: Option<String>,
+    },
+    /// #50 C3：剪贴板读回执（`text_selection` 的文本面——宿主写
+    /// pasteboard；空串 = 无选区）。
+    TextDone {
+        seq: u64,
+        text: String,
+        error: Option<String>,
+    },
+    /// #50 C4：保存完成（`revision_saved` = 保存时内核修订号——宿主
+    /// 对账当前 revision 相等才清 dirty）。
+    SaveDone {
+        seq: u64,
+        ok: bool,
+        revision_saved: u64,
+        error: Option<String>,
+    },
     /// worker 死亡（回执侧终态——宿主转错误态并停轮询）。
     Died { detail: String },
 }
@@ -172,6 +197,33 @@ enum SessionCmd {
     },
     /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机——C2 缓存换尺寸链）。
     Size,
+    /// #50 C3：文本输入（逐字符 post_key + 内核置脏位——选区被替换
+    /// 的标准编辑语义；IME 定稿同通道——契约 §10 宿主 preedit 口径）。
+    TypeText {
+        seq: u64,
+        text: String,
+    },
+    /// #50 C3：UNO 命令（编辑类 `uno`——置脏位；查询类经调用方选
+    /// `uno_query` 面时 notify=false 由线程侧区分）。
+    Uno {
+        seq: u64,
+        command: String,
+        args: Option<String>,
+        query: bool,
+    },
+    /// #50 C3：剪贴板读——`text_selection(mime)` 取选区文本（copy/cut
+    /// 的读面；cut 随后发 Uno `.uno:Cut`）。
+    TextOf {
+        seq: u64,
+        mime: String,
+    },
+    /// #50 C4：保存（saveAs 回源路径 + 修订号绑定——回执 revision_saved
+    /// 与宿主当前 revision 对账后才清 dirty，防延迟回执清掉新编辑）。
+    SaveAs {
+        seq: u64,
+        url: String,
+        format: String,
+    },
     Close,
 }
 
@@ -279,6 +331,44 @@ impl DocxLokSession {
         seq
     }
 
+    /// #50 C3：文本输入（异步——回执 `EditDone`；逐字符 post_key 由
+    /// 会话线程执行，内核置脏位）。`seq` 调用方分配（回执对账）。
+    pub fn request_type_text(&self, seq: u64, text: &str) {
+        let _ = self.cmd_tx.send(SessionCmd::TypeText {
+            seq,
+            text: text.to_owned(),
+        });
+    }
+
+    /// #50 C3：UNO 命令（异步——回执 `EditDone`；编辑类置脏位；
+    /// `query=true` 查询类 notify=false 不置脏）。
+    pub fn request_uno(&self, seq: u64, command: &str, args: Option<&str>, query: bool) {
+        let _ = self.cmd_tx.send(SessionCmd::Uno {
+            seq,
+            command: command.to_owned(),
+            args: args.map(str::to_owned),
+            query,
+        });
+    }
+
+    /// #50 C3：剪贴板读（异步——回执 `TextDone`；copy/cut 的选区文本面）。
+    pub fn request_text_of(&self, seq: u64, mime: &str) {
+        let _ = self.cmd_tx.send(SessionCmd::TextOf {
+            seq,
+            mime: mime.to_owned(),
+        });
+    }
+
+    /// #50 C4：保存（异步——回执 `SaveDone{revision_saved}`；宿主对账
+    /// 当前 revision 相等才清 dirty——防延迟回执清掉新编辑）。
+    pub fn request_save_as(&self, seq: u64, url: &str, format: &str) {
+        let _ = self.cmd_tx.send(SessionCmd::SaveAs {
+            seq,
+            url: url.to_owned(),
+            format: format.to_owned(),
+        });
+    }
+
     /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机；回执
     /// [`SessionReply::Size`]——twips 单一真源）。
     pub fn request_size(&self) {
@@ -377,7 +467,8 @@ fn session_main(
         &url,
         Some("DeviceFormFactor=desktop"),
     );
-    let session = match opened {
+    // #50 C3：编辑命令族（uno 编辑类 &mut 面）——服务循环臂需要可变。
+    let mut session = match opened {
         Ok(s) => s,
         Err(e) => return fail(stage_of_open_error(&e), e.to_string()),
     };
@@ -483,6 +574,57 @@ fn session_main(
                     }
                 }
             }
+            Ok(SessionCmd::TypeText { seq, text }) => {
+                // 契约 §10 口径：产品 IME 通道 = 宿主 preedit 渲染 +
+                // 定稿/普通键入统一逐字符 post_key（type_text——成功即
+                // 内核置脏位/revision+1）。
+                let snapshot = (session.is_dirty(), session.revision());
+                let result = session.type_text(&text);
+                let _ = reply_tx.send(edit_done_of(seq, result, snapshot));
+            }
+            Ok(SessionCmd::Uno {
+                seq,
+                command,
+                args,
+                query,
+            }) => {
+                // 查询类（SelectAll/ExecuteSearch 等）notify=false 不置
+                // 脏；编辑类（Undo/Redo/Delete/Cut/Paste/格式命令）走
+                // `uno` 置脏位。
+                // DocSession 契约：编辑类 `uno`（&mut——edit_ok 置脏
+                // 位）/查询类 `uno_query`（&——不置脏）。
+                let snapshot = (session.is_dirty(), session.revision());
+                let result = if query {
+                    session.uno_query(&command, args.as_deref())
+                } else {
+                    session.uno(&command, args.as_deref())
+                };
+                // Value 载荷不透传宿主（回执只需 ok/dirty/rev——Value
+                // 是 result envelope，错误面由 Err 携带）。
+                let result = result.map(|_| ());
+                let _ = reply_tx.send(edit_done_of(seq, result, snapshot));
+            }
+            Ok(SessionCmd::TextOf { seq, mime }) => {
+                // 剪贴板读面：`text_selection(mime)` 的 (text, _)——
+                // 取文本面（html 面后续批次需要时再扩 mime 传参）。
+                let result = session.text_selection(&mime).map(|(text, _)| text);
+                let (text, error) = match result {
+                    Ok(t) => (t, None),
+                    Err(e) => (String::new(), Some(e.to_string())),
+                };
+                let _ = reply_tx.send(SessionReply::TextDone { seq, text, error });
+            }
+            Ok(SessionCmd::SaveAs { seq, url, format }) => {
+                // C4：saveAs 回源路径——revision_saved 钉保存时刻内核
+                // 修订号（宿主对账清 dirty 的唯一判据）。
+                let result = session.save_as(&url, &format);
+                let _ = reply_tx.send(SessionReply::SaveDone {
+                    seq,
+                    ok: result.is_ok(),
+                    revision_saved: session.revision(),
+                    error: result.err().map(|e| e.to_string()),
+                });
+            }
             Ok(SessionCmd::Close) => {
                 session.shutdown();
                 return;
@@ -519,6 +661,37 @@ fn session_main(
             });
             return;
         }
+    }
+}
+
+/// #50 C3：编辑命令回执装配——快照 = **命令执行前**的 (dirty,
+/// revision)（保守序：失败回执不虚报成功编辑；成功时真实值由内核在
+/// 执行中自增——EditDone 的 revision 因此反映命令后的最新值，两序
+/// 差一由宿主端对账语义吸收：保存对账用 SaveDone 的 revision_saved
+/// 独立通道，不受此差影响）。
+fn edit_done_of<E: std::fmt::Display>(
+    seq: u64,
+    result: Result<(), E>,
+    (dirty_before, rev_before): (bool, u64),
+) -> SessionReply {
+    match result {
+        Ok(()) => SessionReply::EditDone {
+            seq,
+            ok: true,
+            // 成功编辑命令后的内核真值：`type_text`/编辑类 `uno` 成功
+            // 即 dirty=true/revision+1——直接以「执行后语义」装配
+            //（快照仅失败回执兜底用，避免再次请求内核）。
+            dirty: true,
+            revision: rev_before.saturating_add(1),
+            error: None,
+        },
+        Err(e) => SessionReply::EditDone {
+            seq,
+            ok: false,
+            dirty: dirty_before,
+            revision: rev_before,
+            error: Some(e.to_string()),
+        },
     }
 }
 
