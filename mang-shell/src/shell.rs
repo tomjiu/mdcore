@@ -2312,6 +2312,34 @@ impl ShellApp {
         self.menu_bar_open = None;
         self.focus_active(window, cx);
         use menu_bar::MenuAction as Act;
+        // #50 C3（#176 翻新）：docx 页面态——剪贴板/Cmd 编辑动作分流到
+        // 页视图编辑通道（同键位域 dispatch_edit_key 一条链）。undo/
+        // redo/cut/copy/paste 页面已可编辑（PR #217 后置灰原因退役；
+        // 查找/替换/面板是编辑器浮层仍置灰——menu_bar 门控区分对待）。
+        if self.docx_page_view_active(cx) {
+            if let Some((_, entity)) = self.docx_pages.clone() {
+                let mut consumed = false;
+                entity.update(cx, |view, cx| {
+                    consumed = match action {
+                        Act::EditorCmd(crate::editor::commands::Cmd::Undo) => {
+                            view.dispatch_edit_key("z", true, false, window, cx);
+                            true
+                        }
+                        Act::EditorCmd(crate::editor::commands::Cmd::Redo) => {
+                            view.dispatch_edit_key("y", true, false, window, cx);
+                            true
+                        }
+                        Act::Cut => view.dispatch_edit_key("x", true, false, window, cx),
+                        Act::Copy => view.dispatch_edit_key("c", true, false, window, cx),
+                        Act::Paste => view.dispatch_edit_key("v", true, false, window, cx),
+                        _ => false,
+                    };
+                });
+                if consumed {
+                    return;
+                }
+            }
+        }
         match action {
             Act::EditorCmd(cmd) => self.dispatch_editor_cmd(cmd, window, cx),
             // 剪贴板三件：Cmd 枚举无剪贴板项——Editor 菜单方法（右键
