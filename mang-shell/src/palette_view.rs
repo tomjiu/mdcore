@@ -7,20 +7,22 @@
 //! 与浮层容器（#385 批 3b：浮层视觉壳已换 `ui::Popover`）。
 //! 本模块提供 [`palette_sections`]，让编辑器在渲染时按分组取数据。
 
-use gpui::{App, SharedString, px};
+use gpui::{App, FontWeight, SharedString, px};
 use ui::prelude::*;
 use ui::{ListHeader, ListItem};
 
 use crate::command_groups::{Entry, Group, RecentRing, Section, build_sections, flatten};
 use crate::editor::commands::{self, Cmd};
+use std::collections::HashSet;
 
 /// 最近使用容量（面板顶部固定区长度）。
 pub const RECENT_CAPACITY: usize = 4;
 
 /// 计算面板当前应显示的段（查询 → 分组）。
 pub fn palette_sections(query: &str, recent: &RecentRing) -> Vec<Section> {
-    let results = commands::search(query);
-    build_sections(&results, recent)
+    // #112 P1：结果附命中下标集（高亮随条目走）。
+    let results = commands::search_with_highlights(query);
+    build_sections(query, &results, recent)
 }
 
 /// 扁平命令序（键盘上下移动的遍历域）。
@@ -51,17 +53,40 @@ pub fn palette_list(
         }
         // 段标题（最近使用 / 文件 / 编辑 / 导航 / 视图 / 帮助）。
         col = col.child(ListHeader::new(section.group.title()));
-        for Entry { cmd, index } in &section.entries {
+        for Entry {
+            cmd,
+            index,
+            highlights,
+        } in &section.entries
+        {
             if drawn >= max_rows {
                 break;
             }
             drawn += 1;
             let is_sel = *index == selected;
+            // #112 P1（命中片段高亮）：子序列命中的字符用 accent 色强调
+            // （其余字符保持正文色）——长命令列表快速视觉定位。命中
+            // 下标集基于小写标题的 char 位置（match_positions 口径），
+            // 渲染按原文 char 序拼 span（下标集即原文等价下标）。
+            let hl: HashSet<usize> = highlights.iter().copied().collect();
+            let mut title_row = div().flex().flex_row().flex_wrap().gap_0();
+            for (ci, ch) in cmd.title().chars().enumerate() {
+                let hit = hl.contains(&ci);
+                title_row = title_row.child(
+                    div()
+                        .when(hit, |el| {
+                            el.text_color(colors.text_accent)
+                                .font_weight(FontWeight::BOLD)
+                        })
+                        .when(!hit, |el| el.text_color(colors.text))
+                        .child(ch.to_string()),
+                );
+            }
             col = col.child(
                 ListItem::new(SharedString::from(format!("pal-row-{index}")))
                     .inset(true)
                     .toggle_state(is_sel)
-                    .child(div().text_color(colors.text).child(cmd.title()))
+                    .child(title_row)
                     .end_slot(
                         div()
                             .text_size(px(11.))

@@ -602,7 +602,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -671,7 +671,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -754,7 +754,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -826,7 +826,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -897,7 +897,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -965,7 +965,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -1650,6 +1650,8 @@ impl Editor {
                     // #183 A-3：面板执行的命令记入最近使用（下次打开面板
                     // 顶部「最近使用」段可见——分组渲染接线的记账面）。
                     self.palette_recent.touch(c);
+                    // #112 P1：MRU 落盘（跨重启——Enter 执行即记账即持久化）。
+                    self.persist_palette_recent();
                     self.exec_command(c, window, cx);
                 }
             }
@@ -1673,6 +1675,28 @@ impl Editor {
 
     /// #183 A-3：查询 → 分组装配 → 扁平序（键入/打开时算；渲染期按
     /// 段重算——同一纯函数链，结果一致）。
+    fn restore_palette_recent() -> RecentRing {
+        // #112 P1（MRU 持久化）：跨重启恢复最近使用命令（settings
+        // `palette.recent`——稳定名反解；未知名跳过，容量截断同语义）。
+        let mut ring = RecentRing::new(palette_view::RECENT_CAPACITY);
+        for name in crate::settings::load_palette_recent() {
+            if let Some(c) = commands::from_key_name(&name) {
+                ring.touch(c);
+            }
+        }
+        ring
+    }
+
+    fn persist_palette_recent(&self) {
+        // #112 P1：write-through 落盘（容量 4 的微 JSON——无需防抖）。
+        let names: Vec<String> = self
+            .palette_recent
+            .iter()
+            .map(|c| c.key_name().to_string())
+            .collect();
+        crate::settings::save_palette_recent(&names);
+    }
+
     fn palette_flat_of(query: &str, recent: &RecentRing) -> Vec<Cmd> {
         palette_view::palette_flat(&palette_view::palette_sections(query, recent))
     }
@@ -6516,6 +6540,9 @@ mod palette_goto_interaction_tests {
         let (ed, window) = pal_window(cx, "# A\nbody\n");
         ed.update(cx, |ed, _| {
             assert!(ed.find.is_none(), "前置：查找条未开");
+            // #112 P1：构造点会从 settings 恢复 MRU（持久化接线后
+            // 本机/前序测试可能留档）——单测前置显式清零回到旧假设。
+            ed.palette_recent = crate::command_groups::RecentRing::new(4);
             assert!(!ed.palette_recent.contains(Cmd::OpenFind), "前置：无记账");
         });
         let _ = window.update(cx, |_host, window, cx| {
@@ -6611,5 +6638,90 @@ mod palette_goto_interaction_tests {
             assert!(ed.goto.is_none(), "Esc 关框");
             assert_eq!(ed.buffer.cursor().line, 4, "关框不移动光标");
         });
+    }
+    /// #112 P1（MRU 持久化）：跨「重启」回放真链——
+    /// XDG_CONFIG_HOME 重定向 temp 目录 → 构造点恢复 → 面板顶部最近段可见。
+    #[gpui::test]
+    fn palette_recent_survives_restart(cx: &mut gpui::TestAppContext) {
+        let cfg = std::env::temp_dir().join(format!("mdc-112p1-mru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg);
+        std::fs::create_dir_all(&cfg).unwrap();
+        // 隔离本测试的 XDG（进程级 env——测试串行段内安全；测后还原）。
+        // SAFETY：gpui::test 串行执行段内，本进程无其他线程读 env
+        //（config 读取同在此线程）；测尾还原。
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg) };
+        // 预置旧档：Save 最新在前。
+        crate::settings::save_palette_recent(&["Save".to_string(), "OpenFind".to_string()]);
+
+        // 「重启后」的编辑器——构造点走 restore_palette_recent 真链。
+        let (ed, _window) = pal_window(cx, "# t\n正文");
+        assert!(
+            ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::Save)),
+            "恢复 Save（最新在前档）"
+        );
+        assert!(
+            ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::OpenFind)),
+            "恢复 OpenFind"
+        );
+        // 面板空查询 → 最近段在最前且含两条（palette_sections 真链）。
+        let sections = crate::palette_view::palette_sections(
+            "",
+            &ed.read_with(cx, |this, _| {
+                let mut r = crate::command_groups::RecentRing::new(4);
+                for c in this.palette_recent.iter() {
+                    r.touch(c);
+                }
+                r
+            }),
+        );
+        assert!(matches!(
+            sections.first().map(|s| s.group),
+            Some(crate::command_groups::Group::Recent)
+        ));
+        assert_eq!(sections[0].entries.len(), 2, "最近段两条");
+
+        // touch 落盘真链：面板 Enter 执行 GotoLine → settings 文件含 GotoLine。
+        let settings_json =
+            std::fs::read_to_string(cfg.join("mang/settings.json")).unwrap_or_default();
+        assert!(settings_json.contains("Save"), "预置档在盘");
+        ed.update(cx, |this, cx| {
+            this.palette_recent.touch(Cmd::GotoLine);
+            this.persist_palette_recent();
+            let _ = cx;
+        });
+        let after = std::fs::read_to_string(cfg.join("mang/settings.json")).unwrap();
+        assert!(after.contains("GotoLine"), "touch 即落盘（write-through）");
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let _ = std::fs::remove_dir_all(&cfg);
+    }
+
+    /// #112 P1（命中高亮）：palette_sections 高亮集贯通（查询 → Entry.highlights）。
+    #[gpui::test]
+    fn palette_sections_carry_highlights(cx: &mut gpui::TestAppContext) {
+        let (ed, _window) = pal_window(cx, "# t\n正文");
+        let recent = ed.read_with(cx, |this, _| {
+            let mut r = crate::command_groups::RecentRing::new(4);
+            for c in this.palette_recent.iter() {
+                r.touch(c);
+            }
+            r
+        });
+        let sections = crate::palette_view::palette_sections("移左", &recent);
+        // 「移左」命中「移动：左」——该 Entry 的 highlights = [0, 3]。
+        let hit = sections
+            .iter()
+            .flat_map(|s| s.entries.iter())
+            .find(|e| e.cmd == Cmd::MoveLeft)
+            .expect("移左 命中 移动：左");
+        assert_eq!(hit.highlights, vec![0, 3], "命中下标集贯通到条目");
+        // 空查询无高亮（等价展示）。
+        let all = crate::palette_view::palette_sections("", &recent);
+        assert!(
+            all.iter()
+                .flat_map(|s| s.entries.iter())
+                .all(|e| e.highlights.is_empty()),
+            "空查询零高亮"
+        );
     }
 }
