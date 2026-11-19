@@ -49,6 +49,10 @@ serde = { version = "1.0", features = ["derive"] }
 # #132 任务 2：正则查找（Cargo.lock 既有闭包——gpui 传递依赖 regex 1.13.1，
 # 此处只在清单里显式声明，**零新增 crate / 零 lock 变更**）。
 regex = "1.13"
+# #107 批④（2449 D3）：GBK/UTF-16 文档解码——encoding_rs 0.8.42 在
+# Cargo.lock 既有集合（gpui 传递依赖同版本），此处显式声明，
+# **零新增 crate / 零 lock 变更**（同 #132 regex 声明先例口径）。
+encoding_rs = "0.8"
 async-channel = "2.5"
 async-net = "2.0"
 futures-lite = "2.6"
