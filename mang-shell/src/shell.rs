@@ -672,7 +672,18 @@ impl ShellApp {
             tab.editor.read(cx).is_modified()
                 || self.xlsx_dirty_at(&tab.path, cx)
                 || self.pdf_view_dirty(cx, &tab.path)
+                // #50 C3/C4：docx 页面视图脏（EditDone 回执驱动的真实
+                // 脏位——关闭确认/退出确认从此对 LOK 编辑生效）。
+                || self.docx_page_dirty(cx, &tab.path)
         })
+    }
+
+    /// #50 C3/C4：指定路径的 docx 页面视图是否脏（Shell 持有的
+    /// `docx_pages` 槽按路径匹配——无页视图/路径不匹配 = 不脏）。
+    fn docx_page_dirty(&self, cx: &App, path: &Path) -> bool {
+        self.docx_pages
+            .as_ref()
+            .is_some_and(|(owned, entity)| *owned == path && entity.read(cx).is_dirty())
     }
 
     /// #386：指定路径的 pdf 页视图是否有未落盘批注（Shell 持有的
@@ -753,16 +764,32 @@ impl ShellApp {
                     .filter(|(owned, _)| *owned == tab.path)
                     .map(|_| tab.path.clone())
             });
-        if let Some(_owned) = docx_page_owned {
-            // #176 验收②：页面态保存不再静默——明确告知只读渲染无修改可存
-            // （outcome 仍 Unmodified：关闭/退出流程消费三态语义零变化，
-            // 零写盘保证也零变化）。
-            self.show_notice(
-                "DOCX 页面视图为只读渲染，没有可保存的修改——编辑请先切换到文本视图（状态栏「切换到文本视图」）"
-                    .into(),
-                cx,
-            );
-            return SaveOutcome::Unmodified;
+        if let Some(owned) = docx_page_owned {
+            // #50 C3/C4：页面态保存改走 LOK 会话（saveAs 回源路径 +
+            // 修订号对账清 dirty——C1 时期的只读提示退役：编辑面已接）。
+            // 干净态短路（Unmodified——关闭/退出三态语义保持）；脏态发
+            // `request_save`（异步回执 SaveDone——对账后自动清 dirty +
+            // toast；本调用返回 Saved 表「保存已发起」——失败面经回执
+            // toast 显式示警，不静默不假绿）。
+            let dirty = self
+                .docx_pages
+                .as_ref()
+                .is_some_and(|(o, e)| *o == owned && e.read(cx).is_dirty());
+            if !dirty {
+                return SaveOutcome::Unmodified;
+            }
+            let sent = self
+                .docx_pages
+                .as_ref()
+                .map(|(_, e)| e.clone())
+                .map(|entity| entity.update(cx, |view, cx| view.request_save(cx)))
+                .unwrap_or(false);
+            if !sent {
+                self.show_notice("保存未发起——LOK 会话不可用（详见应用日志）".into(), cx);
+                return SaveOutcome::Unmodified;
+            }
+            self.show_notice("保存中（LOK 内核写盘——完成后自动提示）".into(), cx);
+            return SaveOutcome::Saved;
         }
         if is_pdf {
             let tab_path = self.tabs.get(idx).map(|tab| tab.path.clone());
