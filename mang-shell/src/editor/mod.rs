@@ -1390,6 +1390,78 @@ impl Editor {
     /// 光标行随块移动、列保持；选区重映射为新位置（起于块首行首列、
     /// 止于块末行原列——与 Q-IDE 选区复位同型）。移动是编辑事务
     /// （replace_range 两段删除+插入）→ 撤销一键复原。
+    /// #111 P2 批⑦：复制行——光标（或选区覆盖的行块）整块复制到
+    /// 自身下方；光标/选区原地不动（一个原子 batch——undo 一键复原）。
+    /// 单行文档亦可复制（与删除行「末行保留」语义相异——复制无破坏）。
+    pub fn copy_line(&mut self) -> bool {
+        let Some((start, end, _sel_end_col)) = self.line_block_range() else {
+            return false;
+        };
+        // 光标原位（复制不动光标——事务后显式复位：合并窗会把光标
+        // 推到插入点后，破坏「原地不动」语义）。
+        let (cur_line, cur_col) = {
+            let c = self.buffer.cursor();
+            (c.line, c.col)
+        };
+        // 块文本（含内部换行——逐行拼）。
+        let block: String = (start.line..=end.line)
+            .map(|l| self.buffer.line(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 复制 = 块末行行尾插整块（原子事务——undo 一键复原）。
+        let edits = vec![(
+            Point::new(end.line + 1, 0),
+            Point::new(end.line + 1, 0),
+            format!("{block}\n"),
+        )];
+        let ok = self.buffer.replace_batch(edits) > 0;
+        if ok {
+            self.buffer.set_cursor(Point::new(cur_line, cur_col));
+        }
+        ok
+    }
+
+    /// #111 P2 批⑦：删除行——光标（或选区覆盖的行块）整块删除含
+    /// 换行；单行文档返回 false（不删到空文档——「删完内容」用选区
+    /// 删除即可达）。光标复位到删除点行首。
+    pub fn delete_line(&mut self) -> bool {
+        let Some((start, end, _sel_end_col)) = self.line_block_range() else {
+            return false;
+        };
+        let line_count = self.buffer.line_count();
+        // 单行文档保护：删了就空——语义拒（返回 false）。
+        if line_count <= 1 {
+            return false;
+        }
+        // 删除范围（三条路径）：
+        // ① 末块（含末行）：删块首行前的换行（前一行行尾到文档末）。
+        // ② 首块到文档末（= 全删——多行首块+末块）：[0,0] 到文档末。
+        // ③ 常规：块首行行首到块末下一行行首（含换行）。
+        let is_tail = end.line + 1 >= line_count;
+        let end_point = if is_tail {
+            if start.line == 0 {
+                // 全删场景（多行首块+末块）：[0,0] 到末行行尾。
+                let last_line = self.buffer.line(end.line);
+                Point::new(end.line, last_line.chars().count())
+            } else {
+                // 末块：删前一行行尾的换行 + 块（到文档末）。
+                let prev = self.buffer.line(start.line - 1);
+                Point::new(start.line - 1, prev.chars().count())
+            }
+        } else {
+            Point::new(end.line + 1, 0)
+        };
+        let edits = vec![(Point::new(start.line, 0), end_point, String::new())];
+        let ok = self.buffer.replace_batch(edits) > 0;
+        if ok {
+            // 光标复位：删除点行首（行号钳到新文档范围）。
+            let new_count = self.buffer.line_count();
+            self.buffer
+                .set_cursor(Point::new(start.line.min(new_count - 1), 0));
+        }
+        ok
+    }
+
     pub fn move_line_up(&mut self) -> bool {
         let Some((start, end, sel_end_col)) = self.line_block_range() else {
             return false;
@@ -1614,6 +1686,12 @@ impl Editor {
             Cmd::MoveDown => self.do_move(MultiMove::Down, false, false),
             // #111 D1：行移动（面板/RPC run_command 通道——与键位
             // Alt+↑/↓ 同链；只读拒与键位一致）。
+            Cmd::CopyLine => {
+                self.copy_line();
+            }
+            Cmd::DeleteLine => {
+                self.delete_line();
+            }
             Cmd::MoveLineUp => {
                 if self.read_only {
                     return;
@@ -2793,6 +2871,16 @@ impl Editor {
                     }
                     if self.move_line_up() {
                         self.after_edit();
+                    }
+                }
+                EditorAction::CopyLine => {
+                    if self.copy_line() {
+                        cx.notify();
+                    }
+                }
+                EditorAction::DeleteLine => {
+                    if self.delete_line() {
+                        cx.notify();
                     }
                 }
                 EditorAction::MoveLineDown => {
@@ -5713,6 +5801,56 @@ mod tests {
     /// 命令分发，不触发 persist_folds 落盘）。
     fn md_editor(cx: &mut gpui::TestAppContext, text: &str) -> gpui::Entity<Editor> {
         cx.update(|cx| cx.new(|cx| Editor::new(Some("notes.md".into()), text.to_string(), cx)))
+    }
+
+    /// #111 P2 批⑦：复制行——行块复制到自身下方（光标不动；undo
+    /// 一键复原）。先红面：copy_line/delete_line 方法不存在 = 编译红。
+    #[gpui::test]
+    fn copy_line_duplicates_below_keeps_cursor(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "aaa\nbbb\nccc");
+        ed.update(cx, |e, _| {
+            // 单行复制：bbb（行 1）复制到行 2；光标原地不动。
+            e.buffer.set_cursor(p(1, 2));
+            assert!(e.copy_line(), "中间行可复制");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "aaa\nbbb\nbbb\nccc",
+                "bbb 复制到自身下方"
+            );
+            assert_eq!(e.buffer.cursor().line, 1, "光标行不动");
+            assert_eq!(e.buffer.cursor().col, 2, "光标列不动");
+
+            // 多行块（选区覆盖 aaa+bbb）复制：块整体重复到下方。
+            e.buffer.set_selection(p(0, 0), p(2, 0));
+            assert!(e.copy_line(), "块复制成功");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "aaa\nbbb\naaa\nbbb\nbbb\nccc",
+                "块整体重复"
+            );
+        });
+    }
+
+    /// #111 P2 批⑦：删除行——整行删除含换行；单行文档保留语义
+    /// （不删到空——返回 false）。
+    #[gpui::test]
+    fn delete_line_removes_with_newline(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "aaa\nbbb\nccc");
+        ed.update(cx, |e, _| {
+            // 单行删除：bbb（行 1）整行含换行消失。
+            e.buffer.set_cursor(p(1, 1));
+            assert!(e.delete_line(), "中间行可删除");
+            assert_eq!(e.buffer.to_plain_text(), "aaa\nccc", "bbb 整行含换行删除");
+
+            // 多行块（选区 p(0,0)→p(2,0) 覆盖行 0-1）删除：余 ccc。
+            e.buffer.set_selection(p(0, 0), p(2, 0));
+            assert!(e.delete_line(), "块删除成功");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "ccc",
+                "行 0-1 块删除（选区尾行不含——line_block_range 口径）"
+            );
+        });
     }
 
     /// #111 D1：行移动 Alt+↑/↓（Q-IDE editing.rs:60-116 移植）。

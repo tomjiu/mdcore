@@ -352,6 +352,10 @@ pub enum EditorAction {
     PaletteToggle,
     /// #111 D1：Alt+↑ 行移动上移（光标/选区行块整块上移一行）。
     MoveLineUp,
+    /// #111 P2 批⑦：复制行。
+    CopyLine,
+    /// #111 P2 批⑦：删除行。
+    DeleteLine,
     /// #111 D1：Alt+↓ 行移动下移。
     MoveLineDown,
     /// 跳行框开启（原 Ctrl+G 前置分支；`goto.is_none()` 条件在执行层）。
@@ -482,6 +486,8 @@ impl EditorAction {
             EditorAction::PaletteToggle => "toggle_command_palette",
             EditorAction::GotoOpen => "goto_line",
             EditorAction::MoveLineUp => "move_line_up",
+            EditorAction::CopyLine => "copy_line",
+            EditorAction::DeleteLine => "delete_line",
             EditorAction::MoveLineDown => "move_line_down",
             EditorAction::MoveKey(MoveDir::Left) => "move_left",
             EditorAction::MoveKey(MoveDir::Right) => "move_right",
@@ -568,6 +574,8 @@ impl EditorAction {
             | EditorAction::UnfoldAll
             // #111 D1：行移动是编辑事务（undo 可复原）——只读态拒。
             | EditorAction::MoveLineUp
+            | EditorAction::CopyLine
+            | EditorAction::DeleteLine
             | EditorAction::MoveLineDown => false,
         }
     }
@@ -774,6 +782,16 @@ fn default_editor_main() -> Vec<Entry> {
         // （如 ctrl+shift+alt+up）归家族光标移动，move_family 全组合
         // 测试钉定）。只读物理守卫在键层拒（docx readonly_allows
         // up/down alt 分支——readonly_guard_invariant 不变量保持）。
+        // #111 P2 批⑦：Ctrl+D 复制行（IDE 惯例键——VS Code 同键位）。
+        e(
+            Binding::Single(KeyPattern::key("d").with(Yes, No, No)),
+            A::CopyLine,
+        ),
+        // #111 P2 批⑦：Ctrl+Shift+K 删除整行（VS Code 同键位）。
+        e(
+            Binding::Single(KeyPattern::key("k").with(Yes, Yes, No)),
+            A::DeleteLine,
+        ),
         e(
             Binding::Single(KeyPattern::key("up").with(No, No, Yes)),
             A::MoveLineUp,
