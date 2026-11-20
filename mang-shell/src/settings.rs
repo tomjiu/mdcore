@@ -99,6 +99,16 @@ pub fn load_session_tabs() -> (Vec<std::path::PathBuf>, usize) {
         .unwrap_or_default()
 }
 
+/// #114 P1④（#230 同型带入——本分支基面未合）：窗口矩形写（
+/// `window_bounds` 键 {x,y,w,h}）。
+pub fn save_window_bounds(x: f32, y: f32, w: f32, h: f32) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["window_bounds"] = serde_json::json!({ "x": x, "y": y, "w": w, "h": h });
+        save_to(&dir, &value);
+    }
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)

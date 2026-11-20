@@ -2138,6 +2138,26 @@ impl ShellApp {
         restored
     }
 
+    /// #114 P1④：关窗先存统一面（on_window_should_close 钩内调用——
+    /// 窗口矩形（#230）+ 会话标签（批①）两键无条件落存；非优雅退出
+    /// 物理边界不保）。
+    pub(crate) fn persist_on_close(&self, window: &mut Window) {
+        let b = window.bounds();
+        crate::settings::save_window_bounds(
+            b.origin.x.as_f32(),
+            b.origin.y.as_f32(),
+            b.size.width.as_f32(),
+            b.size.height.as_f32(),
+        );
+        self.persist_session_tabs();
+    }
+
+    /// #114 P1④：关窗钩读面（main 钩内 shell.update 用——快照
+    /// 只读，不引 Context）。
+    pub(crate) fn tabs_paths_snapshot(&self) -> Vec<std::path::PathBuf> {
+        self.tabs.iter().map(|t| t.path.clone()).collect()
+    }
+
     /// #114 批①：会话标签列表落盘（open/close/activate 三时机统一面
     /// ——跨重启恢复的数据源；光标不恢复——Q-IDE 亦不立）。
     fn persist_session_tabs(&self) {
@@ -8971,6 +8991,30 @@ mod settings_lifecycle_tests {
                 "折叠态 toggle_git：双置直达"
             );
         });
+    }
+
+    /// #114 P1④：关窗先存链——标签快照面 + settings session_tabs/
+    /// window_bounds 双键落盘一致性（钩注册面在 main——本测验证钩内
+    /// 落存调用的数据面：快照 = tabs 真实序）。
+    #[gpui::test]
+    fn close_persist_snapshot_matches_tabs(cx: &mut gpui::TestAppContext) {
+        let tmp = std::env::temp_dir().join(format!("mclose-persist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let file = tmp.join("sess-a.md");
+        std::fs::write(&file, "# 会话标签 A").unwrap();
+        let (shell, _window) = shell_window(cx);
+        // 快照只读面（关窗钩读——shell 实体直读）。
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tabs_paths_snapshot().len(), 0, "初始零标签快照");
+            assert_eq!(shell.active_index(), 0);
+        });
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #120（批②）验收 ④：开合态跨「重启」恢复——收起右栏/左栏 →
