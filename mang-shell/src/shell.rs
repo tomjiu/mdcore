@@ -2061,6 +2061,8 @@ impl ShellApp {
                     self.tabs.len(),
                     self.active
                 );
+                // #114 批①：开标签落盘（会话恢复数据源）。
+                self.persist_session_tabs();
                 // F2：文件树高亮同步（工作区打开时）。
                 if let Some(tree) = &self.workspace {
                     tree.update(cx, |tree, cx| {
@@ -2107,6 +2109,42 @@ impl ShellApp {
     }
 
     /// F3：激活标签（点击标签 / 重复打开既有文件 / 循环切换落地）。
+    /// #114 批①：启动会话恢复（settings 读 → 逐路径 open_document_tab
+    /// 既有链——报告 D1 约束：不动 docx/pdf/xlsx 编辑器构造链）。
+    /// 上限 20（防炸开）；已删文件静默跳过（Q-IDE 同语义）+ 恢复
+    /// 证据行；激活标签末位恢复（索引越界钳到尾）。返回恢复数。
+    pub fn restore_session_tabs(&mut self, cx: &mut Context<Self>) -> usize {
+        let (paths, active) = crate::settings::load_session_tabs();
+        if paths.is_empty() {
+            return 0;
+        }
+        let mut restored = 0;
+        for path in paths.into_iter().take(20) {
+            if !path.is_file() {
+                eprintln!("session-restore: 已删跳过 {}", path.display());
+                continue;
+            }
+            if self.tabs.iter().any(|t| t.path == path) {
+                continue; // 启动初始标签去重（CLI 直开同文件）
+            }
+            if self.open_document_tab(path, cx).is_some() {
+                restored += 1;
+            }
+        }
+        // 激活恢复（存档索引越界/文件被跳 → 钳到有效尾）。
+        let idx = active.min(self.tabs.len().saturating_sub(1));
+        let _ = self.activate_tab_focus(idx, cx);
+        eprintln!("session-restore: 恢复 {restored} 标签（active {idx}）");
+        restored
+    }
+
+    /// #114 批①：会话标签列表落盘（open/close/activate 三时机统一面
+    /// ——跨重启恢复的数据源；光标不恢复——Q-IDE 亦不立）。
+    fn persist_session_tabs(&self) {
+        let paths: Vec<std::path::PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        crate::settings::save_session_tabs(&paths, self.active);
+    }
+
     pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.activate_tab_focus(idx, cx) {
             window.focus(&focus, cx);
@@ -2117,6 +2155,8 @@ impl ShellApp {
     fn activate_tab_focus(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<FocusHandle> {
         let tab = self.tabs.get(idx)?.clone();
         self.active = idx;
+        // #114 批①：激活切换落盘（会话恢复——激活索引随变更即存）。
+        self.persist_session_tabs();
         // #571：激活编辑器变更 → 大纲面板换绑。
         self.sync_outline(cx);
         // #289-④：pdf 标签 → 页视图随标签落位（同路径复用，异路径重建）。
@@ -2273,6 +2313,8 @@ impl ShellApp {
             self.tabs.len(),
             self.active
         );
+        // #114 批①：关标签落盘（会话恢复——标签集即变更即存）。
+        self.persist_session_tabs();
         // #289-④：新活动标签若是 pdf → 页视图随标签重建。
         self.ensure_pdf_pages(cx);
         // #389 阶段 1：新活动标签若是 xlsx → 网格视图随标签重建。

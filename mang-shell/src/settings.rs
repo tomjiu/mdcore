@@ -59,6 +59,46 @@ pub fn save_indent_unit(key: &str) {
     }
 }
 
+/// #114 批①：会话标签列表读写（`session_tabs` 键：打开文件路径数组 +
+/// `session_active` 键：激活索引——沿 F2 先例；open/close/activate 三
+/// 时机统一落盘）。
+pub fn save_session_tabs(paths: &[std::path::PathBuf], active: usize) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["session_tabs"] = serde_json::Value::Array(
+            paths
+                .iter()
+                .map(|p| serde_json::json!(p.to_string_lossy()))
+                .collect(),
+        );
+        value["session_active"] = serde_json::json!(active);
+        save_to(&dir, &value);
+    }
+}
+
+pub fn load_session_tabs() -> (Vec<std::path::PathBuf>, usize) {
+    config_dir()
+        .map(|dir| load_from(&dir))
+        .map(|v| {
+            let paths = v
+                .get("session_tabs")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.as_str().map(std::path::PathBuf::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let active = v
+                .get("session_active")
+                .and_then(|i| i.as_u64())
+                .map(|u| u as usize)
+                .unwrap_or(0);
+            (paths, active)
+        })
+        .unwrap_or_default()
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)
@@ -455,6 +495,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #114 批①：session_tabs/session_active 写读往返（隔离 temp dir）。
+    #[test]
+    fn session_tabs_roundtrip() {
+        // 容器布局：XDG=container → config_dir=container/mang →
+        // settings.json=container/mang/settings.json。
+        let container = std::env::temp_dir().join(format!("m114-session-{}", std::process::id()));
+        let dir = container.join("mang");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["session_tabs"] = serde_json::Value::Array(vec![
+            serde_json::json!("/tmp/a.md"),
+            serde_json::json!("/tmp/b.pdf"),
+            serde_json::json!("/tmp/c.docx"),
+        ]);
+        value["session_active"] = serde_json::json!(1);
+        save_to(&dir, &value);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &container) };
+        let (paths, active) = super::load_session_tabs();
+        assert_eq!(paths.len(), 3, "三路径读回");
+        assert_eq!(paths[1], std::path::PathBuf::from("/tmp/b.pdf"));
+        assert_eq!(active, 1, "激活索引读回");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&container);
     }
 
     /// 工作区记忆往返（写入 → 读回 → 覆盖写 → 读回）。
