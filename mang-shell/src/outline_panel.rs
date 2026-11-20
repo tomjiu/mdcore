@@ -26,6 +26,7 @@
 //! 行身份按条目序号保留：编辑增加/删除前项时焦点留在原序号位置；
 //! 不把跳转目标行当作条目身份，同目标的不同书签不会共享焦点。
 
+use crate::button_ext::icon_button_36;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -153,6 +154,28 @@ impl OutlinePanel {
             }
             crate::settings::save_outline_collapsed(self.collapsed.iter().copied().collect());
         }
+    }
+
+    /// #108 P2 批④：全部折叠（全部可折叠头入折叠集——候选判定与
+    /// 渲染 foldable 同源：行 i 有更深子级即头；瞬时动作但落盘沿
+    /// 批③语义——折叠集是持久态）。
+    pub fn fold_all(&mut self) {
+        for i in 0..self.rows.len() {
+            if self
+                .rows
+                .get(i + 1)
+                .is_some_and(|next| next.level > self.rows[i].level)
+            {
+                self.collapsed.insert(i);
+            }
+        }
+        crate::settings::save_outline_collapsed(self.collapsed.iter().copied().collect());
+    }
+
+    /// #108 P2 批④：全部展开（折叠集清空——可见行集回全集）。
+    pub fn unfold_all(&mut self) {
+        self.collapsed.clear();
+        crate::settings::save_outline_collapsed(self.collapsed.iter().copied().collect());
     }
 
     /// #108 批②：可见行（分区折叠后——折叠头保留，其子行到下一
@@ -310,11 +333,50 @@ impl gpui::Render for OutlinePanel {
             .child(
                 List::new()
                     .header(
-                        ListHeader::new("文档结构").toggle(true).start_slot(
-                            Icon::new(IconName::ListTree)
-                                .size(IconSize::XSmall)
-                                .color(ui::Color::Muted),
-                        ),
+                        ListHeader::new("文档结构")
+                            .toggle(true)
+                            .start_slot(
+                                Icon::new(IconName::ListTree)
+                                    .size(IconSize::XSmall)
+                                    .color(ui::Color::Muted),
+                            )
+                            // #108 P2 批④：全部展开/全部折叠（面板头
+                            // 工具区——超越参照项，我方定义语义；作用折叠
+                            // 集整体——与批②折叠视图同数据源）。
+                            .end_slot(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        icon_button_36("outline-unfold-all", IconName::Plus)
+                                            .tooltip_text("全部展开")
+                                            .on_click({
+                                                let weak = cx.entity().downgrade();
+                                                move |_, _, cx| {
+                                                    if let Some(panel) = weak.upgrade() {
+                                                        panel.update(cx, |panel, _| {
+                                                            panel.unfold_all();
+                                                        });
+                                                    }
+                                                }
+                                            })
+                                            .build(window, cx),
+                                    )
+                                    .child(
+                                        icon_button_36("outline-fold-all", IconName::SquareMinus)
+                                            .tooltip_text("全部折叠")
+                                            .on_click({
+                                                let weak = cx.entity().downgrade();
+                                                move |_, _, cx| {
+                                                    if let Some(panel) = weak.upgrade() {
+                                                        panel.update(cx, |panel, _| {
+                                                            panel.fold_all();
+                                                        });
+                                                    }
+                                                }
+                                            })
+                                            .build(window, cx),
+                                    ),
+                            ),
                     )
                     .children(rows.iter().map(|(gindex, row)| {
                         let handle = row.focus_handle.clone();
@@ -452,6 +514,57 @@ mod tests {
     /// 面板 + 宿主窗口（开窗 → draw 一帧 → VisualTestContext；
     /// 主题初始化序列镜像 main.rs——ButtonLike/ListItem 渲染需
     /// GlobalThemeSettingsProvider）。
+    /// #108 P2 批④：全部折叠/全部展开——折叠候选全集入集/清空
+    /// （候选 = 有更深子级的头行——与渲染 foldable 同源判定）。
+    #[gpui::test]
+    fn fold_all_and_unfold_all_toggle_full_set(cx: &mut TestAppContext) {
+        let tmp = std::env::temp_dir().join(format!("m108-foldall-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let (_editor, panel, mut visual) =
+            panel_window(cx, "# A\nbody\n## A1\ntext\n# B\nmore\n## B1\ntail");
+        // 两 H1 头（行 0 与行 4）+ 一 H2 头（行 2 与行 6——B1）。
+        // 全部折叠：四个可折叠头全入集（H1×2 + H2×2）。
+        visual.update(|_window, cx| {
+            panel.update(cx, |panel, _| {
+                panel.fold_all();
+                // 大纲行集 = 标题行（A/A1/B/B1 四头）；可折叠候选 =
+                // 有更深子级的头：A 与 B（H1——A1/B1 是叶子 H2）。
+                assert_eq!(
+                    panel.collapsed.len(),
+                    2,
+                    "两个 H1 头全折叠（A1/B1 是叶子——实得 {}）",
+                    panel.collapsed.len()
+                );
+                // 全部折叠后可见行 = 全部标题行（H1 折叠只隐 H2——
+                // A1/B1 藏在 A/B 折叠区内）。
+                assert_eq!(
+                    panel.visible_rows_indexed().len(),
+                    2,
+                    "折叠后仅两 H1 头可见"
+                );
+            });
+        });
+        // 全部展开：清空回全集。
+        visual.update(|_window, cx| {
+            panel.update(cx, |panel, _| {
+                panel.unfold_all();
+                assert!(panel.collapsed.is_empty(), "折叠集清空");
+                assert_eq!(
+                    panel.visible_rows_indexed().len(),
+                    panel.rows.len(),
+                    "展开后全集可见"
+                );
+            });
+        });
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn panel_window(
         cx: &mut TestAppContext,
         text: &str,
