@@ -1632,9 +1632,18 @@ impl Editor {
         };
         let key = ks.key.to_lowercase();
         match key.as_str() {
+            // #112 P2 批④：Esc 两段式（Q-IDE vendor state.rs:602-615
+            // 对照）——查询非空先清查询（面板保持开，候选回全集 +
+            // 选中复位）；查询空才关面板回文档焦点。
             "escape" => {
-                self.palette = None;
-                self.focus_document_input(window, cx);
+                if !pal.query.is_empty() {
+                    pal.query.clear();
+                    Self::palette_refill(pal, &self.palette_recent);
+                    pal.selected = 0;
+                } else {
+                    self.palette = None;
+                    self.focus_document_input(window, cx);
+                }
             }
             "up" => pal.selected = pal.selected.saturating_sub(1),
             "down" => {
@@ -1652,6 +1661,14 @@ impl Editor {
                     self.palette_recent.touch(c);
                     self.exec_command(c, window, cx);
                 }
+            }
+            // #112 P2 批④：Ctrl/Alt 组合令旁路（Q-IDE R4 对照）——
+            // 面板只收纯字符与导航/回车/Esc；ctrl/alt 组合不吞
+            // （返回 false 冒泡编辑键层——Ctrl+F 开查找、Ctrl+S 保存
+            // 等在面板打开时照常可用）。Shift 单独不触发旁路（Shift+
+            // 字符是可打印入查询的大写形态）。
+            _ if ks.modifiers.control || ks.modifiers.alt => {
+                return false;
             }
             _ => {
                 let mut key = ks.clone();
@@ -6415,6 +6432,70 @@ mod palette_goto_interaction_tests {
 
     /// 开合 + 键入过滤 + ↑↓ 选中移动 + Esc 关闭 + 重开换新（状态桥四段）。
     #[gpui::test]
+    /// #112 P2 批④：Esc 两段式——查询非空先清查询（面板保持开，
+    /// 候选回全集）；查询空才关面板。先红面：现行为一步直接关。
+    #[gpui::test]
+    fn palette_esc_two_stage_clears_query_first(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        // 键入「折叠」——查询非空。
+        let _ = window.update(cx, |_host, window, cx| {
+            for ch in ["折", "叠"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+        });
+        // 第一记 Esc：清查询（面板保持开——两段式第一段）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("第一记 Esc 后面板保持开");
+            assert_eq!(pal.query, "", "Esc 第一段：清查询");
+            assert_eq!(
+                pal.items.len(),
+                commands::search("").len(),
+                "候选回全集（与空查询同源）"
+            );
+            assert_eq!(pal.selected, 0, "清查询后选中复位 0");
+        });
+        // 第二记 Esc：关面板（两段式第二段——回到一步语义）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "第二记 Esc：关面板");
+        });
+    }
+
+    /// #112 P2 批④：面板内 Ctrl 组合令旁路——Ctrl+F 在面板打开时
+    /// 照常打开查找框（面板不吞编辑类组合令——冲突裁决归编辑键层，
+    /// Q-IDE R4 对照）。先红面：现面板吞一切 ctrl 组合。
+    #[gpui::test]
+    fn palette_open_ctrl_combo_bypasses_to_editor(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        // 开面板。
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "前置：面板开");
+            assert!(ed.find.is_none(), "前置：查找框未开");
+        });
+        // 面板内 Ctrl+F：旁路执行（打开查找框——不被面板吞）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, ctrl("f"));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.find.is_some(), "Ctrl+F 旁路：查找框打开（面板不吞）");
+        });
+    }
+
     fn palette_open_type_navigate_esc_lifecycle(cx: &mut gpui::TestAppContext) {
         let (ed, window) = pal_window(cx, "# A\nbody\n");
         // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。
