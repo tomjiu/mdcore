@@ -59,6 +59,40 @@ pub fn save_indent_unit(key: &str) {
     }
 }
 
+/// #114 批②：窗口矩形读写（`window_bounds` 键：`{"x":…,"y":…,"w":…,"h":…}`
+/// ——沿 F2 工作区记忆先例；关窗先存跨重启恢复）。
+pub fn save_window_bounds(x: f32, y: f32, w: f32, h: f32) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["window_bounds"] = serde_json::json!({ "x": x, "y": y, "w": w, "h": h });
+        save_to(&dir, &value);
+    }
+}
+
+/// 读回 + 校验钳制（报告锚点 layout.rs:379-394 语义）：坏数据（负值/
+/// 小于最小 760×480）回 None（调用方走默认 96,64,1280,800）。
+pub fn load_window_bounds() -> Option<(f32, f32, f32, f32)> {
+    load_window_bounds_from(&config_dir()?)
+}
+
+/// 注入变体（测试隔离——目录直达）。
+pub fn load_window_bounds_from(dir: &Path) -> Option<(f32, f32, f32, f32)> {
+    let v = load_from(dir);
+    let o = v.get("window_bounds")?;
+    let (x, y, w, h) = (
+        o.get("x")?.as_f64()?,
+        o.get("y")?.as_f64()?,
+        o.get("w")?.as_f64()?,
+        o.get("h")?.as_f64()?,
+    );
+    // 校验：全正 + 不小于最小窗（760×480——WindowOptions window_min_size
+    // 同口径）；越界（屏不存在时 WM 自钳）不预判——只拒明显坏值。
+    if x < 0. || y < 0. || w < 760. || h < 480. || w > 16384. || h > 16384. {
+        return None;
+    }
+    Some((x as f32, y as f32, w as f32, h as f32))
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)
@@ -541,6 +575,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #114 批②：window_bounds 写读往返 + 坏数据校验回退（隔离
+    /// temp dir——load_from/save_to 私有面直达）。
+    #[test]
+    fn window_bounds_roundtrip_and_validation() {
+        let dir = temp_config("win-bounds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["window_bounds"] =
+            serde_json::json!({ "x": 120.0, "y": 80.0, "w": 1600.0, "h": 900.0 });
+        save_to(&dir, &value);
+        let back = super::load_window_bounds_from(&dir);
+        assert_eq!(back, Some((120., 80., 1600., 900.)), "合法矩形读回");
+        // 坏数据：负 origin / 小于最小窗 → None（调用方走默认）。
+        let mut bad = load_from(&dir);
+        bad["window_bounds"] = serde_json::json!({ "x": -5., "y": 0., "w": 1600., "h": 900. });
+        save_to(&dir, &bad);
+        assert_eq!(super::load_window_bounds_from(&dir), None, "负 origin 拒绝");
+        let mut small = load_from(&dir);
+        small["window_bounds"] = serde_json::json!({ "x": 0., "y": 0., "w": 500., "h": 300. });
+        save_to(&dir, &small);
+        assert_eq!(
+            super::load_window_bounds_from(&dir),
+            None,
+            "小于最小窗 760×480 拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 工作区记忆往返（写入 → 读回 → 覆盖写 → 读回）。
