@@ -78,6 +78,8 @@ impl Cmd {
         Cmd::Save,
         Cmd::SelectAll,
         Cmd::Undo,
+        Cmd::CopyLine,
+        Cmd::DeleteLine,
         Cmd::Redo,
     ];
 
@@ -86,7 +88,7 @@ impl Cmd {
     #[rustfmt::skip]
     const NAMES: &[&str] = &[
         "MoveLeft", "MoveRight", "MoveUp", "MoveDown",
-        "MoveLineUp", "MoveLineDown",
+        "MoveLineUp", "CopyLine", "DeleteLine", "MoveLineDown",
         "WordLeft", "WordRight", "MoveHome", "MoveEnd",
         "DocStart", "DocEnd",
         "ToggleFold", "FoldCurrent", "UnfoldCurrent", "FoldAll", "UnfoldAll",
@@ -142,7 +144,7 @@ impl Cmd {
             Cmd::MoveUp => "移动：上",
             Cmd::MoveDown => "移动：下",
             Cmd::MoveLineUp => "行移动：上（Alt+↑）",
-            Cmd::CopyLine => "复制行（Ctrl+D）",
+            Cmd::CopyLine => "复制行（Ctrl+Shift+D）",
             Cmd::DeleteLine => "删除行（Ctrl+Shift+K）",
             Cmd::MoveLineDown => "行移动：下（Alt+↓）",
             Cmd::WordLeft => "词跳：左",
@@ -175,7 +177,7 @@ impl Cmd {
             Cmd::MoveUp => Some("↑"),
             Cmd::MoveDown => Some("↓"),
             Cmd::MoveLineUp => Some("Alt+↑"),
-            Cmd::CopyLine => Some("Ctrl+D"),
+            Cmd::CopyLine => Some("Ctrl+Shift+D"),
             Cmd::DeleteLine => Some("Ctrl+Shift+K"),
             Cmd::MoveLineDown => Some("Alt+↓"),
             Cmd::WordLeft => Some("Ctrl+←"),

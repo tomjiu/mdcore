@@ -782,9 +782,10 @@ fn default_editor_main() -> Vec<Entry> {
         // （如 ctrl+shift+alt+up）归家族光标移动，move_family 全组合
         // 测试钉定）。只读物理守卫在键层拒（docx readonly_allows
         // up/down alt 分支——readonly_guard_invariant 不变量保持）。
-        // #111 P2 批⑦：Ctrl+D 复制行（IDE 惯例键——VS Code 同键位）。
+        // #111 P2 批⑦：Ctrl+Shift+D 复制行（Ctrl+D 已被
+        // AddNextWordMatch 加同词光标占用——键位冲突实测修正）。
         e(
-            Binding::Single(KeyPattern::key("d").with(Yes, No, No)),
+            Binding::Single(KeyPattern::key("d").with(Yes, Yes, No)),
             A::CopyLine,
         ),
         // #111 P2 批⑦：Ctrl+Shift+K 删除整行（VS Code 同键位）。
@@ -2100,9 +2101,10 @@ mod tests {
             EditorOutcome::None
         );
         editor_miss("j", false, false, false);
-        // Shift+K 不挂起（!shift 守卫）。
+        // Shift+K 不挂起（!shift 守卫；ctrl=false 纯 Shift+K——
+        // ctrl+shift+k 现归 #111 批⑦ DeleteLine）。
         assert_eq!(
-            store.resolve_editor_main(&q("k", true, true, false), None),
+            store.resolve_editor_main(&q("k", false, true, false), None),
             EditorOutcome::None
         );
         // Alt+K 挂起（alt Any——现状守卫不查 alt）。
@@ -2621,9 +2623,9 @@ mod tests {
     }
 
     /// chord 解绑赢家镜像 dispatch（#218 review 原例）：表同时有
-    /// `ctrl+shift+k x` 与 `ctrl+k ctrl+x` 时，序列（ctrl+shift+k,
+    /// `ctrl+shift+l x` 与 `ctrl+l ctrl+x` 时，序列（ctrl+shift+l,
     /// ctrl+x）dispatch 触发**后者**（续接尾键精确度 1>0）——
-    /// unbind "ctrl+shift+k ctrl+x" 必须恰移除后者（原 `(首键, 尾键)`
+    /// unbind "ctrl+shift+l ctrl+x" 必须恰移除后者（原 `(首键, 尾键)`
     /// 字典序按头优先移除了前者——dispatch 不会触发的那条），另一条
     /// 完好。
     #[test]
@@ -2631,11 +2633,11 @@ mod tests {
         let mut store = KeymapStore::default_tables();
         let warnings = store.apply_user(&[
             UserOverride::Bind {
-                bind: "ctrl+shift+k x".into(),
+                bind: "ctrl+shift+l x".into(),
                 action: "open_replace".into(),
             },
             UserOverride::Bind {
-                bind: "ctrl+k ctrl+x".into(),
+                bind: "ctrl+l ctrl+x".into(),
                 action: "open_find".into(),
             },
         ]);
@@ -2643,7 +2645,7 @@ mod tests {
         // dispatch 前提对拍：序列（ctrl+shift+k, ctrl+x）触发 open_find
         // 的 chord（首键竞争 ctrl+shift+k 头 spec 2 胜出挂起；续接
         // ctrl+x 尾 spec 1 > open_replace 裸 x 尾 spec 0）。
-        let first = q("k", true, true, false);
+        let first = q("l", true, true, false);
         assert_eq!(
             store.resolve_editor_main(&first, None),
             EditorOutcome::Pending
@@ -2660,7 +2662,7 @@ mod tests {
         );
         // 解绑 dispatch 会触发的那条（review 原例的键串）。
         let warnings = store.apply_user(&[UserOverride::Unbind {
-            bind: "ctrl+shift+k ctrl+x".into(),
+            bind: "ctrl+shift+l ctrl+x".into(),
         }]);
         assert!(warnings.is_empty(), "应恰命中一条移除：{warnings:?}");
         // 另一条完好：同序列现在触发 open_replace 的 chord（若移错了
@@ -2690,7 +2692,7 @@ mod tests {
         let mut store = KeymapStore::default_tables();
         let warnings = store.apply_user(&[
             UserOverride::Bind {
-                bind: "ctrl+shift+k x".into(),
+                bind: "ctrl+shift+l x".into(),
                 action: "open_replace".into(),
             },
             UserOverride::Bind {
@@ -2718,8 +2720,9 @@ mod tests {
         );
         // open_find 无绑定（默认 ctrl+f 已在换绑时让位，chord 又被解绑）。
         assert_eq!(store.label("open_find"), None);
-        // 另一条不受影响：序列（ctrl+shift+k, x）照常触发 open_replace。
-        let first = q("k", true, true, false);
+        // 另一条不受影响：序列（ctrl+shift+l, x）照常触发 open_replace
+        //（原例键 ctrl+shift+k 现归 #111 批⑦ DeleteLine——换 l 保语义）。
+        let first = q("l", true, true, false);
         assert_eq!(
             store.resolve_editor_main(&q("x", false, false, false), Some(&first)),
             EditorOutcome::Matched(EditorAction::OpenReplace)
