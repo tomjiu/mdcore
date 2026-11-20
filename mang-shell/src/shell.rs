@@ -1696,6 +1696,18 @@ impl ShellApp {
                     cx.reveal_path(&reveal);
                 }
             }
+            // #107 P1 批⑦：树面手动刷新（报告 P1① 后半——mtime 轮询
+            // 未立项前的手动面；工作区根整树重读——#595 光标路径重绑定
+            // 既有语义背书零新语义；无工作区时空操作）。
+            (MenuOrigin::FileTree, "ft-refresh") => {
+                if let Some(tree) = &self.workspace {
+                    let root = tree.read(cx).root().to_path_buf();
+                    tree.update(cx, |tree, cx| {
+                        tree.reload(&root);
+                        cx.notify();
+                    });
+                }
+            }
             (MenuOrigin::FileTree, "ft-open") => {
                 // 只对文件有效（菜单构建时目录项已灰显——防御面再验一道）。
                 if let Some(target) = target.filter(|p| !p.is_dir()) {
