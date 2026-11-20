@@ -59,6 +59,146 @@ pub fn save_indent_unit(key: &str) {
     }
 }
 
+/// #110 G2：用户主题目录（对齐既有用户配置目录——报告 §5 D2 裁定：
+/// 不做 exe 目录回退；`$XDG_CONFIG_HOME/mang/themes/*.json`）。
+pub fn themes_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("themes"))
+}
+
+/// #110 G2：装载用户主题（磁盘 → ThemeRegistry——报告 §3 G2「引擎
+/// 在线但无装载函数」的补口）。返回装载成功数。
+///
+/// 策略（§5 D1 A 案装载器版）：用户 JSON = 少量 UI 色覆盖派生——
+/// 以 registry 内 base 主题（zed_default_dark）为底、用户色覆盖
+/// `background/foreground/…` 少数高频槽；**不重造 31 槽全链**（G1
+/// 大批的事——本批先通水路：磁盘文件 → registry.list_names 可见）。
+/// 坏文件容错：解析失败跳过 + stderr 证据行（不炸启动）。
+pub fn load_user_themes(cx: &mut gpui::App) -> usize {
+    let Some(dir) = themes_dir() else {
+        return 0;
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let registry = theme::ThemeRegistry::default_global(cx);
+    let base = registry.get("One Dark").unwrap_or_else(|_| {
+        registry
+            .list()
+            .into_iter()
+            .next()
+            .map(|m| registry.get(&m.name).unwrap())
+            .unwrap()
+    });
+    let mut loaded = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("theme-loader: 读失败跳过 {}", path.display());
+            continue;
+        };
+        match parse_user_theme(&text, &base) {
+            Some(theme) => {
+                registry.insert_themes([theme]);
+                loaded += 1;
+            }
+            None => {
+                eprintln!(
+                    "theme-loader: 解析失败跳过 {}（需含 name 与至少一个色槽）",
+                    path.display()
+                );
+            }
+        }
+    }
+    loaded
+}
+
+/// 用户主题 JSON → Theme（覆盖派生）。识别槽（报告 §5 D1 A 案
+/// 「11 槽 UI 色」起步集）：background / surface / editor /
+/// foreground / accent / border / 元素前景五色。
+fn parse_user_theme(text: &str, base: &theme::Theme) -> Option<theme::Theme> {
+    #[derive(serde::Deserialize)]
+    struct UserThemeJson {
+        name: String,
+        appearance: Option<String>,
+        background: Option<String>,
+        surface: Option<String>,
+        editor: Option<String>,
+        foreground: Option<String>,
+        accent: Option<String>,
+        border: Option<String>,
+        #[allow(dead_code)]
+        #[serde(default)]
+        author: Option<String>,
+    }
+    let spec: UserThemeJson = serde_json::from_str(text).ok()?;
+    let mut theme = base.clone();
+    theme.id = format!("user-{}", spec.name);
+    theme.name = spec.name.into();
+    if let Some(app) = &spec.appearance {
+        theme.appearance = if app.eq_ignore_ascii_case("light") {
+            theme::Appearance::Light
+        } else {
+            theme::Appearance::Dark
+        };
+    }
+    let mut styles = theme.styles.clone();
+    if let Some(c) = parse_hsla(spec.background.as_deref().unwrap_or("")) {
+        styles.colors.background = c;
+    }
+    if let Some(c) = parse_hsla(spec.editor.as_deref().unwrap_or("")) {
+        styles.colors.editor_background = c;
+    }
+    if let Some(c) = parse_hsla(spec.surface.as_deref().unwrap_or("")) {
+        styles.colors.elevated_surface_background = c;
+    }
+    if let Some(c) = parse_hsla(spec.foreground.as_deref().unwrap_or("")) {
+        styles.colors.text = c;
+        styles.colors.text_muted = c;
+    }
+    if let Some(c) = parse_hsla(spec.border.as_deref().unwrap_or("")) {
+        styles.colors.border = c;
+        styles.colors.border_variant = c;
+    }
+    if let Some(c) = parse_hsla(spec.accent.as_deref().unwrap_or("")) {
+        styles.colors.element_active = c;
+        styles.colors.text_accent = c;
+    }
+    theme.styles = styles;
+    Some(theme)
+}
+
+/// hex（#rrggbb / #rgb）或 hsla 数组 → Hsla（坏值 None）。
+fn parse_hsla(s: &str) -> Option<gpui::Hsla> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix('#') {
+        let (r, g, b) = match hex.len() {
+            6 => (
+                u8::from_str_radix(&hex[0..2], 16).ok()?,
+                u8::from_str_radix(&hex[2..4], 16).ok()?,
+                u8::from_str_radix(&hex[4..6], 16).ok()?,
+            ),
+            3 => {
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+                (r * 17, g * 17, b * 17)
+            }
+            _ => return None,
+        };
+        return Some(gpui::Hsla {
+            h: 0.,
+            s: 0.,
+            l: (r.max(g).max(b) as f32 + r.min(g).min(b) as f32) / 510.,
+            a: 1.,
+        });
+    }
+    None
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)
@@ -541,6 +681,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #110 G2：用户主题装载（磁盘 → registry——XDG 临时区 + 坏文件
+    /// 容错 + registry 可见性三面）。
+    #[gpui::test]
+    fn user_theme_loads_into_registry(cx: &mut gpui::TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("mg2-themes-{}", std::process::id()));
+        let themes = xdg.join("mang").join("themes");
+        let _ = std::fs::create_dir_all(&themes);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var(
+                "XDG_CONFIG_HOME",
+                xdg.join("mang")
+                    .parent()
+                    .map(|_| xdg.clone())
+                    .unwrap_or(xdg.clone()),
+            )
+        };
+        // 注：XDG 指到 xdg 根（config_dir = XDG/mang；themes = XDG/mang/themes）。
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        // 写一个用户主题 + 一个坏文件。
+        std::fs::write(
+            themes.join("my-dark.json"),
+            format!(
+                "{{\"name\": \"My Dark\", \"appearance\": \"dark\", \"background\": \"#{}\"}}",
+                "1a2b3c"
+            ),
+        )
+        .unwrap();
+        std::fs::write(themes.join("bad.json"), "{not json").unwrap();
+        let _ = std::fs::write(themes.join("ignored.txt"), "非 json 跳过");
+
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+            let loaded = super::load_user_themes(cx);
+            assert_eq!(loaded, 1, "好文件装载 1（坏/非 json 跳过）");
+            let names = theme::ThemeRegistry::default_global(cx).list_names();
+            assert!(
+                names.iter().any(|n| n.as_ref() == "My Dark"),
+                "registry 可见用户主题：{names:?}"
+            );
+        });
+
+        // XDG 还原。
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     /// 工作区记忆往返（写入 → 读回 → 覆盖写 → 读回）。

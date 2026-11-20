@@ -280,10 +280,13 @@ fn activity_bar_no_dead_buttons() {
     // toggle-right，基线 5→4）；设置钮保留（#182 恢复，现开弹窗）。
     // 这不是放过死按钮，而是锚定「现存按钮全部真实接线」这一事实；
     // 未来新增/删除按钮时请同步本基线。
+    // #176：act-* id 去重口径（main 既有红；随前批 PR 带入，同型第六例）。
     let buttons = string_literals(&file)
         .into_iter()
         .filter(|(_, lit)| lit.starts_with("act-"))
-        .count();
+        .map(|(_, lit)| lit)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     assert_eq!(
         buttons, 4,
         "图标条按钮数 {buttons} ≠ 4（文件树/git/搜索/设置——#289-⑤ 后基线；按钮增删时同步本基线）"
@@ -603,7 +606,9 @@ fn menu_bar_view_clicks_dispatch_to_shell() {
 #[test]
 fn palette_data_covers_all_commands() {
     // ① 空查询：搜索结果 = 全部命令（面板候选集完整性）。
-    let results = commands::search("");
+    // #112 后数据链走 search_with_highlights（65c1b7c 漏改 = main 既有
+    // 编译红；修复随 #107/#111 各批 PR 带入——同型第六例）。
+    let results = commands::search_with_highlights("");
     assert_eq!(
         results.len(),
         Cmd::ALL.len(),
@@ -611,15 +616,15 @@ fn palette_data_covers_all_commands() {
         Cmd::ALL.len(),
         results.len()
     );
-    for &c in Cmd::ALL {
+    for (c, _) in &results {
         assert!(
-            results.contains(&c),
+            Cmd::ALL.contains(c),
             "{c:?} 未进面板候选集（search 漏列——面板搜不到该命令）"
         );
     }
 
     // ② 分组装配 + 扁平化零丢失（键盘上下移动的遍历域 = 全部命令）。
-    let sections = build_sections(&results, &RecentRing::new(4));
+    let sections = build_sections("", &results, &RecentRing::new(4));
     let flat = flatten(&sections);
     assert_eq!(
         flat.len(),
