@@ -59,6 +59,33 @@ pub fn save_indent_unit(key: &str) {
     }
 }
 
+/// #108 批③：大纲折叠态读写（`outline_collapsed` 键：折叠头行索引
+/// 数组——面板 refresh 差量刷新后按当前行集装载；沿 indent_unit
+/// /auto_close 载体先例）。
+pub fn save_outline_collapsed(indexes: Vec<usize>) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["outline_collapsed"] =
+            serde_json::Value::Array(indexes.into_iter().map(|i| serde_json::json!(i)).collect());
+        save_to(&dir, &value);
+    }
+}
+
+pub fn load_outline_collapsed() -> Vec<usize> {
+    config_dir()
+        .map(|dir| load_from(&dir))
+        .and_then(|v| {
+            v.get("outline_collapsed")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.as_u64().map(|u| u as usize))
+                        .collect::<Vec<usize>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)
@@ -541,6 +568,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #108 批③：outline_collapsed 写读往返（load_from/save_to 私有面
+    /// 直达——零全局 config_dir 污染）。
+    #[test]
+    fn outline_collapsed_roundtrip() {
+        let dir = temp_config("outline-fold");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["outline_collapsed"] =
+            serde_json::Value::Array(vec![serde_json::json!(0), serde_json::json!(3)]);
+        save_to(&dir, &value);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(settings_path_in(&dir)).unwrap())
+                .unwrap();
+        assert_eq!(
+            v.get("outline_collapsed"),
+            Some(&serde_json::Value::Array(vec![
+                serde_json::json!(0),
+                serde_json::json!(3)
+            ])),
+            "折叠索引数组写读往返保持"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 工作区记忆往返（写入 → 读回 → 覆盖写 → 读回）。

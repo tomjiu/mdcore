@@ -104,7 +104,9 @@ impl OutlinePanel {
             scroll: ScrollHandle::new(),
             activate_hook,
             escape_hook: None,
-            collapsed: std::collections::HashSet::new(),
+            collapsed: crate::settings::load_outline_collapsed()
+                .into_iter()
+                .collect(),
         };
         this.refresh(cx);
         // 编辑器通知（buffer 编辑/标题增删）→ 行集差量刷新。
@@ -140,6 +142,8 @@ impl OutlinePanel {
     }
 
     /// #108 批②：折叠/展开分区头（toggle——渲染集即时重算）。
+    /// #108 批③：折叠集变更同步落盘（跨重启恢复——settings
+    /// `outline_collapsed` 键沿 indent_unit 先例）。
     pub fn toggle_fold(&mut self, index: usize) {
         if index < self.rows.len() {
             if self.collapsed.contains(&index) {
@@ -147,6 +151,7 @@ impl OutlinePanel {
             } else {
                 self.collapsed.insert(index);
             }
+            crate::settings::save_outline_collapsed(self.collapsed.iter().copied().collect());
         }
     }
 
@@ -529,8 +534,15 @@ mod tests {
     #[gpui::test]
     /// #108 批②：分区折叠——H1 分区折叠后子行不出渲染集、折叠头
     /// 保留；展开恢复全行。先红：方法不存在 = 编译红。
+    /// #108 批③：XDG 临时区 guard（dock_open_states_persist_across_restart
+    /// 同型——toggle_fold 落盘写临时区、构造装载读临时区默认空，
+    /// 不污染真实 config——批③落盘面接入后的测试隔离窗）。
     #[gpui::test]
     fn section_fold_hides_children_keeps_head(cx: &mut TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("moutline-fold-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&xdg);
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         let text = "# A\n## A1\n## A2\n# B\n## B1";
         let (_editor, panel, _visual) = panel_window(cx, text);
         panel.update(cx, |p, _| {
@@ -550,12 +562,22 @@ mod tests {
             p.toggle_fold(0);
             assert_eq!(p.visible_labels().len(), 5, "展开恢复全行");
         });
+        // XDG 还原（先例同型收口）。
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     /// #108 批②：折叠 H1 下嵌套 H2 子分区独立折叠（内层折叠不动
-    /// 外层；两级语义正交）。
+    /// 外层；两级语义正交）。#108 批③：XDG 临时区 guard 同型。
     #[gpui::test]
     fn section_fold_nested_h2_independent(cx: &mut TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("moutline-nested-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&xdg);
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         let text = "# A\n## A1\n### A1a\n## A2";
         let (_editor, panel, _visual) = panel_window(cx, text);
         panel.update(cx, |p, _| {
@@ -571,6 +593,12 @@ mod tests {
                 "同级 A2 不受影响"
             );
         });
+        // XDG 还原（先例同型收口）。
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     fn select_next_moves_focus_to_next_row(cx: &mut TestAppContext) {
