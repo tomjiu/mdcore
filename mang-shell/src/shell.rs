@@ -2391,14 +2391,13 @@ impl ShellApp {
                 // #114 批②：退出前窗口矩形先存（跨重启恢复——关窗
                 // 无条件先存语义的退出链面；非优雅退出不保，边界
                 // 如实——窗口 WM 摩擦场景下次启动回默认）。
-                if let Some(b) = window.bounds() {
-                    crate::settings::save_window_bounds(
-                        b.origin.x.0,
-                        b.origin.y.0,
-                        b.size.width.0,
-                        b.size.height.0,
-                    );
-                }
+                let b = window.bounds();
+                crate::settings::save_window_bounds(
+                    b.origin.x.as_f32(),
+                    b.origin.y.as_f32(),
+                    b.size.width.as_f32(),
+                    b.size.height.as_f32(),
+                );
                 cx.quit();
             }
             // 关于：既有提示横幅承载（层 3 可发现性验收项——版本信息
