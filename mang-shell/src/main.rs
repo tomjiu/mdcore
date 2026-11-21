@@ -589,6 +589,13 @@ fn main() {
                 }
             };
 
+            // #114 批①：会话恢复（上次打开标签列表 + 激活标签——
+            // settings 读 → 逐路径 open_document_tab 既有链；已删静默
+            // 跳过 + 上限 20 + 恢复证据行；F2 工作区恢复后接续）。
+            window_handle.update(cx, |shell, _window, cx| {
+                shell.restore_session_tabs(cx);
+            });
+
             // #104 任务 2：本机控制通道启动（默认开；失败降级不致命——
             // 端点被占/绑定失败只损失 RPC 能力，桌面本体照常）。服务
             // 句柄挂 GPUI 应用全局（run 闭包返回后事件循环才开跑，
