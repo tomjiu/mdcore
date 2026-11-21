@@ -99,8 +99,8 @@ pub fn load_session_tabs() -> (Vec<std::path::PathBuf>, usize) {
         .unwrap_or_default()
 }
 
-/// #114 批②：窗口矩形读写（`window_bounds` 键：`{"x":…,"y":…,"w":…,"h":…}`
-/// ——沿 F2 工作区记忆先例；关窗先存跨重启恢复）。
+/// #114 P1④（#230 同型带入——本分支基面未合）：窗口矩形写（
+/// `window_bounds` 键 {x,y,w,h}）。
 pub fn save_window_bounds(x: f32, y: f32, w: f32, h: f32) {
     if let Some(dir) = config_dir() {
         let mut value = load_from(&dir);

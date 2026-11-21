@@ -546,7 +546,36 @@ fn main() {
             // （EX_SOFTWARE）——替代原 .expect 的裸 panic（exit 101 裸
             // 错误链，桌面双击启动时 stderr 无处落 ≈ 静默失败）。
             let window_handle = match cx.open_window(options, |window, cx| {
-                cx.new(|cx| shell::ShellApp::new(editor_entity, remembered_workspace, window, cx))
+                // #114 P1④：关窗无条件先存（impl Window 钩子——返回
+                // true 放行关窗；窗口矩形 + 会话标签统一落存；非优雅
+                // 退出物理边界不保）。闭包首注册（shell 建立后拿实体面
+                // ——落存走 settings 直写，无需 shell 实体）。
+                cx.new(|cx| {
+                    let shell_entity =
+                        shell::ShellApp::new(editor_entity, remembered_workspace, window, cx);
+                    let weak = cx.entity().downgrade();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        // 关窗钩：窗口矩形（当前窗面）+ 会话标签（shell
+                        // 弱引用读 tabs）双键先存——返回 true 放行。
+                        let b = _window.bounds();
+                        settings::save_window_bounds(
+                            b.origin.x.as_f32(),
+                            b.origin.y.as_f32(),
+                            b.size.width.as_f32(),
+                            b.size.height.as_f32(),
+                        );
+                        if let Some(shell) = weak.upgrade() {
+                            shell.update(cx, |shell, _cx| {
+                                let paths: Vec<std::path::PathBuf> =
+                                    shell.tabs_paths_snapshot();
+                                let active = shell.active_index();
+                                settings::save_session_tabs(&paths, active);
+                            });
+                        }
+                        true
+                    });
+                    shell_entity
+                })
             }) {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -595,6 +624,8 @@ fn main() {
             window_handle.update(cx, |shell, _window, cx| {
                 shell.restore_session_tabs(cx);
             });
+
+
 
             // #104 任务 2：本机控制通道启动（默认开；失败降级不致命——
             // 端点被占/绑定失败只损失 RPC 能力，桌面本体照常）。服务
