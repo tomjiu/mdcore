@@ -59,6 +59,33 @@ pub fn save_indent_unit(key: &str) {
     }
 }
 
+/// #108 批③：大纲折叠态读写（`outline_collapsed` 键：折叠头行索引
+/// 数组——面板 refresh 差量刷新后按当前行集装载；沿 indent_unit
+/// /auto_close 载体先例）。
+pub fn save_outline_collapsed(indexes: Vec<usize>) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["outline_collapsed"] =
+            serde_json::Value::Array(indexes.into_iter().map(|i| serde_json::json!(i)).collect());
+        save_to(&dir, &value);
+    }
+}
+
+pub fn load_outline_collapsed() -> Vec<usize> {
+    config_dir()
+        .map(|dir| load_from(&dir))
+        .and_then(|v| {
+            v.get("outline_collapsed")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.as_u64().map(|u| u as usize))
+                        .collect::<Vec<usize>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// #114 批①：会话标签列表读写（`session_tabs` 键：打开文件路径数组 +
 /// `session_active` 键：激活索引——沿 F2 先例；open/close/activate 三
 /// 时机统一落盘）。
@@ -615,6 +642,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #108 批③：outline_collapsed 写读往返（load_from/save_to 私有面
+    /// 直达——零全局 config_dir 污染）。
+    #[test]
+    fn outline_collapsed_roundtrip() {
+        let dir = temp_config("outline-fold");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["outline_collapsed"] =
+            serde_json::Value::Array(vec![serde_json::json!(0), serde_json::json!(3)]);
+        save_to(&dir, &value);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(settings_path_in(&dir)).unwrap())
+                .unwrap();
+        assert_eq!(
+            v.get("outline_collapsed"),
+            Some(&serde_json::Value::Array(vec![
+                serde_json::json!(0),
+                serde_json::json!(3)
+            ])),
+            "折叠索引数组写读往返保持"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #114 批①：session_tabs/session_active 写读往返（隔离 temp dir）。
