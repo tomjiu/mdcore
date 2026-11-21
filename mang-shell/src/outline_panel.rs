@@ -62,13 +62,21 @@ struct OutlineRow {
 /// 既有 [`Editor::headings`] 数据面）。
 ///
 /// 订阅编辑器通知：buffer 编辑 → 行集差量刷新（句柄按条目序号保留）。
+/// #121 批③b：大纲面板 dock 键（布局序列化身份——发布后不可改）。
+pub const OUTLINE_PANEL_KEY: &str = "outline";
+
 pub struct OutlinePanel {
+    /// #121 批③b：面板位置（拖拽换侧——Right 起，可换 Left）。
+    position: mdc_dock::DockPosition,
     editor: Entity<Editor>,
     rows: Vec<OutlineRow>,
     /// 条目序号 → 焦点句柄缓存（不依赖可能重复的jump目标line）。
     handles: HashMap<usize, FocusHandle>,
     /// 大纲体滚动句柄（NavigableEntry 滚动锚点——键盘导航越视口滚动）。
     scroll: ScrollHandle,
+    /// #121 批③b：面板焦点句柄（dock 激活协议落点——树行句柄之外
+    /// 的面板根焦点面，FileTree tree_focus 同构）。
+    panel_focus: FocusHandle,
     /// bin 面副作用注入（见模块文档「lib 树纪律」）。
     activate_hook: Option<ActivateHook>,
     /// 独立宿主可省略；Shell 注入当前活动视图的焦点路由。
@@ -83,6 +91,8 @@ impl OutlinePanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
+            position: mdc_dock::DockPosition::Right,
+            panel_focus: cx.focus_handle(),
             editor,
             rows: Vec::new(),
             handles: HashMap::new(),
@@ -175,6 +185,40 @@ impl OutlinePanel {
         if let Some(hook) = hook {
             hook(line, window, cx);
         }
+    }
+}
+
+impl gpui::EventEmitter<mdc_dock::PanelEvent> for OutlinePanel {}
+
+impl gpui::Focusable for OutlinePanel {
+    fn focus_handle(&self, _cx: &gpui::App) -> gpui::FocusHandle {
+        self.panel_focus.clone()
+    }
+}
+
+impl mdc_dock::Panel for OutlinePanel {
+    fn persistent_name() -> &'static str {
+        OUTLINE_PANEL_KEY
+    }
+
+    fn panel_key() -> &'static str {
+        OUTLINE_PANEL_KEY
+    }
+
+    fn position(&self) -> mdc_dock::DockPosition {
+        self.position
+    }
+
+    fn position_is_valid(&self, position: mdc_dock::DockPosition) -> bool {
+        // #121 批③b：大纲面板可停靠右/左。
+        matches!(
+            position,
+            mdc_dock::DockPosition::Left | mdc_dock::DockPosition::Right
+        )
+    }
+
+    fn set_position(&mut self, position: mdc_dock::DockPosition, _cx: &mut Context<Self>) {
+        self.position = position;
     }
 }
 

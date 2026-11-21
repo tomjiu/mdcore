@@ -437,6 +437,9 @@ pub enum ShellAction {
     FontReset,
     /// Ctrl+T 循环主题（`cycle_theme`）。
     CycleTheme,
+    /// #109 批②③：Ctrl+Shift+F 项目搜索面板（`toggle_search`——图标条
+    /// 搜索钮/菜单「项目搜索」同链）。
+    ToggleSearchPanel,
 }
 
 /// 两域动作统一面（用户覆盖的 `action` 机器名解析目标 / 冲突检测的
@@ -577,6 +580,7 @@ impl ShellAction {
             ShellAction::FontSmaller => "font_smaller",
             ShellAction::FontReset => "font_reset",
             ShellAction::CycleTheme => "cycle_theme",
+            ShellAction::ToggleSearchPanel => "project_search",
         }
     }
 }
@@ -630,6 +634,7 @@ const SHELL_ACTION_IDS: &[ShellAction] = &[
     ShellAction::FontBigger,
     ShellAction::FontSmaller,
     ShellAction::FontReset,
+    ShellAction::ToggleSearchPanel,
     ShellAction::CycleTheme,
 ];
 
@@ -773,6 +778,7 @@ fn default_editor_main() -> Vec<Entry> {
         ),
         // 查找/替换（E28-E29：f-ctrl 臂在 [-] 臂之后——表序复现）。
         e(
+            // shift Any（f-ctrl 家族全归编辑器——面板键走 chord）。
             Binding::Single(KeyPattern::key("f").with(Yes, Any, Any)),
             A::OpenFind,
         ),
@@ -868,6 +874,10 @@ fn default_shell() -> Vec<Entry> {
         e(Binding::Single(plain("t")), A::CycleTheme),
         // S11：Ctrl+O 打开文件（和弦续接优先——无挂起时才到此）。
         e(Binding::Single(plain("o")), A::PromptOpenFile),
+        // #109 批②③ S12：Ctrl+K Ctrl+F 和弦项目搜索面板（与
+        // Ctrl+K Ctrl+O 工作区同族——f 单键家族全归编辑器域（open_find
+        // 是 shift Any 展开面），单键无处可错；chord 无冲突面）。
+        e(Binding::Chord(plain("k"), plain("f")), A::ToggleSearchPanel),
     ]
 }
 

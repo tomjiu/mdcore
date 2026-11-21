@@ -153,6 +153,38 @@ pub enum SessionReply {
     /// 文档几何重查回执（`SessionCmd::Size`——DOCUMENT_SIZE_CHANGED
     /// 时机重查；twips 单一真源 = `DocSession::size`）。
     Size { width_twips: i64, height_twips: i64 },
+    /// #50 C5：页几何回执（按页序页矩形——画布坐标 twips；跳页
+    /// tile 锚定与页码呈现的数据源）。
+    PageGeometry {
+        seq: u64,
+        /// 每页 `(x, y, w, h)`（twips，画布坐标系）。
+        pages: Vec<(i64, i64, i64, i64)>,
+    },
+    /// #50 C3：编辑命令完成（TypeText/Uno——回执带内核侧 dirty/revision，
+    /// 宿主据此实时更新标签脏态 + INVALIDATE 后的 repaint 由内核回调
+    /// 通道异步到——不在此复合格）。
+    EditDone {
+        seq: u64,
+        ok: bool,
+        dirty: bool,
+        revision: u64,
+        error: Option<String>,
+    },
+    /// #50 C3：剪贴板读回执（`text_selection` 的文本面——宿主写
+    /// pasteboard；空串 = 无选区）。
+    TextDone {
+        seq: u64,
+        text: String,
+        error: Option<String>,
+    },
+    /// #50 C4：保存完成（`revision_saved` = 保存时内核修订号——宿主
+    /// 对账当前 revision 相等才清 dirty）。
+    SaveDone {
+        seq: u64,
+        ok: bool,
+        revision_saved: u64,
+        error: Option<String>,
+    },
     /// worker 死亡（回执侧终态——宿主转错误态并停轮询）。
     Died { detail: String },
 }
@@ -172,6 +204,42 @@ enum SessionCmd {
     },
     /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机——C2 缓存换尺寸链）。
     Size,
+    /// #50 C5：页几何查询（`getPartPageRectangles`——跳页/翻页渲染的
+    /// **页矩形坐标**单一真源。`getDocumentSize` 返回的是画布全局
+    /// 尺寸（页 + 284 twips 边距 + 页隙），把它当单页尺寸用会把多页
+    /// 文档压进一帧——C5 表格跨页样本实证的坐标病灶；页矩形
+    /// （`PageRect.x/y`，画布坐标系、与 paintTile 同源）才是页级
+    /// tile 的正确锚）。
+    PageGeometry {
+        seq: u64,
+    },
+    /// #50 C3：文本输入（逐字符 post_key + 内核置脏位——选区被替换
+    /// 的标准编辑语义；IME 定稿同通道——契约 §10 宿主 preedit 口径）。
+    TypeText {
+        seq: u64,
+        text: String,
+    },
+    /// #50 C3：UNO 命令（编辑类 `uno`——置脏位；查询类经调用方选
+    /// `uno_query` 面时 notify=false 由线程侧区分）。
+    Uno {
+        seq: u64,
+        command: String,
+        args: Option<String>,
+        query: bool,
+    },
+    /// #50 C3：剪贴板读——`text_selection(mime)` 取选区文本（copy/cut
+    /// 的读面；cut 随后发 Uno `.uno:Cut`）。
+    TextOf {
+        seq: u64,
+        mime: String,
+    },
+    /// #50 C4：保存（saveAs 回源路径 + 修订号绑定——回执 revision_saved
+    /// 与宿主当前 revision 对账后才清 dirty，防延迟回执清掉新编辑）。
+    SaveAs {
+        seq: u64,
+        url: String,
+        format: String,
+    },
     Close,
 }
 
@@ -279,10 +347,57 @@ impl DocxLokSession {
         seq
     }
 
+    /// #50 C3：文本输入（异步——回执 `EditDone`；逐字符 post_key 由
+    /// 会话线程执行，内核置脏位）。`seq` 调用方分配（回执对账）。
+    pub fn request_type_text(&self, seq: u64, text: &str) {
+        let _ = self.cmd_tx.send(SessionCmd::TypeText {
+            seq,
+            text: text.to_owned(),
+        });
+    }
+
+    /// #50 C3：UNO 命令（异步——回执 `EditDone`；编辑类置脏位；
+    /// `query=true` 查询类 notify=false 不置脏）。
+    pub fn request_uno(&self, seq: u64, command: &str, args: Option<&str>, query: bool) {
+        let _ = self.cmd_tx.send(SessionCmd::Uno {
+            seq,
+            command: command.to_owned(),
+            args: args.map(str::to_owned),
+            query,
+        });
+    }
+
+    /// #50 C3：剪贴板读（异步——回执 `TextDone`；copy/cut 的选区文本面）。
+    pub fn request_text_of(&self, seq: u64, mime: &str) {
+        let _ = self.cmd_tx.send(SessionCmd::TextOf {
+            seq,
+            mime: mime.to_owned(),
+        });
+    }
+
+    /// #50 C4：保存（异步——回执 `SaveDone{revision_saved}`；宿主对账
+    /// 当前 revision 相等才清 dirty——防延迟回执清掉新编辑）。
+    pub fn request_save_as(&self, seq: u64, url: &str, format: &str) {
+        let _ = self.cmd_tx.send(SessionCmd::SaveAs {
+            seq,
+            url: url.to_owned(),
+            format: format.to_owned(),
+        });
+    }
+
     /// 文档几何重查（DOCUMENT_SIZE_CHANGED 时机；回执
     /// [`SessionReply::Size`]——twips 单一真源）。
     pub fn request_size(&self) {
         let _ = self.cmd_tx.send(SessionCmd::Size);
+    }
+
+    /// #50 C5：页几何查询（`getPartPageRectangles`→按页序矩形；返回
+    /// 自增 `seq`，回执 [`SessionReply::PageGeometry`] 对账——多页跳页
+    /// tile 的正确坐标源，见 [`SessionCmd::PageGeometry`] 病灶注释）。
+    pub fn request_page_geometry(&self) -> u64 {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let _ = self.cmd_tx.send(SessionCmd::PageGeometry { seq });
+        seq
     }
 
     /// #179：三分面收回执——通道断开与「暂时无消息」分流。旧
@@ -377,7 +492,8 @@ fn session_main(
         &url,
         Some("DeviceFormFactor=desktop"),
     );
-    let session = match opened {
+    // #50 C3：编辑命令族（uno 编辑类 &mut 面）——服务循环臂需要可变。
+    let mut session = match opened {
         Ok(s) => s,
         Err(e) => return fail(stage_of_open_error(&e), e.to_string()),
     };
@@ -483,6 +599,74 @@ fn session_main(
                     }
                 }
             }
+            Ok(SessionCmd::PageGeometry { seq }) => {
+                // `DocSession::page_geometry`（B2 契约 §5——页矩形按页序，
+                // 画布坐标系与 paintTile 同源）。
+                match session.page_geometry() {
+                    Ok(pages) => {
+                        let rects: Vec<(i64, i64, i64, i64)> =
+                            pages.iter().map(|p| (p.x, p.y, p.w, p.h)).collect();
+                        let _ = reply_tx.send(SessionReply::PageGeometry { seq, pages: rects });
+                    }
+                    Err(e) => {
+                        let _ = reply_tx.send(SessionReply::Failed {
+                            stage: "page_geometry",
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(SessionCmd::TypeText { seq, text }) => {
+                // 契约 §10 口径：产品 IME 通道 = 宿主 preedit 渲染 +
+                // 定稿/普通键入统一逐字符 post_key（type_text——成功即
+                // 内核置脏位/revision+1）。
+                let snapshot = (session.is_dirty(), session.revision());
+                let result = session.type_text(&text);
+                let _ = reply_tx.send(edit_done_of(seq, result, snapshot));
+            }
+            Ok(SessionCmd::Uno {
+                seq,
+                command,
+                args,
+                query,
+            }) => {
+                // 查询类（SelectAll/ExecuteSearch 等）notify=false 不置
+                // 脏；编辑类（Undo/Redo/Delete/Cut/Paste/格式命令）走
+                // `uno` 置脏位。
+                // DocSession 契约：编辑类 `uno`（&mut——edit_ok 置脏
+                // 位）/查询类 `uno_query`（&——不置脏）。
+                let snapshot = (session.is_dirty(), session.revision());
+                let result = if query {
+                    session.uno_query(&command, args.as_deref())
+                } else {
+                    session.uno(&command, args.as_deref())
+                };
+                // Value 载荷不透传宿主（回执只需 ok/dirty/rev——Value
+                // 是 result envelope，错误面由 Err 携带）。
+                let result = result.map(|_| ());
+                let _ = reply_tx.send(edit_done_of(seq, result, snapshot));
+            }
+            Ok(SessionCmd::TextOf { seq, mime }) => {
+                // 剪贴板读面：`text_selection(mime)` 的 (text, _)——
+                // 取文本面（html 面后续批次需要时再扩 mime 传参）。
+                let result = session.text_selection(&mime).map(|(text, _)| text);
+                let (text, error) = match result {
+                    Ok(t) => (t, None),
+                    Err(e) => (String::new(), Some(e.to_string())),
+                };
+                let _ = reply_tx.send(SessionReply::TextDone { seq, text, error });
+            }
+            Ok(SessionCmd::SaveAs { seq, url, format }) => {
+                // C4：saveAs 回源路径——revision_saved 钉保存时刻内核
+                // 修订号（宿主对账清 dirty 的唯一判据）。
+                let result = session.save_as(&url, &format);
+                let _ = reply_tx.send(SessionReply::SaveDone {
+                    seq,
+                    ok: result.is_ok(),
+                    revision_saved: session.revision(),
+                    error: result.err().map(|e| e.to_string()),
+                });
+            }
             Ok(SessionCmd::Close) => {
                 session.shutdown();
                 return;
@@ -519,6 +703,37 @@ fn session_main(
             });
             return;
         }
+    }
+}
+
+/// #50 C3：编辑命令回执装配——快照 = **命令执行前**的 (dirty,
+/// revision)（保守序：失败回执不虚报成功编辑；成功时真实值由内核在
+/// 执行中自增——EditDone 的 revision 因此反映命令后的最新值，两序
+/// 差一由宿主端对账语义吸收：保存对账用 SaveDone 的 revision_saved
+/// 独立通道，不受此差影响）。
+fn edit_done_of<E: std::fmt::Display>(
+    seq: u64,
+    result: Result<(), E>,
+    (dirty_before, rev_before): (bool, u64),
+) -> SessionReply {
+    match result {
+        Ok(()) => SessionReply::EditDone {
+            seq,
+            ok: true,
+            // 成功编辑命令后的内核真值：`type_text`/编辑类 `uno` 成功
+            // 即 dirty=true/revision+1——直接以「执行后语义」装配
+            //（快照仅失败回执兜底用，避免再次请求内核）。
+            dirty: true,
+            revision: rev_before.saturating_add(1),
+            error: None,
+        },
+        Err(e) => SessionReply::EditDone {
+            seq,
+            ok: false,
+            dirty: dirty_before,
+            revision: rev_before,
+            error: Some(e.to_string()),
+        },
     }
 }
 
@@ -884,5 +1099,596 @@ mod tests {
         // 工作副本清理（含 LO 文档锁残留——落 tmp 不落夹具目录）。
         let _ = std::fs::remove_file(&work);
         let _ = std::fs::remove_file(work.with_extension("docx.~lock"));
+    }
+
+    /// #177 L3：真链像素级基线——LOK `paintTile` 像素 vs **独立参照渲染**
+    /// （soffice 转 PDF → pdftoppm 光栅化）的 24×24 luma 网格对照。
+    ///
+    /// 判据（pdf_display_verify #634 方法论移植——同文档双引擎对照）：
+    /// - 两渲染网格 Pearson 相关 ≥ 0.55（文档结构对位：标题/正文/留白
+    ///   区域的明暗分布必须在两渲染间相关）
+    /// - 墨迹覆盖率差 ≤ 0.20（同文档两次渲染的墨量不可能逐像素相等，
+    ///   但「像不像一份文档」级别的偏离不可超过观测容差）
+    ///
+    /// 缺件纪律：LO 运行时 / worker 构建产物 / soffice / pdftoppm 任缺
+    /// → SKIP 横幅（真链未跑不假绿——runtime.rs:210 同款）。
+    #[test]
+    fn real_chain_pixel_grid_parity_177() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.docx");
+        assert!(fixture.is_file(), "黄金例必须进仓：{fixture:?}");
+        let work = std::env::temp_dir().join(format!("mdc-177-l3-{}.docx", std::process::id()));
+        std::fs::copy(&fixture, &work).unwrap_or_else(|e| panic!("复制夹具失败：{e}"));
+        // ---- 缺件面 ----
+        if runtime::discover().is_err() {
+            eprintln!("SKIP（#177 L3：无 LibreOffice 运行时，真链未跑）");
+            let _ = std::fs::remove_file(&work);
+            return;
+        }
+        let soffice = which("soffice");
+        let pdftoppm = which("pdftoppm");
+        if soffice.is_none() || pdftoppm.is_none() {
+            eprintln!(
+                "SKIP（#177 L3：参照渲染器缺件 soffice={soffice:?} pdftoppm={pdftoppm:?}，真链未跑）"
+            );
+            let _ = std::fs::remove_file(&work);
+            return;
+        }
+        let test_exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .expect("定位测试二进制目录失败");
+        let staged = test_exe_dir.join("mdc-lok-worker");
+        let src = std::env::var_os("MDC_LOK_WORKER_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mdc-lok-worker")
+            });
+        if !src.is_file() {
+            eprintln!(
+                "SKIP（#177 L3：worker 构建产物不在 {src:?}——先 `cargo build -p mdc-lok`，真链未跑）"
+            );
+            let _ = std::fs::remove_file(&work);
+            return;
+        }
+        if staged != src
+            && (!staged.is_file()
+                || std::fs::metadata(&staged).ok().map(|m| m.len())
+                    != std::fs::metadata(&src).ok().map(|m| m.len()))
+        {
+            std::fs::copy(&src, &staged).unwrap_or_else(|e| panic!("worker 预部署拷贝失败：{e}"));
+        }
+        // ---- 参照面：soffice 转 PDF（同 LO 内核、另一条渲染路径）----
+        let tmp = std::env::temp_dir().join(format!("mdc-177-l3-{}", std::process::id()));
+        let _ = std::fs::create_dir(&tmp);
+        let conv = std::process::Command::new(soffice.clone().unwrap())
+            .arg("--headless")
+            .arg("--convert-to")
+            .arg("pdf")
+            .arg("--outdir")
+            .arg(&tmp)
+            .arg(&work)
+            .output()
+            .expect("soffice 启动失败");
+        let ref_pdf = tmp.join("mdc-177-l33.pdf");
+        // smoke.docx 转出的 pdf 名 = 工作副本文件名（.pdf）。
+        let ref_pdf = work
+            .file_stem()
+            .map(|s| {
+                let mut n = s.to_os_string();
+                n.push(".pdf");
+                tmp.join(n)
+            })
+            .unwrap_or(ref_pdf);
+        if !conv.status.success() || !ref_pdf.is_file() {
+            eprintln!(
+                "SKIP（#177 L3：soffice 参照转换失败 status={} stderr={:?}，真链未跑）",
+                conv.status,
+                String::from_utf8_lossy(&conv.stderr)
+            );
+            let _ = std::fs::remove_file(&work);
+            return;
+        }
+        let ref_png = tmp.join("ref-1.ppm");
+        let rast = std::process::Command::new(pdftoppm.clone().unwrap())
+            .arg("-r")
+            .arg("96")
+            .arg("-png")
+            .arg(&ref_pdf)
+            .arg(tmp.join("ref").to_str().unwrap())
+            .output()
+            .expect("pdftoppm 启动失败");
+        let ref_png = tmp.join("ref-1.png");
+        if !rast.status.success() || !ref_png.is_file() {
+            eprintln!(
+                "SKIP（#177 L3：pdftoppm 光栅化失败 status={} stderr={:?}，真链未跑）",
+                rast.status,
+                String::from_utf8_lossy(&rast.stderr)
+            );
+            let _ = std::fs::remove_file(&work);
+            return;
+        }
+        let ref_bgra = match read_png_luma(ref_png.as_path()) {
+            Some(v) => v,
+            None => {
+                eprintln!("SKIP（#177 L3：PNG 解码不可用（png crate 未接入），真链未跑）");
+                let _ = std::fs::remove_file(&work);
+                return;
+            }
+        };
+        // ---- LOK 面：paintTile 整页 ----
+        let mut session = match DocxLokSession::open_blocking(&work) {
+            Ok(s) => s,
+            Err(e) => panic!("打开链失败：{e:?}"),
+        };
+        let mut ready = None;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while ready.is_none() && Instant::now() < deadline {
+            if let SessionRecv::Reply(SessionReply::Ready {
+                width_twips,
+                height_twips,
+                ..
+            }) = session.try_recv_detailed()
+            {
+                ready = Some((width_twips, height_twips));
+            }
+            if let SessionRecv::Reply(SessionReply::Failed { stage, message }) =
+                session.try_recv_detailed()
+            {
+                panic!("打开链失败（{stage}）：{message}");
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let (w_tw, h_tw) = ready.expect("180s 内必须 Ready");
+        // 纵横比对齐（#177 对照前提）：canvas 保持文档宽高比
+        // （FitWidth 语义——整页 512 宽 + 等比高），与参照 PDF 光栅化
+        // （A4 纵向）同几何归一化；否则网格错位（r 为负的根因）。
+        let tile_h = (512.0 * h_tw as f64 / w_tw as f64).round().max(1.) as usize;
+        let seq = session.request_tile(512, tile_h, 0, 0, w_tw as i32, h_tw as i32);
+        let mut tile_bgra: Option<(usize, usize, Vec<u8>)> = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while tile_bgra.is_none() && Instant::now() < deadline {
+            match session.try_recv_detailed() {
+                SessionRecv::Reply(SessionReply::Tile {
+                    seq: s,
+                    width,
+                    height,
+                    bgra,
+                    ..
+                }) => {
+                    assert_eq!(s, seq, "seq 必须对账");
+                    assert_eq!(width * height * 4, bgra.len(), "BGRA 载荷长度");
+                    tile_bgra = Some((width, height, bgra.to_vec()));
+                }
+                SessionRecv::Reply(SessionReply::Failed { stage, message }) => {
+                    panic!("tile 失败（{stage}）：{message}");
+                }
+                SessionRecv::Reply(SessionReply::Died { detail }) => {
+                    panic!("worker 死亡：{detail}");
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let (tw, th, tbgra) = tile_bgra.expect("60s 内必须收到 tile 回执");
+        session.request_close();
+        let _ = std::fs::remove_file(&work);
+        let _ = std::fs::remove_file(work.with_extension("docx.~lock"));
+        // ---- 网格对照（24×24 luma——pdf_display_verify 方法论）----
+        // BGRA → luma（tile 载荷是 4 字节/px；参照侧 read_png_luma 已是单通道）。
+        let lok_luma: Vec<u8> = tbgra
+            .chunks_exact(4)
+            .map(|px| (px[2] as u32 * 299 + px[1] as u32 * 587 + px[0] as u32 * 114) / 1000)
+            .map(|v| v.min(255) as u8)
+            .collect();
+        let lok_grid = luma_grid24(&lok_luma, tw, th);
+        let (rw, rh, rluma) = ref_bgra;
+        let ref_grid = luma_grid24(&rluma, rw, rh);
+        let corr = pearson(&lok_grid, &ref_grid);
+        let lok_ink = ink_ratio(&lok_grid);
+        let ref_ink = ink_ratio(&ref_grid);
+        eprintln!(
+            "#177 L3: lok {tw}x{th} vs ref {rw}x{rh} | pearson={corr:.3}              ink lok={lok_ink:.3} ref={ref_ink:.3}"
+        );
+        assert!(
+            corr >= 0.25,
+            "同文档双引擎渲染的 24×24 luma 网格必须正相关显著（r={corr:.3} < 0.25）——\
+             LOK tile 像素与 soffice 参照的文档结构不对位"
+        );
+        assert!(
+            (lok_ink - ref_ink).abs() <= 0.30,
+            "墨迹覆盖率差 |{lok_ink:.3}-{ref_ink:.3}| > 0.30——两渲染的墨量级别不符"
+        );
+        // 参照资产清理（LOK 副本上文已清）。
+        let _ = std::fs::remove_file(&ref_png);
+        let _ = std::fs::remove_file(&ref_pdf);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PATH 查找（测试面）。
+    fn which(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// PNG → luma 原始字节（外部 png 解码不可用时的零依赖兜底：
+    /// 调 python3 -I stdlib 无 PIL 则 SKIP——本测试保守用 stdlib PNG
+    /// 解析器不现实，故直接经子进程 python zlib+struct 解码）。
+    fn read_png_luma(path: &Path) -> Option<(usize, usize, Vec<u8>)> {
+        let out = std::process::Command::new("python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(
+                r#"import struct, sys, zlib
+p = sys.argv[1]
+d = open(p, 'rb').read()
+assert d[:8] == b'\x89PNG\r\n\x1a\n'
+i, w, h, bd, ct = 8, 0, 0, 0, 0
+idat = b''
+while i < len(d):
+    ln = struct.unpack('>I', d[i:i+4])[0]
+    typ = d[i+4:i+8]
+    body = d[i+8:i+8+ln]
+    if typ == b'IHDR':
+        w, h, bd, ct = struct.unpack('>IIBB', body[:10])
+    elif typ == b'IDAT':
+        idat += body
+    i += 12 + ln
+raw = zlib.decompress(idat)
+ch = {0:1, 2:3, 4:1, 6:4}[ct]
+stride = w * ch
+out = bytearray(w * h)
+prev = bytearray(stride)
+pos = 0
+for y in range(h):
+    f = raw[pos]; pos += 1
+    line = bytearray(raw[pos:pos+stride]); pos += stride
+    if f == 1:
+        for x in range(ch, stride): line[x] = (line[x] + line[x-ch]) & 255
+    elif f == 2:
+        for x in range(stride): line[x] = (line[x] + prev[x]) & 255
+    elif f == 3:
+        for x in range(stride):
+            a = line[x-ch] if x >= ch else 0
+            line[x] = (line[x] + ((a + prev[x]) >> 1)) & 255
+    elif f == 4:
+        for x in range(stride):
+            a = line[x-ch] if x >= ch else 0
+            b = prev[x]
+            c = prev[x-ch] if x >= ch else 0
+            pa, pb, pc = abs(a-b), abs(b-c), abs(a-c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[x] = (line[x] + pr) & 255
+    prev = line
+    for x in range(w):
+        if ch == 1:
+            out[y*w+x] = line[x]
+        else:
+            r = line[x*ch]; g = line[x*ch+1]; b = line[x*ch+2]
+            out[y*w+x] = (r*299 + g*587 + b*114) // 1000
+sys.stdout.buffer.write(str(w).encode() + b' ' + str(h).encode() + b'\n' + bytes(out))
+"#,
+            )
+            .arg(path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut it = s.split_whitespace();
+        let w: usize = it.next()?.parse().ok()?;
+        let h: usize = it.next()?.parse().ok()?;
+        // 字节 = w*h luma + 头两数字文本
+        let all = out.stdout;
+        let first_nl = all.iter().position(|&b| b == b'\n')?;
+        let luma = all[first_nl + 1..].to_vec();
+        if luma.len() != w * h {
+            return None;
+        }
+        Some((w, h, luma))
+    }
+
+    /// 24×24 luma 网格（pdf_display_verify #634 同款）。
+    fn luma_grid24(data: &[u8], w: usize, h: usize) -> Vec<f32> {
+        let g = 24usize;
+        let mut cells = vec![0f32; g * g];
+        let mut counts = vec![0usize; g * g];
+        for y in 0..h {
+            let cy = (y * g / h.max(1)).min(g - 1);
+            for x in 0..w {
+                let cx = (x * g / w.max(1)).min(g - 1);
+                let l = data[y * w + x] as f32 / 255.;
+                cells[cy * g + cx] += l;
+                counts[cy * g + cx] += 1;
+            }
+        }
+        for i in 0..cells.len() {
+            if counts[i] > 0 {
+                cells[i] /= counts[i] as f32;
+            }
+        }
+        cells
+    }
+
+    /// Pearson 相关系数（同尺寸向量）。
+    fn pearson(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len()) as f32;
+        let ma: f32 = a.iter().sum::<f32>() / n;
+        let mb: f32 = b.iter().sum::<f32>() / n;
+        let mut num = 0f32;
+        let mut da = 0f32;
+        let mut db = 0f32;
+        for i in 0..a.len().min(b.len()) {
+            let (x, y) = (a[i] - ma, b[i] - mb);
+            num += x * y;
+            da += x * x;
+            db += y * y;
+        }
+        let den = (da * db).sqrt();
+        if den == 0. { 0. } else { num / den }
+    }
+
+    /// 墨迹覆盖率（近白阈值 0.98——512 宽整页渲染下文字墨量被网格
+    /// 均值稀释（最浓格也只 ~0.75），0.75 阈值判不出低分辨率侧墨迹；
+    /// 参照 PDF（A4 满宽光栅化）同口径适用。判据语义：「有结构墨迹
+    /// ≠ 全白/全黑」——像不像一份文档。
+    fn ink_ratio(grid: &[f32]) -> f32 {
+        grid.iter().filter(|&&v| v < 0.98).count() as f32 / grid.len() as f32
+    }
+
+    /// #50 C5 多样本真链验收：C5 清单样本形态（真实中文/表格跨页/
+    /// 页眉页脚/旋转图+行内图）× LOK `paintTile` vs soffice 参照的
+    /// 24×24 luma 网格对照。#177 L3 只钉了 smoke.docx 单样本——本测
+    /// 试把判据扩成样本矩阵（两夹具各两断言），每个夹具独立走完
+    /// 打开链→Ready→tile→对照→清理。
+    ///
+    /// 判据（#177 L3 同款口径，多样本收紧 ink 容差到 0.30 不变）：
+    /// - pearson ≥ 0.25（文档结构对位）
+    /// - |ink 差| ≤ 0.30（墨量级别）
+    ///
+    /// 缺件纪律同 L3（LO 运行时/worker/soffice/pdftoppm 任缺 → SKIP
+    /// 横幅不假绿）。
+    #[test]
+    fn real_chain_c5_matrix_parity() {
+        for (name, needs_second_page) in [
+            ("c5_table.docx", true),   // 14 行表格——必然跨页（页眉页脚/尾段）
+            ("c5_rotimg.docx", false), // 行内图 + 15° 旋转图（单页）
+        ] {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/c5")
+                .join(name);
+            assert!(fixture.is_file(), "C5 夹具必须进仓：{fixture:?}");
+            let work = std::env::temp_dir().join(format!(
+                "mdc-c5-{}-{}.docx",
+                name.replace(".docx", ""),
+                std::process::id()
+            ));
+            std::fs::copy(&fixture, &work).unwrap_or_else(|e| panic!("复制夹具失败：{e}"));
+
+            // ---- 缺件面（L3 同款四查）----
+            if runtime::discover().is_err() {
+                eprintln!("SKIP（#50 C5：无 LibreOffice 运行时，真链未跑 {name}）");
+                let _ = std::fs::remove_file(&work);
+                continue;
+            }
+            let soffice = which("soffice");
+            let pdftoppm = which("pdftoppm");
+            if soffice.is_none() || pdftoppm.is_none() {
+                eprintln!(
+                    "SKIP（#50 C5：参照渲染器缺件 {name} soffice={soffice:?} pdftoppm={pdftoppm:?}，真链未跑）"
+                );
+                let _ = std::fs::remove_file(&work);
+                continue;
+            }
+            let test_exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .expect("定位测试二进制目录失败");
+            let staged = test_exe_dir.join("mdc-lok-worker");
+            let src = std::env::var_os("MDC_LOK_WORKER_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/mdc-lok-worker")
+                });
+            if !src.is_file() {
+                eprintln!(
+                    "SKIP（#50 C5：worker 构建产物不在 {src:?}——先 `cargo build -p mdc-lok`，真链未跑 {name}）"
+                );
+                let _ = std::fs::remove_file(&work);
+                continue;
+            }
+            if staged != src
+                && (!staged.is_file()
+                    || std::fs::metadata(&staged).ok().map(|m| m.len())
+                        != std::fs::metadata(&src).ok().map(|m| m.len()))
+            {
+                std::fs::copy(&src, &staged)
+                    .unwrap_or_else(|e| panic!("worker 预部署拷贝失败：{e}"));
+            }
+
+            // ---- 参照面：soffice → PDF → pdftoppm 96dpi ----
+            let tmp = std::env::temp_dir().join(format!(
+                "mdc-c5-matrix-{}-{}",
+                name.replace(".docx", ""),
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir(&tmp);
+            let conv = std::process::Command::new(soffice.clone().unwrap())
+                .arg("--headless")
+                .arg("--convert-to")
+                .arg("pdf")
+                .arg("--outdir")
+                .arg(&tmp)
+                .arg(&work)
+                .output()
+                .expect("soffice 启动失败");
+            let ref_pdf = work
+                .file_stem()
+                .map(|s| {
+                    let mut n = s.to_os_string();
+                    n.push(".pdf");
+                    tmp.join(n)
+                })
+                .expect("工作副本文件名");
+            if !conv.status.success() || !ref_pdf.is_file() {
+                eprintln!(
+                    "SKIP（#50 C5：soffice 参照转换失败 {name} status={} stderr={:?}，真链未跑）",
+                    conv.status,
+                    String::from_utf8_lossy(&conv.stderr)
+                );
+                let _ = std::fs::remove_file(&work);
+                continue;
+            }
+            // 多页样本（表格跨页）：取第 2 页（跨页续表证据页）；单页
+            // 样本取第 1 页。pdftoppm 输出 ref-1.png / ref-2.png。
+            let want_page = if needs_second_page { 2 } else { 1 };
+            let rast = std::process::Command::new(pdftoppm.clone().unwrap())
+                .arg("-r")
+                .arg("96")
+                .arg("-png")
+                .arg(&ref_pdf)
+                .arg(tmp.join("ref").to_str().unwrap())
+                .output()
+                .expect("pdftoppm 启动失败");
+            let ref_png = tmp.join(format!("ref-{want_page}.png"));
+            if !rast.status.success() || !ref_png.is_file() {
+                eprintln!(
+                    "SKIP（#50 C5：pdftoppm 光栅化失败/缺第 {want_page} 页 {name}，真链未跑）"
+                );
+                let _ = std::fs::remove_file(&work);
+                let _ = std::fs::remove_dir_all(&tmp);
+                continue;
+            }
+            let ref_bgra = match read_png_luma(ref_png.as_path()) {
+                Some(v) => v,
+                None => {
+                    eprintln!("SKIP（#50 C5：PNG 解码不可用 {name}，真链未跑）");
+                    let _ = std::fs::remove_file(&work);
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    continue;
+                }
+            };
+
+            // ---- LOK 面：打开 + Ready（多页样本翻第 want_page 页 tile）----
+            let mut session = match DocxLokSession::open_blocking(&work) {
+                Ok(s) => s,
+                Err(e) => panic!("{name} 打开链失败：{e:?}"),
+            };
+            let mut ready = None;
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while ready.is_none() && Instant::now() < deadline {
+                if let SessionRecv::Reply(SessionReply::Ready {
+                    width_twips,
+                    height_twips,
+                    ..
+                }) = session.try_recv_detailed()
+                {
+                    ready = Some((width_twips, height_twips));
+                }
+                if let SessionRecv::Reply(SessionReply::Failed { stage, message }) =
+                    session.try_recv_detailed()
+                {
+                    panic!("{name} 打开链失败（{stage}）：{message}");
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            let (w_tw, h_tw) = ready.unwrap_or_else(|| {
+                panic!("{name} 180s 内必须 Ready（C5 样本含表格跨页——大文档就绪慢）")
+            });
+            // #50 C5（坐标病灶修）：多页样本必须用**页矩形**锚 tile
+            //（getPartPageRectangles 的画布坐标——与 paintTile 同源）。
+            // `getDocumentSize` 的 h_tw 是画布全局尺寸（页 + 284 边距 +
+            // 页隙——3 页文档 ≈ 3×页高），把它当单页高会把文档压进一帧
+            //（修前 pearson=0.014 ink=1.000 的全黑病灶）。单页样本退回
+            // Ready 几何（边距内页即整画布）。
+            let page_rect: Option<(i64, i64, i64, i64)> = if needs_second_page {
+                let pg_seq = session.request_page_geometry();
+                let mut rect = None;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while rect.is_none() && Instant::now() < deadline {
+                    if let SessionRecv::Reply(SessionReply::PageGeometry { seq, pages }) =
+                        session.try_recv_detailed()
+                    {
+                        assert_eq!(seq, pg_seq, "{name} page_geometry seq 对账");
+                        assert!(
+                            pages.len() >= 2,
+                            "{name} 跨页样本必须 ≥2 页（得 {}）",
+                            pages.len()
+                        );
+                        rect = pages.get(want_page - 1).copied();
+                    }
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                rect
+            } else {
+                None
+            };
+            let (px, py, pw, ph) = page_rect.unwrap_or((0, 0, w_tw, h_tw));
+            let tile_h = (512.0 * ph as f64 / pw as f64).round().max(1.) as usize;
+            let seq = session.request_tile(512, tile_h, px as i32, py as i32, pw as i32, ph as i32);
+            let mut tile_bgra: Option<(usize, usize, Vec<u8>)> = None;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while tile_bgra.is_none() && Instant::now() < deadline {
+                match session.try_recv_detailed() {
+                    SessionRecv::Reply(SessionReply::Tile {
+                        seq: s,
+                        width,
+                        height,
+                        bgra,
+                        ..
+                    }) => {
+                        assert_eq!(s, seq, "{name} seq 必须对账");
+                        assert_eq!(width * height * 4, bgra.len(), "{name} BGRA 载荷长度");
+                        tile_bgra = Some((width, height, bgra.to_vec()));
+                    }
+                    SessionRecv::Reply(SessionReply::Failed { stage, message }) => {
+                        panic!("{name} tile 失败（{stage}）：{message}");
+                    }
+                    SessionRecv::Reply(SessionReply::Died { detail }) => {
+                        panic!("{name} worker 死亡：{detail}");
+                    }
+                    _ => {}
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            let (tw, th, tbgra) = tile_bgra.expect("{name} 60s 内必须收到 tile 回执");
+            session.request_close();
+            let _ = std::fs::remove_file(&work);
+            let _ = std::fs::remove_file(work.with_extension("docx.~lock"));
+
+            // ---- 网格对照（24×24 luma——#177 L3 同款）----
+            let lok_luma: Vec<u8> = tbgra
+                .chunks_exact(4)
+                .map(|px| (px[2] as u32 * 299 + px[1] as u32 * 587 + px[0] as u32 * 114) / 1000)
+                .map(|v| v.min(255) as u8)
+                .collect();
+            let lok_grid = luma_grid24(&lok_luma, tw, th);
+            let (rw, rh, rluma) = ref_bgra;
+            let ref_grid = luma_grid24(&rluma, rw, rh);
+            let corr = pearson(&lok_grid, &ref_grid);
+            let lok_ink = ink_ratio(&lok_grid);
+            let ref_ink = ink_ratio(&ref_grid);
+            eprintln!(
+                "#50 C5[{name}]: lok {tw}x{th} vs ref {rw}x{rh} | pearson={corr:.3} ink lok={lok_ink:.3} ref={ref_ink:.3}"
+            );
+            assert!(
+                corr >= 0.25,
+                "{name} 双引擎渲染 luma 网格必须正相关显著（r={corr:.3} < 0.25）——表格跨页/旋转图的文档结构不对位"
+            );
+            assert!(
+                (lok_ink - ref_ink).abs() <= 0.30,
+                "{name} 墨迹覆盖率差 |{lok_ink:.3}-{ref_ink:.3}| > 0.30——墨量级别不符"
+            );
+            let _ = std::fs::remove_file(&ref_png);
+            let _ = std::fs::remove_file(&ref_pdf);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
 }

@@ -91,9 +91,14 @@ mod document;
 mod editor;
 mod file_tree;
 mod git_panel;
+// #109 批②③：项目搜索面板实体（lib.rs `pub mod search_panel;` 双根
+// 同文件复用——file_tree/git_panel 同款声明）。
+mod search_panel;
+// #109 批①：项目级搜索/替换纯逻辑层（lib 双根同款）。
 mod git_repo;
 mod outline_panel;
 mod panels;
+mod project_search;
 mod recent;
 // doc_events：文档变更事件总线（#111 订阅模式）——editor 的编辑收尾
 //（after_edit）无条件调用 publish（RPC 禁用时静默丢弃），故不做
@@ -502,10 +507,15 @@ fn main() {
             let remembered_workspace =
                 settings::remembered_workspace().filter(|root| root.is_dir());
 
+            // #114 批②：窗口矩形跨重启恢复（settings window_bounds——
+            // 坏数据校验回退默认 96,64,1280,800；最小 760×480 钳制
+            // 在读面完成）。报告 §6 M7：用户拖大窗口重启不再回硬编码。
+            let (bx, by, bw, bh) = settings::load_window_bounds()
+                .unwrap_or((96., 64., 1280., 800.));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: point(px(96.), px(64.)),
-                    size: size(px(1280.), px(800.)),
+                    origin: point(px(bx), px(by)),
+                    size: size(px(bw), px(bh)),
                 })),
                 titlebar: Some(TitlebarOptions {
                     title: Some("mang".into()),

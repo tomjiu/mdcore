@@ -99,6 +99,40 @@ pub fn load_session_tabs() -> (Vec<std::path::PathBuf>, usize) {
         .unwrap_or_default()
 }
 
+/// #114 批②：窗口矩形读写（`window_bounds` 键：`{"x":…,"y":…,"w":…,"h":…}`
+/// ——沿 F2 工作区记忆先例；关窗先存跨重启恢复）。
+pub fn save_window_bounds(x: f32, y: f32, w: f32, h: f32) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["window_bounds"] = serde_json::json!({ "x": x, "y": y, "w": w, "h": h });
+        save_to(&dir, &value);
+    }
+}
+
+/// 读回 + 校验钳制（报告锚点 layout.rs:379-394 语义）：坏数据（负值/
+/// 小于最小 760×480）回 None（调用方走默认 96,64,1280,800）。
+pub fn load_window_bounds() -> Option<(f32, f32, f32, f32)> {
+    load_window_bounds_from(&config_dir()?)
+}
+
+/// 注入变体（测试隔离——目录直达）。
+pub fn load_window_bounds_from(dir: &Path) -> Option<(f32, f32, f32, f32)> {
+    let v = load_from(dir);
+    let o = v.get("window_bounds")?;
+    let (x, y, w, h) = (
+        o.get("x")?.as_f64()?,
+        o.get("y")?.as_f64()?,
+        o.get("w")?.as_f64()?,
+        o.get("h")?.as_f64()?,
+    );
+    // 校验：全正 + 不小于最小窗（760×480——WindowOptions window_min_size
+    // 同口径）；越界（屏不存在时 WM 自钳）不预判——只拒明显坏值。
+    if x < 0. || y < 0. || w < 760. || h < 480. || w > 16384. || h > 16384. {
+        return None;
+    }
+    Some((x as f32, y as f32, w as f32, h as f32))
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)
@@ -163,6 +197,92 @@ fn load_dock_layout_in(dir: &Path) -> Option<(mdc_dock::DockAreaState, bool)> {
     let left: mdc_dock::DockAreaState = serde_json::from_value(node.get("left")?.clone()).ok()?;
     let right_open = node.get("right_open")?.as_bool()?;
     Some((left, right_open))
+}
+
+/// #121（批③b）：右 dock 布局落盘（`dock.right` additive 键——旧文件
+/// 缺键读取走 None 默认，`left`/`right_open` 形状不动：serde 形状冻结
+/// 纪律只加不改）。
+pub fn save_right_dock_layout(right: &mdc_dock::DockAreaState) {
+    if let Some(dir) = config_dir() {
+        save_right_dock_layout_in(&dir, right);
+    }
+}
+
+/// #121（批③b）：右 dock 布局记忆读取（无/坏/缺 = None——调用方默认）。
+pub fn load_right_dock_layout() -> Option<mdc_dock::DockAreaState> {
+    let dir = config_dir()?;
+    load_right_dock_layout_in(&dir)
+}
+
+/// #112 P1（MRU 持久化）：命令面板最近使用落盘（`palette.recent` 键，
+/// 值 = 命令稳定名数组——[`crate::editor::commands::Cmd::key_name`] 口径，
+/// 最新在前）。write-through：容量 4 的微 JSON，无需防抖。
+pub fn save_palette_recent(names: &[String]) {
+    if let Some(dir) = config_dir() {
+        save_palette_recent_in(&dir, names);
+    }
+}
+
+/// #112 P1：恢复最近使用（构造点消费——旧档未知名/缺键返回空，容忍前向）。
+pub fn load_palette_recent() -> Vec<String> {
+    config_dir()
+        .map(|dir| load_palette_recent_in(&dir))
+        .unwrap_or_default()
+}
+
+/// 测试形态：直接写指定目录（e2e 注入用——不动进程 env，避免并行套件
+/// 下的 XDG 污染窗；生产路径走 [`save_palette_recent`]）。
+pub fn save_palette_recent_for_test(dir: &Path, names: &[String]) {
+    std::fs::create_dir_all(dir).unwrap();
+    save_palette_recent_in(dir, names);
+}
+
+/// 测试形态：直接读指定目录（同上）。
+pub fn load_palette_recent_from_test(dir: &Path) -> Vec<String> {
+    load_palette_recent_in(dir)
+}
+
+fn save_palette_recent_in(dir: &Path, names: &[String]) {
+    let mut value = load_from(dir);
+    if value.get("palette").is_none() {
+        value["palette"] = serde_json::json!({});
+    }
+    value["palette"]["recent"] = serde_json::json!(names);
+    save_to(dir, &value);
+}
+
+fn load_palette_recent_in(dir: &Path) -> Vec<String> {
+    value_recent_names(load_from(dir).get("palette"))
+}
+
+fn value_recent_names(palette: Option<&serde_json::Value>) -> Vec<String> {
+    palette
+        .and_then(|p| p.get("recent"))
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_right_dock_layout_in(dir: &Path, right: &mdc_dock::DockAreaState) {
+    let mut value = load_from(dir);
+    // dock 节点存在则 additive 合入；不存在则建骨架（right_open 用
+    // 中性 true——随后 save_dock_layout 会写真实值）。
+    if value.get("dock").is_none() {
+        value["dock"] = serde_json::json!({});
+    }
+    value["dock"]["right"] = serde_json::to_value(right).unwrap_or(serde_json::Value::Null);
+    save_to(dir, &value);
+}
+
+fn load_right_dock_layout_in(dir: &Path) -> Option<mdc_dock::DockAreaState> {
+    let value = load_from(dir);
+    let node = value.get("dock")?;
+    let right: mdc_dock::DockAreaState = serde_json::from_value(node.get("right")?.clone()).ok()?;
+    Some(right)
 }
 
 /// 记住工作区（`workspace` 键——路径以 lossy 写入，非 UTF-8 路径的
@@ -526,6 +646,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&container);
     }
 
+    /// #114 批②：window_bounds 写读往返 + 坏数据校验回退（隔离
+    /// temp dir——load_from/save_to 私有面直达）。
+    #[test]
+    fn window_bounds_roundtrip_and_validation() {
+        let dir = temp_config("win-bounds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["window_bounds"] =
+            serde_json::json!({ "x": 120.0, "y": 80.0, "w": 1600.0, "h": 900.0 });
+        save_to(&dir, &value);
+        let back = super::load_window_bounds_from(&dir);
+        assert_eq!(back, Some((120., 80., 1600., 900.)), "合法矩形读回");
+        // 坏数据：负 origin / 小于最小窗 → None（调用方走默认）。
+        let mut bad = load_from(&dir);
+        bad["window_bounds"] = serde_json::json!({ "x": -5., "y": 0., "w": 1600., "h": 900. });
+        save_to(&dir, &bad);
+        assert_eq!(super::load_window_bounds_from(&dir), None, "负 origin 拒绝");
+        let mut small = load_from(&dir);
+        small["window_bounds"] = serde_json::json!({ "x": 0., "y": 0., "w": 500., "h": 300. });
+        save_to(&dir, &small);
+        assert_eq!(
+            super::load_window_bounds_from(&dir),
+            None,
+            "小于最小窗 760×480 拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 工作区记忆往返（写入 → 读回 → 覆盖写 → 读回）。
     #[test]
     fn workspace_memory_roundtrip() {
@@ -549,6 +697,47 @@ mod tests {
     fn missing_settings_returns_none() {
         let dir = temp_config("missing");
         assert_eq!(remembered_workspace_in(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #112 P1：面板最近使用往返（写 → 读回 → 覆盖写 → 读回）。
+    #[test]
+    fn palette_recent_roundtrip() {
+        let dir = temp_config("palette-recent");
+        save_palette_recent_in(&dir, &["Save".to_string(), "OpenFind".to_string()]);
+        assert_eq!(
+            load_palette_recent_in(&dir),
+            vec!["Save".to_string(), "OpenFind".to_string()],
+            "首写读回"
+        );
+        save_palette_recent_in(&dir, &["Undo".to_string()]);
+        assert_eq!(
+            load_palette_recent_in(&dir),
+            vec!["Undo".to_string()],
+            "覆盖写生效（最新在前）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #112 P1：缺键/空档返回空；非字符串项过滤；既有键（theme）不被冲掉。
+    #[test]
+    fn palette_recent_missing_and_mixed_entries() {
+        let dir = temp_config("palette-mixed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(settings_path_in(&dir), r#"{ "theme": "dark" }"#).unwrap();
+        assert!(load_palette_recent_in(&dir).is_empty(), "缺键=空");
+        std::fs::write(
+            settings_path_in(&dir),
+            r#"{ "theme": "dark", "palette": { "recent": ["Save", 42, null, "Undo"] } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_palette_recent_in(&dir),
+            vec!["Save".to_string(), "Undo".to_string()],
+            "非字符串项过滤（旧档/脏档容忍）"
+        );
+        let value = load_from(&dir);
+        assert_eq!(value["theme"].as_str(), Some("dark"), "既有键保留");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
