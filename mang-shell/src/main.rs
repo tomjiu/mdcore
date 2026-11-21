@@ -507,10 +507,15 @@ fn main() {
             let remembered_workspace =
                 settings::remembered_workspace().filter(|root| root.is_dir());
 
+            // #114 批②：窗口矩形跨重启恢复（settings window_bounds——
+            // 坏数据校验回退默认 96,64,1280,800；最小 760×480 钳制
+            // 在读面完成）。报告 §6 M7：用户拖大窗口重启不再回硬编码。
+            let (bx, by, bw, bh) = settings::load_window_bounds()
+                .unwrap_or((96., 64., 1280., 800.));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: point(px(96.), px(64.)),
-                    size: size(px(1280.), px(800.)),
+                    origin: point(px(bx), px(by)),
+                    size: size(px(bw), px(bh)),
                 })),
                 titlebar: Some(TitlebarOptions {
                     title: Some("mang".into()),

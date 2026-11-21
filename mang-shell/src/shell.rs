@@ -2399,7 +2399,19 @@ impl ShellApp {
             // 与标题栏 × 钮同一条 cx.quit 既有路径（该路径不经
             // on_should_close 脏确认——× 钮现状同此，行为对齐不超范围
             // 修补；统一走脏确认建议另开 issue）。
-            Act::Quit => cx.quit(),
+            Act::Quit => {
+                // #114 批②：退出前窗口矩形先存（跨重启恢复——关窗
+                // 无条件先存语义的退出链面；非优雅退出不保，边界
+                // 如实——窗口 WM 摩擦场景下次启动回默认）。
+                let b = window.bounds();
+                crate::settings::save_window_bounds(
+                    b.origin.x.as_f32(),
+                    b.origin.y.as_f32(),
+                    b.size.width.as_f32(),
+                    b.size.height.as_f32(),
+                );
+                cx.quit();
+            }
             // 关于：既有提示横幅承载（层 3 可发现性验收项——版本信息
             // 面向用户可见）。
             Act::About => self.show_notice(
