@@ -280,6 +280,10 @@ fn activity_bar_no_dead_buttons() {
     // toggle-right，基线 5→4）；设置钮保留（#182 恢复，现开弹窗）。
     // 这不是放过死按钮，而是锚定「现存按钮全部真实接线」这一事实；
     // 未来新增/删除按钮时请同步本基线。
+<<<<<<< HEAD
+=======
+    // #176：act-* id 去重口径（main 既有红；随前批 PR 带入，同型修复）。
+>>>>>>> origin/main
     // #176：act-* id 去重口径（main 既有红；随前批 PR 带入，同型第六例）。
     let buttons = string_literals(&file)
         .into_iter()
@@ -624,7 +628,13 @@ fn palette_data_covers_all_commands() {
     }
 
     // ② 分组装配 + 扁平化零丢失（键盘上下移动的遍历域 = 全部命令）。
+<<<<<<< HEAD
     let sections = build_sections("", &results, &RecentRing::new(4));
+=======
+    // #212 后签名演进：results 需带命中下标（空查询 = 全部命中、下标集空）。
+    let hl_results = commands::search_with_highlights("");
+    let sections = build_sections("", &hl_results, &RecentRing::new(4));
+>>>>>>> origin/main
     let flat = flatten(&sections);
     assert_eq!(
         flat.len(),

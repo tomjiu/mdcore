@@ -86,6 +86,80 @@ pub fn load_outline_collapsed() -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// #114 批①：会话标签列表读写（`session_tabs` 键：打开文件路径数组 +
+/// `session_active` 键：激活索引——沿 F2 先例；open/close/activate 三
+/// 时机统一落盘）。
+pub fn save_session_tabs(paths: &[std::path::PathBuf], active: usize) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["session_tabs"] = serde_json::Value::Array(
+            paths
+                .iter()
+                .map(|p| serde_json::json!(p.to_string_lossy()))
+                .collect(),
+        );
+        value["session_active"] = serde_json::json!(active);
+        save_to(&dir, &value);
+    }
+}
+
+pub fn load_session_tabs() -> (Vec<std::path::PathBuf>, usize) {
+    config_dir()
+        .map(|dir| load_from(&dir))
+        .map(|v| {
+            let paths = v
+                .get("session_tabs")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.as_str().map(std::path::PathBuf::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let active = v
+                .get("session_active")
+                .and_then(|i| i.as_u64())
+                .map(|u| u as usize)
+                .unwrap_or(0);
+            (paths, active)
+        })
+        .unwrap_or_default()
+}
+
+/// #114 P1④（#230 同型带入——本分支基面未合）：窗口矩形写（
+/// `window_bounds` 键 {x,y,w,h}）。
+pub fn save_window_bounds(x: f32, y: f32, w: f32, h: f32) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["window_bounds"] = serde_json::json!({ "x": x, "y": y, "w": w, "h": h });
+        save_to(&dir, &value);
+    }
+}
+
+/// 读回 + 校验钳制（报告锚点 layout.rs:379-394 语义）：坏数据（负值/
+/// 小于最小 760×480）回 None（调用方走默认 96,64,1280,800）。
+pub fn load_window_bounds() -> Option<(f32, f32, f32, f32)> {
+    load_window_bounds_from(&config_dir()?)
+}
+
+/// 注入变体（测试隔离——目录直达）。
+pub fn load_window_bounds_from(dir: &Path) -> Option<(f32, f32, f32, f32)> {
+    let v = load_from(dir);
+    let o = v.get("window_bounds")?;
+    let (x, y, w, h) = (
+        o.get("x")?.as_f64()?,
+        o.get("y")?.as_f64()?,
+        o.get("w")?.as_f64()?,
+        o.get("h")?.as_f64()?,
+    );
+    // 校验：全正 + 不小于最小窗（760×480——WindowOptions window_min_size
+    // 同口径）；越界（屏不存在时 WM 自钳）不预判——只拒明显坏值。
+    if x < 0. || y < 0. || w < 760. || h < 480. || w > 16384. || h > 16384. {
+        return None;
+    }
+    Some((x as f32, y as f32, w as f32, h as f32))
+}
+
 pub fn load_indent_unit() -> Option<String> {
     let dir = config_dir()?;
     load_from(&dir)
@@ -590,6 +664,63 @@ mod tests {
                 serde_json::json!(3)
             ])),
             "折叠索引数组写读往返保持"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #114 批①：session_tabs/session_active 写读往返（隔离 temp dir）。
+    #[test]
+    fn session_tabs_roundtrip() {
+        // 容器布局：XDG=container → config_dir=container/mang →
+        // settings.json=container/mang/settings.json。
+        let container = std::env::temp_dir().join(format!("m114-session-{}", std::process::id()));
+        let dir = container.join("mang");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["session_tabs"] = serde_json::Value::Array(vec![
+            serde_json::json!("/tmp/a.md"),
+            serde_json::json!("/tmp/b.pdf"),
+            serde_json::json!("/tmp/c.docx"),
+        ]);
+        value["session_active"] = serde_json::json!(1);
+        save_to(&dir, &value);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &container) };
+        let (paths, active) = super::load_session_tabs();
+        assert_eq!(paths.len(), 3, "三路径读回");
+        assert_eq!(paths[1], std::path::PathBuf::from("/tmp/b.pdf"));
+        assert_eq!(active, 1, "激活索引读回");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&container);
+    }
+
+    /// #114 批②：window_bounds 写读往返 + 坏数据校验回退（隔离
+    /// temp dir——load_from/save_to 私有面直达）。
+    #[test]
+    fn window_bounds_roundtrip_and_validation() {
+        let dir = temp_config("win-bounds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["window_bounds"] =
+            serde_json::json!({ "x": 120.0, "y": 80.0, "w": 1600.0, "h": 900.0 });
+        save_to(&dir, &value);
+        let back = super::load_window_bounds_from(&dir);
+        assert_eq!(back, Some((120., 80., 1600., 900.)), "合法矩形读回");
+        // 坏数据：负 origin / 小于最小窗 → None（调用方走默认）。
+        let mut bad = load_from(&dir);
+        bad["window_bounds"] = serde_json::json!({ "x": -5., "y": 0., "w": 1600., "h": 900. });
+        save_to(&dir, &bad);
+        assert_eq!(super::load_window_bounds_from(&dir), None, "负 origin 拒绝");
+        let mut small = load_from(&dir);
+        small["window_bounds"] = serde_json::json!({ "x": 0., "y": 0., "w": 500., "h": 300. });
+        save_to(&dir, &small);
+        assert_eq!(
+            super::load_window_bounds_from(&dir),
+            None,
+            "小于最小窗 760×480 拒绝"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
