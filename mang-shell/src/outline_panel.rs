@@ -30,7 +30,10 @@ use crate::button_ext::icon_button_36;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, FocusHandle, ScrollAnchor, ScrollHandle, Window};
+use gpui::{
+    App, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, ScrollAnchor,
+    ScrollHandle, Window,
+};
 use ui::prelude::*;
 use ui::{
     Icon, IconName, IconSize, Label, LabelSize, List, ListHeader, ListItem, Navigable,
@@ -82,6 +85,12 @@ pub struct OutlinePanel {
     activate_hook: Option<ActivateHook>,
     /// 独立宿主可省略；Shell 注入当前活动视图的焦点路由。
     escape_hook: Option<EscapeHook>,
+    /// #108 D1：过滤查询（大小写不敏感子串——纯前端行集过滤，
+    /// 不动数据面；报告 §3 P1 口径）。空 = 全行。
+    filter: String,
+    /// #108 D1：过滤框焦点（面板独立实体——不借 Editor 表单域，
+    /// 自持输入焦点与键盘消费）。
+    filter_focus: FocusHandle,
     /// #108 批②：分区折叠集（行索引 = 数据面身份——不随渲染漂移；
     /// 报告 §3 提示「行焦点按序号协议与折叠的行序号漂移交互需设计
     /// 先行」：折叠集按全量 headings 的行索引记，句柄缓存不清退
@@ -105,6 +114,8 @@ impl OutlinePanel {
             scroll: ScrollHandle::new(),
             activate_hook,
             escape_hook: None,
+            filter: String::new(),
+            filter_focus: cx.focus_handle(),
             collapsed: crate::settings::load_outline_collapsed()
                 .into_iter()
                 .collect(),
@@ -140,6 +151,86 @@ impl OutlinePanel {
     /// 行集是否为空（left_panel 沿用「无标题不渲染分组」的批 5a 前语义）。
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// #108 D1：设置过滤查询（实时——每键入即时生效；空恢复全行）。
+    pub fn set_filter(&mut self, query: String) {
+        self.filter = query;
+    }
+
+    /// #108 D1：过滤框键盘编辑（最小文本语义——单字符追加 / 退格 /
+    /// Esc 清空；IME 长文本组合走 GPUI 平台输入通道时以 marked
+    /// 段提交形态扩展，此处起步语义为 ASCII/直接输入面）。字符
+    /// 追加含 CJK（`key` 为单字符判定——`to_lowercase` 过滤域不变）。
+    fn dispatch_filter_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ks = &event.keystroke;
+        let key = ks.key.to_lowercase();
+        // 修饰键形态不进过滤编辑（Ctrl/Alt/Shift 组合留给动作面）。
+        let plain = !ks.modifiers.control && !ks.modifiers.alt && !ks.modifiers.platform;
+        if plain && key == "escape" {
+            self.filter.clear();
+            cx.notify();
+            return;
+        }
+        if plain && key == "backspace" {
+            self.filter.pop();
+            cx.notify();
+            return;
+        }
+        if plain && key == "enter" {
+            // Enter 落在过滤框：无编辑语义（行激活 Enter 在行级
+            // menu::Confirm——过滤框消费防误触行跳）。
+            cx.stop_propagation();
+            return;
+        }
+        if plain && key.chars().count() == 1 && !ks.modifiers.shift {
+            // 单字符键（GPUI key 面：字母/数字/符号单字符形态）。
+            let ch = key.chars().next().unwrap();
+            self.filter.push(ch);
+            cx.notify();
+            return;
+        }
+        if plain && key.chars().count() == 1 && ks.modifiers.shift {
+            // Shift+字母：GPUI key 已小写化——shift 语义查英文大写
+            //（中文输入法下 key 为原始形态，Shift 组合不追加——
+            // 简化面：仅 ASCII 大写近似，非英文布局可能不完全准确，
+            // 真机 IME 走平台输入通道不进此分支）。
+            let ch = key.chars().next().unwrap();
+            if ch.is_ascii_alphabetic() {
+                self.filter.push(ch.to_ascii_uppercase());
+            }
+            cx.notify();
+            return;
+        }
+    }
+
+    /// #108 D1：过滤后可见行标签（测试断言面——渲染同源 visible_rows）。
+    /// #108 D1：过滤后行集（无过滤 = 全行；大小写不敏感子串——
+    /// `to_lowercase` 两侧同域比较，CJK 无大小写变换恒等）。
+    fn visible_rows(&self) -> Vec<&OutlineRow> {
+        if self.filter.is_empty() {
+            return self.rows.iter().collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.rows
+            .iter()
+            .filter(|r| r.label.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// #108 D1：过滤空集提示文案（有标题但无命中——可见语义非白屏；
+    /// 无过滤/有命中 = None 不渲染）。
+    fn filter_empty_hint(&self) -> &'static str {
+        if !self.filter.is_empty() && self.visible_rows().is_empty() {
+            "无匹配标题"
+        } else {
+            ""
+        }
     }
 
     /// #108 批②：折叠/展开分区头（toggle——渲染集即时重算）。
@@ -184,7 +275,19 @@ impl OutlinePanel {
     pub fn visible_rows_indexed(&self) -> Vec<(usize, &OutlineRow)> {
         let mut out = Vec::new();
         let mut hiding_until_level: Option<usize> = None;
+        // #108 D1：过滤门前置于折叠视图（无过滤 = 全行；过滤与折叠
+        // 两层正交——被折叠隐藏的行不进过滤比较，命中行仍受折叠门）。
+        let needle = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
         for (index, row) in self.rows.iter().enumerate() {
+            if let Some(n) = &needle {
+                if !row.label.to_lowercase().contains(n.as_str()) {
+                    continue;
+                }
+            }
             if let Some(min_level) = hiding_until_level {
                 if row.level <= min_level {
                     // 到同级/更高级标题——恢复可见。
@@ -319,12 +422,78 @@ impl gpui::Render for OutlinePanel {
                 .is_some_and(|next| next.level > rows_snapshot[i].level)
         };
         let collapsed = self.collapsed.clone();
+        // #108 D1：过滤面渲染变量（与折叠视图共存——过滤是前端
+        // 行集门，折叠是层级门；两层各自独立生效）。
+        let filter = self.filter.clone();
+        let filter_focus = self.filter_focus.clone();
+        let filter_hint = self.filter_empty_hint().to_string();
         let scroll = self.scroll.clone();
         let mut entries = Vec::with_capacity(rows.len());
 
         // 行体（批 5a 组件面原样 + 焦点挂载）：外层 stateful div 持
         // track_focus（ListItem 无焦点 API——ui 组件面单证），点击聚焦；
         // ListItem 承载视觉与跳行（批 5a 点击链不动）。
+        // #108 D1：过滤框（面板顶条——List 外独立装配；List.header 只
+        // 接 ListHeader 不可嵌任意元素）。键盘编辑自持：on_key_down 进
+        // dispatch_filter_key（字符追加/退格/Esc 清空）。
+        let filter_bar = h_flex()
+            .id("outline-filter")
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .child(
+                Icon::new(IconName::Filter)
+                    .size(IconSize::XSmall)
+                    .color(ui::Color::Muted),
+            )
+            .child(
+                div()
+                    .id("outline-filter-input")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(22.))
+                    .overflow_hidden()
+                    .track_focus(&filter_focus)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        this.dispatch_filter_key(event, window, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        Label::new(if filter.is_empty() {
+                            "过滤…"
+                        } else {
+                            filter.as_str()
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(if filter.is_empty() {
+                            ui::Color::Muted
+                        } else {
+                            ui::Color::Default
+                        }),
+                    ),
+            );
+
+        // #108 D1：空集提示（有标题无命中——可见非白屏；根列承载）。
+        let empty_hint = (!filter_hint.is_empty()).then(|| {
+            h_flex()
+                .id("outline-filter-empty")
+                .flex_none()
+                .px_2()
+                .pb_1()
+                .child(
+                    Label::new(filter_hint.as_str())
+                        .size(LabelSize::XSmall)
+                        .color(ui::Color::Muted),
+                )
+        });
+
         let body = div()
             .id("outline-body")
             .size_full()
@@ -451,6 +620,8 @@ impl gpui::Render for OutlinePanel {
             .id("outline-panel")
             .flex_1()
             .min_h_0()
+            .flex()
+            .flex_col()
             // ↑↓/Enter/Esc 走 main.rs 既有 menu 键位族（批 4 注册面——
             // 键上下文匹配聚焦元素祖先链，本根即 "menu"）。
             .key_context("menu")
@@ -482,6 +653,11 @@ impl gpui::Render for OutlinePanel {
                     }
                 }
             })
+            // 根列向承载：过滤条 + 空集提示 +（滚动 body 的）navigable
+            //（body 形态零变化——List 虚拟化有界容器保持，长文档滚动
+            // 测试语义不变）。
+            .child(filter_bar)
+            .when_some(empty_hint, |el, hint| el.child(hint))
             .child(navigable)
     }
 }
@@ -645,6 +821,41 @@ mod tests {
 
     /// 导航面：首行聚焦 → SelectNext → 次行含焦点（Navigable 遍历语义）。
     #[gpui::test]
+    /// #108 D1：过滤框——实时忽略大小写子串匹配（报告 §3 P1 原文
+    /// 口径），纯前端过滤行集不动数据面。先红：方法不存在 = 编译红。
+    #[gpui::test]
+    fn filter_narrows_rows_case_insensitive(cx: &mut TestAppContext) {
+        let (_editor, panel, _visual) = panel_window(cx, "# Alpha\n## Beta\n# Gamma\n### Delta");
+        panel.update(cx, |p, _| {
+            // 初始全行（4 标题）。
+            assert_eq!(p.visible_labels().len(), 4, "无过滤全行");
+
+            // 键入 "beta"：小写查询命中大写 Beta 行——大小写不敏感。
+            p.set_filter("beta".into());
+            assert_eq!(p.visible_labels().len(), 1, "过滤后 1 行");
+            assert!(
+                p.visible_labels()[0].contains("Beta"),
+                "命中的是 Beta 行（大小写不敏感）"
+            );
+
+            // 清空：恢复全行。
+            p.set_filter(String::new());
+            assert_eq!(p.visible_labels().len(), 4, "清空恢复全行");
+        });
+    }
+
+    /// #108 D1：过滤空集提示（有标题文档过滤无命中 =「无匹配」可见
+    /// 语义——不是白屏）。
+    #[gpui::test]
+    fn filter_no_match_is_visible_not_blank(cx: &mut TestAppContext) {
+        let (_editor, panel, _visual) = panel_window(cx, "# Alpha\n## Beta");
+        panel.update(cx, |p, _| {
+            p.set_filter("zzz".into());
+            assert_eq!(p.visible_labels().len(), 0, "无命中空集");
+            assert_eq!(p.filter_empty_hint(), "无匹配标题", "空集提示文案");
+        });
+    }
+
     /// #108 批②：分区折叠——H1 分区折叠后子行不出渲染集、折叠头
     /// 保留；展开恢复全行。先红：方法不存在 = 编译红。
     /// #108 批③：XDG 临时区 guard（dock_open_states_persist_across_restart
