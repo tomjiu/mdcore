@@ -434,6 +434,13 @@ fn main() {
         .run(move |cx: &mut App| {
             theme::init(theme::LoadThemes::JustBase, cx);
             theme::set_theme_settings_provider(Box::new(settings::ShellThemeSettings), cx);
+            // #110 G2：用户主题装载（磁盘 themes/*.json → registry——
+            // 报告 §3 G2「引擎在线但无装载函数」补口；对齐既有用户
+            // 配置目录（§5 D2 裁定）；坏文件跳过 + stderr 证据行不炸启动）。
+            let loaded = settings::load_user_themes(cx);
+            if loaded > 0 {
+                eprintln!("theme-loader: {loaded} 个用户主题装载完成");
+            }
 
             // #385 批 4：ui::ContextMenu 族的键盘导航激活面——组件的
             // on_action（menu::Cancel/SelectNext/Confirm…）依赖宿主 app
