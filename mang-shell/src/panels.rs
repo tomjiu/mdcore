@@ -45,7 +45,7 @@ pub const RIGHT_PANEL_MAX: Pixels = px(600.);
 /// G4：面板边缘拖拽热区宽（px）。
 pub const PANEL_RESIZE_HOTZONE: Pixels = px(4.);
 /// 面板主内边距（px，Lead：主要区域 12-16px）。
-const PANEL_PADDING: Pixels = px(12.);
+pub(crate) const PANEL_PADDING: Pixels = px(12.);
 /// 面板头部下缘留白（px）。
 const HEADER_MARGIN: Pixels = px(8.);
 
@@ -81,6 +81,9 @@ pub fn left_panel(
     git_panel: Option<&Entity<GitPanel>>,
     git_view: bool,
     width: Pixels,
+    // #121（批③b）：标题拖拽手柄（宿主构造——标题 Label 包进手柄
+    // div；None = 纯 Label 旧语义，测试/窄路径不受扰）。
+    title_drag: Option<gpui::AnyElement>,
     // #571：大纲面板实体（批 7——键盘导航结构树；空态不渲染分组
     // 沿用批 5a 前语义）。None = 无激活文档。
     outline: Option<&Entity<crate::outline_panel::OutlinePanel>>,
@@ -109,16 +112,22 @@ pub fn left_panel(
         .p(PANEL_PADDING)
         .gap_1()
         // 栏头随视图切换（VS Code 语义：资源管理器 / 源代码管理）。
-        .child(
-            Label::new(if git_view {
+        // #121 批③b：标题在手柄内（拖拽源——DragPanel 载荷经宿主
+        // on_drag 挂接）。
+        .child({
+            let label = Label::new(if git_view {
                 "源代码管理"
             } else {
                 "资源管理器"
             })
             .size(LabelSize::Small)
-            .color(ui::Color::Muted)
-            .mb(HEADER_MARGIN),
-        )
+            .color(ui::Color::Muted);
+            if let Some(handle) = title_drag {
+                v_flex().mb(HEADER_MARGIN).child(handle).child(label)
+            } else {
+                v_flex().mb(HEADER_MARGIN).child(label)
+            }
+        })
         // #183 A-3（#188）：git 视图——GitPanel 本体占剩余高度（自带
         // overflow_y_scroll 的列表体；实体 clone 挂载，改动/历史点击/
         // 刷新钮均在其 Render 内已接）。未开工作区时呈现引导提示，

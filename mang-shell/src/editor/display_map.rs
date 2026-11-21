@@ -149,11 +149,17 @@ impl DisplayMap {
 
     /// 清空全部已回填断点 + 失效缓存（编辑/宽度变更后由调用方触发；
     /// 下一帧重新回填可见行）。
+    ///
+    /// #201 修复：**无条件失效**。旧版只在 `!wraps.is_empty()` 时
+    /// clear+invalidate——wraps 为空（编辑发生在任何 wrap 回填之前：
+    /// 开文件后 0/1 帧内的连打、后台 tab 从未 paint）时空转，RowTable
+    /// 仍描述编辑前文档：`display_row_count` 返回旧行数（uniform_list
+    /// 不派新行渲染 → 画面无新增文本），而 buffer 已变（脏点亮、save
+    /// 直读 buffer 落盘）——正是 #201 四症状形态。空 wraps 也是编辑：
+    /// 失效是语义必须，与回填状态无关。
     pub fn reset_wraps(&mut self) {
-        if !self.wraps.is_empty() {
-            self.wraps.clear();
-            self.invalidate();
-        }
+        self.wraps.clear();
+        self.invalidate();
     }
 
     /// 已登记折叠头行（升序——持久化/诊断面）。
@@ -666,6 +672,51 @@ mod tests {
         assert_eq!(m.display_row_count(&b), 1);
         assert_eq!(m.to_display(&b, p(0, 0)), dp(0, 0));
         assert_eq!(m.row_text(&b, 0), "");
+    }
+
+    /// 复现 #201 形态：编辑发生在任何 wrap 回填**之前**（wraps 为空——
+    /// 开文件后 0/1 帧内的自动化连打、后台 tab 从未 paint）。
+    ///
+    /// 旧 `reset_wraps` 只在 `!wraps.is_empty()` 时失效——空 wraps 走
+    /// `refresh_caches → reset_wraps` 空转，RowTable 仍描述编辑前文档：
+    /// `display_row_count` 返回旧行数（uniform_list 不派新行 → 画面无
+    /// 新增文本），而 buffer 已变（脏点亮、save 直读 buffer 落盘）。
+    #[test]
+    fn edit_before_any_wrap_backfill_keeps_row_table_fresh() {
+        let b = map3();
+        let mut m = DisplayMap::default();
+        // 前置：没有任何 set_wrap_points 调用（wraps 空）——但行表已被
+        // 首帧 display_row_count 查询构建（渲染链真实形态：draw 先查行数）。
+        let rows_before = m.display_row_count(&b);
+        assert_eq!(rows_before, 3, "3 行无断点 = 3 显示行");
+        // 编辑：行 2 追加 + 新增第 3、4 行（模拟插入带换行文本）
+        let b2 = Buffer::from_plain_text(
+            "aaaaaaaaaabbbbbbbbbbccccc\n0123456789\n中文\nnewline-proof\nlast",
+        );
+        // 模拟 refresh_caches 的完整链：reset_wraps 是唯一失效入口
+        m.reset_wraps();
+        // 修复后期望：行表立即反映新 buffer（5 行）
+        assert_eq!(
+            m.display_row_count(&b2),
+            5,
+            "#201：编辑发生在 wrap 回填前（wraps 空），reset_wraps 空转导致行表仍报旧行数 3"
+        );
+    }
+
+    /// 同位面：编辑路径 (after_edit → refresh_caches → reset_wraps) 的
+    /// 单一入口语义——空 wraps 也是编辑，不能跳过失效。
+    #[test]
+    fn reset_wraps_on_empty_wraps_invalidates_cache() {
+        let b = map3();
+        let mut m = DisplayMap::default();
+        let _ = m.display_row_count(&b); // 建缓存
+        m.set_wrap_points(&b, 0, vec![10]);
+        assert_eq!(m.display_row_count(&b), 4, "断点使行 0 拆 2 段");
+        // 撤空：clear 语义 = 回到无断点，但 wraps 非空（历史回填过）——
+        // 旧代码这条路径已失效。真正的空转路径在上一测试。
+        m.set_wrap_points(&b, 0, vec![]);
+        assert_eq!(m.display_row_count(&b), 3, "清断点回到 3 行");
+        assert!(m.wrap_points(0).is_some(), "显式空 = 已回填无断点");
     }
 }
 

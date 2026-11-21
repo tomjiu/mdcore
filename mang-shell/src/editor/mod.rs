@@ -602,7 +602,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -671,7 +671,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -754,7 +754,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -826,7 +826,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -897,7 +897,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -965,7 +965,7 @@ impl Editor {
             last_text_width: RefCell::new(None),
             cursors: Cursors::single(Point::new(0, 0)),
             palette: None,
-            palette_recent: RecentRing::new(palette_view::RECENT_CAPACITY),
+            palette_recent: Self::restore_palette_recent(),
             goto: None,
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
@@ -1632,9 +1632,18 @@ impl Editor {
         };
         let key = ks.key.to_lowercase();
         match key.as_str() {
+            // #112 P2 批④：Esc 两段式（Q-IDE vendor state.rs:602-615
+            // 对照）——查询非空先清查询（面板保持开，候选回全集 +
+            // 选中复位）；查询空才关面板回文档焦点。
             "escape" => {
-                self.palette = None;
-                self.focus_document_input(window, cx);
+                if !pal.query.is_empty() {
+                    pal.query.clear();
+                    Self::palette_refill(pal, &self.palette_recent);
+                    pal.selected = 0;
+                } else {
+                    self.palette = None;
+                    self.focus_document_input(window, cx);
+                }
             }
             "up" => pal.selected = pal.selected.saturating_sub(1),
             "down" => {
@@ -1650,8 +1659,18 @@ impl Editor {
                     // #183 A-3：面板执行的命令记入最近使用（下次打开面板
                     // 顶部「最近使用」段可见——分组渲染接线的记账面）。
                     self.palette_recent.touch(c);
+                    // #112 P1：MRU 落盘（跨重启——Enter 执行即记账即持久化）。
+                    self.persist_palette_recent();
                     self.exec_command(c, window, cx);
                 }
+            }
+            // #112 P2 批④：Ctrl/Alt 组合令旁路（Q-IDE R4 对照）——
+            // 面板只收纯字符与导航/回车/Esc；ctrl/alt 组合不吞
+            // （返回 false 冒泡编辑键层——Ctrl+F 开查找、Ctrl+S 保存
+            // 等在面板打开时照常可用）。Shift 单独不触发旁路（Shift+
+            // 字符是可打印入查询的大写形态）。
+            _ if ks.modifiers.control || ks.modifiers.alt => {
+                return false;
             }
             _ => {
                 let mut key = ks.clone();
@@ -1673,6 +1692,28 @@ impl Editor {
 
     /// #183 A-3：查询 → 分组装配 → 扁平序（键入/打开时算；渲染期按
     /// 段重算——同一纯函数链，结果一致）。
+    fn restore_palette_recent() -> RecentRing {
+        // #112 P1（MRU 持久化）：跨重启恢复最近使用命令（settings
+        // `palette.recent`——稳定名反解；未知名跳过，容量截断同语义）。
+        let mut ring = RecentRing::new(palette_view::RECENT_CAPACITY);
+        for name in crate::settings::load_palette_recent() {
+            if let Some(c) = commands::from_key_name(&name) {
+                ring.touch(c);
+            }
+        }
+        ring
+    }
+
+    fn persist_palette_recent(&self) {
+        // #112 P1：write-through 落盘（容量 4 的微 JSON——无需防抖）。
+        let names: Vec<String> = self
+            .palette_recent
+            .iter()
+            .map(|c| c.key_name().to_string())
+            .collect();
+        crate::settings::save_palette_recent(&names);
+    }
+
     fn palette_flat_of(query: &str, recent: &RecentRing) -> Vec<Cmd> {
         palette_view::palette_flat(&palette_view::palette_sections(query, recent))
     }
@@ -6199,6 +6240,38 @@ mod ime_composition_tests {
         });
         std::fs::remove_file(path).unwrap();
     }
+
+    /// #201：Editor 层链路——编辑发生在任何 wrap 回填之前（零帧
+    /// render_lines 的回填块从未执行）时，display_row_count 仍须立即
+    /// 反映 buffer 行数。旧 reset_wraps 空 wraps 空转 → 行表陈旧 →
+    /// uniform_list 永不派新行（真机形态：脏点亮/磁盘已写/画面无
+    /// 新增文本）。纯 DisplayMap 单测（display_map.rs）之外，这里锁
+    /// `after_edit → refresh_caches → reset_wraps` 真实编辑路径。
+    #[gpui::test]
+    fn edit_before_wrap_backfill_editor_level_row_freshness(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = ime_window(cx, "AB");
+        window.update(cx, |_host, _window, cx| {
+            ed.update(cx, |ed, cx| {
+                // 前置：不调用任何渲染路径——display_map.wraps 保持空
+                //（真实形态：开文件后 0/1 帧内的自动化连打）。
+                // 查询一次行数构建 RowTable 缓存（首帧 draw 的行为）。
+                let before = ed.display_map.display_row_count(&ed.buffer);
+                assert_eq!(before, 1, "「AB」1 行");
+                // 平台文本通道插入带换行文本（IME commit 形态）：
+                // 初始光标 (0,0) 无选区 → 行首插入 → "CD\nEF\nGHAB" 3 行。
+                ed.replace_text_in_range(None, "CD\nEF\nGH", _window, cx);
+                // #201 断言：编辑后行数立即反映 buffer（旧缺陷形态
+                // = 旧表 1 行卡死——首查询构建的缓存永不刷新）
+                let after = ed.display_map.display_row_count(&ed.buffer);
+                assert_eq!(
+                    after, 3,
+                    "#201：wrap 未回填时编辑后行表必须仍新鲜（行首插 CD/EF/GH + AB = 3 行）"
+                );
+                assert_eq!(ed.buffer.line_count(), 3);
+            });
+        });
+    }
+
     /// 预编辑全链：起（ni）→ 更新（你好，带选中）→ 提交（unmark 保文）
     /// ——marked 区间（UTF16）逐态断言 + 提交后脏。
     #[gpui::test]
@@ -6415,6 +6488,70 @@ mod palette_goto_interaction_tests {
 
     /// 开合 + 键入过滤 + ↑↓ 选中移动 + Esc 关闭 + 重开换新（状态桥四段）。
     #[gpui::test]
+    /// #112 P2 批④：Esc 两段式——查询非空先清查询（面板保持开，
+    /// 候选回全集）；查询空才关面板。先红面：现行为一步直接关。
+    #[gpui::test]
+    fn palette_esc_two_stage_clears_query_first(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        // 键入「折叠」——查询非空。
+        let _ = window.update(cx, |_host, window, cx| {
+            for ch in ["折", "叠"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+        });
+        // 第一记 Esc：清查询（面板保持开——两段式第一段）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("第一记 Esc 后面板保持开");
+            assert_eq!(pal.query, "", "Esc 第一段：清查询");
+            assert_eq!(
+                pal.items.len(),
+                commands::search("").len(),
+                "候选回全集（与空查询同源）"
+            );
+            assert_eq!(pal.selected, 0, "清查询后选中复位 0");
+        });
+        // 第二记 Esc：关面板（两段式第二段——回到一步语义）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "第二记 Esc：关面板");
+        });
+    }
+
+    /// #112 P2 批④：面板内 Ctrl 组合令旁路——Ctrl+F 在面板打开时
+    /// 照常打开查找框（面板不吞编辑类组合令——冲突裁决归编辑键层，
+    /// Q-IDE R4 对照）。先红面：现面板吞一切 ctrl 组合。
+    #[gpui::test]
+    fn palette_open_ctrl_combo_bypasses_to_editor(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        // 开面板。
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "前置：面板开");
+            assert!(ed.find.is_none(), "前置：查找框未开");
+        });
+        // 面板内 Ctrl+F：旁路执行（打开查找框——不被面板吞）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, ctrl("f"));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.find.is_some(), "Ctrl+F 旁路：查找框打开（面板不吞）");
+        });
+    }
+
     fn palette_open_type_navigate_esc_lifecycle(cx: &mut gpui::TestAppContext) {
         let (ed, window) = pal_window(cx, "# A\nbody\n");
         // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。
@@ -6484,6 +6621,9 @@ mod palette_goto_interaction_tests {
         let (ed, window) = pal_window(cx, "# A\nbody\n");
         ed.update(cx, |ed, _| {
             assert!(ed.find.is_none(), "前置：查找条未开");
+            // #112 P1：构造点会从 settings 恢复 MRU（持久化接线后
+            // 本机/前序测试可能留档）——单测前置显式清零回到旧假设。
+            ed.palette_recent = crate::command_groups::RecentRing::new(4);
             assert!(!ed.palette_recent.contains(Cmd::OpenFind), "前置：无记账");
         });
         let _ = window.update(cx, |_host, window, cx| {
@@ -6579,5 +6719,108 @@ mod palette_goto_interaction_tests {
             assert!(ed.goto.is_none(), "Esc 关框");
             assert_eq!(ed.buffer.cursor().line, 4, "关框不移动光标");
         });
+    }
+    /// #112 P1（MRU 持久化）：跨「重启」回放——settings 往返 + restore 序 +
+    /// 落盘序三段真链（**注入形态**：直接走 `_for_test` 目录注入，不动进程
+    /// env——并行套件下 XDG 重定向会让同进程其他 Editor 构造测试读到污染窗，
+    /// 曾间歇红；构造点全链（restore_palette_recent）与段2同构，由
+    /// 段2的注入等价覆盖）。
+    #[gpui::test]
+    fn palette_recent_survives_restart(cx: &mut gpui::TestAppContext) {
+        let cfg = std::env::temp_dir().join(format!("mdc-112p1-mru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg);
+        std::fs::create_dir_all(&cfg).unwrap();
+        // 段1：settings 层往返（注入形态）。
+        crate::settings::save_palette_recent_for_test(
+            &cfg,
+            &["Save".to_string(), "OpenFind".to_string()],
+        );
+        let names = crate::settings::load_palette_recent_from_test(&cfg);
+        assert_eq!(
+            names,
+            vec!["Save".to_string(), "OpenFind".to_string()],
+            "档往返"
+        );
+
+        // 段2：restore 序真链（与构造点 restore_palette_recent 同构——
+        // 稳定名反解 + touch 顺序回放到 RecentRing）。
+        let (ed, _window) = pal_window(cx, "# t\n正文");
+        ed.update(cx, |this, _| {
+            this.palette_recent = RecentRing::new(palette_view::RECENT_CAPACITY);
+            for name in names.clone() {
+                if let Some(c) = commands::from_key_name(&name) {
+                    this.palette_recent.touch(c);
+                }
+            }
+        });
+        assert!(
+            ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::Save)),
+            "恢复 Save（最新在前档）"
+        );
+        assert!(
+            ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::OpenFind)),
+            "恢复 OpenFind"
+        );
+        // 面板空查询 → 最近段在最前且含两条（palette_sections 真链）。
+        let sections = crate::palette_view::palette_sections(
+            "",
+            &ed.read_with(cx, |this, _| {
+                let mut r = crate::command_groups::RecentRing::new(4);
+                for c in this.palette_recent.iter() {
+                    r.touch(c);
+                }
+                r
+            }),
+        );
+        assert!(matches!(
+            sections.first().map(|s| s.group),
+            Some(crate::command_groups::Group::Recent)
+        ));
+        assert_eq!(sections[0].entries.len(), 2, "最近段两条");
+
+        // 段3：touch 后的落盘序真链（persist 同构——names 化后写注入档）。
+        let names_after: Vec<String> = ed.read_with(cx, |this, _| {
+            let mut r = this.palette_recent.clone();
+            r.touch(Cmd::GotoLine);
+            r.iter().map(|c| c.key_name().to_string()).collect()
+        });
+        crate::settings::save_palette_recent_for_test(&cfg, &names_after);
+        let after = std::fs::read_to_string(cfg.join("settings.json")).unwrap();
+        assert!(
+            after.contains("GotoLine"),
+            "touch 即落盘（write-through 序）"
+        );
+        assert!(after.contains("Save"), "既有项保留");
+
+        let _ = std::fs::remove_dir_all(&cfg);
+    }
+
+    /// #112 P1（命中高亮）：palette_sections 高亮集贯通（查询 → Entry.highlights）。
+    #[gpui::test]
+    fn palette_sections_carry_highlights(cx: &mut gpui::TestAppContext) {
+        let (ed, _window) = pal_window(cx, "# t\n正文");
+        let recent = ed.read_with(cx, |this, _| {
+            let mut r = crate::command_groups::RecentRing::new(4);
+            for c in this.palette_recent.iter() {
+                r.touch(c);
+            }
+            r
+        });
+        let sections = crate::palette_view::palette_sections("移左", &recent);
+        // 「移左」命中「移动：左」——该 Entry 的 highlights = [0, 3]。
+        let hit = sections
+            .iter()
+            .flat_map(|s| s.entries.iter())
+            .find(|e| e.cmd == Cmd::MoveLeft)
+            .expect("移左 命中 移动：左");
+        assert_eq!(hit.highlights, vec![0, 3], "命中下标集贯通到条目");
+        // 空查询无高亮（等价展示）。
+        let all = crate::palette_view::palette_sections("", &recent);
+        assert!(
+            all.iter()
+                .flat_map(|s| s.entries.iter())
+                .all(|e| e.highlights.is_empty()),
+            "空查询零高亮"
+        );
     }
 }

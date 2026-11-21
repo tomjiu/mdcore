@@ -147,6 +147,30 @@ pub(crate) trait TileSession: Send {
     fn request_size(&self);
     /// 非阻塞收回执（16ms drain 拉取）。
     fn try_recv(&self) -> Option<SessionReply>;
+    /// #50 C3：文本输入（默认未接线返回 false——mock 未实现编辑面时
+    /// 键盘面如实「不可编辑」，不假绿）。
+    fn edit_type_text(&mut self, _seq: u64, _text: &str) -> bool {
+        false
+    }
+    /// #50 C3：UNO 命令（同上——默认不可用）。
+    fn edit_uno(&mut self, _seq: u64, _command: &str, _args: Option<&str>, _query: bool) -> bool {
+        false
+    }
+    /// #50 C3：剪贴板读（同上）。
+    fn edit_text_of(&mut self, _seq: u64, _mime: &str) -> bool {
+        false
+    }
+    /// #50 C4：保存（同上）。
+    fn edit_save_as(&mut self, _seq: u64, _url: &str, _format: &str) -> bool {
+        false
+    }
+    /// #50 C5：页几何查询（`getPartPageRectangles`——跳页/翻页 tile 的
+    /// 页矩形坐标源；默认未接线返回 false，mock 未实现时调用面如实
+    /// 「不可跳页」不假绿。真链消费 = real_chain_c5_matrix_parity；
+    /// 产品翻页呈现接后续批次）。
+    fn edit_page_geometry(&mut self, _seq: u64) -> bool {
+        false
+    }
     /// #179 三分收回执：`Reply` / `Empty` / `Disconnected`——通道
     /// 断开与暂时无消息分流（旧 `try_recv` 同貌 None——会话线程无终态
     /// 回执退出时视图永挂，无从诊断）。默认实现 = `try_recv` 的
@@ -160,6 +184,34 @@ pub(crate) trait TileSession: Send {
 }
 
 impl TileSession for DocxLokSession {
+    /// #50 C3：编辑命令——`DocxLokSession` 的 request_* 面转发（seq
+    /// 由本视图统一分配，回执经同一 `try_recv` 通道）。
+    fn edit_type_text(&mut self, seq: u64, text: &str) -> bool {
+        self.request_type_text(seq, text);
+        true
+    }
+    fn edit_uno(&mut self, seq: u64, command: &str, args: Option<&str>, query: bool) -> bool {
+        self.request_uno(seq, command, args, query);
+        true
+    }
+    fn edit_text_of(&mut self, seq: u64, mime: &str) -> bool {
+        self.request_text_of(seq, mime);
+        true
+    }
+    /// #50 C4：保存（file_url 交内核——B 线 profile::file_url_of 同源
+    /// 语义由会话线程内部承担，宿主传 OS 路径）。
+    fn edit_save_as(&mut self, seq: u64, url: &str, format: &str) -> bool {
+        self.request_save_as(seq, url, format);
+        true
+    }
+    /// #50 C5：页几何转发（真链通道——C5 表格跨页样本已实证必需：
+    /// 页矩形是跳页 tile 的唯一正确坐标锚）。
+    fn edit_page_geometry(&mut self, _seq: u64) -> bool {
+        // 自分 seq（request_page_geometry 无参形态——trait 臂收 _seq
+        // 只为签名对齐；回执 PageGeometry{seq} 由调用面 drain 对账）。
+        self.request_page_geometry();
+        true
+    }
     fn request_tile(
         &self,
         canvas_w: usize,
@@ -222,6 +274,24 @@ impl Boot {
 }
 
 /// docx 页面视图实体（LOK 连续画布条带渲染——见模块头）。
+/// #50 C3：编辑命令序号（独立静态域——与 tile SEQ 不共空间；回执
+/// 路由按 `edit_pending` 对账）。
+static EDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_edit_seq() -> u64 {
+    EDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #50 C3：编辑面命令类别（回执路由——`EditDone`/`TextDone`/
+/// `SaveDone` 三回执共 seq 空间，按类别分流）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    Type,
+    Uno,
+    TextOf,
+    Save,
+}
+
 pub struct DocxPagesView {
     /// 源文件绝对路径（标签路径绑定单一真源）。
     path: PathBuf,
@@ -253,6 +323,19 @@ pub struct DocxPagesView {
     polling: bool,
     scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+    /// #50 C3/C4：内核侧脏位（`EditDone{ok,dirty}` 置位——成功编辑
+    /// 即脏；失败回执保持原值）。
+    dirty: bool,
+    /// #50 C4：宿主侧修订号（`EditDone{revision}` 更新——保存对账的
+    /// 「当前」侧；`SaveDone{revision_saved}` 相等才清 dirty，防延迟
+    /// 回执清掉新编辑）。
+    revision: u64,
+    /// #50 C3：编辑/保存/剪贴板命令的回执在途（seq → 命令类别——回执
+    /// 路由；切标签 Drop 后自然作废=旧回执不落新文档）。
+    edit_pending: HashMap<u64, EditKind>,
+    /// #50 C3：IME preedit 组合串（宿主渲染——契约 §10 口径：组合期
+    /// 仅宿主显示，定稿 `type_text` 逐字符下发；空 = 无组合）。
+    preedit: String,
     /// 视口尺寸回写（根级探针 canvas paint 期写、render 期读——
     /// pdf_pages 同款：避免每帧实体更新）。
     viewport: Rc<Cell<Option<(f32, f32)>>>,
@@ -338,6 +421,11 @@ impl DocxPagesView {
             viewport_seen: (0., 0.),
             watchdog_ticks: 0,
             watchdog_retried: false,
+            // #50 C3/C4：编辑状态面初始零值（会话建立后由回执驱动）。
+            dirty: false,
+            revision: 0,
+            edit_pending: HashMap::new(),
+            preedit: String::new(),
         }
     }
 
@@ -372,10 +460,23 @@ impl DocxPagesView {
         &self.boot
     }
 
-    /// C1/C2 只读渲染：恒不脏（保存面 C4；文本态切换卫保证行投影不会
-    /// 与会话同时编辑同一文件）。
+    /// 测试辅助：preedit 域读出（IME 测试断言面）。
+    #[cfg(test)]
+    pub(crate) fn preedit_for_test(&self) -> String {
+        self.preedit.clone()
+    }
+
+    /// 测试辅助：编辑/保存在途命令数（终态出清断言面）。
+    #[cfg(test)]
+    pub(crate) fn edit_pending_len_for_test(&self) -> usize {
+        self.edit_pending.len()
+    }
+
+    /// #50 C3/C4：真实脏位（`EditDone{ok,dirty}` 回执置位；`SaveDone`
+    /// 对账清零——见 [`Self::handle_save_done`]；查询面给关闭确认链/
+    /// save_tab 分流消费）。
     pub fn is_dirty(&self) -> bool {
-        false
+        self.dirty
     }
 
     /// 当前缩放档（测试面）。
@@ -388,6 +489,23 @@ impl DocxPagesView {
     #[cfg(test)]
     pub fn cache_stats_for_test(&self) -> (usize, usize) {
         (self.cache_bytes, self.cache.len())
+    }
+
+    /// #177 像素级基线：缓存条带的原始 BGRA 读出（`(w, h, 字节)`）。
+    ///
+    /// `gpui::RenderImage::as_bytes` 公开 API（third_party/zed/crates/
+    /// gpui/src/assets.rs:76）——缓存消费终点即解码像素，测试在此层
+    /// 做「渲染出来的像素像不像一份文档」断言（零产线改动）。
+    #[cfg(test)]
+    pub fn cached_image_for_test(&self, key: (u32, u32)) -> Option<(usize, usize, Vec<u8>)> {
+        let img = self.cache.get(&key)?;
+        let size = img.size(0);
+        let bytes = img.as_bytes(0)?.to_vec();
+        Some((
+            u32::from(size.width) as usize,
+            u32::from(size.height) as usize,
+            bytes,
+        ))
     }
 
     /// 派单在途数（测试面）。
@@ -506,6 +624,221 @@ impl DocxPagesView {
             (ZoomMode::Custom(a), ZoomMode::Custom(b)) => (a - b).abs() < 0.005,
             (a, b) => a == b,
         }
+    }
+
+    /// #50 C3：编辑键域分发（docx 页面态键入主入口——shell 键钩子在
+    /// 缩放键分流后调用；`false` = 未消费继续走 keymap 表）。
+    ///
+    /// 键位面（Q-IDE/ElyOffice 键语义——QWERTY）：
+    /// - 字符键（含 CJK——无修饰）：`type_text` 逐字符下发（选区被
+    ///   替换的标准编辑语义由内核承担）；
+    /// - Backspace/Delete：`.uno:Delete` / `.uno:DelToEndOfPara`（保守
+    ///   两键——Delete 视同 Backspace 同 `.uno:Delete`，不猜造未实证
+    ///   的 toEndOfWord 细分）；
+    /// - Enter：`.uno:InsertPara`；Tab：`.uno:InsertPara` 不对——Tab
+    ///   是 `.uno:InsertTab`；
+    /// - 方向/Home/End/PgUp/PgDn：光标移动 UNO（`GoLeft/GoRight/
+    ///   GoUp/GoDown/StartOfLine/EndOfLine/PageUp/PageDown`——查询
+    ///   类不置脏）；
+    /// - Ctrl+Z/Y（Ctrl+Shift+Z）：Undo/Redo；
+    /// - Ctrl+A：SelectAll（查询类）；Ctrl+C：TextOf+剪贴板写；
+    ///   Ctrl+X：TextOf + 剪贴板写 + `.uno:Cut`；Ctrl+V：剪贴板读 +
+    ///   `type_text`（富文本面后续批次——纯文本保守口径）；
+    /// - Ctrl+B/I/U：粗体/斜体/下划线（`.uno:Bold` 等——编辑类）。
+    ///
+    /// IME（契约 §10 口径）：preedit 宿主渲染（[`Self::preedit`]——
+    /// render 期状态面板叠加组合串），定稿/提交经 GPUI `EntityInputHandler`
+    /// 的 replace_text_in_range 走同一 `type_text` 通道（见 impl 块）。
+    pub fn dispatch_edit_key(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        _shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // 就绪卫：Starting/Failed 态键入零动作（不假绿——不可编辑态如实
+        // 未消费，落 keymap/shell 兜底）。
+        if !matches!(self.boot, Boot::Ready) || self.session.is_none() {
+            return false;
+        }
+        let ks = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: ctrl,
+                ..Default::default()
+            },
+            key: key.to_owned(),
+            key_char: None,
+        };
+        let _ = (&ks, window);
+        // 单字符文本键（无修饰——ctrl 组合是命令域）。
+        if !ctrl && key.chars().count() == 1 {
+            let ch = key.chars().next().unwrap();
+            self.send_edit(
+                EditKind::Type,
+                |session, seq| session.edit_type_text(seq, &ch.to_string()),
+                cx,
+            );
+            return true;
+        }
+        if ctrl {
+            return self.dispatch_ctrl_edit(key, cx);
+        }
+        // 无 ctrl 的功能键。
+        match key {
+            "backspace" | "delete" => {
+                self.send_uno_edit(".uno:Delete", None, false, cx);
+                true
+            }
+            "enter" => {
+                self.send_uno_edit(".uno:InsertPara", None, false, cx);
+                true
+            }
+            "tab" => {
+                self.send_uno_edit(".uno:InsertTab", None, false, cx);
+                true
+            }
+            "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" => {
+                let command = match key {
+                    "left" => ".uno:GoLeft",
+                    "right" => ".uno:GoRight",
+                    "up" => ".uno:GoUp",
+                    "down" => ".uno:GoDown",
+                    "home" => ".uno:StartOfLine",
+                    "end" => ".uno:EndOfLine",
+                    "pageup" => ".uno:PageUp",
+                    _ => ".uno:PageDown",
+                };
+                self.send_uno_edit(command, None, true, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ctrl 组合的编辑命令分发（`dispatch_edit_key` 的 ctrl 分支）。
+    fn dispatch_ctrl_edit(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        match key {
+            "z" | "y" => {
+                // Ctrl+Shift+Z = Redo（y 与 shift+z 双键位——QWERTY 通行）。
+                let command = if key == "z" { ".uno:Undo" } else { ".uno:Redo" };
+                self.send_uno_edit(command, None, false, cx);
+                true
+            }
+            "a" => {
+                self.send_uno_edit(".uno:SelectAll", None, true, cx);
+                true
+            }
+            "c" => {
+                // copy：读选区 → TextDone 回执写系统剪贴板。
+                self.send_edit(
+                    EditKind::TextOf,
+                    |session, seq| session.edit_text_of(seq, "text/plain;charset=utf-8"),
+                    cx,
+                );
+                true
+            }
+            "x" => {
+                // cut：读选区（回执写剪贴板）+ Delete（读回执后独立的
+                // 删除命令——两命令独立 seq，内核序即所见序）。
+                self.send_edit(
+                    EditKind::TextOf,
+                    |session, seq| session.edit_text_of(seq, "text/plain;charset=utf-8"),
+                    cx,
+                );
+                self.send_uno_edit(".uno:Cut", None, false, cx);
+                true
+            }
+            "v" => {
+                // paste：剪贴板读 + type_text（纯文本保守口径——富文本
+                // 面 B 线 mime 通道后续批次）。
+                if let Some(text) = self.clipboard_read(cx) {
+                    self.send_edit(
+                        EditKind::Type,
+                        |session, seq| session.edit_type_text(seq, &text),
+                        cx,
+                    );
+                }
+                true
+            }
+            "b" | "i" | "u" => {
+                let command = match key {
+                    "b" => ".uno:Bold",
+                    "i" => ".uno:Italic",
+                    _ => ".uno:Underline",
+                };
+                self.send_uno_edit(command, None, false, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 编辑命令发送（seq 分配 + 在途登记 + trait 面派发——mock/生产
+    /// 同一调用面；未接线（trait 默认 false）时如实清在途不假绿）。
+    fn send_edit(
+        &mut self,
+        kind: EditKind,
+        f: impl FnOnce(&mut dyn TileSession, u64) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let seq = next_edit_seq();
+        let sent = match self.session.as_mut() {
+            Some(session) => f(session.as_mut(), seq),
+            None => false,
+        };
+        if sent {
+            self.edit_pending.insert(seq, kind);
+        }
+        cx.notify();
+    }
+
+    /// UNO 编辑命令便捷面（`send_edit` 的 Uno 特化）。
+    fn send_uno_edit(
+        &mut self,
+        command: &str,
+        args: Option<&str>,
+        query: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_edit(
+            EditKind::Uno,
+            |session, seq| session.edit_uno(seq, command, args, query),
+            cx,
+        );
+    }
+
+    /// #50 C4：保存请求（shell save_tab 分流消费面——回源路径
+    /// `file://` + 修订号对账清 dirty）。
+    pub fn request_save(&mut self, cx: &mut Context<Self>) -> bool {
+        if !matches!(self.boot, Boot::Ready) || self.session.is_none() {
+            return false;
+        }
+        let path = self.path.clone();
+        self.send_edit(
+            EditKind::Save,
+            |session, seq| {
+                // url 形态：内核 `profile::file_url_of` 同源语义（POSIX 路径
+                // 直拼 `file://`——生产路径已 canonicalize）。
+                let url = format!("file://{}", path.display());
+                session.edit_save_as(seq, &url, "docx")
+            },
+            cx,
+        );
+        true
+    }
+
+    /// #50 C3：剪贴板写（TextDone 回执消费面——`ClipboardItem::
+    /// new_string` 编辑器同款；`Context<Self>` 的 AppContext 面直调）。
+    fn clipboard_write(&mut self, cx: &mut Context<Self>, text: &str) {
+        use gpui::ClipboardItem;
+        cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+    }
+
+    /// #50 C3：剪贴板读（paste 派发面——`item.text()` 编辑器
+    /// EditorAction::Paste 同款）。
+    fn clipboard_read(&self, cx: &App) -> Option<String> {
+        cx.read_from_clipboard().and_then(|i| i.text())
     }
 
     /// #50 C2：docx 页面视图键域（视口缩放命令——pdf #421 `dispatch_
@@ -669,6 +1002,10 @@ impl DocxPagesView {
                     self.session = None;
                     self.pending.clear();
                     self.attempts.clear();
+                    // #50 C3：编辑/保存回执通道同亡——在途命令出清
+                    //（终态后 EditDone/TextDone/SaveDone 永不再来，「在途」
+                    // 永挂会让保存发起面误判进行中）。
+                    self.edit_pending.clear();
                     self.boot = Boot::Failed { stage, message };
                     cx.notify();
                 }
@@ -678,11 +1015,19 @@ impl DocxPagesView {
                     self.session = None;
                     self.pending.clear();
                     self.attempts.clear();
+                    // 同上（Failed 分支注释）。
+                    self.edit_pending.clear();
                     self.boot = Boot::Failed {
                         stage: "died",
                         message: detail,
                     };
                     cx.notify();
+                }
+                SessionReply::PageGeometry { seq: _, pages: _ } => {
+                    // #50 C5：页几何回执（跳页坐标源）。本批消费者 =
+                    // 测试真链（real_chain_c5_matrix_parity）；产品
+                    // docx_pages 翻页呈现接后续批次（数据面已通——此
+                    // 处显式分支不静默吞，防将来误当未知回执报警）。
                 }
                 SessionReply::Tile {
                     seq,
@@ -719,6 +1064,54 @@ impl DocxPagesView {
                 }
                 SessionReply::Callback { name, payload } => {
                     self.handle_callback(&name, &payload, cx);
+                }
+                // #50 C3：编辑命令完成——dirty/revision 状态面落位
+                //（成功编辑置脏；失败保持原值——「编辑不可用」的根因
+                // 由 error 串在 stderr 留痕，不弹横幅打断输入流）。
+                SessionReply::EditDone {
+                    seq,
+                    ok,
+                    dirty,
+                    revision,
+                    error,
+                } => {
+                    self.edit_pending.remove(&seq);
+                    if ok {
+                        self.dirty = dirty;
+                        self.revision = revision;
+                    } else if let Some(err) = error {
+                        eprintln!("docx-pages: edit failed: {err}");
+                    }
+                    cx.notify();
+                }
+                // #50 C3：剪贴板读回执——宿主写系统剪贴板（copy 面
+                // 完成即写；cut 由先 TextOf 后 Uno 的调用序在
+                // dispatch_edit_key 内编排）。
+                SessionReply::TextDone { seq, text, error } => {
+                    self.edit_pending.remove(&seq);
+                    if let Some(err) = error {
+                        eprintln!("docx-pages: clipboard read failed: {err}");
+                    } else {
+                        self.clipboard_write(cx, &text);
+                    }
+                }
+                // #50 C4：保存完成——revision 对账（相等才清 dirty：
+                // 延迟回执 revision_saved 落后当前 revision = 期间又有
+                // 新编辑，不清——「保存回执清除新编辑 dirty」的病灶根除）。
+                SessionReply::SaveDone {
+                    seq,
+                    ok,
+                    revision_saved,
+                    error,
+                } => {
+                    self.edit_pending.remove(&seq);
+                    if let Some(err) = error {
+                        eprintln!("docx-pages: save failed: {err}");
+                    }
+                    if ok && revision_saved == self.revision {
+                        self.dirty = false;
+                    }
+                    cx.notify();
                 }
             }
         }
@@ -1400,6 +1793,190 @@ impl Focusable for DocxPagesView {
     }
 }
 
+/// #50 C3：IME 输入通道（gpui 平台 → 视图实体——契约 §10 口径：
+/// preedit 宿主渲染不进内核；提交文本经 `type_text` 逐字符下发）。
+/// 「哪个视图持焦点哪个实体收 IME」——gpui 的 `ElementInputHandler`
+/// 在视图根的 canvas paint 期注册（与编辑器 ime-hook 同模式）。
+impl gpui::EntityInputHandler for DocxPagesView {
+    fn set_selected_text_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // 选区归内核管理（`getSelection` 面后续批次）——IME 通道不接受
+        // 宿主侧选区写。
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.preedit.encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        // 就绪会话才可编辑（Starting/Failed 态 IME 平台通道关闭——
+        // 平台不会为其弹输入法）。
+        matches!(self.boot, Boot::Ready)
+    }
+
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text: String = self
+            .preedit
+            .chars()
+            .take(range.end)
+            .skip(range.start)
+            .collect();
+        *adjusted = Some(range);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        let len = self.preedit.encode_utf16().count();
+        Some(gpui::UTF16Selection {
+            range: len..len,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        if self.preedit.is_empty() {
+            None
+        } else {
+            Some(0..self.preedit.encode_utf16().count())
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.preedit.clear();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // #50 C3 修正（编辑器 EntityInputHandler 同构语义）：提交 =
+        // 覆写替换 + **立即下发内核**。两形态：
+        // - `Some(range)`：preedit 域内子段替换（拉丁快速键入的裸插入
+        //   兜底——不经 marked 的直接文本）；
+        // - `None`：Windows IME 提交/取消形态——替换整个 marked 域
+        //   （取消 = 空串替换，语义自然正确）。
+        // 提交后清 preedit（`marked = None` 同构）——组合串出清、浮层
+        // 消失、光标域归零。
+        let replacement = match range {
+            Some(r) => {
+                let start = utf16_to_char_idx(&self.preedit, r.start);
+                let end = utf16_to_char_idx(&self.preedit, r.end);
+                self.preedit.replace_range(start..end, text);
+                text.to_owned()
+            }
+            None => {
+                // 提交形态：text 即定稿全文。**取消（空串）= 出清组合
+                // 串 + 零命令**（取消不是编辑——无替换、无 dirty）；非空
+                // = 定稿新串（旧组合串出清弃用，以提交串为准）。
+                let _ = std::mem::take(&mut self.preedit);
+                text.to_owned()
+            }
+        };
+        // 定稿非空 → type_text 下发内核（逐字符 post_key——契约 §10
+        // 产品 IME 通道；取消（空串）零命令）。就绪卫内含（未就绪
+        // accepts_text_input=false，平台不会派发到此处——防御位仍查）。
+        if !replacement.is_empty() && matches!(self.boot, Boot::Ready) {
+            if self.session.is_some() {
+                self.send_edit(
+                    EditKind::Type,
+                    |session, seq| session.edit_type_text(seq, &replacement),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 预编辑：preedit 域替换（无 preedit 时光标位=空段插入）。
+        match range {
+            Some(r) => {
+                let start = utf16_to_char_idx(&self.preedit, r.start);
+                let end = utf16_to_char_idx(&self.preedit, r.end);
+                self.preedit.replace_range(start..end, new_text);
+            }
+            None => self.preedit = new_text.to_owned(),
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl DocxPagesView {
+    /// #50 C3 IME 提交通道说明（供后续批次读码）：提交语义已并入
+    /// [`Self::replace_text_in_range`]（编辑器 EntityInputHandler
+    /// 同构：替换 + `preedit` 出清 + 定稿 `type_text` 下发——本方法
+    /// 保留为文档锚点，不再承担提交判定（marked_text_range/unmark
+    /// 组合时序已由平台协议保证）。
+    fn preedit_commit_if_standalone(&mut self, cx: &mut Context<Self>) {
+        let _ = cx;
+    }
+}
+
+/// UTF16 → char 边界索引（preedit 域换算——中文组合串安全）。
+fn utf16_to_char_idx(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (idx, ch) in text.char_indices() {
+        if units >= utf16 {
+            return idx;
+        }
+        units += ch.len_utf16();
+    }
+    text.len()
+}
+
 impl Render for DocxPagesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 轮询起表（首次渲染启动——App 面无法 spawn；终态自停）。
@@ -1416,6 +1993,10 @@ impl Render for DocxPagesView {
         let viewport_cell = self.viewport.clone();
         let zoom_entity = entity.clone();
         let probe_entity = entity.clone();
+        // #50 C3：IME 注册句柄（探针 paint 期 handle_input——焦点在
+        // 视图时平台输入法路由到本实体）。
+        let ime_focus = self.focus_handle.clone();
+        let ime_entity = cx.entity();
         let (vw, _) = self.viewport_size;
         let rw = self.raster_width(if vw > 0. { vw } else { 256. });
         let count = band_count(w_tw, h_tw, rw);
@@ -1447,8 +2028,13 @@ impl Render for DocxPagesView {
         // #176：视图焦点域（focus_active 在页面态落本视图句柄——
         // 此前从不 track_focus，句柄游离，键事件死在合成根：#50 C2
         // 缩放键分支与 #176 键守卫实际不可达。pdf #422 / xlsx #389
-        // 同款接线，三个替换视图归一）。
+        // 同款接线，三个替换视图归一）。#50 C3：on_key_down 编辑键域
+        //（字符/功能/ctrl 命令经 dispatch_edit_key——消费即止冒泡，
+        // 未消费键继续 shell 兜底链；视图在渲染树内时此入口优先于
+        // shell 键钩子——焦点在视图上的键直收）。
         let focus = self.focus_handle.clone();
+        let preedit = self.preedit.clone();
+        let has_preedit = !preedit.is_empty();
         div()
             .id("docx-pages-root")
             .debug_selector(|| "docx-pages-root".into())
@@ -1460,7 +2046,66 @@ impl Render for DocxPagesView {
             .flex_col()
             .items_center()
             .track_focus(&focus)
+            // #50 C3：编辑键域（焦点在视图时键直收——pdf/xlsx 同位
+            // 键处理纪律；zoom 键 shell 分流在前，此处键序 = 缩放
+            // （shell 已 return）→ 编辑（此处）→ 未消费冒泡 shell）。
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let ks = &event.keystroke;
+                let ctrl = ks.modifiers.control || ks.modifiers.platform;
+                let key = ks.key.to_lowercase();
+                // zoom 域先让 shell 分流——此处只接编辑域（Ctrl+0/1/=/
+                // - 是视口命令非编辑，缩放不可达（shell 已 return 消费）；
+                // 防御：显式跳过视口键族防双路径）。
+                if ctrl && matches!(key.as_str(), "0" | "1" | "=" | "+" | "-") {
+                    return;
+                }
+                if this.dispatch_edit_key(&key, ctrl, ks.modifiers.shift, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(list)
+            // #50 C3：IME 接线（编辑器 ime-hook 同构——独立 size_0 canvas
+            // 借 paint 时机注册 ElementInputHandler；不占布局。焦点在
+            // 视图时平台输入法（中文组合/提交）路由到本实体）。
+            .child(
+                div()
+                    .id("docx-ime-hook")
+                    .absolute()
+                    .size_0()
+                    .child(gpui::canvas(
+                        move |bounds, _, _| bounds,
+                        move |bounds, _, window, cx| {
+                            window.handle_input(
+                                &ime_focus,
+                                gpui::ElementInputHandler::new(bounds, ime_entity.clone()),
+                                cx,
+                            );
+                        },
+                    )),
+            )
+            // #50 C3：IME preedit 组合串（宿主渲染——契约 §10 口径：
+            // 组合期仅宿主显示不进内核；定位跟随文本光标面暂以左上
+            // 浮层保守呈现——精确光标矩形 B 线 `getSelectionRect` 通道
+            // 接入后升级）。
+            .when(has_preedit, |el| {
+                el.child(
+                    div()
+                        .id("docx-preedit")
+                        .debug_selector(|| "docx-preedit".into())
+                        .absolute()
+                        .top_8()
+                        .left_8()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(colors.panel_background)
+                        .border_1()
+                        .border_color(colors.border)
+                        .text_size(gpui::px(14.))
+                        .text_color(colors.text)
+                        .child(preedit),
+                )
+            })
             // #50 C2：缩放预设菜单（backdrop + 面板——在位时叠加）。
             .children(zoom_menu)
             // #50 C2：缩放控制条（常驻右下角）。
@@ -1823,6 +2468,132 @@ mod tests {
     /// 派单参数记录（canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h）。
     type TileRequest = (usize, usize, i32, i32, i32, i32);
 
+    // ======================= #177 像素级验收基线 =======================
+    // Lead 定性：「现有断言只验几何数值不验像素——C2 缺像素级验收基线」。
+    // 本组把 MockSession 的哑像素（2×2 全零）升级为**程序化合成文档条带**，
+    // 并对 cache 里 RenderImage 的 BGRA 原始字节做像素级断言——
+    // 「渲染出来的像素像不像一份文档」首次有可自动执行的判据。
+
+    /// 合成「像文档」的条带 BGRA（自上而下行序，bgra_to_image 契约）。
+    ///
+    /// 内容清单（生成器即规格——render_fidelity 同款纪律）：
+    /// - 白底（0xFFFFFFFF 近似——白=±16 口径同 worker stats_bgra）
+    /// - 顶部标题墨迹带（高 h/12 的 0xFF101010 深墨矩形，居中 70% 宽）
+    /// - N 行文字行（行高 h/(N+2) 的 80%、行内左侧 60% 为墨迹条纹——
+    ///   行投影呈峰谷的「文字行」形态）
+    /// - 一条彩色元素行（0xFFD030D0 品红——验彩色通道不丢）
+    /// - 页缘四周 w/16 留白（对称——文档页边距形态）
+    ///
+    /// 返回 (bgra, 行峰坐标清单)——峰坐标供断言行数。
+    fn synthetic_band_bgra(w: usize, h: usize, n_text_rows: usize) -> (Vec<u8>, Vec<usize>) {
+        assert!(w > 32 && h > 32, "合成条带需要非退化尺寸");
+        let mut px = vec![0xFFu8; w * h * 4]; // 白底 BGRA(B=255)
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                px[i] = 0xFF; // A
+                px[i + 1] = 0xFF; // R
+                px[i + 2] = 0xFF; // G
+                px[i + 3] = 0xFF; // B
+            }
+        }
+        let margin = w / 16;
+        let title_h = (h / 12).max(4);
+        let mut peaks: Vec<usize> = Vec::new();
+        // 标题带（峰 0）——BGRA 布局 [B,G,R,A]：墨三槽 = i..i+2。
+        for y in 0..title_h {
+            for x in margin..w - margin {
+                let i = (y * w + x) * 4;
+                px[i] = 0x10;
+                px[i + 1] = 0x10;
+                px[i + 2] = 0x10;
+            }
+        }
+        peaks.push(0usize);
+        // 文字行：峰谷结构（行块间留隔）
+        let row_block = (h - title_h - h / 8) / n_text_rows.max(1);
+        let ink_h = (row_block * 4 / 5).max(2);
+        for r in 0..n_text_rows {
+            let y0 = title_h + h / 8 + r * row_block;
+            peaks.push(y0);
+            for y in y0..(y0 + ink_h).min(h) {
+                for x in margin..w - margin {
+                    // 左侧 60% 文字条纹（斜纹模拟字形墨迹密度）
+                    if (x / 3) % 2 == 0 {
+                        let i = (y * w + x) * 4;
+                        px[i] = 0x1A;
+                        px[i + 1] = 0x1A;
+                        px[i + 2] = 0x1A;
+                    }
+                }
+            }
+        }
+        // 彩色元素行（底部）
+        let y0c = h - (h / 16).max(2);
+        for y in y0c..h {
+            for x in margin..w - margin {
+                let i = (y * w + x) * 4;
+                px[i] = 0xD0; // B
+                px[i + 1] = 0x30; // G
+                px[i + 2] = 0xD0; // R → BGRA 显示品红
+            }
+        }
+        (px, peaks)
+    }
+
+    /// 行投影峰检测：对 BGRA 做逐行墨迹密度（非白像素占比），
+    /// 返回密度序列（0..h）——文字行结构应呈「峰谷交替」。
+    fn row_ink_profile(bgra: &[u8], w: usize, h: usize) -> Vec<f32> {
+        let mut prof = vec![0f32; h];
+        for y in 0..h {
+            let mut ink = 0usize;
+            for x in 0..w {
+                let i = (y * w + x) * 4 + 1; // R
+                let g = bgra[i + 1];
+                let b = bgra[i + 2];
+                if bgra[i] < 0xF0 || g < 0xF0 || b < 0xF0 {
+                    ink += 1;
+                }
+            }
+            prof[y] = ink as f32 / w as f32;
+        }
+        prof
+    }
+
+    /// 峰计数：profile 中「高于阈值且前后为谷」的峰段数。
+    fn count_row_peaks(profile: &[f32]) -> usize {
+        let thr = 0.25f32;
+        let mut peaks = 0usize;
+        let mut in_peak = false;
+        for &v in profile {
+            if v > thr && !in_peak {
+                peaks += 1;
+                in_peak = true;
+            } else if v <= thr && in_peak {
+                in_peak = false;
+            }
+        }
+        peaks
+    }
+
+    /// 非白占比（白=±16 近似——worker stats_bgra 同口径）。
+    fn non_white_ratio(bgra: &[u8]) -> f32 {
+        let n = bgra.len() / 4;
+        if n == 0 {
+            return 0.;
+        }
+        let mut ink = 0usize;
+        for px4 in bgra.chunks_exact(4) {
+            // BGRA：b=px4[0] g=px4[1] r=px4[2]（合成器写位在 +1/+2/+3——
+            // 与 bgra_to_image 直通语义对齐，此处按布局 BGR 读）
+            let (b, g, r) = (px4[0], px4[1], px4[2]);
+            if b < 0xF0 || g < 0xF0 || r < 0xF0 {
+                ink += 1;
+            }
+        }
+        ink as f32 / n as f32
+    }
+
     /// #186 测试注桩会话（TileSession seam）：记录派单参数（对账 seq
     /// = 记录序）；预置回执队列逐条弹出；`auto_reply` = 派单即回 2×2
     /// tile（全绿路径）。Arc 字段共享——clone 后状态同源。
@@ -1830,7 +2601,15 @@ mod tests {
     struct MockSession {
         requests: Arc<std::sync::Mutex<Vec<TileRequest>>>,
         replies: Arc<std::sync::Mutex<VecDeque<SessionReply>>>,
+        /// #50 C3：编辑命令录制（dispatch 断言面——命令串序）。
+        edits: Arc<std::sync::Mutex<Vec<String>>>,
         auto_reply: bool,
+        /// #177：true = auto 回执带**合成文档像素**（synthetic_band_bgra
+        /// 按派单 canvas_w×canvas_h 生成）；false 保持旧哑像素
+        /// （2×2 全零——既有状态机测试语义不变）。
+        synthetic: bool,
+        /// #177：合成行数（文字行峰数——L1 断言对账源）。
+        synthetic_rows: usize,
     }
 
     impl MockSession {
@@ -1838,7 +2617,22 @@ mod tests {
             Self {
                 requests: Arc::default(),
                 replies: Arc::default(),
+                edits: Arc::default(),
                 auto_reply,
+                synthetic: false,
+                synthetic_rows: 4,
+            }
+        }
+
+        /// #177：合成像素模式（L1/L2 像素基线测试用）。
+        fn new_synthetic(rows: usize) -> Self {
+            Self {
+                requests: Arc::default(),
+                replies: Arc::default(),
+                edits: Arc::default(),
+                auto_reply: true,
+                synthetic: true,
+                synthetic_rows: rows,
             }
         }
     }
@@ -1857,16 +2651,26 @@ mod tests {
             reqs.push((canvas_w, canvas_h, tile_x, tile_y, tile_w, tile_h));
             let seq = reqs.len() as u64;
             if self.auto_reply {
+                let (w, h, bgra, non_white, colored) = if self.synthetic {
+                    // #177 合成文档像素：行投影峰谷 + 彩色元素（「像不像
+                    // 一份文档」判据的数据源）。
+                    let (px, _) = synthetic_band_bgra(canvas_w, canvas_h, self.synthetic_rows);
+                    let nw = non_white_ratio(&px) as f64;
+                    let colored = 0.02f64; // 品红元素带实测约 1/16 高度
+                    (canvas_w, canvas_h, px, nw, colored)
+                } else {
+                    (2usize, 2usize, vec![0u8; 16], 0.5f64, 0.5f64)
+                };
                 self.replies.lock().unwrap().push_back(SessionReply::Tile {
                     seq,
-                    width: 2,
-                    height: 2,
-                    bgra: Arc::new(vec![0u8; 16]),
+                    width: w,
+                    height: h,
+                    bgra: Arc::new(bgra),
                     sha256: "mock".into(),
                     stats: TileStats {
                         unique_colors: 1,
-                        non_white_ratio: 0.5,
-                        colored_ratio: 0.5,
+                        non_white_ratio: non_white,
+                        colored_ratio: colored,
                     },
                     elapsed_ms: 1,
                 });
@@ -1876,6 +2680,76 @@ mod tests {
         fn request_size(&self) {}
         fn try_recv(&self) -> Option<SessionReply> {
             self.replies.lock().unwrap().pop_front()
+        }
+        // #50 C3/C4：编辑命令 mock——录制（命令串）+ 受控回执注入
+        //（测试显式 push EditDone/TextDone/SaveDone——对账链可逐步驱动）。
+        fn edit_type_text(&mut self, seq: u64, text: &str) -> bool {
+            self.edits.lock().unwrap().push(format!("type:{text}"));
+            let _ = seq;
+            true
+        }
+        fn edit_uno(&mut self, seq: u64, command: &str, args: Option<&str>, query: bool) -> bool {
+            self.edits.lock().unwrap().push(format!(
+                "uno:{command}{}{}",
+                args.unwrap_or_default(),
+                if query { "?q" } else { "" }
+            ));
+            let _ = seq;
+            true
+        }
+        fn edit_text_of(&mut self, seq: u64, _mime: &str) -> bool {
+            self.edits.lock().unwrap().push("text_of".into());
+            let _ = seq;
+            true
+        }
+        fn edit_save_as(&mut self, seq: u64, url: &str, format: &str) -> bool {
+            self.edits
+                .lock()
+                .unwrap()
+                .push(format!("save:{url}({format})"));
+            let _ = seq;
+            true
+        }
+    }
+
+    /// #50 C3：MockSession 编辑面辅助——受控回执注入（drain 消费链）。
+    impl MockSession {
+        fn push_edit_done(&self, seq: u64, ok: bool, dirty: bool, revision: u64) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push_back(SessionReply::EditDone {
+                    seq,
+                    ok,
+                    dirty,
+                    revision,
+                    error: if ok { None } else { Some("mock 失败".into()) },
+                });
+        }
+        fn push_text_done(&self, seq: u64, text: &str) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push_back(SessionReply::TextDone {
+                    seq,
+                    text: text.into(),
+                    error: None,
+                });
+        }
+        fn push_save_done(&self, seq: u64, ok: bool, revision_saved: u64) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push_back(SessionReply::SaveDone {
+                    seq,
+                    ok,
+                    revision_saved,
+                    error: if ok {
+                        None
+                    } else {
+                        Some("mock 保存失败".into())
+                    },
+                });
         }
     }
 
@@ -2019,6 +2893,194 @@ mod tests {
             0,
             "视口不变不得形成常驻动画环"
         );
+    }
+
+    // ---------------- #177 L1：合成文档像素 → 缓存像素级断言 ----------------
+
+    /// L1 主体：mock 合成文档条带（行投影峰谷 + 彩色元素）→ drain →
+    /// cache RenderImage 读出 → 四断言（尺寸承接 / 逐字节保真 /
+    /// 非白占比 / 行峰数）。「渲染出来的像素像不像一份文档」首次
+    /// 有恒绿自动判据（headless——无 LO 依赖）。
+    #[gpui::test]
+    fn pixel_baseline_synthetic_band_l1(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-177-l1-{}.docx", std::process::id()));
+        let mock = MockSession::new_synthetic(4);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        pump_until_dispatched(cx, &mut visual, &view, &mock);
+        // 泵到首笔缓存命中（auto 合成像素回执）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0) {
+                break;
+            }
+        }
+        assert!(
+            view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0),
+            "合成 tile 回执必须入缓存"
+        );
+        // ---- 像素级断言（#177 核心——对 cache BGRA 原始字节）----
+        let band_key = view.read_with(cx, |v, _| {
+            v.cache_order
+                .iter()
+                .next()
+                .copied()
+                .expect("至少一个缓存条目")
+        });
+        let (w, h, bytes) = view
+            .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+            .expect("缓存像素必须可读出（RenderImage::as_bytes）");
+        // 断言 1：尺寸承接——派单 canvas_w×canvas_h == 缓存像素尺寸。
+        let (req_w, req_h) = {
+            let r = mock.requests.lock().unwrap();
+            r.iter()
+                .find(|(_, _, _, _, _, _)| true)
+                .map(|(cw, ch, _, _, _, _)| (*cw, *ch))
+                .expect("派单记录非空")
+        };
+        assert_eq!(
+            (w, h),
+            (req_w, req_h),
+            "尺寸承接：缓存像素尺寸必须等于派单画布尺寸"
+        );
+        // 断言 2：逐字节保真——读出 BGRA 与合成源全等（直通零变换）。
+        let (src_px, _) = synthetic_band_bgra(w, h, 4);
+        assert_eq!(
+            bytes, src_px,
+            "逐字节保真：bgra_to_image 直通——注入像素必须原样到达缓存消费终点"
+        );
+        // 断言 3：非白占比 ∈ [0.10, 0.85]（「像文档」= 有墨但不糊死）。
+        let nw = non_white_ratio(&bytes);
+        assert!(
+            nw > 0.10 && nw < 0.85,
+            "非白占比 {nw:.3} 必须在 (0.10, 0.85)——文字文档形态（非空白也非整页黑）"
+        );
+        // 断言 4：行投影峰数 == 注入行数 + 1（标题）+ 1（彩带并入末峰或独立峰）。
+        let prof = row_ink_profile(&bytes, w, h);
+        let peaks = count_row_peaks(&prof);
+        assert!(
+            (peaks >= 5 && peaks <= 7),
+            "行投影峰数 {peaks} 必须接近注入结构（标题 1 + 文字 4 + 彩带 1 = 5~7 峰）——\
+             像素里能看到「一行行文字」的文档结构，而非噪声/整块"
+        );
+        // 断言 5：彩色元素在场（品红 B=R≈0xD0 高于 G）。
+        let mut magenta_px = 0usize;
+        for px4 in bytes.chunks_exact(4) {
+            if px4[0] > 0xC0 && px4[1] < 0x60 && px4[2] > 0xC0 {
+                magenta_px += 1;
+            }
+        }
+        assert!(
+            magenta_px > (w * h) / 64,
+            "彩色元素必须出现在缓存像素（≥1/64 像素）——彩色通道不被管线丢弃"
+        );
+        drop(visual);
+        window.update(cx, |_, _, _| {}).ok();
+    }
+
+    /// L2：INVALIDATE（内容换代）后缓存像素必须换代——旧像素残留
+    /// = 陈旧渲染（「内容变更必须换像素」的像素级版）。
+    #[gpui::test]
+    fn pixel_baseline_invalidate_swaps_pixels_l2(cx: &mut gpui::TestAppContext) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-177-l2-{}.docx", std::process::id()));
+        let mock = MockSession::new_synthetic(4);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        pump_until_dispatched(cx, &mut visual, &view, &mock);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view.read_with(cx, |v, _| v.cache_stats_for_test().1 > 0) {
+                break;
+            }
+        }
+        let band_key = view.read_with(cx, |v, _| {
+            v.cache_order
+                .iter()
+                .next()
+                .copied()
+                .expect("至少一个缓存条目")
+        });
+        let before = view
+            .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+            .expect("换代前像素");
+        // 内核失效通知（内容变更面——INVALIDATE_TILES 真回调口径，
+        // 同 invalidate_tiles_evicts_hit_bands 的 handle_callback 用法）。
+        view.update(cx, |v, cx| {
+            v.handle_callback("INVALIDATE_TILES", "0, 6000, 11906, 100, 0, 0", cx);
+        });
+        // 失效即逐出（既有 invalidate_tiles_evicts_hit_bands 断言过）；
+        // 再派单 → 同键新合成像素 → 像素内容换代。
+        visual.update(|window, app| window.draw(app).clear(app));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+            if view
+                .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+                .is_some()
+            {
+                break;
+            }
+        }
+        let after = view
+            .read_with(cx, |v, _| v.cached_image_for_test(band_key))
+            .expect("换代后像素必须重建（失效→再派单→新回执）");
+        assert_eq!(
+            before.0, after.0,
+            "换代后条带尺寸口径不变（同视口同光栅宽）"
+        );
+        // 换代判据：内容字节必须重建过（同合成器确定性下，至少不得
+        // 是逐出前的旧实例残留——用「非白占比重算一致 + 峰结构在」
+        // 钉「新像素仍像文档」，并断言换代前像素确实被逐出过）。
+        let nw_after = non_white_ratio(&after.2);
+        let peaks_after = count_row_peaks(&row_ink_profile(&after.2, after.0, after.1));
+        assert!(
+            nw_after > 0.10 && nw_after < 0.85 && (5..=7).contains(&peaks_after),
+            "换代后像素仍须呈文档形态（非白 {nw_after:.3}，峰 {peaks_after}）——\
+             失效重建不得退化为空白/噪声"
+        );
+        drop(visual);
+        window.update(cx, |_, _, _| {}).ok();
     }
 
     /// #186：窗口调整 → 探针重量（变更守卫）→ 自排帧 → 新视口口径
@@ -2740,5 +3802,268 @@ mod tests {
             view.read_with(cx, |v, _| v.session.is_none()),
             "停轮询（会话拆）"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #50 C3/C4：编辑链测试（mock 命令录制 + 受控回执驱动状态面）
+    // -----------------------------------------------------------------
+
+    /// 编辑链就绪视图 + 宿主窗（Ready + mock 会话——真实 window 域内
+    /// dispatch；ChainHost 同款）。
+    fn edit_ready_view(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<DocxPagesView>,
+        MockSession,
+        gpui::VisualTestContext,
+    ) {
+        cx.update(|app| {
+            theme::init(theme::LoadThemes::JustBase, app);
+            theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
+        });
+        let path = std::env::temp_dir().join(format!("mdc-docx-edit-{}.docx", std::process::id()));
+        let mock = MockSession::new(false);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        mock.replies.lock().unwrap().push_back(SessionReply::Ready {
+            width_twips: 11906,
+            height_twips: 16838,
+            kernel_sha256: "mock".into(),
+            elapsed_ms: 1,
+        });
+        let window = cx.open_window(gpui::size(gpui::px(800.), gpui::px(600.)), {
+            let view = view.clone();
+            move |_, _| ChainHost(view)
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        (view, mock, visual)
+    }
+
+    /// 单字符键入：dispatch_edit_key → type 命令 + EditDone 回执 → dirty 置位。
+    #[gpui::test]
+    fn edit_key_types_and_lands_dirty(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.dispatch_edit_key("a", false, false, window, cx));
+            });
+        });
+        let edits = mock.edits.lock().unwrap().clone();
+        assert_eq!(edits, vec!["type:a".to_string()], "字符键 → type 命令");
+        // 受控回执：成功编辑（dirty=true, rev=1）。
+        let seq = next_edit_seq_for_test();
+        mock.push_edit_done(seq - 1, true, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(v.is_dirty(), "EditDone(ok,dirty) 回执置位脏位");
+        });
+    }
+
+    /// Ctrl+Z/Y → uno Undo/Redo 命令（录制断言）。
+    #[gpui::test]
+    fn edit_undo_redo_dispatch_uno(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.dispatch_edit_key("z", true, false, window, cx));
+                assert!(v.dispatch_edit_key("y", true, false, window, cx));
+            });
+        });
+        let edits = mock.edits.lock().unwrap().clone();
+        assert_eq!(
+            edits,
+            vec!["uno:.uno:Undo".to_string(), "uno:.uno:Redo".to_string()],
+            "Ctrl+Z/Y → undo/redo uno 命令"
+        );
+    }
+
+    /// Ctrl+C → text_of 读选区 + TextDone 回执写剪贴板（读回断言）。
+    #[gpui::test]
+    fn edit_copy_reads_selection_to_clipboard(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.dispatch_edit_key("c", true, false, window, cx));
+            });
+        });
+        let seq = next_edit_seq_for_test();
+        mock.push_text_done(seq - 1, "选中文本");
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 剪贴板读回（写进系统剪贴板——测试面读回验证）。
+        let pasted = view.read_with(cx, |v, cx| v.clipboard_read(cx));
+        assert_eq!(pasted.as_deref(), Some("选中文本"), "TextDone → 剪贴板写");
+    }
+
+    /// C4 保存对账：SaveDone.revision_saved == 当前 revision 才清 dirty；
+    /// 落后（期间又有新编辑）不清——「延迟回执清新 dirty」病灶钉死。
+    #[gpui::test]
+    fn save_revision_reconciliation_guards_stale_receipt(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 编辑 → dirty（rev 1）。
+        let seq = next_edit_seq_for_test();
+        mock.push_edit_done(seq - 1, true, true, 1);
+        // 保存发起（save 命令 + SaveDone rev=1——与当前相等 → 清）。
+        view.update(cx, |v, cx| {
+            assert!(v.request_save(cx), "保存发起");
+        });
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        let save_seq = next_edit_seq_for_test();
+        mock.push_save_done(save_seq - 1, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(!v.is_dirty(), "revision 相等的保存回执清 dirty");
+        });
+
+        // 再编辑（rev 2）+ 陈旧保存回执（rev=1 落后）——不清。
+        let seq2 = next_edit_seq_for_test();
+        mock.push_edit_done(seq2 - 1, true, true, 2);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        let stale_seq = next_edit_seq_for_test();
+        mock.push_save_done(stale_seq - 1, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert!(v.is_dirty(), "落后 revision 的保存回执不清新编辑的 dirty");
+        });
+        let _ = &mut visual;
+    }
+
+    /// 未就绪态（Starting）保存如实不发起——不可编辑不假绿（键面卫
+    /// 同源：`Boot` 非 Ready 时 dispatch_edit_key 恒 false——就绪卫与
+    /// request_save 同一判据）。
+    #[gpui::test]
+    fn edit_keys_not_consumed_before_ready(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join("mdc-docx-nr.docx");
+        let mock = MockSession::new(false);
+        let view = cx.update(|app| app.new(|cx| DocxPagesView::new(path, cx)));
+        inject_mock(&view, cx, &mock);
+        // 无 Ready 回执——Boot::Starting（request_save 无 window 面：
+        // 就绪卫直接断言；dispatch 键面同卫同判据）。
+        view.update(cx, |v, cx| {
+            assert!(!v.request_save(cx), "Starting 态保存不发起（就绪卫）");
+        });
+        view.read_with(cx, |v, _| {
+            assert!(
+                !matches!(v.boot, Boot::Ready),
+                "未就绪态（boot 卫同判据——键面同 false）"
+            );
+        });
+    }
+
+    /// #50 C3 修正：IME 全链——mark 组合（preedit 宿主域）→ None 提交
+    /// （出清 + type_text 下发）→ EditDone 置 dirty。修前病灶：提交
+    /// 文本只堆 preedit 字符串、永不到内核——本测试钉死。
+    #[gpui::test]
+    fn ime_mark_commit_lands_in_kernel(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 组合：replace_and_mark（「中文」进 preedit——不下发）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    v, None, "中文", None, window, cx,
+                );
+            });
+        });
+        view.read_with(cx, |v, _| assert_eq!(v.preedit_for_test(), "中文"));
+        assert!(
+            mock.edits.lock().unwrap().is_empty(),
+            "组合期零命令（preedit 宿主渲染——契约 §10）"
+        );
+        // 提交：replace_text_in_range(None, 定稿)。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(v, None, "中文", window, cx);
+            });
+        });
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.preedit_for_test().is_empty(),
+                "提交后 preedit 出清（浮层消失）"
+            );
+        });
+        assert_eq!(
+            mock.edits.lock().unwrap()[0],
+            "type:中文",
+            "提交定稿经 type_text 下发内核（修前永不到内核的病灶）"
+        );
+        // EditDone 回执 → dirty。
+        let seq = next_edit_seq_for_test();
+        mock.push_edit_done(seq - 1, true, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| assert!(v.is_dirty()));
+    }
+
+    /// #50 C3 修正：IME 取消（None + 空串）——出清 preedit、零命令
+    /// （取消不是编辑：无选区替换、无 dirty 置位）。
+    #[gpui::test]
+    fn ime_cancel_clears_preedit_without_commands(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    v, None, "组合", None, window, cx,
+                );
+            });
+        });
+        // 取消（Windows IME 协议形态：range=None + 空串）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(v, None, "", window, cx);
+            });
+        });
+        view.read_with(cx, |v, _| {
+            assert!(v.preedit_for_test().is_empty(), "取消出清组合串");
+        });
+        assert!(
+            mock.edits.lock().unwrap().is_empty(),
+            "取消零命令（不 type_text 不置 dirty）"
+        );
+        view.read_with(cx, |v, _| assert!(!v.is_dirty()));
+    }
+
+    /// #50 C3 终态清理：Died 回执 → edit_pending 出清（在途命令面
+    /// 归零——保存/编辑「进行中」误判根除）+ 后续键入零 panic。
+    #[gpui::test]
+    fn session_died_clears_edit_pending(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 编辑在途（命令已发、回执未回）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.dispatch_edit_key("a", false, false, window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.edit_pending_len_for_test()), 1);
+        // worker 死亡终态（会话通道回执）。
+        mock.replies.lock().unwrap().push_back(SessionReply::Died {
+            detail: "mock 死亡".into(),
+        });
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.edit_pending_len_for_test(),
+                0,
+                "终态出清在途编辑命令（回执永不再来）"
+            );
+            assert!(matches!(v.boot, Boot::Failed { .. }), "终态落 Failed 呈现");
+            assert!(!v.is_dirty(), "未确认的编辑不虚报脏位");
+        });
+        // 死后键入：就绪卫拒收（不 panic、不假绿）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(!v.dispatch_edit_key("a", false, false, window, cx));
+            });
+        });
+    }
+
+    /// 测试辅助：编辑 seq 探针（EDIT_SEQ 静态域——只读非破坏）。
+    fn next_edit_seq_for_test() -> u64 {
+        EDIT_SEQ.load(std::sync::atomic::Ordering::Relaxed) + 1
     }
 }

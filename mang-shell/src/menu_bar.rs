@@ -90,6 +90,8 @@ pub struct MenuContext {
     pub left_open: bool,
     /// 左栏当前是 git 视图（侧栏子菜单勾选标记）。
     pub git_view: bool,
+    /// #109：左栏当前是项目搜索视图（侧栏子菜单勾选标记）。
+    pub search_view: bool,
     /// 活动标签是 DOCX（#307「导出为 PDF」门槛——仅 docx 形态提供）。
     pub active_is_docx: bool,
     /// 活动标签是 PDF（#307 ②「导出为 DOCX」门槛——仅 pdf 形态提供）。
@@ -115,8 +117,7 @@ pub struct MenuContext {
 /// 跟踪，留在代码注释里）。
 /// 编辑类（撤销/重做/剪切/复制/粘贴/替换）——read_only 灰显本就在，
 /// 页面态补原因说明。
-pub const REASON_PAGE_EDIT: &str =
-    "页面视图为只读渲染——切换到文本视图后可编辑（状态栏「切换到文本视图」）";
+pub const REASON_PAGE_EDIT: &str = "页面视图尚未就绪（LOK 会话建立后可编辑）——稍候或切换到文本视图";
 /// 查找/替换（编辑器浮层——页面态编辑器不在树内，开了也看不见）。
 pub const REASON_PAGE_FIND: &str = "页面视图暂不支持查找/替换——切换到文本视图后使用";
 /// 命令面板（编辑器浮层，同上）。
@@ -180,6 +181,9 @@ pub enum MenuAction {
     ToggleFileTreePanel,
     /// 切换 git 面板（shell 既有 `toggle_git`——图标条 git 钮同链）。
     ToggleGitPanel,
+    /// #109 批②③：切换项目搜索面板（shell `toggle_search`——图标条
+    /// 搜索钮/Ctrl+Shift+F 同链）。
+    ToggleSearchPanel,
     /// 占位（无既有命令可映射——置灰项不绑动作，派发面只留证据行）。
     None,
 }
@@ -351,34 +355,37 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                     // #176 Lead 补齐：菜单禁用以**当前显示面**为准——
                     // 页面态下文本编辑器不在树内（其 read_only/选区不可
                     // 作为页面态可用性判据），作用于 Editor 的动作一律
-                    // 禁用 + 原因（不进死路）。
-                    .with_enabled(writable && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态可编辑已接——shell
+                    // activate_menu_action 分流到 dispatch_edit_key（与
+                    // 键位域同一条链）。undo/redo/cut/copy/paste 页面态
+                    // 启用；就绪卫在 dispatch 内（未就绪零动作不假绿）。
+                    .with_enabled(writable || ctx.docx_page_view),
                 // dispatch_key 的 redo 实际绑定是 Ctrl+Shift+Z（z if
                 // ctrl && shift 臂）与 Ctrl+Y 双臂——标签取前者。
                 MenuEntry::item("edit-redo", "重做")
                     .shortcut_for("redo")
                     .act(MenuAction::EditorCmd(Cmd::Redo))
-                    .with_enabled(writable && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // 同 undo（#50 C3 翻新——页面态启用）。
+                    .with_enabled(writable || ctx.docx_page_view),
                 MenuEntry::Separator,
                 MenuEntry::item("edit-cut", "剪切")
                     .shortcut_for("cut")
                     .act(MenuAction::Cut)
-                    .with_enabled(writable && ctx.has_selection && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态 cut 走 LOK（TextOf 读
+                    // 选区 + Cut——选区有无内核裁决，无选区零效果非死路）。
+                    .with_enabled((writable && ctx.has_selection) || ctx.docx_page_view),
                 MenuEntry::item("edit-copy", "复制")
                     .shortcut_for("copy")
                     .act(MenuAction::Copy)
-                    // 复制同判（Lead 复验：页面态隐藏选区不得启用
-                    // copy——选区判定不可跨显示面）。
-                    .with_enabled(doc && ctx.has_selection && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态 copy 走 LOK TextOf +
+                    // 剪贴板写（无选区 = 写空串，内核裁决）。
+                    .with_enabled((doc && ctx.has_selection) || ctx.docx_page_view),
                 MenuEntry::item("edit-paste", "粘贴")
                     .shortcut_for("paste")
                     .act(MenuAction::Paste)
-                    .with_enabled(writable && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态 paste 走剪贴板读 +
+                    // type_text（空剪贴板零效果）。
+                    .with_enabled(writable || ctx.docx_page_view),
                 MenuEntry::Separator,
                 // #176：查找/替换/命令面板是编辑器浮层——页面态编辑器
                 // 不在树内，点了也不可见；置灰 + 原因（不进死路）。
@@ -446,11 +453,13 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                         // 搜索 = 既有 Cmd::OpenFind（图标条搜索钮同链）。
                         // #176：页面态守卫同编辑菜单「查找」（同一动作
                         // 同一死路——同灰同因）。
-                        MenuEntry::item("view-side-search", "搜索")
-                            .shortcut_for("open_find")
-                            .act(MenuAction::EditorCmd(Cmd::OpenFind))
-                            .with_enabled(doc && !ctx.docx_page_view)
-                            .with_page_reason(ctx, REASON_PAGE_FIND),
+                        // #109 批②③：项目搜索面板（图标条搜索钮/
+                        // Ctrl+Shift+F 同链——面板独立于编辑器，页面视图/
+                        // 无文档可用；#176 页面态守卫随之退役）。
+                        MenuEntry::item("view-side-search", "项目搜索")
+                            .shortcut_for("project_search")
+                            .act(MenuAction::ToggleSearchPanel)
+                            .checked(ctx.left_open && ctx.search_view),
                     ],
                 ),
                 MenuEntry::Separator,
@@ -525,6 +534,7 @@ mod tests {
             theme_mode: THEME_LIGHT,
             left_open: true,
             git_view: false,
+            search_view: false,
             active_is_docx: true,
             active_is_pdf: false,
             pdf_ocr_pending: false,
@@ -547,6 +557,7 @@ mod tests {
             theme_mode: THEME_SYSTEM,
             left_open: true,
             git_view: false,
+            search_view: false,
             active_is_docx: false,
             active_is_pdf: false,
             pdf_ocr_pending: false,
@@ -626,7 +637,7 @@ mod tests {
             ("view-font-inc", "Ctrl+="),
             ("view-font-dec", "Ctrl+-"),
             ("view-font-reset", "Ctrl+0"),
-            ("view-side-search", "Ctrl+F"),
+            ("view-side-search", "Ctrl+K Ctrl+F"),
         ];
         for (id, key) in pinned {
             let spec = find(&menus[0].entries, id)
@@ -661,7 +672,6 @@ mod tests {
             ("edit-redo", Cmd::Redo),
             ("edit-find", Cmd::OpenFind),
             ("edit-replace", Cmd::OpenReplace),
-            ("view-side-search", Cmd::OpenFind),
         ];
         for (id, want) in cases {
             let spec = find(&menus[0].entries, id)
@@ -674,6 +684,12 @@ mod tests {
                 "{id} Cmd 映射漂移"
             );
         }
+        // #109 批②③：view-side-search 改挂面板族（不再 EditorCmd）。
+        let search = find(&menus[0].entries, "view-side-search")
+            .or_else(|| find(&menus[1].entries, "view-side-search"))
+            .or_else(|| find(&menus[2].entries, "view-side-search"))
+            .unwrap_or_else(|| panic!("view-side-search 缺失"));
+        assert_eq!(search.action, MenuAction::ToggleSearchPanel);
     }
 
     /// 无既有命令的项：置灰 + 不绑动作（禁用态是验收项）。
@@ -711,7 +727,6 @@ mod tests {
             "edit-find",
             "edit-replace",
             "edit-palette",
-            "view-side-search",
         ];
         for id in disabled {
             let spec = find(&menus[0].entries, id)
@@ -720,14 +735,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} 缺失"));
             assert!(!spec.enabled, "无文档时 {id} 应灰显");
         }
-        // shell 级动作不依赖文档。
-        let enabled = ["file-open", "file-open-folder", "file-quit", "help-about"];
+        // shell 级动作不依赖文档。#109 批②③：项目搜索面板亦不依赖
+        // （面板独立域——无文档可搜工作区）。
+        let enabled = [
+            "file-open",
+            "file-open-folder",
+            "file-quit",
+            "view-side-search",
+        ];
         for id in enabled {
             let spec = find(&menus[0].entries, id)
-                .or_else(|| find(&menus[3].entries, id))
+                .or_else(|| find(&menus[1].entries, id))
+                .or_else(|| find(&menus[2].entries, id))
                 .unwrap_or_else(|| panic!("{id} 缺失"));
             assert!(spec.enabled, "无文档时 {id} 仍应可用（shell 级动作）");
         }
+        // help-about 在第四菜单（帮助）——原链含 menus[3] 的用例保留。
+        let about = find(&menus[3].entries, "help-about").expect("help-about 缺失");
+        assert!(about.enabled);
     }
 
     /// 只读态（docx/pdf）：变更类灰显，浏览类（复制/查找）可用——与编辑器
@@ -767,7 +792,9 @@ mod tests {
         ctx.docx_page_view = true;
         let menus = build_menus(&ctx);
 
-        // 编辑类：本就 read_only 灰显，页面态补原因说明。
+        // #50 C3（#176 翻新）：编辑类页面态**启用**——shell
+        // activate_menu_action 分流到 dispatch_edit_key（LOK 真实
+        // 派发；就绪卫在 dispatch 内——read_only 快照不跨显示面生效）。
         for id in [
             "edit-undo",
             "edit-redo",
@@ -776,12 +803,8 @@ mod tests {
             "edit-paste",
         ] {
             let spec = find(&menus[1].entries, id).unwrap_or_else(|| panic!("{id} 缺失"));
-            assert!(!spec.enabled, "页面态 {id} 应灰显");
-            assert_eq!(
-                spec.disabled_reason,
-                Some(REASON_PAGE_EDIT),
-                "页面态 {id} 灰显须带原因（不静默）"
-            );
+            assert!(spec.enabled, "页面态 {id} 应启用（LOK 编辑通道已接）");
+            assert_eq!(spec.disabled_reason, None, "页面态 {id} 启用不挂禁用原因");
         }
 
         // 编辑器浮层类（查找/替换/命令面板）：页面态编辑器不在树内，
@@ -790,7 +813,6 @@ mod tests {
             ("edit-find", REASON_PAGE_FIND),
             ("edit-replace", REASON_PAGE_FIND),
             ("edit-palette", REASON_PAGE_PALETTE),
-            ("view-side-search", REASON_PAGE_FIND),
         ] {
             let spec = find(&menus[1].entries, id)
                 .or_else(|| find(&menus[2].entries, id))
@@ -870,8 +892,10 @@ mod tests {
         ctx.docx_page_view = true;
         let menus = build_menus(&ctx);
 
-        // Lead 反例五项：撤销/重做/剪切/复制/粘贴——修前 undo/redo/
-        // paste 为 (true, None)（无禁用原因的启用态——真实缺陷形态）。
+        // #50 C3（#176 翻新）：Lead 反例五项的「正确行为」随产品
+        // 前进重钉——页面可编辑已接（PR #217 编辑面 + shell 分流），
+        // 撤销/重做/剪切/复制/粘贴页面态**启用**（hidden Editor 的
+        // read_only/选区不再跨显示面禁用——LOK 通道裁决真实可用性）。
         for id in [
             "edit-undo",
             "edit-redo",
@@ -881,13 +905,12 @@ mod tests {
         ] {
             let spec = find(&menus[1].entries, id).unwrap_or_else(|| panic!("{id} 缺失"));
             assert!(
-                !spec.enabled,
-                "可编辑 docx 页面态 {id} 必须禁用（以当前显示面为准）"
+                spec.enabled,
+                "可编辑 docx 页面态 {id} 应启用（LOK 编辑通道已接——#176 置灰退役）"
             );
             assert_eq!(
-                spec.disabled_reason,
-                Some(REASON_PAGE_EDIT),
-                "可编辑 docx 页面态 {id} 禁用须带原因（不静默）"
+                spec.disabled_reason, None,
+                "可编辑 docx 页面态 {id} 启用不挂禁用原因"
             );
         }
         // 对照组：shell 级动作不受影响（保存/另存为/导出/退出）。

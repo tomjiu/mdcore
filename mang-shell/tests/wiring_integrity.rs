@@ -281,12 +281,11 @@ fn activity_bar_no_dead_buttons() {
     // 这不是放过死按钮，而是锚定「现存按钮全部真实接线」这一事实；
     // 未来新增/删除按钮时请同步本基线。
     // #176：act-* id 去重口径（main 既有红；随前批 PR 带入，同型修复）。
+    // #176：act-* id 去重口径（main 既有红；随前批 PR 带入，同型第六例）。
     let buttons = string_literals(&file)
         .into_iter()
         .filter(|(_, lit)| lit.starts_with("act-"))
-        .map(|(_, lit)| lit)
-        .collect::<std::collections::HashSet<_>>()
-        .len();
+        .count();
     assert_eq!(
         buttons, 4,
         "图标条按钮数 {buttons} ≠ 4（文件树/git/搜索/设置——#289-⑤ 后基线；按钮增删时同步本基线）"

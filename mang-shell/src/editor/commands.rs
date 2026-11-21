@@ -71,6 +71,18 @@ impl Cmd {
         Cmd::Redo,
     ];
 
+    /// 变体名表（[`Self::key_name`] 的数据源——与 `ALL` 声明序一致；
+    /// #112 P1 MRU 持久化的稳定序列化名）。
+    #[rustfmt::skip]
+    const NAMES: &[&str] = &[
+        "MoveLeft", "MoveRight", "MoveUp", "MoveDown",
+        "WordLeft", "WordRight", "MoveHome", "MoveEnd",
+        "DocStart", "DocEnd",
+        "ToggleFold", "FoldCurrent", "UnfoldCurrent", "FoldAll", "UnfoldAll",
+        "OpenFind", "OpenReplace", "GotoLine",
+        "Save", "SelectAll", "Undo", "Redo",
+    ];
+
     /// #134：机器名（snake_case——RPC `run_command` 按名调用的口径；
     /// 与变体名的对应关系稳定可预测，新命令逆推零成本）。
     pub fn id(self) -> &'static str {
@@ -166,39 +178,126 @@ impl Cmd {
 
     /// 标题模糊匹配（子序列——大小写不敏感；空查询恒命中）。
     /// 返回 (命令, 命中度)——度=匹配字符数/标题长度（排序用）。
+    /// #112 P1（MRU 持久化）：稳定序列化名（= Debug 变体名——枚举变体
+    /// 名即稳定身份，不随标题文案改动漂移）。
+    pub fn key_name(self) -> &'static str {
+        // Debug 格式「Cmd::MoveLeft」取变体名段。
+        match Self::NAMES.get(self as usize) {
+            Some(s) => s,
+            None => "Unknown",
+        }
+    }
+
     pub fn matches_query(self, query: &str) -> Option<f32> {
+        self.match_positions(query)
+            .map(|(qi, _)| qi as f32 / self.title().chars().count() as f32)
+    }
+
+    /// #112 P1（命中片段高亮）：子序列命中的**标题下标集**。
+    ///
+    /// 与 [`Self::matches_query`] 同一贪心扫描（单一真源——首处命中即取，
+    /// 度=命中字符数/标题字符数）；返回 (命中字符数, 标题下标集)，
+    /// `None` = 不命中。下标集供面板渲染命中字符高亮 span；
+    /// 空查询命中度为 0（无高亮——全列表等价展示）。
+    pub fn match_positions(self, query: &str) -> Option<(usize, Vec<usize>)> {
         let q: Vec<char> = query.to_lowercase().chars().collect();
         if q.is_empty() {
-            return Some(0.);
+            return Some((0, vec![]));
         }
         let title: Vec<char> = self.title().to_lowercase().chars().collect();
         let mut qi = 0;
-        for tc in title.iter() {
+        let mut positions = Vec::with_capacity(q.len());
+        for (ti, tc) in title.iter().enumerate() {
             if qi < q.len() && *tc == q[qi] {
+                positions.push(ti);
                 qi += 1;
             }
         }
         if qi == q.len() {
-            Some(qi as f32 / title.len() as f32)
+            Some((qi, positions))
         } else {
             None
         }
     }
 }
 
+/// #112 P1：按稳定名反解（settings 恢复路径——未知名返回 None 容忍旧档）。
+pub fn from_key_name(name: &str) -> Option<Cmd> {
+    Cmd::ALL.iter().copied().find(|&c| c.key_name() == name)
+}
+
 /// 按查询排序命令（匹配度降序；同度保文档序）。
 pub fn search(query: &str) -> Vec<Cmd> {
-    let mut out: Vec<(f32, Cmd)> = Cmd::ALL
+    search_with_highlights(query)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect()
+}
+
+/// #112 P1（命中片段高亮）：搜索结果附命中下标集（渲染层高亮消费）。
+///
+/// 排序语义与 [`search`] 完全一致（度=命中字符数/标题字符数，降序、
+/// 同度保文档序）；`search` 委托本函数——单一真源，门禁口径不变。
+pub fn search_with_highlights(query: &str) -> Vec<(Cmd, Vec<usize>)> {
+    let mut out: Vec<(f32, usize, Cmd, Vec<usize>)> = Cmd::ALL
         .iter()
-        .filter_map(|&c| c.matches_query(query).map(|d| (d, c)))
+        .enumerate()
+        .filter_map(|(doc, &c)| {
+            c.match_positions(query).map(|(qi, positions)| {
+                (
+                    qi as f32 / c.title().chars().count() as f32,
+                    doc,
+                    c,
+                    positions,
+                )
+            })
+        })
         .collect();
-    out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    out.into_iter().map(|(_, c)| c).collect()
+    // 度降序；同度保文档序（ALL 声明序——与旧实现一致）。
+    out.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    out.into_iter()
+        .map(|(_, _, c, positions)| (c, positions))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #112 P1：命中下标集（子序列贪心首处命中——高亮渲染的数据源）。
+    #[test]
+    fn match_positions_reports_subsequence_indices() {
+        // "移左" 在 "移动：左" 中的命中下标（小写标题 char 序）：
+        // 移(0) 左(3)。
+        let (n, pos) = Cmd::MoveLeft.match_positions("移左").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(pos, vec![0, 3]);
+
+        // 大小写不敏感：英文命令 "sv" → "保存(Save)"?——标题中文为主，
+        // 用两字查询打同一条验证贪心首处命中。
+        let (n2, pos2) = Cmd::MoveLeft.match_positions("移动").unwrap();
+        assert_eq!(n2, 2);
+        assert_eq!(pos2, vec![0, 1], "前缀连续命中");
+
+        // 不命中 → None。
+        assert!(Cmd::MoveLeft.match_positions("zzz").is_none());
+        // 空查询 → 命中 0 无高亮（全列表等价展示）。
+        assert_eq!(Cmd::MoveLeft.match_positions(""), Some((0, vec![])));
+    }
+
+    /// #112 P1：稳定名往返（key_name ↔ from_key_name——MRU 持久化口径）。
+    #[test]
+    fn key_name_roundtrip_all_commands() {
+        for &c in Cmd::ALL {
+            let name = c.key_name();
+            assert_eq!(from_key_name(name), Some(c), "{} 反解回同一命令", name);
+        }
+        assert_eq!(from_key_name("不存在命令"), None, "未知名 None 容忍");
+    }
 
     #[test]
     fn empty_query_lists_all() {

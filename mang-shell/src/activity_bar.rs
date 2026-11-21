@@ -9,8 +9,8 @@
 //! 很不好」）：**左图标条只管左栏**——
 //! - 主面板钮（文件树/git）在上，切换左栏视图（vscode 资源管理器/
 //!   源代码管理同构）；
-//! - 搜索钮接线 `Cmd::OpenFind`（与 Ctrl+F / 右键菜单「查找」同一
-//!   分派路径 `Editor::run_command`——不另造入口）；
+//! - 搜索钮接项目搜索面板（#109 批②③——`ShellApp::toggle_search`，
+//!   与文件树/git 钮同构的左栏视图钮；编辑器内 Ctrl+F 独立并存）；
 //! - 设置钮沉底（vscode 同款位置）：#289-⑤ 起改为打开**设置弹窗**
 //!   （`ShellApp::open_settings`——不再占用右栏视图；zed/vscode 的
 //!   「设置不是任何 dock 的视图」语义）；
@@ -26,7 +26,6 @@ use gpui::{App, ClickEvent, Context, Hsla, Pixels, Window, px};
 use ui::prelude::*;
 use ui::{Color, Icon, IconName, IconSize, Tooltip};
 
-use crate::editor::commands::Cmd;
 use crate::shell::ShellApp;
 
 /// 图标条实宽（px）：8 边距 + 36 按钮 + 8 边距。
@@ -52,6 +51,10 @@ pub fn activity_bar(
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
+    // #109：search_disabled 参数保留签名兼容（恒 false——置灰口径退役）。
+    let _ = search_disabled;
+    // #109：搜索视图态（图标条选中——与 git_view 同源 dock 读）。
+    let search_view = cx.entity().read(cx).search_active(cx);
     v_flex()
         .id("activity-bar")
         .debug_selector(|| "activity-bar".into())
@@ -80,33 +83,22 @@ pub fn activity_bar(
             colors.element_selected,
             cx.listener(|this, _, _, cx| this.toggle_git(cx)),
         ))
-        // #165：搜索钮 → Cmd::OpenFind（与 Ctrl+F 同链——Editor::run_command
-        // 统一分派；无打开文档时与 Ctrl+F 同为无操作，行为一致不特殊化）。
-        // #176：docx 页面视图下置灰 + 原因（编辑器浮层死路不进——
-        // 同 Ctrl+F 键守卫的提示文案）。
-        .child(if search_disabled {
-            disabled_bar_button(
-                "act-search",
-                IconName::MagnifyingGlass,
-                "搜索（Ctrl+F）——页面视图暂不支持，切换到文本视图后可用",
-            )
-            .into_any_element()
-        } else {
+        // #109 批②③：搜索钮 → 项目搜索面板（toggle_search——面板激活
+        // 协议，与文件树/git 钮同构；#165 的编辑器内 Ctrl+F 键位不受影响
+        // ——两域并存）。#176 置灰口径退役：项目搜索不依赖编辑器浮层
+        // （docx 页面视图/无文档均可搜工作区）。
+        .child(
             bar_button(
                 "act-search",
                 IconName::MagnifyingGlass,
-                false,
-                "搜索（Ctrl+F）",
+                left_open && search_view,
+                "项目搜索（Ctrl+K Ctrl+F）",
                 colors.element_hover,
                 colors.element_selected,
-                cx.listener(|this, _, window, cx| {
-                    if let Some(editor) = this.editor().cloned() {
-                        editor.update(cx, |ed, cx| ed.run_command(Cmd::OpenFind, window, cx));
-                    }
-                }),
+                cx.listener(|this, _, _, cx| this.toggle_search(cx)),
             )
-            .into_any_element()
-        })
+            .into_any_element(),
+        )
         .child(div().flex_1())
         // #289-⑤：设置钮沉底（vscode 同款位置）——打开设置**弹窗**
         // （不再驱动右栏视图；右栏只归属性/来源，右缘 dock 条自管）。
