@@ -621,7 +621,9 @@ fn palette_data_covers_all_commands() {
     }
 
     // ② 分组装配 + 扁平化零丢失（键盘上下移动的遍历域 = 全部命令）。
-    let sections = build_sections(&results, &RecentRing::new(4));
+    // #212 后签名演进：results 需带命中下标（空查询 = 全部命中、下标集空）。
+    let hl_results = commands::search_with_highlights("");
+    let sections = build_sections("", &hl_results, &RecentRing::new(4));
     let flat = flatten(&sections);
     assert_eq!(
         flat.len(),
