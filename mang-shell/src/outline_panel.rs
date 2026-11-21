@@ -81,6 +81,11 @@ pub struct OutlinePanel {
     activate_hook: Option<ActivateHook>,
     /// 独立宿主可省略；Shell 注入当前活动视图的焦点路由。
     escape_hook: Option<EscapeHook>,
+    /// #108 批②：分区折叠集（行索引 = 数据面身份——不随渲染漂移；
+    /// 报告 §3 提示「行焦点按序号协议与折叠的行序号漂移交互需设计
+    /// 先行」：折叠集按全量 headings 的行索引记，句柄缓存不清退
+    /// （retain 按全量 len——解折叠即恢复，与编辑差量刷新同语义）。
+    collapsed: std::collections::HashSet<usize>,
 }
 
 impl OutlinePanel {
@@ -99,6 +104,9 @@ impl OutlinePanel {
             scroll: ScrollHandle::new(),
             activate_hook,
             escape_hook: None,
+            collapsed: crate::settings::load_outline_collapsed()
+                .into_iter()
+                .collect(),
         };
         this.refresh(cx);
         // 编辑器通知（buffer 编辑/标题增删）→ 行集差量刷新。
@@ -131,6 +139,52 @@ impl OutlinePanel {
     /// 行集是否为空（left_panel 沿用「无标题不渲染分组」的批 5a 前语义）。
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// #108 批②：折叠/展开分区头（toggle——渲染集即时重算）。
+    /// #108 批③：折叠集变更同步落盘（跨重启恢复——settings
+    /// `outline_collapsed` 键沿 indent_unit 先例）。
+    pub fn toggle_fold(&mut self, index: usize) {
+        if index < self.rows.len() {
+            if self.collapsed.contains(&index) {
+                self.collapsed.remove(&index);
+            } else {
+                self.collapsed.insert(index);
+            }
+            crate::settings::save_outline_collapsed(self.collapsed.iter().copied().collect());
+        }
+    }
+
+    /// #108 批②：可见行（分区折叠后——折叠头保留，其子行到下一
+    /// 同级或更高级标题前隐藏；行索引按全量数据面身份——渲染
+    /// 序号协议稳定）。
+    pub fn visible_rows_indexed(&self) -> Vec<(usize, &OutlineRow)> {
+        let mut out = Vec::new();
+        let mut hiding_until_level: Option<usize> = None;
+        for (index, row) in self.rows.iter().enumerate() {
+            if let Some(min_level) = hiding_until_level {
+                if row.level <= min_level {
+                    // 到同级/更高级标题——恢复可见。
+                    hiding_until_level = None;
+                } else {
+                    continue; // 深层子行隐藏
+                }
+            }
+            out.push((index, row));
+            if self.collapsed.contains(&index) {
+                // 折叠头：其后的更深层行隐藏（到 level ≤ 头级止）。
+                hiding_until_level = Some(row.level);
+            }
+        }
+        out
+    }
+
+    /// #108 批②：可见行标签（测试断言面——渲染同源 visible_rows_indexed）。
+    pub fn visible_labels(&self) -> Vec<&str> {
+        self.visible_rows_indexed()
+            .iter()
+            .map(|(_, r)| r.label.as_str())
+            .collect()
     }
 
     /// 行集差量刷新：重建行数据，句柄按条目序号保留、清退删除项、
@@ -226,7 +280,22 @@ impl gpui::Render for OutlinePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let editor = self.editor.clone();
         let hook = self.activate_hook.clone();
-        let rows = self.rows.clone();
+        // #108 批②：渲染行集走折叠视图（visible_rows_indexed——折叠头
+        // 保留、子行隐藏；行身份 = 全量索引（句柄协议不变——解折叠
+        // 即恢复），折叠箭头 toggle 按全量索引落点）。
+        let rows: Vec<(usize, OutlineRow)> = self
+            .visible_rows_indexed()
+            .into_iter()
+            .map(|(i, r)| (i, r.clone()))
+            .collect();
+        // 折叠候选：紧邻全量行有更深子级（箭头只渲染在可折叠头上）。
+        let rows_snapshot = self.rows.clone();
+        let foldable = move |i: usize| {
+            rows_snapshot
+                .get(i + 1)
+                .is_some_and(|next| next.level > rows_snapshot[i].level)
+        };
+        let collapsed = self.collapsed.clone();
         let scroll = self.scroll.clone();
         let mut entries = Vec::with_capacity(rows.len());
 
@@ -247,7 +316,7 @@ impl gpui::Render for OutlinePanel {
                                 .color(ui::Color::Muted),
                         ),
                     )
-                    .children(rows.iter().enumerate().map(|(index, row)| {
+                    .children(rows.iter().map(|(gindex, row)| {
                         let handle = row.focus_handle.clone();
                         let editor = editor.clone();
                         let hook = hook.clone();
@@ -259,8 +328,8 @@ impl gpui::Render for OutlinePanel {
                             scroll_anchor: Some(anchor.clone()),
                         });
                         div()
-                            .id(SharedString::from(format!("outline-row-{index}")))
-                            .debug_selector(move || format!("outline-row-{index}"))
+                            .id(SharedString::from(format!("outline-row-{gindex}")))
+                            .debug_selector(move || format!("outline-row-{gindex}"))
                             .track_focus(&handle)
                             .anchor_scroll(Some(anchor))
                             // 点击 = 聚焦该行（键盘导航起点）。
@@ -269,11 +338,38 @@ impl gpui::Render for OutlinePanel {
                                 move |_, window, cx| handle.focus(window, cx)
                             })
                             .child(
-                                ListItem::new(SharedString::from(format!("outline-item-{index}")))
+                                ListItem::new(SharedString::from(format!("outline-item-{gindex}")))
                                     .inset(true)
                                     // 层级缩进：每级 12px（1 级不缩进——批 5a 同款）。
                                     .indent_level(row.level.saturating_sub(1))
                                     .focused(focused)
+                                    // #108 批②：折叠箭头（可折叠头才有——点击
+                                    // toggle 折叠/展开；stop_propagation 防行跳）。
+                                    .when(foldable(*gindex), |li| {
+                                        let g = *gindex;
+                                        let is_collapsed = collapsed.contains(&g);
+                                        li.start_slot(
+                                            div()
+                                                .id(SharedString::from(format!("outline-fold-{g}")))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(
+                                                    move |this, _: &gpui::ClickEvent, _, cx| {
+                                                        this.toggle_fold(g);
+                                                        cx.stop_propagation();
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .child(
+                                                    Icon::new(if is_collapsed {
+                                                        IconName::ChevronRight
+                                                    } else {
+                                                        IconName::ChevronDown
+                                                    })
+                                                    .size(IconSize::XSmall)
+                                                    .color(ui::Color::Muted),
+                                                ),
+                                        )
+                                    })
                                     .child(Label::new(row.label.as_str()).size(LabelSize::Small))
                                     .on_click(move |_, window, cx| {
                                         Self::activate(&editor, line, hook.as_deref(), window, cx);
@@ -302,9 +398,9 @@ impl gpui::Render for OutlinePanel {
                 let editor = editor.clone();
                 let hook = hook.clone();
                 move |_: &menu::Confirm, window, cx| {
-                    if let Some(row) = rows
+                    if let Some((_, row)) = rows
                         .iter()
-                        .find(|r| r.focus_handle.contains_focused(window, cx))
+                        .find(|(_, r)| r.focus_handle.contains_focused(window, cx))
                     {
                         Self::activate(&editor, row.line, hook.as_deref(), window, cx);
                     }
@@ -436,6 +532,75 @@ mod tests {
 
     /// 导航面：首行聚焦 → SelectNext → 次行含焦点（Navigable 遍历语义）。
     #[gpui::test]
+    /// #108 批②：分区折叠——H1 分区折叠后子行不出渲染集、折叠头
+    /// 保留；展开恢复全行。先红：方法不存在 = 编译红。
+    /// #108 批③：XDG 临时区 guard（dock_open_states_persist_across_restart
+    /// 同型——toggle_fold 落盘写临时区、构造装载读临时区默认空，
+    /// 不污染真实 config——批③落盘面接入后的测试隔离窗）。
+    #[gpui::test]
+    fn section_fold_hides_children_keeps_head(cx: &mut TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("moutline-fold-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&xdg);
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        let text = "# A\n## A1\n## A2\n# B\n## B1";
+        let (_editor, panel, _visual) = panel_window(cx, text);
+        panel.update(cx, |p, _| {
+            // 初始 5 行（A/A1/A2/B/B1）。
+            assert_eq!(p.visible_labels().len(), 5, "初始全行");
+
+            // 折叠 H1 A（行 0）：A1/A2 隐藏，B/B1 保留。
+            p.toggle_fold(0);
+            assert_eq!(p.visible_labels().len(), 3, "折叠 A 后 3 行");
+            assert!(p.visible_labels()[0].contains("H1 · A"), "折叠头 A 保留");
+            assert!(
+                !p.visible_labels().iter().any(|l| l.contains("A1")),
+                "A1 子行隐藏"
+            );
+
+            // 展开：恢复 5 行（句柄不清退——解折叠即恢复）。
+            p.toggle_fold(0);
+            assert_eq!(p.visible_labels().len(), 5, "展开恢复全行");
+        });
+        // XDG 还原（先例同型收口）。
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    /// #108 批②：折叠 H1 下嵌套 H2 子分区独立折叠（内层折叠不动
+    /// 外层；两级语义正交）。#108 批③：XDG 临时区 guard 同型。
+    #[gpui::test]
+    fn section_fold_nested_h2_independent(cx: &mut TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("moutline-nested-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&xdg);
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        let text = "# A\n## A1\n### A1a\n## A2";
+        let (_editor, panel, _visual) = panel_window(cx, text);
+        panel.update(cx, |p, _| {
+            // 折叠 H2 A1（行 1）：A1a 隐藏，A/A2 保留。
+            p.toggle_fold(1);
+            assert_eq!(p.visible_labels().len(), 3, "折叠 A1 后 3 行");
+            assert!(
+                !p.visible_labels().iter().any(|l| l.contains("A1a")),
+                "A1a 深层子行隐藏"
+            );
+            assert!(
+                p.visible_labels().iter().any(|l| l.contains("A2")),
+                "同级 A2 不受影响"
+            );
+        });
+        // XDG 还原（先例同型收口）。
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
     fn select_next_moves_focus_to_next_row(cx: &mut TestAppContext) {
         let (_editor, panel, mut visual) = panel_window(cx, "# A\n正文\n## B\n尾段");
 

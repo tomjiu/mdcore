@@ -514,10 +514,15 @@ fn main() {
             let remembered_workspace =
                 settings::remembered_workspace().filter(|root| root.is_dir());
 
+            // #114 批②：窗口矩形跨重启恢复（settings window_bounds——
+            // 坏数据校验回退默认 96,64,1280,800；最小 760×480 钳制
+            // 在读面完成）。报告 §6 M7：用户拖大窗口重启不再回硬编码。
+            let (bx, by, bw, bh) = settings::load_window_bounds()
+                .unwrap_or((96., 64., 1280., 800.));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: point(px(96.), px(64.)),
-                    size: size(px(1280.), px(800.)),
+                    origin: point(px(bx), px(by)),
+                    size: size(px(bw), px(bh)),
                 })),
                 titlebar: Some(TitlebarOptions {
                     title: Some("mang".into()),
@@ -548,7 +553,36 @@ fn main() {
             // （EX_SOFTWARE）——替代原 .expect 的裸 panic（exit 101 裸
             // 错误链，桌面双击启动时 stderr 无处落 ≈ 静默失败）。
             let window_handle = match cx.open_window(options, |window, cx| {
-                cx.new(|cx| shell::ShellApp::new(editor_entity, remembered_workspace, window, cx))
+                // #114 P1④：关窗无条件先存（impl Window 钩子——返回
+                // true 放行关窗；窗口矩形 + 会话标签统一落存；非优雅
+                // 退出物理边界不保）。闭包首注册（shell 建立后拿实体面
+                // ——落存走 settings 直写，无需 shell 实体）。
+                cx.new(|cx| {
+                    let shell_entity =
+                        shell::ShellApp::new(editor_entity, remembered_workspace, window, cx);
+                    let weak = cx.entity().downgrade();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        // 关窗钩：窗口矩形（当前窗面）+ 会话标签（shell
+                        // 弱引用读 tabs）双键先存——返回 true 放行。
+                        let b = _window.bounds();
+                        settings::save_window_bounds(
+                            b.origin.x.as_f32(),
+                            b.origin.y.as_f32(),
+                            b.size.width.as_f32(),
+                            b.size.height.as_f32(),
+                        );
+                        if let Some(shell) = weak.upgrade() {
+                            shell.update(cx, |shell, _cx| {
+                                let paths: Vec<std::path::PathBuf> =
+                                    shell.tabs_paths_snapshot();
+                                let active = shell.active_index();
+                                settings::save_session_tabs(&paths, active);
+                            });
+                        }
+                        true
+                    });
+                    shell_entity
+                })
             }) {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -590,6 +624,15 @@ fn main() {
                     std::process::exit(70);
                 }
             };
+
+            // #114 批①：会话恢复（上次打开标签列表 + 激活标签——
+            // settings 读 → 逐路径 open_document_tab 既有链；已删静默
+            // 跳过 + 上限 20 + 恢复证据行；F2 工作区恢复后接续）。
+            window_handle.update(cx, |shell, _window, cx| {
+                shell.restore_session_tabs(cx);
+            });
+
+
 
             // #104 任务 2：本机控制通道启动（默认开；失败降级不致命——
             // 端点被占/绑定失败只损失 RPC 能力，桌面本体照常）。服务
