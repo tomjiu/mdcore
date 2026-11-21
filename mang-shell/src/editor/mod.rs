@@ -1427,6 +1427,221 @@ impl Editor {
     }
 
     // ------------------------------------------------------------------
+    // #111 D1：行移动（Alt+↑/↓——Q-IDE editing.rs:60-116 纯算法移植）。
+    // ------------------------------------------------------------------
+
+    /// #111 D1：Alt+↑——光标（或选区覆盖的行块）整块上移一行。
+    ///
+    /// 语义（参照移植）：多行块整体移动（选区从块首行首列到块末行
+    /// 任意列均整块）；首行拒移返回 false（buffer 零变更）；移动后
+    /// 光标行随块移动、列保持；选区重映射为新位置（起于块首行首列、
+    /// 止于块末行原列——与 Q-IDE 选区复位同型）。移动是编辑事务
+    /// （replace_range 两段删除+插入）→ 撤销一键复原。
+    /// #111 P2 批⑦：复制行——光标（或选区覆盖的行块）整块复制到
+    /// 自身下方；光标/选区原地不动（一个原子 batch——undo 一键复原）。
+    /// 单行文档亦可复制（与删除行「末行保留」语义相异——复制无破坏）。
+    pub fn copy_line(&mut self) -> bool {
+        let Some((start, end, _sel_end_col)) = self.line_block_range() else {
+            return false;
+        };
+        // 光标原位（复制不动光标——事务后显式复位：合并窗会把光标
+        // 推到插入点后，破坏「原地不动」语义）。
+        let (cur_line, cur_col) = {
+            let c = self.buffer.cursor();
+            (c.line, c.col)
+        };
+        // 块文本（含内部换行——逐行拼）。
+        let block: String = (start.line..=end.line)
+            .map(|l| self.buffer.line(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 复制 = 块末行行尾插整块（原子事务——undo 一键复原）。
+        let edits = vec![(
+            Point::new(end.line + 1, 0),
+            Point::new(end.line + 1, 0),
+            format!("{block}\n"),
+        )];
+        let ok = self.buffer.replace_batch(edits) > 0;
+        if ok {
+            self.buffer.set_cursor(Point::new(cur_line, cur_col));
+        }
+        ok
+    }
+
+    /// #111 P2 批⑦：删除行——光标（或选区覆盖的行块）整块删除含
+    /// 换行；单行文档返回 false（不删到空文档——「删完内容」用选区
+    /// 删除即可达）。光标复位到删除点行首。
+    pub fn delete_line(&mut self) -> bool {
+        let Some((start, end, _sel_end_col)) = self.line_block_range() else {
+            return false;
+        };
+        let line_count = self.buffer.line_count();
+        // 单行文档保护：删了就空——语义拒（返回 false）。
+        if line_count <= 1 {
+            return false;
+        }
+        // 删除范围（三条路径）：
+        // ① 末块（含末行）：删块首行前的换行（前一行行尾到文档末）。
+        // ② 首块到文档末（= 全删——多行首块+末块）：[0,0] 到文档末。
+        // ③ 常规：块首行行首到块末下一行行首（含换行）。
+        let is_tail = end.line + 1 >= line_count;
+        let end_point = if is_tail {
+            if start.line == 0 {
+                // 全删场景（多行首块+末块）：[0,0] 到末行行尾。
+                let last_line = self.buffer.line(end.line);
+                Point::new(end.line, last_line.chars().count())
+            } else {
+                // 末块：删前一行行尾的换行 + 块（到文档末）。
+                let prev = self.buffer.line(start.line - 1);
+                Point::new(start.line - 1, prev.chars().count())
+            }
+        } else {
+            Point::new(end.line + 1, 0)
+        };
+        let edits = vec![(Point::new(start.line, 0), end_point, String::new())];
+        let ok = self.buffer.replace_batch(edits) > 0;
+        if ok {
+            // 光标复位：删除点行首（行号钳到新文档范围）。
+            let new_count = self.buffer.line_count();
+            self.buffer
+                .set_cursor(Point::new(start.line.min(new_count - 1), 0));
+        }
+        ok
+    }
+
+    pub fn move_line_up(&mut self) -> bool {
+        let Some((start, end, sel_end_col)) = self.line_block_range() else {
+            return false;
+        };
+        if start.line == 0 {
+            return false; // 边界拒移（首行）
+        }
+        let above = start.line - 1;
+        let above_text = self.buffer.line(above);
+        // 换位 = 一个原子 batch（两坐标段按原始文档表达；事务版本
+        // 只 +1 → undo 一键复原——探针实证：拆两次 replace_range 会被
+        // 合并窗接管/撤销不完整，batch 与全部替换同语义）：
+        //   删上行整行（含换行）+ 块末行后插上行（行首插入语义）。
+        let edits = vec![
+            (
+                Point::new(above, 0),
+                Point::new(start.line, 0),
+                String::new(),
+            ),
+            (
+                Point::new(end.line + 1, 0),
+                Point::new(end.line + 1, 0),
+                format!("{above_text}\n"),
+            ),
+        ];
+        if self.buffer.replace_batch(edits) == 0 {
+            return false;
+        }
+        // 光标/选区复位：块整体 -1 行。
+        self.restore_after_line_move(start.line, end.line, sel_end_col, true);
+        true
+    }
+
+    /// #111 D1：Alt+↓——光标（或选区覆盖的行块）整块下移一行。
+    pub fn move_line_down(&mut self) -> bool {
+        let Some((start, end, sel_end_col)) = self.line_block_range() else {
+            return false;
+        };
+        let line_count = self.buffer.line_count();
+        if end.line + 1 >= line_count {
+            return false; // 边界拒移（末块）
+        }
+        let below = end.line + 1;
+        let below_text = self.buffer.line(below);
+        // 换位 = 一个原子 batch（上移对偶——undo 一键复原）：
+        //   删下行整行（含换行）+ 块首行前插下行（行首插入语义）。
+        let edits = vec![
+            (
+                Point::new(below, 0),
+                Point::new(below + 1, 0),
+                String::new(),
+            ),
+            (
+                Point::new(start.line, 0),
+                Point::new(start.line, 0),
+                format!("{below_text}\n"),
+            ),
+        ];
+        if self.buffer.replace_batch(edits) == 0 {
+            return false;
+        }
+        // 光标/选区复位：块整体 +1 行。
+        self.restore_after_line_move(start.line, end.line, sel_end_col, false);
+        true
+    }
+
+    /// 行块域：光标无选区 = 光标行单行；有选区 = 覆盖行块（首行
+    /// 首列到末行选区终点列）。返回 (块首行, 块末行, 选区终点列——
+    /// 单光标时 = 光标列)。#111 D1。
+    fn line_block_range(&mut self) -> Option<(Point, Point, usize)> {
+        let sel = self.buffer.selection();
+        match sel {
+            Some(range) => {
+                let (s, e) = (range.start, range.end);
+                // 半开选区终点在行首（col=0 且跨行）= 该行未被选——
+                // 块末行 = 终点行 -1（选到 ccc 行首 = 块含到 bbb 行；
+                // Q-IDE editing.rs 多行块同型）。终点终点列用于复位：
+                // 退化到块末行 line_len（选到行首的列 0 复位无意义）。
+                let block_end_line = if e.line > s.line && e.col == 0 {
+                    e.line - 1
+                } else {
+                    e.line
+                };
+                let sel_end_col = if e.line > s.line && e.col == 0 {
+                    self.buffer.line_len(block_end_line)
+                } else {
+                    e.col
+                };
+                Some((s, Point::new(block_end_line, 0), sel_end_col))
+            }
+            None => {
+                let c = self.buffer.cursor();
+                Some((c, c, c.col))
+            }
+        }
+    }
+
+    /// 块文本（行 start..=end 连同行间换行；无尾换行）。#111 D1。
+    fn block_text(&self, start: usize, end: usize) -> String {
+        (start..=end)
+            .map(|l| self.buffer.line(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 移动后光标/选区复位：块首行 ±1；选区重映射（起块首行首列、
+    /// 止块末行原终点列——单光标 = 仅光标行 ±1 列保持）。#111 D1。
+    fn restore_after_line_move(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+        sel_end_col: usize,
+        up: bool,
+    ) {
+        // 光标/选区行域来自**移动前的块域**（start_line/end_line——
+        // replace_range 内部重定位不可依赖；Q-IDE 同型：移动语义里
+        // 光标跟块走，不是跟字符偏移走）。单光标块 = start 行本身。
+        let delta: isize = if up { -1 } else { 1 };
+        let new_start = (start_line as isize + delta).max(0) as usize;
+        let new_end = (end_line as isize + delta).max(0) as usize;
+        let had_selection = self.buffer.selection().is_some();
+        if had_selection {
+            // 选区重映射：起 = 新块首行首列；止 = 新块末行原终点列。
+            let end_col = sel_end_col.min(self.buffer.line_len(new_end));
+            self.buffer
+                .set_selection(Point::new(new_start, 0), Point::new(new_end, end_col));
+        } else {
+            let col = sel_end_col.min(self.buffer.line_len(new_start));
+            self.buffer.set_cursor(Point::new(new_start, col));
+        }
+    }
+
+    // ------------------------------------------------------------------
     // RPC 桥扩展面（#111 任务 2「RPC 扩展」）：撤销/重做统一入口 +
     // 光标/选区/滚动的程序化控制——键位面板与机器通道同一路径。
     // ------------------------------------------------------------------
@@ -1516,6 +1731,32 @@ impl Editor {
             Cmd::MoveRight => self.do_move(MultiMove::Right, false, false),
             Cmd::MoveUp => self.do_move(MultiMove::Up, false, false),
             Cmd::MoveDown => self.do_move(MultiMove::Down, false, false),
+            // #111 D1：行移动（面板/RPC run_command 通道——与键位
+            // Alt+↑/↓ 同链；只读拒与键位一致）。
+            Cmd::CopyLine => {
+                self.copy_line();
+            }
+            Cmd::DeleteLine => {
+                self.delete_line();
+            }
+            Cmd::MoveLineUp => {
+                if self.read_only {
+                    return;
+                }
+                if self.move_line_up() {
+                    self.after_edit();
+                    cx.notify();
+                }
+            }
+            Cmd::MoveLineDown => {
+                if self.read_only {
+                    return;
+                }
+                if self.move_line_down() {
+                    self.after_edit();
+                    cx.notify();
+                }
+            }
             Cmd::WordLeft => self.do_move(MultiMove::WordLeft, true, false),
             Cmd::WordRight => self.do_move(MultiMove::WordRight, true, false),
             Cmd::MoveHome => self.do_move(MultiMove::Home, false, false),
@@ -1687,9 +1928,18 @@ impl Editor {
         };
         let key = ks.key.to_lowercase();
         match key.as_str() {
+            // #112 P2 批④：Esc 两段式（Q-IDE vendor state.rs:602-615
+            // 对照）——查询非空先清查询（面板保持开，候选回全集 +
+            // 选中复位）；查询空才关面板回文档焦点。
             "escape" => {
-                self.palette = None;
-                self.focus_document_input(window, cx);
+                if !pal.query.is_empty() {
+                    pal.query.clear();
+                    Self::palette_refill(pal, &self.palette_recent);
+                    pal.selected = 0;
+                } else {
+                    self.palette = None;
+                    self.focus_document_input(window, cx);
+                }
             }
             "up" => pal.selected = pal.selected.saturating_sub(1),
             "down" => {
@@ -1709,6 +1959,14 @@ impl Editor {
                     self.persist_palette_recent();
                     self.exec_command(c, window, cx);
                 }
+            }
+            // #112 P2 批④：Ctrl/Alt 组合令旁路（Q-IDE R4 对照）——
+            // 面板只收纯字符与导航/回车/Esc；ctrl/alt 组合不吞
+            // （返回 false 冒泡编辑键层——Ctrl+F 开查找、Ctrl+S 保存
+            // 等在面板打开时照常可用）。Shift 单独不触发旁路（Shift+
+            // 字符是可打印入查询的大写形态）。
+            _ if ks.modifiers.control || ks.modifiers.alt => {
+                return false;
             }
             _ => {
                 let mut key = ks.clone();
@@ -2639,7 +2897,7 @@ impl Editor {
         // 只读门禁（批 3）：浏览类命令放行（移动/选区/全选/复制/查找），
         // 变更类整段拒绝（输入/删除/回车/Tab/剪切/粘贴/撤销/重做/保存）
         // ——纯函数面单测钉定（docx_doc::readonly_allows）。
-        if self.read_only && !docx_doc::readonly_allows(&key, ctrl) {
+        if self.read_only && !docx_doc::readonly_allows(&key, ctrl, ks.modifiers.alt) {
             *perf_rejected = true; // #164：拒绝路径独立证据行（key-rejected）
             cx.notify();
             return;
@@ -2677,6 +2935,34 @@ impl Editor {
             // and to shell shortcuts; keydown must not insert a second copy.
             keymap::EditorOutcome::None => return,
             keymap::EditorOutcome::Matched(action) => match action {
+                // #111 D1：Alt+↑/↓ 行移动（只读态拒——变更类；undo 可
+                // 复原；编辑事务 = replace_range 两段换位）。
+                EditorAction::MoveLineUp => {
+                    if self.read_only {
+                        return;
+                    }
+                    if self.move_line_up() {
+                        self.after_edit();
+                    }
+                }
+                EditorAction::CopyLine => {
+                    if self.copy_line() {
+                        cx.notify();
+                    }
+                }
+                EditorAction::DeleteLine => {
+                    if self.delete_line() {
+                        cx.notify();
+                    }
+                }
+                EditorAction::MoveLineDown => {
+                    if self.read_only {
+                        return;
+                    }
+                    if self.move_line_down() {
+                        self.after_edit();
+                    }
+                }
                 // r42 阶段 C：移动统一入口 do_move（多光标同向分派）；
                 // ctrl 词跳/shift 选区在执行层参数化（原家族臂结构）。
                 EditorAction::MoveKey(keymap::MoveDir::Left) => {
@@ -5723,6 +6009,105 @@ mod tests {
         ed.update(cx, |e, _| e.toggle_comment());
         ed.update(cx, |e, _| {
             assert_eq!(e.buffer.line(2), "# x = 1", "python 围栏 # 注释");
+    /// #111 P2 批⑦：复制行——行块复制到自身下方（光标不动；undo
+    /// 一键复原）。先红面：copy_line/delete_line 方法不存在 = 编译红。
+    #[gpui::test]
+    fn copy_line_duplicates_below_keeps_cursor(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "aaa\nbbb\nccc");
+        ed.update(cx, |e, _| {
+            // 单行复制：bbb（行 1）复制到行 2；光标原地不动。
+            e.buffer.set_cursor(p(1, 2));
+            assert!(e.copy_line(), "中间行可复制");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "aaa\nbbb\nbbb\nccc",
+                "bbb 复制到自身下方"
+            );
+            assert_eq!(e.buffer.cursor().line, 1, "光标行不动");
+            assert_eq!(e.buffer.cursor().col, 2, "光标列不动");
+
+            // 多行块（选区覆盖 aaa+bbb）复制：块整体重复到下方。
+            e.buffer.set_selection(p(0, 0), p(2, 0));
+            assert!(e.copy_line(), "块复制成功");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "aaa\nbbb\naaa\nbbb\nbbb\nccc",
+                "块整体重复"
+            );
+        });
+    }
+
+    /// #111 P2 批⑦：删除行——整行删除含换行；单行文档保留语义
+    /// （不删到空——返回 false）。
+    #[gpui::test]
+    fn delete_line_removes_with_newline(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "aaa\nbbb\nccc");
+        ed.update(cx, |e, _| {
+            // 单行删除：bbb（行 1）整行含换行消失。
+            e.buffer.set_cursor(p(1, 1));
+            assert!(e.delete_line(), "中间行可删除");
+            assert_eq!(e.buffer.to_plain_text(), "aaa\nccc", "bbb 整行含换行删除");
+
+            // 多行块（选区 p(0,0)→p(2,0) 覆盖行 0-1）删除：余 ccc。
+            e.buffer.set_selection(p(0, 0), p(2, 0));
+            assert!(e.delete_line(), "块删除成功");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "ccc",
+                "行 0-1 块删除（选区尾行不含——line_block_range 口径）"
+            );
+        });
+    }
+
+    /// #111 D1：行移动 Alt+↑/↓（Q-IDE editing.rs:60-116 移植）。
+    /// 三语义：单行/多行块移动、首行拒移（buffer 不动）、光标列保持
+    /// 与行内位置复位。先红面：move_line_up/down 方法不存在 = 编译红。
+    #[gpui::test]
+    fn move_line_up_down_semantics(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "aaa\nbbb\nccc\nddd");
+        ed.update(cx, |e, _| {
+            // 单行上移：bbb（行 1）→ 行 0；光标随行。
+            e.buffer.set_cursor(p(1, 1));
+            assert!(e.move_line_up(), "中间行可上移");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "bbb\naaa\nccc\nddd",
+                "bbb 整行上移"
+            );
+            assert_eq!(e.buffer.cursor().line, 0, "光标随移动行");
+            assert_eq!(e.buffer.cursor().col, 1, "光标列保持");
+
+            // 首行拒移：语义「边界拒移」——返回 false、buffer 零变更。
+            assert!(!e.move_line_up(), "首行拒移返回 false");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "bbb\naaa\nccc\nddd",
+                "首行拒移 buffer 不动"
+            );
+        });
+    }
+
+    /// #111 D1：多行块下移 + undo 一键复原（编辑事务进撤销栈——
+    /// 同 Q-IDE「移动也是编辑」语义）。
+    #[gpui::test]
+    fn move_line_block_down_and_undo(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "aaa\nbbb\nccc\nddd");
+        ed.update(cx, |e, _| {
+            // 多行块（选区覆盖 aaa+bbb）下移：与 ccc 换位。
+            e.buffer.set_selection(p(0, 0), p(2, 0));
+            assert!(e.move_line_down(), "块下移成功");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "ccc\naaa\nbbb\nddd",
+                "aaa+bbb 块与 ccc 换位"
+            );
+            // undo 一键复原（行移动是编辑事务——可撤销）。
+            assert!(e.buffer.undo(), "行移动进撤销栈");
+            assert_eq!(
+                e.buffer.to_plain_text(),
+                "aaa\nbbb\nccc\nddd",
+                "undo 复原块移动"
+            );
         });
     }
 
@@ -6663,6 +7048,70 @@ mod palette_goto_interaction_tests {
 
     /// 开合 + 键入过滤 + ↑↓ 选中移动 + Esc 关闭 + 重开换新（状态桥四段）。
     #[gpui::test]
+    /// #112 P2 批④：Esc 两段式——查询非空先清查询（面板保持开，
+    /// 候选回全集）；查询空才关面板。先红面：现行为一步直接关。
+    #[gpui::test]
+    fn palette_esc_two_stage_clears_query_first(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        // 键入「折叠」——查询非空。
+        let _ = window.update(cx, |_host, window, cx| {
+            for ch in ["折", "叠"] {
+                press(&ed, window, cx, key(ch, Some(ch)));
+            }
+        });
+        // 第一记 Esc：清查询（面板保持开——两段式第一段）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            let pal = ed.palette.as_ref().expect("第一记 Esc 后面板保持开");
+            assert_eq!(pal.query, "", "Esc 第一段：清查询");
+            assert_eq!(
+                pal.items.len(),
+                commands::search("").len(),
+                "候选回全集（与空查询同源）"
+            );
+            assert_eq!(pal.selected, 0, "清查询后选中复位 0");
+        });
+        // 第二记 Esc：关面板（两段式第二段——回到一步语义）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, key("escape", None));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "第二记 Esc：关面板");
+        });
+    }
+
+    /// #112 P2 批④：面板内 Ctrl 组合令旁路——Ctrl+F 在面板打开时
+    /// 照常打开查找框（面板不吞编辑类组合令——冲突裁决归编辑键层，
+    /// Q-IDE R4 对照）。先红面：现面板吞一切 ctrl 组合。
+    #[gpui::test]
+    fn palette_open_ctrl_combo_bypasses_to_editor(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        // 开面板。
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "前置：面板开");
+            assert!(ed.find.is_none(), "前置：查找框未开");
+        });
+        // 面板内 Ctrl+F：旁路执行（打开查找框——不被面板吞）。
+        let _ = window.update(cx, |_host, window, cx| {
+            press(&ed, window, cx, ctrl("f"));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.find.is_some(), "Ctrl+F 旁路：查找框打开（面板不吞）");
+        });
+    }
+
     fn palette_open_type_navigate_esc_lifecycle(cx: &mut gpui::TestAppContext) {
         let (ed, window) = pal_window(cx, "# A\nbody\n");
         // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。

@@ -62,9 +62,9 @@ pub fn group_of(cmd: Cmd) -> Group {
     use Cmd::*;
     match cmd {
         Save => Group::File,
-        Undo | Redo | SelectAll | OpenFind | OpenReplace | ToggleComment => Group::Edit,
+        Undo | Redo | SelectAll | OpenFind | OpenReplace | CopyLine | DeleteLine | ToggleComment => Group::Edit,
         MoveLeft | MoveRight | MoveUp | MoveDown | WordLeft | WordRight | MoveHome | MoveEnd
-        | DocStart | DocEnd | GotoLine => Group::Navigate,
+        | DocStart | DocEnd | GotoLine | MoveLineUp | MoveLineDown => Group::Navigate,
         ToggleFold | FoldCurrent | UnfoldCurrent | FoldAll | UnfoldAll => Group::View,
     }
 }

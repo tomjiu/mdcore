@@ -18,6 +18,14 @@ pub enum Cmd {
     MoveRight,
     MoveUp,
     MoveDown,
+    /// #111 D1：行移动上移（Alt+↑——整行/块换位）。
+    MoveLineUp,
+    /// #111 P2 批⑦：复制行（块复制到自身下方——光标不动）。
+    CopyLine,
+    /// #111 P2 批⑦：删除行（整块含换行——单行文档拒删）。
+    DeleteLine,
+    /// #111 D1：行移动下移（Alt+↓）。
+    MoveLineDown,
     WordLeft,
     WordRight,
     MoveHome,
@@ -55,6 +63,8 @@ impl Cmd {
         Cmd::MoveRight,
         Cmd::MoveUp,
         Cmd::MoveDown,
+        Cmd::MoveLineUp,
+        Cmd::MoveLineDown,
         Cmd::WordLeft,
         Cmd::WordRight,
         Cmd::MoveHome,
@@ -73,6 +83,8 @@ impl Cmd {
         Cmd::Save,
         Cmd::SelectAll,
         Cmd::Undo,
+        Cmd::CopyLine,
+        Cmd::DeleteLine,
         Cmd::Redo,
     ];
 
@@ -81,6 +93,7 @@ impl Cmd {
     #[rustfmt::skip]
     const NAMES: &[&str] = &[
         "MoveLeft", "MoveRight", "MoveUp", "MoveDown",
+        "MoveLineUp", "CopyLine", "DeleteLine", "MoveLineDown",
         "WordLeft", "WordRight", "MoveHome", "MoveEnd",
         "DocStart", "DocEnd",
         "ToggleFold", "FoldCurrent", "UnfoldCurrent", "FoldAll", "UnfoldAll",
@@ -96,6 +109,10 @@ impl Cmd {
             Cmd::MoveRight => "move_right",
             Cmd::MoveUp => "move_up",
             Cmd::MoveDown => "move_down",
+            Cmd::MoveLineUp => "move_line_up",
+            Cmd::CopyLine => "copy_line",
+            Cmd::DeleteLine => "delete_line",
+            Cmd::MoveLineDown => "move_line_down",
             Cmd::WordLeft => "word_left",
             Cmd::WordRight => "word_right",
             Cmd::MoveHome => "move_home",
@@ -132,6 +149,10 @@ impl Cmd {
             Cmd::MoveRight => "移动：右",
             Cmd::MoveUp => "移动：上",
             Cmd::MoveDown => "移动：下",
+            Cmd::MoveLineUp => "行移动：上（Alt+↑）",
+            Cmd::CopyLine => "复制行（Ctrl+Shift+D）",
+            Cmd::DeleteLine => "删除行（Ctrl+Shift+K）",
+            Cmd::MoveLineDown => "行移动：下（Alt+↓）",
             Cmd::WordLeft => "词跳：左",
             Cmd::WordRight => "词跳：右",
             Cmd::MoveHome => "移动：行首",
@@ -163,6 +184,10 @@ impl Cmd {
             Cmd::MoveRight => Some("→"),
             Cmd::MoveUp => Some("↑"),
             Cmd::MoveDown => Some("↓"),
+            Cmd::MoveLineUp => Some("Alt+↑"),
+            Cmd::CopyLine => Some("Ctrl+Shift+D"),
+            Cmd::DeleteLine => Some("Ctrl+Shift+K"),
+            Cmd::MoveLineDown => Some("Alt+↓"),
             Cmd::WordLeft => Some("Ctrl+←"),
             Cmd::WordRight => Some("Ctrl+→"),
             Cmd::MoveHome => Some("Home"),

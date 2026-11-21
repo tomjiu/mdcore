@@ -350,6 +350,14 @@ pub enum MoveDir {
 pub enum EditorAction {
     /// 命令面板开/关（原 Ctrl+Shift+P 前置分支）。
     PaletteToggle,
+    /// #111 D1：Alt+↑ 行移动上移（光标/选区行块整块上移一行）。
+    MoveLineUp,
+    /// #111 P2 批⑦：复制行。
+    CopyLine,
+    /// #111 P2 批⑦：删除行。
+    DeleteLine,
+    /// #111 D1：Alt+↓ 行移动下移。
+    MoveLineDown,
     /// 跳行框开启（原 Ctrl+G 前置分支；`goto.is_none()` 条件在执行层）。
     GotoOpen,
     /// 方向键移动家族（left/right/up/down 键，修饰参数化）。
@@ -480,6 +488,10 @@ impl EditorAction {
         match self {
             EditorAction::PaletteToggle => "toggle_command_palette",
             EditorAction::GotoOpen => "goto_line",
+            EditorAction::MoveLineUp => "move_line_up",
+            EditorAction::CopyLine => "copy_line",
+            EditorAction::DeleteLine => "delete_line",
+            EditorAction::MoveLineDown => "move_line_down",
             EditorAction::MoveKey(MoveDir::Left) => "move_left",
             EditorAction::MoveKey(MoveDir::Right) => "move_right",
             EditorAction::MoveKey(MoveDir::Up) => "move_up",
@@ -564,7 +576,12 @@ impl EditorAction {
             | EditorAction::FoldCurrent
             | EditorAction::UnfoldCurrent
             | EditorAction::FoldAll
-            | EditorAction::UnfoldAll => false,
+            | EditorAction::UnfoldAll
+            // #111 D1：行移动是编辑事务（undo 可复原）——只读态拒。
+            | EditorAction::MoveLineUp
+            | EditorAction::CopyLine
+            | EditorAction::DeleteLine
+            | EditorAction::MoveLineDown => false,
         }
     }
 }
@@ -765,6 +782,30 @@ fn default_editor_main() -> Vec<Entry> {
         e(
             Binding::Single(KeyPattern::key("d").with(Yes, Any, Any)),
             A::AddNextWordMatch,
+        ),
+        // #111 D1：Alt+↑/↓ 行移动（纯 Alt 专用条目 (No,No,Yes)——
+        // 约束数 3 > MoveKey 家族 0，精确者胜：ctrl/shift 叠加形态
+        // （如 ctrl+shift+alt+up）归家族光标移动，move_family 全组合
+        // 测试钉定）。只读物理守卫在键层拒（docx readonly_allows
+        // up/down alt 分支——readonly_guard_invariant 不变量保持）。
+        // #111 P2 批⑦：Ctrl+Shift+D 复制行（Ctrl+D 已被
+        // AddNextWordMatch 加同词光标占用——键位冲突实测修正）。
+        e(
+            Binding::Single(KeyPattern::key("d").with(Yes, Yes, No)),
+            A::CopyLine,
+        ),
+        // #111 P2 批⑦：Ctrl+Shift+K 删除整行（VS Code 同键位）。
+        e(
+            Binding::Single(KeyPattern::key("k").with(Yes, Yes, No)),
+            A::DeleteLine,
+        ),
+        e(
+            Binding::Single(KeyPattern::key("up").with(No, No, Yes)),
+            A::MoveLineUp,
+        ),
+        e(
+            Binding::Single(KeyPattern::key("down").with(No, No, Yes)),
+            A::MoveLineDown,
         ),
         // Alt+F 折叠 toggle（E25——臂序在 [-] 臂前、"f" if ctrl 臂后……
         // 不：match 臂序 f-alt 在 [ 前；同约束数并存时 ctrl+alt+f 走
@@ -1793,6 +1834,42 @@ mod tests {
         );
     }
 
+    // ─── #111 D1：行移动 Alt+↑/↓ 键位表 ────────────────────────────
+
+    /// #111 D1：Alt+↑/↓ 命中行移动（表接线面——编译红先行：
+    /// EditorAction::MoveLineUp/Down 变体未定义时本测试不可编译）。
+    #[test]
+    fn alt_up_down_hit_line_move() {
+        editor_hit("up", false, false, true, EditorAction::MoveLineUp);
+        editor_hit("down", false, false, true, EditorAction::MoveLineDown);
+        // 修饰精确性：ctrl+alt+up 不应命中（Any/Yes 约束数——精确者胜，
+        // 3 修饰键 = 纯 Alt↑ 条目 ctrl=Any 不匹配 ctrl=Yes 查询……
+        // 不：Any 接受 Yes。表条目 (Any, Any, Yes) 对 ctrl+alt+up 也命中
+        // ——参照 Q-IDE「alt 修饰 + 忽略 ctrl/shift」宽面同型。此处钉
+        // 主形态纯 Alt；ctrl 叠加形态不另设条目（无二义）。
+        editor_hit("up", false, false, true, EditorAction::MoveLineUp);
+    }
+
+    /// #111 D1：裸 ↑/↓ 仍命中光标移动（行移动不劫持光标键主形态——
+    /// alt=false 走 MoveKey 家族，回归面）。
+    #[test]
+    fn bare_up_down_still_cursor_move() {
+        editor_hit(
+            "up",
+            false,
+            false,
+            false,
+            EditorAction::MoveKey(MoveDir::Up),
+        );
+        editor_hit(
+            "down",
+            false,
+            false,
+            false,
+            EditorAction::MoveKey(MoveDir::Down),
+        );
+    }
+
     // ─── 默认表自检 ─────────────────────────────────────────────────
 
     /// 默认表无歧义绑定（同域相交不等的合法取舍 + Pass 豁免之外无冲突
@@ -2036,9 +2113,10 @@ mod tests {
             EditorOutcome::None
         );
         editor_miss("j", false, false, false);
-        // Shift+K 不挂起（!shift 守卫）。
+        // Shift+K 不挂起（!shift 守卫；ctrl=false 纯 Shift+K——
+        // ctrl+shift+k 现归 #111 批⑦ DeleteLine）。
         assert_eq!(
-            store.resolve_editor_main(&q("k", true, true, false), None),
+            store.resolve_editor_main(&q("k", false, true, false), None),
             EditorOutcome::None
         );
         // Alt+K 挂起（alt Any——现状守卫不查 alt）。
@@ -2557,9 +2635,9 @@ mod tests {
     }
 
     /// chord 解绑赢家镜像 dispatch（#218 review 原例）：表同时有
-    /// `ctrl+shift+k x` 与 `ctrl+k ctrl+x` 时，序列（ctrl+shift+k,
+    /// `ctrl+shift+l x` 与 `ctrl+l ctrl+x` 时，序列（ctrl+shift+l,
     /// ctrl+x）dispatch 触发**后者**（续接尾键精确度 1>0）——
-    /// unbind "ctrl+shift+k ctrl+x" 必须恰移除后者（原 `(首键, 尾键)`
+    /// unbind "ctrl+shift+l ctrl+x" 必须恰移除后者（原 `(首键, 尾键)`
     /// 字典序按头优先移除了前者——dispatch 不会触发的那条），另一条
     /// 完好。
     #[test]
@@ -2567,11 +2645,11 @@ mod tests {
         let mut store = KeymapStore::default_tables();
         let warnings = store.apply_user(&[
             UserOverride::Bind {
-                bind: "ctrl+shift+k x".into(),
+                bind: "ctrl+shift+l x".into(),
                 action: "open_replace".into(),
             },
             UserOverride::Bind {
-                bind: "ctrl+k ctrl+x".into(),
+                bind: "ctrl+l ctrl+x".into(),
                 action: "open_find".into(),
             },
         ]);
@@ -2579,7 +2657,7 @@ mod tests {
         // dispatch 前提对拍：序列（ctrl+shift+k, ctrl+x）触发 open_find
         // 的 chord（首键竞争 ctrl+shift+k 头 spec 2 胜出挂起；续接
         // ctrl+x 尾 spec 1 > open_replace 裸 x 尾 spec 0）。
-        let first = q("k", true, true, false);
+        let first = q("l", true, true, false);
         assert_eq!(
             store.resolve_editor_main(&first, None),
             EditorOutcome::Pending
@@ -2596,7 +2674,7 @@ mod tests {
         );
         // 解绑 dispatch 会触发的那条（review 原例的键串）。
         let warnings = store.apply_user(&[UserOverride::Unbind {
-            bind: "ctrl+shift+k ctrl+x".into(),
+            bind: "ctrl+shift+l ctrl+x".into(),
         }]);
         assert!(warnings.is_empty(), "应恰命中一条移除：{warnings:?}");
         // 另一条完好：同序列现在触发 open_replace 的 chord（若移错了
@@ -2626,7 +2704,7 @@ mod tests {
         let mut store = KeymapStore::default_tables();
         let warnings = store.apply_user(&[
             UserOverride::Bind {
-                bind: "ctrl+shift+k x".into(),
+                bind: "ctrl+shift+l x".into(),
                 action: "open_replace".into(),
             },
             UserOverride::Bind {
@@ -2654,8 +2732,9 @@ mod tests {
         );
         // open_find 无绑定（默认 ctrl+f 已在换绑时让位，chord 又被解绑）。
         assert_eq!(store.label("open_find"), None);
-        // 另一条不受影响：序列（ctrl+shift+k, x）照常触发 open_replace。
-        let first = q("k", true, true, false);
+        // 另一条不受影响：序列（ctrl+shift+l, x）照常触发 open_replace
+        //（原例键 ctrl+shift+k 现归 #111 批⑦ DeleteLine——换 l 保语义）。
+        let first = q("l", true, true, false);
         assert_eq!(
             store.resolve_editor_main(&q("x", false, false, false), Some(&first)),
             EditorOutcome::Matched(EditorAction::OpenReplace)
@@ -2747,8 +2826,10 @@ mod tests {
     /// readonly_allows 镜像夹具（**镜像自 docx_doc.rs:1101，两处需同步
     /// 改**——keymap 层纯 std 红线不依赖 docx_doc，单测用誊抄副本对拍；
     /// docx_doc 侧有同名单测钉定其自身）。
-    fn readonly_allows_mirror(key: &str, ctrl: bool) -> bool {
+    fn readonly_allows_mirror(key: &str, ctrl: bool, alt: bool) -> bool {
         match key {
+            // #111 D1：Alt+↑/↓ 行移动（编辑命令）——镜像同步拒。
+            "up" | "down" if alt => false,
             "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown"
             | "escape" => true,
             "a" | "c" | "f" | "tab" | "=" | "+" | "-" | "0" | "t" | "g" => ctrl,
@@ -2830,13 +2911,13 @@ mod tests {
                 let canon = canonical_queries(&e.binding);
                 let passes = match canon.as_slice() {
                     // 单键：物理守卫放行该键 → 动作必须 safe。
-                    [c1] => readonly_allows_mirror(&c1.key, c1.ctrl),
+                    [c1] => readonly_allows_mirror(&c1.key, c1.ctrl, c1.alt),
                     // chord：首键过守卫（挂起）且尾键过守卫（续接执行）
                     // → 动作必须 safe（默认表首键 ctrl+k 不过白名单，
                     // 恒 false——断言对默认表恒空转，用户换绑后生效）。
                     [c1, c2] => {
-                        readonly_allows_mirror(&c1.key, c1.ctrl)
-                            && readonly_allows_mirror(&c2.key, c2.ctrl)
+                        readonly_allows_mirror(&c1.key, c1.ctrl, c1.alt)
+                            && readonly_allows_mirror(&c2.key, c2.ctrl, c2.alt)
                     }
                     _ => false,
                 };
@@ -2859,8 +2940,8 @@ mod tests {
     #[test]
     fn readonly_bypass_blocked_at_action_level() {
         // 物理守卫对 ctrl+c 放行（绕道前提——镜像夹具对拍）。
-        assert!(readonly_allows_mirror("c", true));
-        assert!(!readonly_allows_mirror("c", false));
+        assert!(readonly_allows_mirror("c", true, false));
+        assert!(!readonly_allows_mirror("c", false, false));
         let mut store = KeymapStore::default_tables();
         let warnings = store.apply_user(&[UserOverride::Bind {
             bind: "ctrl+c".into(),
