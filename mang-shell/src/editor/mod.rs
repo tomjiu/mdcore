@@ -277,6 +277,53 @@ fn outdent_line_edit(
     Some((Point::new(line, 0), Point::new(line, take), String::new()))
 }
 
+/// #111 G2 批⑧：`line` 的加注释编辑——`(start, end, 插入文本)`。
+/// 注释符插行首 + 尾随一空格（VS Code `editor.insertSpace` 基础口径
+/// ——不对齐缩进内插；空行只插注释符不留行尾孤空格）。
+fn comment_line_edit(line: usize, marker: &str) -> (Point, Point, String) {
+    // 注释符 + 尾随一空格（VS Code insertSpace 基础口径——不对齐
+    // 缩进内插；统一行首插）。
+    (
+        Point::new(line, 0),
+        Point::new(line, 0),
+        format!("{marker} "),
+    )
+}
+
+/// #111 G2 批⑧：`line_text` 的去注释编辑——行首（可越前导空白）有
+/// `marker ` 前缀则删除（含尾随空格）；裸 marker 无空格也删。无可删
+/// `None`。
+fn uncomment_line_edit(line_text: &str, marker: &str) -> Option<(usize, usize)> {
+    let with_space = format!("{marker} ");
+    let bare = marker;
+    let chars: Vec<char> = line_text.chars().collect();
+    let ws_count = chars.iter().take_while(|c| c.is_whitespace()).count();
+    let rest: String = chars[ws_count..].iter().collect();
+    let take = if rest.starts_with(&with_space) {
+        ws_count + with_space.chars().count()
+    } else if rest.starts_with(bare) {
+        ws_count + bare.chars().count()
+    } else {
+        return None;
+    };
+    Some((0, take))
+}
+
+/// #111 G2 批⑧：围栏语言 → 行注释符（FenceState 推导——报告 D2
+/// 路径；非硬编码语言字符串挂在调用点）。围栏内 rust/js → `//`、
+/// python → `#`；围栏外（md 正文）→ `<!--` 块注释半（D2 决策点：
+/// md 正文的块注释形态 Lead 未裁——本函数先给围栏面）。
+fn comment_marker_for(lang: Option<highlight::CodeLang>, in_fence: bool) -> Option<&'static str> {
+    if !in_fence {
+        return None; // md 正文块注释（<!-- -->）需 Lead 裁 D2——本批不覆盖
+    }
+    match lang {
+        Some(highlight::CodeLang::Rust) | Some(highlight::CodeLang::Js) => Some("//"),
+        Some(highlight::CodeLang::Python) => Some("#"),
+        None => Some("//"), // 未标注/未识别围栏——默认 //（行注释最大公约数）
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #132 任务 1：文件级代码语言推断
 // ---------------------------------------------------------------------------
@@ -1752,6 +1799,14 @@ impl Editor {
                 self.open_goto(cx);
                 self.focus_form(FormField::Goto, window, cx);
             }
+            // #111 G2 批⑧：切换注释（编辑写类——只读态拒；面板入口
+            // 同路径同门）。
+            Cmd::ToggleComment => {
+                if self.read_only {
+                    return;
+                }
+                self.toggle_comment();
+            }
             Cmd::Save => {
                 self.save();
             }
@@ -3046,6 +3101,13 @@ impl Editor {
                 EditorAction::OpenFind => self.open_find(window, cx),
                 // G1：Ctrl+H 替换条（只读门禁在前——docx/pdf 态不达此处）。
                 EditorAction::OpenReplace => self.open_replace(window, cx),
+                // #111 G2 批⑧：切换注释（Ctrl+/——只读门禁同 exec 侧）。
+                EditorAction::ToggleComment => {
+                    if self.read_only {
+                        return;
+                    }
+                    self.toggle_comment();
+                }
                 EditorAction::Save => {
                     self.save();
                 }
@@ -3164,6 +3226,85 @@ impl Editor {
     ///   手势时撤销条目数累加。
     /// - 光标/选区列按各行的编辑位移平移（缩进 +n / 反缩进 -k，
     ///   列下限 0）。
+    /// #111 G2 批⑧：切换注释（Ctrl+/——选区行集或光标行；「已有
+    /// 注释则去」判定按批内多数：全部已注释 → 去注释；否则 → 加
+    /// （VS Code 同款「至少一行未注释则加」口径的简化面）。
+    ///
+    /// 注释符从 [`comment_marker_for`]（FenceState 推导——报告 D2 路
+    /// 径）：行语言按 `fence_lang_cache`；**批内语言必须一致**（跨
+    /// 围栏/跨语言混批拒绝执行——语义混乱防御，与 indent 的单位语义
+    /// 同一纪律）；md 正文（围栏外）本批不覆盖（D2 决策点待 Lead 裁
+    /// 块注释形态）。
+    fn toggle_comment(&mut self) {
+        // ① 行集收集（indent_key 同型——选区跨行展开 + 裸光标所在行）。
+        let mut lines: Vec<usize> = Vec::new();
+        for (a, h) in self.cursors.entries() {
+            let (start, end) = if a <= h { (*a, *h) } else { (*h, *a) };
+            lines.extend(start.line..=end.line);
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        // ② 逐行推注释符（围栏态 + 语言一致门）。
+        let mut marker: Option<&'static str> = None;
+        for &line in lines.iter() {
+            let in_fence = self.fence_at(line);
+            let lang = self.fence_lang_cache.get(line).copied().flatten();
+            let m = match comment_marker_for(lang, in_fence) {
+                Some(m) => m,
+                None => return, // md 正文（D2 未裁）——本批不覆盖
+            };
+            match marker {
+                None => marker = Some(m),
+                Some(prev) if prev != m => return, // 跨语言混批拒绝
+                _ => {}
+            }
+        }
+        let Some(marker) = marker else { return };
+        // ③ 加/去判定：全部行已是注释 → 去注释；否则加。
+        let all_commented = !lines.is_empty()
+            && lines
+                .iter()
+                .all(|&l| uncomment_line_edit(&self.buffer.line(l), marker).is_some());
+        // ④ 尾→头批应用（replace_batch 一条历史；光标列平移——加
+        //    +marker.len()+1、去则减）。
+        let mut edits: Vec<(Point, Point, String)> = Vec::with_capacity(lines.len());
+        let mut deltas: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+        for &line in lines.iter().rev() {
+            if all_commented {
+                if let Some((cs, ce)) = uncomment_line_edit(&self.buffer.line(line), marker) {
+                    deltas.insert(line, -((ce - cs) as i64));
+                    edits.push((Point::new(line, cs), Point::new(line, ce), String::new()));
+                }
+            } else {
+                let (start, end, text) = comment_line_edit(line, marker);
+                let width = text.chars().count() as i64;
+                deltas.insert(line, width);
+                edits.push((start, end, text));
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let applied = edits.len();
+        if self.buffer.replace_batch(edits) == 0 {
+            return;
+        }
+        self.cursors.add_undo_batch(1);
+        self.cursors
+            .shift_cols_by_line(|line| deltas.get(&line).copied().unwrap_or(0));
+        self.sync_buffer_from_cursors_primary();
+        self.after_edit();
+        // 证据行（烟雾断言通道）。
+        eprintln!(
+            "toggle-comment: {applied} lines ({marker} → {})",
+            if all_commented {
+                "uncomment"
+            } else {
+                "comment"
+            }
+        );
+    }
+
     fn indent_key(&mut self, shift: bool) {
         let unit = self.indent_unit;
         // ① 收集：行集（去重）+ 裸光标 Tab 插入点（多光标批）。
@@ -5818,6 +5959,68 @@ mod tests {
     /// 命令分发，不触发 persist_folds 落盘）。
     fn md_editor(cx: &mut gpui::TestAppContext, text: &str) -> gpui::Entity<Editor> {
         cx.update(|cx| cx.new(|cx| Editor::new(Some("notes.md".into()), text.to_string(), cx)))
+    }
+
+    /// #111 G2 批⑧：围栏内切换注释——跨行批加（`// ` 前缀）→
+    /// 再切幂等往返（去）回原文。
+    #[gpui::test]
+    fn toggle_comment_roundtrip_in_rust_fence(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "```rust\nlet a = 1;\nlet b = 2;\n```\ntail");
+        // 选区跨 fence 内两行（行 1-2）。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(1, 0), p(2, 7));
+            e.sync_cursors_from_buffer();
+        });
+        ed.update(cx, |e, _| e.toggle_comment());
+        ed.update(cx, |e, _| {
+            assert_eq!(e.buffer.line(1), "// let a = 1;", "跨行批同加");
+            assert_eq!(e.buffer.line(2), "// let b = 2;");
+            assert_eq!(e.buffer.line(4), "tail", "围栏外不动");
+        });
+        // 再切（重设选区——首次切后选区存续不属本断言语义）——
+        // 全注释 → 去（幂等往返回原文）。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(1, 0), p(2, 10));
+            e.sync_cursors_from_buffer();
+        });
+        ed.update(cx, |e, _| e.toggle_comment());
+        ed.update(cx, |e, _| {
+            assert_eq!(e.buffer.line(1), "let a = 1;", "往返回原文");
+            assert_eq!(e.buffer.line(2), "let b = 2;");
+        });
+    }
+
+    fn toggle_comment_python_hash_and_md_body_noop(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "正文段\n```python\nx = 1\n```");
+        ed.update(cx, |e, _| {
+            e.buffer.set_cursor(p(0, 0));
+            e.sync_cursors_from_buffer();
+        });
+        // md 正文（围栏外）——D2 未裁：无操作。
+        ed.update(cx, |e, _| e.toggle_comment());
+        ed.update(cx, |e, _| {
+            assert_eq!(e.buffer.line(0), "正文段", "md 正文不动（D2 待裁）");
+        });
+        // python 围栏行 2——`#` 注释符。
+        ed.update(cx, |e, _| {
+            e.buffer.set_cursor(p(2, 0));
+            e.sync_cursors_from_buffer();
+        });
+        ed.update(cx, |e, _| e.toggle_comment());
+        ed.update(cx, |e, _| {
+            assert_eq!(e.buffer.line(2), "# x = 1", "python 围栏 # 注释");
+        });
+        // 再切（重设选区——首次切后选区存续不属本断言语义）——
+        // 全注释 → 去（幂等往返回原文）。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(1, 0), p(2, 10));
+            e.sync_cursors_from_buffer();
+        });
+        ed.update(cx, |e, _| e.toggle_comment());
+        ed.update(cx, |e, _| {
+            assert_eq!(e.buffer.line(1), "let a = 1;", "往返回原文");
+            assert_eq!(e.buffer.line(2), "let b = 2;");
+        });
     }
 
     /// #111 P2 批⑦：复制行——行块复制到自身下方（光标不动；undo
