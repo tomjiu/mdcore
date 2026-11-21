@@ -164,6 +164,13 @@ pub(crate) trait TileSession: Send {
     fn edit_save_as(&mut self, _seq: u64, _url: &str, _format: &str) -> bool {
         false
     }
+    /// #50 C5：页几何查询（`getPartPageRectangles`——跳页/翻页 tile 的
+    /// 页矩形坐标源；默认未接线返回 false，mock 未实现时调用面如实
+    /// 「不可跳页」不假绿。真链消费 = real_chain_c5_matrix_parity；
+    /// 产品翻页呈现接后续批次）。
+    fn edit_page_geometry(&mut self, _seq: u64) -> bool {
+        false
+    }
     /// #179 三分收回执：`Reply` / `Empty` / `Disconnected`——通道
     /// 断开与暂时无消息分流（旧 `try_recv` 同貌 None——会话线程无终态
     /// 回执退出时视图永挂，无从诊断）。默认实现 = `try_recv` 的
@@ -195,6 +202,14 @@ impl TileSession for DocxLokSession {
     /// 语义由会话线程内部承担，宿主传 OS 路径）。
     fn edit_save_as(&mut self, seq: u64, url: &str, format: &str) -> bool {
         self.request_save_as(seq, url, format);
+        true
+    }
+    /// #50 C5：页几何转发（真链通道——C5 表格跨页样本已实证必需：
+    /// 页矩形是跳页 tile 的唯一正确坐标锚）。
+    fn edit_page_geometry(&mut self, _seq: u64) -> bool {
+        // 自分 seq（request_page_geometry 无参形态——trait 臂收 _seq
+        // 只为签名对齐；回执 PageGeometry{seq} 由调用面 drain 对账）。
+        self.request_page_geometry();
         true
     }
     fn request_tile(
@@ -1007,6 +1022,12 @@ impl DocxPagesView {
                         message: detail,
                     };
                     cx.notify();
+                }
+                SessionReply::PageGeometry { seq: _, pages: _ } => {
+                    // #50 C5：页几何回执（跳页坐标源）。本批消费者 =
+                    // 测试真链（real_chain_c5_matrix_parity）；产品
+                    // docx_pages 翻页呈现接后续批次（数据面已通——此
+                    // 处显式分支不静默吞，防将来误当未知回执报警）。
                 }
                 SessionReply::Tile {
                     seq,
