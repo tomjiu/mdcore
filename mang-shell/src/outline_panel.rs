@@ -85,20 +85,17 @@ pub struct OutlinePanel {
     activate_hook: Option<ActivateHook>,
     /// 独立宿主可省略；Shell 注入当前活动视图的焦点路由。
     escape_hook: Option<EscapeHook>,
-<<<<<<< HEAD
     /// #108 D1：过滤查询（大小写不敏感子串——纯前端行集过滤，
     /// 不动数据面；报告 §3 P1 口径）。空 = 全行。
     filter: String,
     /// #108 D1：过滤框焦点（面板独立实体——不借 Editor 表单域，
     /// 自持输入焦点与键盘消费）。
     filter_focus: FocusHandle,
-=======
     /// #108 批②：分区折叠集（行索引 = 数据面身份——不随渲染漂移；
     /// 报告 §3 提示「行焦点按序号协议与折叠的行序号漂移交互需设计
     /// 先行」：折叠集按全量 headings 的行索引记，句柄缓存不清退
     /// （retain 按全量 len——解折叠即恢复，与编辑差量刷新同语义）。
     collapsed: std::collections::HashSet<usize>,
->>>>>>> origin/main
 }
 
 impl OutlinePanel {
@@ -117,14 +114,11 @@ impl OutlinePanel {
             scroll: ScrollHandle::new(),
             activate_hook,
             escape_hook: None,
-<<<<<<< HEAD
             filter: String::new(),
             filter_focus: cx.focus_handle(),
-=======
             collapsed: crate::settings::load_outline_collapsed()
                 .into_iter()
                 .collect(),
->>>>>>> origin/main
         };
         this.refresh(cx);
         // 编辑器通知（buffer 编辑/标题增删）→ 行集差量刷新。
@@ -159,7 +153,6 @@ impl OutlinePanel {
         self.rows.is_empty()
     }
 
-<<<<<<< HEAD
     /// #108 D1：设置过滤查询（实时——每键入即时生效；空恢复全行）。
     pub fn set_filter(&mut self, query: String) {
         self.filter = query;
@@ -217,13 +210,6 @@ impl OutlinePanel {
     }
 
     /// #108 D1：过滤后可见行标签（测试断言面——渲染同源 visible_rows）。
-    pub fn visible_labels(&self) -> Vec<&str> {
-        self.visible_rows()
-            .iter()
-            .map(|r| r.label.as_str())
-            .collect()
-    }
-
     /// #108 D1：过滤后行集（无过滤 = 全行；大小写不敏感子串——
     /// `to_lowercase` 两侧同域比较，CJK 无大小写变换恒等）。
     fn visible_rows(&self) -> Vec<&OutlineRow> {
@@ -247,7 +233,6 @@ impl OutlinePanel {
         }
     }
 
-=======
     /// #108 批②：折叠/展开分区头（toggle——渲染集即时重算）。
     /// #108 批③：折叠集变更同步落盘（跨重启恢复——settings
     /// `outline_collapsed` 键沿 indent_unit 先例）。
@@ -290,7 +275,19 @@ impl OutlinePanel {
     pub fn visible_rows_indexed(&self) -> Vec<(usize, &OutlineRow)> {
         let mut out = Vec::new();
         let mut hiding_until_level: Option<usize> = None;
+        // #108 D1：过滤门前置于折叠视图（无过滤 = 全行；过滤与折叠
+        // 两层正交——被折叠隐藏的行不进过滤比较，命中行仍受折叠门）。
+        let needle = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
         for (index, row) in self.rows.iter().enumerate() {
+            if let Some(n) = &needle {
+                if !row.label.to_lowercase().contains(n.as_str()) {
+                    continue;
+                }
+            }
             if let Some(min_level) = hiding_until_level {
                 if row.level <= min_level {
                     // 到同级/更高级标题——恢复可见。
@@ -316,7 +313,6 @@ impl OutlinePanel {
             .collect()
     }
 
->>>>>>> origin/main
     /// 行集差量刷新：重建行数据，句柄按条目序号保留、清退删除项、
     /// 补建新增行。
     ///
@@ -410,14 +406,6 @@ impl gpui::Render for OutlinePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let editor = self.editor.clone();
         let hook = self.activate_hook.clone();
-<<<<<<< HEAD
-        // #108 D1：渲染行集走过滤视图（visible_rows——空过滤 = 全行；
-        // 行体/Enter/↑↓ 同一过滤集，焦点链不脱钩）。
-        let rows: Vec<OutlineRow> = self.visible_rows().into_iter().cloned().collect();
-        let filter = self.filter.clone();
-        let filter_focus = self.filter_focus.clone();
-        let filter_hint = self.filter_empty_hint().to_string();
-=======
         // #108 批②：渲染行集走折叠视图（visible_rows_indexed——折叠头
         // 保留、子行隐藏；行身份 = 全量索引（句柄协议不变——解折叠
         // 即恢复），折叠箭头 toggle 按全量索引落点）。
@@ -434,7 +422,11 @@ impl gpui::Render for OutlinePanel {
                 .is_some_and(|next| next.level > rows_snapshot[i].level)
         };
         let collapsed = self.collapsed.clone();
->>>>>>> origin/main
+        // #108 D1：过滤面渲染变量（与折叠视图共存——过滤是前端
+        // 行集门，折叠是层级门；两层各自独立生效）。
+        let filter = self.filter.clone();
+        let filter_focus = self.filter_focus.clone();
+        let filter_hint = self.filter_empty_hint().to_string();
         let scroll = self.scroll.clone();
         let mut entries = Vec::with_capacity(rows.len());
 
@@ -829,7 +821,6 @@ mod tests {
 
     /// 导航面：首行聚焦 → SelectNext → 次行含焦点（Navigable 遍历语义）。
     #[gpui::test]
-<<<<<<< HEAD
     /// #108 D1：过滤框——实时忽略大小写子串匹配（报告 §3 P1 原文
     /// 口径），纯前端过滤行集不动数据面。先红：方法不存在 = 编译红。
     #[gpui::test]
@@ -863,7 +854,8 @@ mod tests {
             assert_eq!(p.visible_labels().len(), 0, "无命中空集");
             assert_eq!(p.filter_empty_hint(), "无匹配标题", "空集提示文案");
         });
-=======
+    }
+
     /// #108 批②：分区折叠——H1 分区折叠后子行不出渲染集、折叠头
     /// 保留；展开恢复全行。先红：方法不存在 = 编译红。
     /// #108 批③：XDG 临时区 guard（dock_open_states_persist_across_restart
@@ -931,7 +923,6 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         let _ = std::fs::remove_dir_all(&xdg);
->>>>>>> origin/main
     }
 
     fn select_next_moves_focus_to_next_row(cx: &mut TestAppContext) {
