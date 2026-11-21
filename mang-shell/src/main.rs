@@ -86,6 +86,7 @@ use gpui_platform::application;
 
 mod activity_bar;
 mod assets;
+mod button_ext;
 mod canvas_view;
 mod document;
 mod editor;
