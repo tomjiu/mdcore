@@ -38,6 +38,10 @@ pub enum Cmd {
     OpenReplace,
     /// G2：跳转到行输入框（Ctrl+G——导航类，只读态可用）。
     GotoLine,
+    /// #111 G2 批⑧：切换注释（Ctrl+/——注释符从 FenceState 推导：
+    /// 围栏内按语言 rust `//` / python `#` / js `//`；未识别围栏
+    /// `<!-- -->` 块注释）。
+    ToggleComment,
     Save,
     SelectAll,
     Undo,
@@ -65,6 +69,7 @@ impl Cmd {
         Cmd::OpenFind,
         Cmd::OpenReplace,
         Cmd::GotoLine,
+        Cmd::ToggleComment,
         Cmd::Save,
         Cmd::SelectAll,
         Cmd::Undo,
@@ -79,7 +84,7 @@ impl Cmd {
         "WordLeft", "WordRight", "MoveHome", "MoveEnd",
         "DocStart", "DocEnd",
         "ToggleFold", "FoldCurrent", "UnfoldCurrent", "FoldAll", "UnfoldAll",
-        "OpenFind", "OpenReplace", "GotoLine",
+        "OpenFind", "OpenReplace", "GotoLine", "ToggleComment",
         "Save", "SelectAll", "Undo", "Redo",
     ];
 
@@ -106,6 +111,7 @@ impl Cmd {
             Cmd::OpenFind => "open_find",
             Cmd::OpenReplace => "open_replace",
             Cmd::GotoLine => "goto_line",
+            Cmd::ToggleComment => "toggle_comment",
             Cmd::Save => "save",
             Cmd::SelectAll => "select_all",
             Cmd::Undo => "undo",
@@ -141,6 +147,8 @@ impl Cmd {
             // G1：替换（只读态 exec 侧拒——面板候选集含之，执行有门）。
             Cmd::OpenReplace => "替换（Ctrl+H）",
             Cmd::GotoLine => "跳转到行（Ctrl+G）",
+            // #111 G2 批⑧：切换注释（编辑类——只读态 exec 侧拒）。
+            Cmd::ToggleComment => "切换注释（Ctrl+/）",
             Cmd::Save => "保存（Ctrl+S）",
             Cmd::SelectAll => "全选（Ctrl+A）",
             Cmd::Undo => "撤销（Ctrl+Z）",
@@ -169,6 +177,7 @@ impl Cmd {
             Cmd::OpenFind => Some("Ctrl+F"),
             Cmd::OpenReplace => Some("Ctrl+H"),
             Cmd::GotoLine => Some("Ctrl+G"),
+            Cmd::ToggleComment => Some("Ctrl+/"),
             Cmd::Save => Some("Ctrl+S"),
             Cmd::SelectAll => Some("Ctrl+A"),
             Cmd::Undo => Some("Ctrl+Z"),

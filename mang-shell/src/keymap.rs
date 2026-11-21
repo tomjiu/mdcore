@@ -402,6 +402,9 @@ pub enum EditorAction {
     OpenFind,
     /// Ctrl+H 打开替换条。
     OpenReplace,
+    /// #111 G2 批⑧：切换注释（Ctrl+/——编辑键；Cmd::ToggleComment
+    /// 的 keymap 动作面）。
+    ToggleComment,
     /// Ctrl+S 保存（!shift 守卫）。
     Save,
     /// Ctrl+Shift+S 的编辑器空臂（`"s" if ctrl => {}`——不消费，
@@ -505,6 +508,7 @@ impl EditorAction {
             EditorAction::UnfoldAll => "unfold_all",
             EditorAction::OpenFind => "open_find",
             EditorAction::OpenReplace => "open_replace",
+            EditorAction::ToggleComment => "toggle_comment",
             EditorAction::Save => "editor_save",
             EditorAction::Pass => "editor_pass",
         }
@@ -555,6 +559,7 @@ impl EditorAction {
             | EditorAction::AddNextWordMatch
             | EditorAction::Save
             | EditorAction::OpenReplace
+            | EditorAction::ToggleComment
             | EditorAction::ToggleFold
             | EditorAction::FoldCurrent
             | EditorAction::UnfoldCurrent
@@ -617,6 +622,7 @@ const EDITOR_ACTION_IDS: &[EditorAction] = &[
     EditorAction::UnfoldAll,
     EditorAction::OpenFind,
     EditorAction::OpenReplace,
+    EditorAction::ToggleComment,
     EditorAction::Save,
     EditorAction::Pass,
 ];
@@ -785,6 +791,12 @@ fn default_editor_main() -> Vec<Entry> {
         e(
             Binding::Single(KeyPattern::key("h").with(Yes, Any, Any)),
             A::OpenReplace,
+        ),
+        // #111 G2 批⑧：切换注释（Ctrl+/——slash 键；shift/alt Any
+        // 只认 ctrl 家族）。
+        e(
+            Binding::Single(KeyPattern::key("/").with(Yes, Any, No)),
+            A::ToggleComment,
         ),
         // 保存（#386：E30 旧默认键位（ctrl+!shift → Save）已移除
         // ——Ctrl+S 不再由编辑器自处理，整键放行冒泡至 shell 域
@@ -2777,6 +2789,7 @@ mod tests {
             EditorAction::AddNextWordMatch,
             EditorAction::Save,
             EditorAction::OpenReplace,
+            EditorAction::ToggleComment,
             EditorAction::ToggleFold,
             EditorAction::FoldCurrent,
             EditorAction::UnfoldCurrent,
