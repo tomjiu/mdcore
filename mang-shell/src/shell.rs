@@ -284,6 +284,9 @@ pub struct ShellApp {
     /// 新建标签仍从 settings 读，两处同源不漂移；持久化走
     /// `settings::indent_unit` 既有键，零新增存储）。
     indent_unit: IndentUnit,
+    /// #111 P2：软换行开关（settings `soft_wrap` 键——set_soft_wrap_all
+    /// 传播全部标签；沿 set_indent_unit_all 先例）。
+    soft_wrap: bool,
     /// F1：提示横幅（打开失败 / 类型不支持 / 对话框不可用等面向用户消息）。
     notice_board: NoticeBoard,
     /// #63 打磨（#385 批 1）：右键菜单实体（`ui::ContextMenu` 组件，
@@ -549,6 +552,7 @@ impl ShellApp {
                 .as_deref()
                 .map(IndentUnit::from_setting)
                 .unwrap_or_default(),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             notice_board: NoticeBoard::default(),
             context_menu: None,
             context_menu_generation: 0,
@@ -4021,6 +4025,21 @@ impl ShellApp {
         cx.notify();
     }
 
+    /// #111 P2：软换行开关传播（存盘 + 全标签 Editor::set_soft_wrap——
+    /// 关 = 已有断点清空显示行回落；沿 set_indent_unit_all 同型）。
+    pub fn set_soft_wrap_all(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.soft_wrap == on {
+            return;
+        }
+        self.soft_wrap = on;
+        crate::settings::save_soft_wrap(on);
+        for tab in &self.tabs {
+            tab.editor.update(cx, |ed, _| ed.set_soft_wrap(on));
+        }
+        eprintln!("soft-wrap: {}", if on { "on" } else { "off" });
+        cx.notify();
+    }
+
     /// #182：重置左右栏宽度（设置面板「重置默认」钮触发——恢复缺省宽
     /// + 持久化；与拖拽收尾 finish_panel_drag 同一存储面）。
     pub fn reset_panel_widths(&mut self, cx: &mut Context<Self>) {
@@ -4665,6 +4684,7 @@ impl Render for ShellApp {
                     self.theme_mode,
                     self.font_size,
                     self.indent_unit,
+                    self.soft_wrap,
                     cx,
                 ))
             })
