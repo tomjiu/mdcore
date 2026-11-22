@@ -59,6 +59,21 @@ pub fn save_indent_unit(key: &str) {
     }
 }
 
+/// #111 批②：括号自动闭合读写（`auto_close_brackets` 键：bool——
+/// 默认开；沿 indent_unit 载体先例）。
+pub fn save_auto_close_brackets(on: bool) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["auto_close_brackets"] = serde_json::Value::Bool(on);
+        save_to(&dir, &value);
+    }
+}
+
+pub fn load_auto_close_brackets() -> Option<bool> {
+    let dir = config_dir()?;
+    load_from(&dir).get("auto_close_brackets")?.as_bool()
+}
+
 /// #110 G2：用户主题目录（对齐既有用户配置目录——报告 §5 D2 裁定：
 /// 不做 exe 目录回退；`$XDG_CONFIG_HOME/mang/themes/*.json`）。
 pub fn themes_dir() -> Option<PathBuf> {
@@ -782,6 +797,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #111 批②：auto_close_brackets 写读往返（load_from/save_to 私有
+    /// 面经 mod tests 子模块可见性直达——零全局 config_dir 污染）。
+    #[test]
+    fn auto_close_brackets_roundtrip() {
+        let dir = temp_config("auto-close");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["auto_close_brackets"] = serde_json::Value::Bool(false);
+        save_to(&dir, &value);
+        let back = load_from(&dir);
+        assert_eq!(
+            back.get("auto_close_brackets").and_then(|b| b.as_bool()),
+            Some(false),
+            "写读往返保持"
+        );
+        // 未知/缺失键 → 消费方 unwrap_or(true) 缺省开（构造面语义）。
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #110 G2：用户主题装载（磁盘 → registry——XDG 临时区 + 坏文件

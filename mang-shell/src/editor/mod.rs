@@ -240,6 +240,31 @@ const TEXT_PADDING: Pixels = px(8.);
 const PAGE_LINES: usize = 20;
 
 /// G3：`line` 的缩进编辑（行首插入单位文本）——`(start, end, 插入文本)`。
+/// #111 批②：开括号/引号 → 对应闭合字符（配对表——报告 §3 P1 项：
+/// `()[]{}` + `""` 「」『』）。纯函数（单测面零依赖）。
+fn auto_close_pair_of(open: char) -> Option<char> {
+    Some(match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '"' => '"',
+        '\'' => '\'',
+        '\u{300c}' => '\u{300d}', // 「 」
+        '\u{3008}' => '\u{3009}', // 『 』
+        '\u{ff08}' => '\u{ff09}', // （ ）
+        _ => return None,
+    })
+}
+
+/// #111 批②：字符是否为配对表的**闭合侧**（over-type 判定用——
+/// 键入闭字符且光标右侧同字符 → 跳过）。含对称引号（既 open 又 close）。
+fn is_close_pair_char(ch: char) -> bool {
+    matches!(
+        ch,
+        ')' | ']' | '}' | '"' | '\'' | '\u{300d}' | '\u{3009}' | '\u{ff09}'
+    )
+}
+
 fn indent_line_edit(line: usize, unit: IndentUnit) -> (Point, Point, String) {
     (
         Point::new(line, 0),
@@ -506,6 +531,9 @@ pub struct Editor {
     /// G3：缩进单位（Tab/Shift+Tab 消费——settings `indent_unit` 键；
     /// 缺省 Spaces4 与既有 Tab 插 4 空格语义一致）。
     indent_unit: IndentUnit,
+    /// #111 批②：括号/引号自动闭合开关（settings `auto_close_brackets`
+    /// 键——默认开；沿 indent_unit 载体先例）。
+    auto_close_brackets: bool,
     /// docx 转换产物（行模型 + 标题树 + 属性；`None` = 非 docx 态）。
     docx: Option<DocxPayload>,
     /// #115：docx 可编辑面（映射桥 + 引擎窄面；`None` = 只读 docx /
@@ -626,6 +654,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
             replacement_focus: cx.focus_handle(),
@@ -693,6 +722,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
             replacement_focus: cx.focus_handle(),
@@ -778,6 +808,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
             replacement_focus: cx.focus_handle(),
@@ -849,6 +880,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
             replacement_focus: cx.focus_handle(),
@@ -928,6 +960,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             scroll: UniformListScrollHandle::new(),
             // xlsx 无围栏语义——fence 恒 false（同 docx 态口径，
             // refresh_caches 在 xlsx 模式下跳过 md 逐行推进）。
@@ -987,6 +1020,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
             replacement_focus: cx.focus_handle(),
@@ -3194,6 +3228,15 @@ impl Editor {
 
     /// 多光标插入（常态走 Buffer 单点路径）。
     fn insert_text_multi(&mut self, text: &str) {
+        // #111 批②：括号/引号自动闭合（前置钩子——单字符配对表）。
+        // 多光标态不接（多点位闭合对的撤销/同步语义复杂——保守收窄，
+        // 单光标主形态先行；Q-IDE 参照也是单光标面）。
+        if !self.cursors.is_multiple() && self.auto_close_brackets {
+            if let Some(closed) = self.auto_close_insert(text) {
+                let _ = closed;
+                return;
+            }
+        }
         if self.cursors.is_multiple() {
             self.cursors.insert_all(&mut self.buffer, text);
             self.sync_buffer_from_cursors_primary();
@@ -3201,6 +3244,89 @@ impl Editor {
             self.buffer.insert(text);
             self.sync_cursors_from_buffer();
         }
+    }
+
+    /// #111 批②：单字符配对闭合插入。返回 Some(()) = 已处理（调用方
+    /// 早退）；None = 非配对键走原路径。语义三面：
+    /// - 开括号/开引号（无选区）：插「开+闭」光标居中
+    /// - 开括号/开引号（有选区）：**包裹**——选区文本被对围住，选区保持内容
+    /// - 闭括号 over-type：光标右侧恰为对应闭括号 → 跳过（光标右移 1）
+    fn auto_close_insert(&mut self, text: &str) -> Option<()> {
+        if text.chars().count() != 1 {
+            return None; // 仅单字符（IME 长文本/多字符粘贴不触发）
+        }
+        let ch = text.chars().next().unwrap();
+
+        // over-type 先行：键入的是**闭括号/闭引号**且光标右侧恰为同字
+        // 符 → 跳过（光标右移 1）。此判定不依赖 open 配对表——闭字符
+        // 自身即判定条件（探针实证：先查 open 表会在 ')' 上早退 None）。
+        if is_close_pair_char(ch) {
+            let c = self.buffer.cursor();
+            if self.buffer.selection().is_none() {
+                let line_len = self.buffer.line_len(c.line);
+                if c.col < line_len {
+                    let line = self.buffer.line(c.line);
+                    if line.chars().nth(c.col) == Some(ch) {
+                        self.buffer.set_cursor(Point::new(c.line, c.col + 1));
+                        self.sync_cursors_from_buffer();
+                        return Some(());
+                    }
+                }
+            }
+            // 闭字符但右侧非同字符（如引号另起新对）——引号对称字符
+            // 落 open 表（" 和 ' 互为 open/close），继续走 open 路径。
+        }
+
+        let close = auto_close_pair_of(ch)?;
+
+        // over-type（open 路径下的旧判定保留——防御性：键入 open 但
+        // 右侧恰为对应 close 的场景实际由上文闭字符分支承担）。
+        let c = self.buffer.cursor();
+        if self.buffer.selection().is_none() {
+            let line_len = self.buffer.line_len(c.line);
+            if c.col < line_len {
+                let line = self.buffer.line(c.line);
+                let at = line.chars().nth(c.col);
+                if at == Some(close) {
+                    self.buffer.set_cursor(Point::new(c.line, c.col + 1));
+                    return Some(());
+                }
+            }
+        }
+
+        if let Some(range) = self.buffer.selection() {
+            // 包裹：选区首插开、选区尾+1 插闭（两段一个 batch——undo
+            // 一键复原；选区保持内容）。
+            let s = range.start;
+            let e = range.end;
+            let close_s = Point::new(s.line, s.col);
+            let close_e = Point::new(e.line, e.col);
+            let did = self.buffer.replace_batch(vec![
+                (close_s, close_s, ch.to_string()),
+                (close_e, close_e, close.to_string()),
+            ]);
+            if did == 0 {
+                return None;
+            }
+            // 选区重映射：内容域（开括号后到闭括号前）。
+            let new_s = Point::new(s.line, s.col + 1);
+            let new_e = Point::new(e.line, e.col + 1);
+            self.buffer.set_selection(new_s, new_e);
+            self.sync_cursors_from_buffer();
+            return Some(());
+        }
+
+        // 无选区：插「开+闭」光标居中（单事务）。
+        let insert_at = c;
+        let did = self
+            .buffer
+            .replace_batch(vec![(insert_at, insert_at, format!("{ch}{close}"))]);
+        if did == 0 {
+            return None;
+        }
+        self.buffer.set_cursor(Point::new(c.line, c.col + 1));
+        self.sync_cursors_from_buffer();
+        Some(())
     }
 
     /// 多光标换行（单光态走 Buffer 语义 API——newline/tab 的生产消费面）。
@@ -5959,6 +6085,65 @@ mod tests {
     /// 命令分发，不触发 persist_folds 落盘）。
     fn md_editor(cx: &mut gpui::TestAppContext, text: &str) -> gpui::Entity<Editor> {
         cx.update(|cx| cx.new(|cx| Editor::new(Some("notes.md".into()), text.to_string(), cx)))
+    }
+
+    /// #111 批②：括号自动闭合——键入开括号插入对、光标居中；
+    /// 有选区 = 包裹语义。先红：键入 "(" 现状单插无闭合。
+    #[gpui::test]
+    fn auto_close_pairs_basic(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "");
+        ed.update(cx, |e, _| {
+            e.insert_text_multi("(");
+            assert_eq!(e.buffer.to_plain_text(), "()", "开括号自动闭合");
+            assert_eq!(e.buffer.cursor().col, 1, "光标居括号对间");
+
+            // over-type：光标右侧已是对应闭括号 → 跳过不插。
+            e.insert_text_multi(")");
+            assert_eq!(e.buffer.to_plain_text(), "()", "闭括号跳过");
+            assert_eq!(e.buffer.cursor().col, 2, "光标跳过闭合括号");
+        });
+    }
+
+    /// #111 批②：选区包裹——有选区键入开括号 = 选区被对围住。
+    #[gpui::test]
+    fn auto_close_pairs_wraps_selection(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "abc");
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(0, 1), p(0, 3));
+            e.insert_text_multi("(");
+            assert_eq!(e.buffer.to_plain_text(), "a(bc)", "选区被括号包裹");
+        });
+    }
+
+    /// #111 批②：配对表纯函数面（含引号对称——既 open 又 close）。
+    #[test]
+    fn auto_close_pair_table_pinned() {
+        assert_eq!(auto_close_pair_of('('), Some(')'));
+        assert_eq!(auto_close_pair_of('['), Some(']'));
+        assert_eq!(auto_close_pair_of('{'), Some('}'));
+        assert_eq!(auto_close_pair_of('"'), Some('"'));
+        assert_eq!(auto_close_pair_of('\u{300c}'), Some('\u{300d}')); // 「」
+        assert_eq!(auto_close_pair_of('\u{ff08}'), Some('\u{ff09}')); // （）
+        assert_eq!(auto_close_pair_of('x'), None, "普通字符不在配对表");
+        assert!(is_close_pair_char(')'));
+        assert!(is_close_pair_char('"'));
+        assert!(!is_close_pair_char('('), "开括号非闭合侧");
+    }
+
+    /// #111 批②：配对表全覆盖（方/花/引号/全角括号）+ 非配对键
+    /// 原样单插（回归面）。
+    #[gpui::test]
+    fn auto_close_pairs_table_and_plain_chars(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "");
+        ed.update(cx, |e, _| {
+            // 非配对字符：原样单插（回归面）。
+            e.insert_text_multi("x");
+            assert_eq!(e.buffer.to_plain_text(), "x", "普通字符原样单插");
+            // 方括号对。
+            e.buffer.set_cursor(p(0, 1));
+            e.insert_text_multi("[");
+            assert_eq!(e.buffer.to_plain_text(), "x[]", "方括号对闭合");
+        });
     }
 
     /// #111 G2 批⑧：围栏内切换注释——跨行批加（`// ` 前缀）→
