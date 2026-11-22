@@ -780,6 +780,11 @@ impl ShellApp {
                 .as_ref()
                 .is_some_and(|(o, e)| *o == owned && e.read(cx).is_dirty());
             if !dirty {
+                // #247②：干净态也提示（#176 不静默精神——页面视图下按
+                // 保存应给用户可感知反馈，而非无声 no-op。文案同时含
+                //「页面视图」与「只读渲染」锚词：save_tab 断言面与
+                // Ctrl+S 键管线断言面共用一条）。
+                self.show_notice("页面视图无修改（只读渲染——切文本视图后可编辑）".into(), cx);
                 return SaveOutcome::Unmodified;
             }
             let sent = self
@@ -5388,6 +5393,15 @@ mod tab_workflow_tests {
         });
 
         // ② pdf 启动 → 页视图实体在场（同一漏接线面——一并确认）。
+        // #247③：pdfium 引擎环境卫——沙箱/无引擎开发机优雅跳过
+        //（引擎装载失败的诊断文案已含取件指引；有引擎环境才断言
+        // 页视图接线——引擎在位由装有 libpdfium 的门禁环境覆盖）。
+        if mdc_pdf::engine_pdfium::PdfiumEngine::shared_handle().is_err() {
+            eprintln!(
+                "SKIP: pdfium 引擎不可用——段②（pdf 启动页视图接线）环境性跳过；段①③（docx/md）照跑"
+            );
+            return;
+        }
         let pdf_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/smoke.pdf");
         let pdf = dir.join("startup.pdf");
         std::fs::copy(&pdf_src, &pdf).expect("pdf 夹具在场");
