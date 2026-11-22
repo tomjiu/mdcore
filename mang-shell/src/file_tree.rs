@@ -461,6 +461,9 @@ impl Render for FileTree {
         // 走 main.rs 既有绑定；焦点经行点击落入树根句柄）。
         div()
             .id("file-tree")
+            // #247①：行命中锚（真实鼠标链测试用——树 bounds + 行高
+            // 22 × index 定位行中心，替代对面板头高度的脆弱硬编码）。
+            .debug_selector(|| "file-tree".into())
             .key_context("menu")
             .track_focus(&tree_focus)
             .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| {
