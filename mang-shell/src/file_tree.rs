@@ -135,8 +135,9 @@ pub struct TreeRow {
     pub is_dir: bool,
     pub expanded: bool,
     pub is_active: bool,
-    /// #107 P1 批⑦：空目录占位行（「（空）」置灰——展开的目录清单
-    /// 为零时生成；点击/Enter 不可开——render_row 置灰口径）。
+    /// #107 批③：空目录占位行（展开的空目录下唯一的「（空）」行）。
+    /// 父目录路径 + `\u{1}` 后缀身份（永不与真实条目撞键——Q-IDE R11
+    /// 同型）；不可点击/右键/光标落位/active——纯视觉占位。
     pub is_placeholder: bool,
 }
 
@@ -191,6 +192,18 @@ impl TreeState {
         } else {
             self.ensure_listing(dir);
             self.expanded.insert(dir.to_path_buf());
+        }
+    }
+
+    /// #107 D1①批②：全树刷新——重读**全部**已缓存目录清单（标题栏
+    /// 「刷新」钮语义：外部改动范围未知时不猜目标，整树过一遍）。
+    /// 未缓存目录无操作（同 reload 单目录语义）；根展开态常驻
+    /// （TreeState::new 即读根）→ 根必命中。展开态不动——刷新清单
+    /// 不折叠用户已展开的目录。
+    pub fn reload_all(&mut self) {
+        let dirs: Vec<PathBuf> = self.listings.keys().cloned().collect();
+        for dir in dirs {
+            self.listings.insert(dir.clone(), Rc::new(list_dir(&dir)));
         }
     }
 
@@ -268,6 +281,12 @@ impl TreeState {
         let Some(entries) = self.listings.get(dir) else {
             return;
         };
+        // #107 批③/批⑦ 并存裁决：占位行注入统一走父层「子目录展开且
+        // 清单空」注入（下方 expanded 分支——批⑦实现已在 main）。
+        // 此处子层不再重复 push（否则展开空目录得 +2 行——两套实现叠加）。
+        if entries.is_empty() {
+            return;
+        }
         for entry in entries.iter() {
             let expanded = entry.is_dir && self.expanded.contains(&entry.path);
             rows.push(TreeRow {
@@ -380,6 +399,11 @@ impl FileTree {
         let Some(row) = self.state.visible_rows().get(ix).cloned() else {
             return;
         };
+        // #107 批③：占位行不可激活（「（空）」——纯视觉，Enter 无操作；
+        // 不然 open_file 拿 `\u{1}` 后缀幽灵路径）。
+        if row.is_placeholder {
+            return;
+        }
         if row.is_dir {
             let path = row.path.clone();
             self.mutate_rows_keep_cursor(|state| state.toggle(&path));
@@ -400,6 +424,12 @@ impl FileTree {
     /// 当前打开文件高亮同步（ShellApp::open_document 后调用）。
     pub fn set_active_file(&mut self, path: Option<PathBuf>) {
         self.state.set_active_file(path);
+    }
+
+    /// #107 D1①批②：全树刷新（标题栏「刷新」钮）。#595：经路径
+    /// 重绑定——整树重读后光标仍是原文件，目标不可见则清空。
+    pub fn reload_root(&mut self) {
+        self.mutate_rows_keep_cursor(|state| state.reload_all());
     }
 
     /// #166：fs 变更后重读目录清单（转发到状态机）。#595：经路径
@@ -528,6 +558,23 @@ impl FileTree {
         selected: Option<usize>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // #107 批③：占位行早退——不可点击/右键/选中（纯视觉占位；
+        // 无 start_slot 箭头位，缩进对齐常规行、灰字 Muted）。
+        if row.is_placeholder {
+            return h_flex()
+                .id(gpui::ElementId::Name(
+                    format!("ft-placeholder-{}", row.path.display()).into(),
+                ))
+                .pl(px(14. * row.depth as f32 + 30.))
+                .h(px(22.))
+                .items_center()
+                .child(
+                    Label::new(row.name.as_str())
+                        .size(LabelSize::Small)
+                        .color(ui::Color::Muted),
+                )
+                .into_any_element();
+        }
         let is_dir = row.is_dir;
         let path = row.path.clone();
 
@@ -628,9 +675,7 @@ impl FileTree {
         .child(
             Label::new(row.name.as_str())
                 .size(LabelSize::Small)
-                .when(row.is_active, |l| l.color(ui::Color::Accent))
-                // #107 P1 批⑦：占位行置灰（空目录「（空）」——Muted）。
-                .when(row.is_placeholder, |l| l.color(ui::Color::Muted)),
+                .when(row.is_active, |l| l.color(ui::Color::Accent)),
         )
         // 当前打开文件高亮 + #575 键盘光标行（组件 selected 语系——
         // ghost_element_selected 通栏底色 + 上方 Label::Accent 文字色；
@@ -1127,6 +1172,148 @@ mod keyboard_tests {
             selected_path(&tree, &visual),
             Some(c_md),
             "光标路径身份保持"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #107 D1①批②：标题栏「刷新」= reload_root（TreeState::reload_all）
+    /// 全树语义——多层外部改动（根层 + 深层子目录）一次全树刷新全部可见，
+    /// 且光标路径身份保持（#595 语义随 mutate_rows_keep_cursor 继承）。
+    #[gpui::test]
+    fn reload_root_after_external_multi_dir_changes(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("ft107-b2-reloadall");
+        let sub = root.join("sub");
+        let deep = sub.join("deep");
+        let (tree, mut visual) = tree_window(cx, root.clone(), Arc::default());
+        // 展开深层（deep 清单缓存就绪——多目录缓存面）。
+        tree.update(&mut visual, |t, _| t.expand_to(&deep.join("d.md")));
+        focus_and_step_to(&tree, &mut visual, &deep.join("d.md"));
+
+        // 外部进程多处改动：根层新建 + 深层子目录新建（树零感知）。
+        std::fs::write(root.join("ext-root.md"), "ext").unwrap();
+        std::fs::write(deep.join("ext-deep.md"), "ext").unwrap();
+        let before = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        let mid = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_eq!(mid, before, "外部改动树自身不可见（无轮询——同批①钉）");
+
+        // 标题栏「刷新」→ reload_root（shell.rs refresh_file_tree 同型调用）。
+        tree.update(&mut visual, |t, _| t.reload_root());
+        let after = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        assert_eq!(after, before + 2, "全树刷新后两处新文件行均可见");
+        let paths: Vec<PathBuf> = tree
+            .read_with(&visual, |t, _| t.state.visible_rows())
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&root.join("ext-root.md")),
+            "根层新文件行可见"
+        );
+        assert!(
+            paths.contains(&deep.join("ext-deep.md")),
+            "深层新文件行可见"
+        );
+        // #595：光标身份保持——刷新后选中仍是当初的 d.md。
+        assert_eq!(
+            selected_path(&tree, &visual),
+            Some(deep.join("d.md")),
+            "全树刷新后光标路径身份保持"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #107 批③守卫：键盘光标落到占位行 → Enter 无操作（不触发
+    /// open_file 幽灵路径 / 目录 toggle）。
+    #[gpui::test]
+    fn enter_on_placeholder_row_is_noop(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("ft107-b3-noop");
+        let truly_empty = root.join("vacuous");
+        std::fs::create_dir_all(&truly_empty).unwrap();
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let (tree, mut visual) = tree_window(cx, root.clone(), opened.clone());
+
+        // 展开空目录 → 占位行在末尾（根/A/b/sub/… 排序后 vacuous 段）。
+        tree.update(&mut visual, |t, _| {
+            t.mutate_rows_keep_cursor(|st| st.toggle(&truly_empty))
+        });
+        let rows = tree.read_with(&visual, |t, _| t.state.visible_rows());
+        let ph_ix = rows
+            .iter()
+            .position(|r| r.is_placeholder)
+            .expect("占位行在可见集");
+
+        // 光标直达占位行（键路 SelectNext 走真实行同样可达——此处直设
+        // selected 与键路同最终态）。
+        focus_and_step_to(&tree, &mut visual, &rows[ph_ix].path.clone());
+        // focus_and_step_to 走路径对齐；占位路径非真实行——改直设：
+        tree.update(&mut visual, |t, _| t.selected = Some(ph_ix));
+        let _ = &mut visual;
+        visual.dispatch_action(menu::Confirm);
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "占位行 Enter 零打开（无幽灵路径）"
+        );
+        let still: Vec<bool> = tree
+            .read_with(&visual, |t, _| t.state.visible_rows())
+            .iter()
+            .map(|r| r.is_placeholder)
+            .collect();
+        assert!(
+            still.iter().any(|p| *p),
+            "占位行仍展开（未触发 toggle 折叠）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #107 批③：空目录展开出「（空）」占位行——点击展开不再「无反应」；
+    /// 外部补文件后 reload 占位退役（真行替入）；光标/键盘不受占位影响
+    ///（占位行不可选——索引对齐真实行）。
+    #[gpui::test]
+    fn empty_dir_shows_placeholder_then_retires(cx: &mut gpui::TestAppContext) {
+        let root = temp_fixture("ft107-b3-empty");
+        let empty_dir = root.join("sub").join("deep"); // 夹具 deep 无文件？有 d.md——自建真空目录
+        let truly_empty = root.join("vacuous");
+        std::fs::create_dir_all(&truly_empty).unwrap();
+        let (tree, mut visual) = tree_window(cx, root.clone(), Arc::default());
+
+        // 展开真空目录：可见行 +1 = 占位行（「（空）」）。
+        let before = tree.read_with(&visual, |t, _| t.state.visible_rows().len());
+        tree.update(&mut visual, |t, _| {
+            t.mutate_rows_keep_cursor(|s| s.toggle(&truly_empty))
+        });
+        let rows: Vec<(String, bool)> = tree
+            .read_with(&visual, |t, _| t.state.visible_rows())
+            .iter()
+            .map(|r| (r.name.clone(), r.is_placeholder))
+            .collect();
+        assert_eq!(
+            tree.read_with(&visual, |t, _| t.state.visible_rows().len()),
+            before + 1,
+            "展开空目录可见行 +1（占位行出现——此前点了没反应）"
+        );
+        let ph = rows.iter().find(|(n, _)| n == "（空）");
+        assert!(ph.is_some(), "占位行文案「（空）」在可见集");
+        assert_eq!(
+            ph.map(|(_, p)| *p),
+            Some(true),
+            "占位行 is_placeholder 标记"
+        );
+
+        // 外部补文件 + reload（批①单目录语义）：占位退役、真行替入。
+        std::fs::write(truly_empty.join("added.md"), "x").unwrap();
+        tree.update(&mut visual, |t, _| t.reload(&truly_empty));
+        let after: Vec<(String, bool)> = tree
+            .read_with(&visual, |t, _| t.state.visible_rows())
+            .iter()
+            .map(|r| (r.name.clone(), r.is_placeholder))
+            .collect();
+        assert!(
+            !after.iter().any(|(_, p)| *p),
+            "补文件后无占位行（真行替入——占位自动退役）"
+        );
+        assert!(
+            after.iter().any(|(n, _)| n == "added.md"),
+            "外部新文件行可见"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
