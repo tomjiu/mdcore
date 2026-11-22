@@ -226,3 +226,19 @@ mod tests {
         }
     }
 }
+// #107 D1① 先红面：刷新入口存在性判据（外部改动后用户感知手段）。
+#[test]
+fn file_tree_menu_has_refresh_entry() {
+    for is_dir in [true, false] {
+        let items = file_tree_menu(is_dir);
+        let refresh = items.iter().find_map(|i| match i {
+            MenuItem::Action { id, enabled, .. } if *id == "ft-refresh" => Some(*enabled),
+            _ => None,
+        });
+        assert!(
+            refresh.is_some(),
+            "文件树右键菜单须含「刷新」入口（#107 D1①——is_dir={is_dir}）"
+        );
+        assert_eq!(refresh, Some(true), "刷新须可用（无前置条件门）");
+    }
+}

@@ -2067,6 +2067,25 @@ impl ShellApp {
             // ----------------------------------------------------------
             // #166：文件树动作（全部接线——不允许「点了只打日志」）。
             // ----------------------------------------------------------
+            (MenuOrigin::FileTree, "ft-refresh") => {
+                // #107 D1①：外部改动后的手动同步——重读目标目录（目录）
+                // 或父目录（文件）清单。复用 #166 既有 reload（只刷已缓存
+                // 目录；未展开目录本无清单，展开时现读）；根展开态常驻
+                // （TreeState::new 即读根），根级刷新必然命中缓存重读。
+                if let Some(target) = target {
+                    let dir = if target.is_dir() {
+                        target
+                    } else {
+                        target.parent().map(|p| p.to_path_buf()).unwrap_or(target)
+                    };
+                    if let Some(ws) = self.workspace.as_ref().cloned() {
+                        ws.update(cx, |tree, cx| {
+                            tree.reload(&dir);
+                            cx.notify();
+                        });
+                    }
+                }
+            }
             (MenuOrigin::FileTree, "ft-reveal") => {
                 // 揭示目标本身（目录）或所在目录（文件）——原实现恒揭示
                 // 工作区根，与右键目标无关，#166 修正为目标面。
