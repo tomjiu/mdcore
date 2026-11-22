@@ -4624,7 +4624,9 @@ impl Render for ShellApp {
                         // #109 批②③：搜索钮改接项目搜索面板（R8 口径）——
                         // 面板不依赖编辑器浮层，docx 页面视图/无文档均可用
                         //（置灰口径退役；Ctrl+F 编辑器内查找不受影响）。
-                        false,
+                        // 搜索视图态在此读（render 持 &self——activity_bar
+                        // 内读 ShellApp 会双租约 panic，见其函数注释）。
+                        self.search_active(cx),
                         cx,
                     ))
                     .when(self.left_open(cx), |el| {

@@ -41,20 +41,19 @@ pub(crate) const BAR_PADDING: Pixels = px(8.);
 
 /// 渲染图标条。`left_open`/`git_view` 决定文件树/git 钮的选中态；
 /// `settings_open` 决定设置钮的选中态（弹窗开 = 选中视觉）。
-/// `search_disabled`（#176）：docx 页面视图下搜索钮置灰 + 原因
+/// `search_view`（#109）：项目搜索面板激活态（调用方 render 持
+/// `&self` 读 dock 传入——**不得在本函数内 `cx.entity().read(cx)`**
+/// 再租 ShellApp：render 链内双租约会 panic，曾致 bin 目标 69 个 GUI
+/// 测试基线全红（cd96080 引入，本修复回归）。
 /// tooltip（查找是编辑器浮层，页面态编辑器不在树内——不进死路）。
 pub fn activity_bar(
     left_open: bool,
     git_view: bool,
     settings_open: bool,
-    search_disabled: bool,
+    search_view: bool,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
-    // #109：search_disabled 参数保留签名兼容（恒 false——置灰口径退役）。
-    let _ = search_disabled;
-    // #109：搜索视图态（图标条选中——与 git_view 同源 dock 读）。
-    let search_view = cx.entity().read(cx).search_active(cx);
     v_flex()
         .id("activity-bar")
         .debug_selector(|| "activity-bar".into())
