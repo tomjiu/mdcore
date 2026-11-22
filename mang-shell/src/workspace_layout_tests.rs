@@ -138,8 +138,19 @@ fn file_tree_open_and_reopen_use_real_shell_without_entity_reentry(cx: &mut Test
             .debug_bounds("left-panel")
             .expect("real file tree is visible");
         // Root row is followed by the only file in this real temporary workspace.
+        // #247①：命中位改「树 bounds + 行高×行号」计算——面板头高度
+        // 是易变面（#121 批③b 标题拖拽手柄后 +~27px，曾把 y=70 硬编码
+        // 挤进根行域——点击变目录 toggle 而非开文件）。树行高 22px
+        //（file_tree.rs render_rows 钉值）；行 1 = 根下文件行，取行中心。
+        let tree = visual
+            .debug_bounds("file-tree")
+            .expect("file tree rows are addressable");
+        let row = 1;
         visual.simulate_click(
-            gpui::point(panel.origin.x + px(80.), panel.origin.y + px(70.)),
+            gpui::point(
+                tree.origin.x + px(80.),
+                tree.origin.y + px(22. * row as f32 + 11.),
+            ),
             Default::default(),
         );
         cx.run_until_parked();
