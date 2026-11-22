@@ -139,9 +139,6 @@ pub struct TreeRow {
     /// 父目录路径 + `\u{1}` 后缀身份（永不与真实条目撞键——Q-IDE R11
     /// 同型）；不可点击/右键/光标落位/active——纯视觉占位。
     pub is_placeholder: bool,
-    /// #107 P1 批⑦：空目录占位行（「（空）」置灰——展开的目录清单
-    /// 为零时生成；点击/Enter 不可开——render_row 置灰口径）。
-    pub is_placeholder: bool,
 }
 
 /// 深度上限（DFS 双保险——符号链接/异常环防御）。
@@ -284,20 +281,10 @@ impl TreeState {
         let Some(entries) = self.listings.get(dir) else {
             return;
         };
-        // #107 批③：展开的空目录插一条「（空）」占位行——否则展开后
-        // 行集无任何新增，视觉上「点了没反应」，新手误判树损坏
-        //（2449 报告 P1 缺口；参照 Q-IDE explorer.rs R11 空文件夹
-        // 占位子条目）。身份 = 父目录 + `\u{1}` 后缀（同型防撞键）。
-        if entries.is_empty() && self.expanded.contains(dir) {
-            rows.push(TreeRow {
-                path: dir.join("\u{1}"),
-                name: "（空）".to_string(),
-                depth,
-                is_dir: false,
-                expanded: false,
-                is_active: false,
-                is_placeholder: true,
-            });
+        // #107 批③/批⑦ 并存裁决：占位行注入统一走父层「子目录展开且
+        // 清单空」注入（下方 expanded 分支——批⑦实现已在 main）。
+        // 此处子层不再重复 push（否则展开空目录得 +2 行——两套实现叠加）。
+        if entries.is_empty() {
             return;
         }
         for entry in entries.iter() {
