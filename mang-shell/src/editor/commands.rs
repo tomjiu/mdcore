@@ -18,6 +18,14 @@ pub enum Cmd {
     MoveRight,
     MoveUp,
     MoveDown,
+    /// #111 D1：行移动上移（Alt+↑——整行/块换位）。
+    MoveLineUp,
+    /// #111 P2 批⑦：复制行（块复制到自身下方——光标不动）。
+    CopyLine,
+    /// #111 P2 批⑦：删除行（整块含换行——单行文档拒删）。
+    DeleteLine,
+    /// #111 D1：行移动下移（Alt+↓）。
+    MoveLineDown,
     WordLeft,
     WordRight,
     MoveHome,
@@ -38,6 +46,10 @@ pub enum Cmd {
     OpenReplace,
     /// G2：跳转到行输入框（Ctrl+G——导航类，只读态可用）。
     GotoLine,
+    /// #111 G2 批⑧：切换注释（Ctrl+/——注释符从 FenceState 推导：
+    /// 围栏内按语言 rust `//` / python `#` / js `//`；未识别围栏
+    /// `<!-- -->` 块注释）。
+    ToggleComment,
     Save,
     SelectAll,
     Undo,
@@ -51,6 +63,8 @@ impl Cmd {
         Cmd::MoveRight,
         Cmd::MoveUp,
         Cmd::MoveDown,
+        Cmd::MoveLineUp,
+        Cmd::MoveLineDown,
         Cmd::WordLeft,
         Cmd::WordRight,
         Cmd::MoveHome,
@@ -65,9 +79,12 @@ impl Cmd {
         Cmd::OpenFind,
         Cmd::OpenReplace,
         Cmd::GotoLine,
+        Cmd::ToggleComment,
         Cmd::Save,
         Cmd::SelectAll,
         Cmd::Undo,
+        Cmd::CopyLine,
+        Cmd::DeleteLine,
         Cmd::Redo,
     ];
 
@@ -76,10 +93,11 @@ impl Cmd {
     #[rustfmt::skip]
     const NAMES: &[&str] = &[
         "MoveLeft", "MoveRight", "MoveUp", "MoveDown",
+        "MoveLineUp", "CopyLine", "DeleteLine", "MoveLineDown",
         "WordLeft", "WordRight", "MoveHome", "MoveEnd",
         "DocStart", "DocEnd",
         "ToggleFold", "FoldCurrent", "UnfoldCurrent", "FoldAll", "UnfoldAll",
-        "OpenFind", "OpenReplace", "GotoLine",
+        "OpenFind", "OpenReplace", "GotoLine", "ToggleComment",
         "Save", "SelectAll", "Undo", "Redo",
     ];
 
@@ -91,6 +109,10 @@ impl Cmd {
             Cmd::MoveRight => "move_right",
             Cmd::MoveUp => "move_up",
             Cmd::MoveDown => "move_down",
+            Cmd::MoveLineUp => "move_line_up",
+            Cmd::CopyLine => "copy_line",
+            Cmd::DeleteLine => "delete_line",
+            Cmd::MoveLineDown => "move_line_down",
             Cmd::WordLeft => "word_left",
             Cmd::WordRight => "word_right",
             Cmd::MoveHome => "move_home",
@@ -106,6 +128,7 @@ impl Cmd {
             Cmd::OpenFind => "open_find",
             Cmd::OpenReplace => "open_replace",
             Cmd::GotoLine => "goto_line",
+            Cmd::ToggleComment => "toggle_comment",
             Cmd::Save => "save",
             Cmd::SelectAll => "select_all",
             Cmd::Undo => "undo",
@@ -126,6 +149,10 @@ impl Cmd {
             Cmd::MoveRight => "移动：右",
             Cmd::MoveUp => "移动：上",
             Cmd::MoveDown => "移动：下",
+            Cmd::MoveLineUp => "行移动：上（Alt+↑）",
+            Cmd::CopyLine => "复制行（Ctrl+Shift+D）",
+            Cmd::DeleteLine => "删除行（Ctrl+Shift+K）",
+            Cmd::MoveLineDown => "行移动：下（Alt+↓）",
             Cmd::WordLeft => "词跳：左",
             Cmd::WordRight => "词跳：右",
             Cmd::MoveHome => "移动：行首",
@@ -141,6 +168,8 @@ impl Cmd {
             // G1：替换（只读态 exec 侧拒——面板候选集含之，执行有门）。
             Cmd::OpenReplace => "替换（Ctrl+H）",
             Cmd::GotoLine => "跳转到行（Ctrl+G）",
+            // #111 G2 批⑧：切换注释（编辑类——只读态 exec 侧拒）。
+            Cmd::ToggleComment => "切换注释（Ctrl+/）",
             Cmd::Save => "保存（Ctrl+S）",
             Cmd::SelectAll => "全选（Ctrl+A）",
             Cmd::Undo => "撤销（Ctrl+Z）",
@@ -155,6 +184,10 @@ impl Cmd {
             Cmd::MoveRight => Some("→"),
             Cmd::MoveUp => Some("↑"),
             Cmd::MoveDown => Some("↓"),
+            Cmd::MoveLineUp => Some("Alt+↑"),
+            Cmd::CopyLine => Some("Ctrl+Shift+D"),
+            Cmd::DeleteLine => Some("Ctrl+Shift+K"),
+            Cmd::MoveLineDown => Some("Alt+↓"),
             Cmd::WordLeft => Some("Ctrl+←"),
             Cmd::WordRight => Some("Ctrl+→"),
             Cmd::MoveHome => Some("Home"),
@@ -169,6 +202,7 @@ impl Cmd {
             Cmd::OpenFind => Some("Ctrl+F"),
             Cmd::OpenReplace => Some("Ctrl+H"),
             Cmd::GotoLine => Some("Ctrl+G"),
+            Cmd::ToggleComment => Some("Ctrl+/"),
             Cmd::Save => Some("Ctrl+S"),
             Cmd::SelectAll => Some("Ctrl+A"),
             Cmd::Undo => Some("Ctrl+Z"),

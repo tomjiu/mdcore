@@ -672,7 +672,18 @@ impl ShellApp {
             tab.editor.read(cx).is_modified()
                 || self.xlsx_dirty_at(&tab.path, cx)
                 || self.pdf_view_dirty(cx, &tab.path)
+                // #50 C3/C4：docx 页面视图脏（EditDone 回执驱动的真实
+                // 脏位——关闭确认/退出确认从此对 LOK 编辑生效）。
+                || self.docx_page_dirty(cx, &tab.path)
         })
+    }
+
+    /// #50 C3/C4：指定路径的 docx 页面视图是否脏（Shell 持有的
+    /// `docx_pages` 槽按路径匹配——无页视图/路径不匹配 = 不脏）。
+    fn docx_page_dirty(&self, cx: &App, path: &Path) -> bool {
+        self.docx_pages
+            .as_ref()
+            .is_some_and(|(owned, entity)| *owned == path && entity.read(cx).is_dirty())
     }
 
     /// #386：指定路径的 pdf 页视图是否有未落盘批注（Shell 持有的
@@ -753,16 +764,32 @@ impl ShellApp {
                     .filter(|(owned, _)| *owned == tab.path)
                     .map(|_| tab.path.clone())
             });
-        if let Some(_owned) = docx_page_owned {
-            // #176 验收②：页面态保存不再静默——明确告知只读渲染无修改可存
-            // （outcome 仍 Unmodified：关闭/退出流程消费三态语义零变化，
-            // 零写盘保证也零变化）。
-            self.show_notice(
-                "DOCX 页面视图为只读渲染，没有可保存的修改——编辑请先切换到文本视图（状态栏「切换到文本视图」）"
-                    .into(),
-                cx,
-            );
-            return SaveOutcome::Unmodified;
+        if let Some(owned) = docx_page_owned {
+            // #50 C3/C4：页面态保存改走 LOK 会话（saveAs 回源路径 +
+            // 修订号对账清 dirty——C1 时期的只读提示退役：编辑面已接）。
+            // 干净态短路（Unmodified——关闭/退出三态语义保持）；脏态发
+            // `request_save`（异步回执 SaveDone——对账后自动清 dirty +
+            // toast；本调用返回 Saved 表「保存已发起」——失败面经回执
+            // toast 显式示警，不静默不假绿）。
+            let dirty = self
+                .docx_pages
+                .as_ref()
+                .is_some_and(|(o, e)| *o == owned && e.read(cx).is_dirty());
+            if !dirty {
+                return SaveOutcome::Unmodified;
+            }
+            let sent = self
+                .docx_pages
+                .as_ref()
+                .map(|(_, e)| e.clone())
+                .map(|entity| entity.update(cx, |view, cx| view.request_save(cx)))
+                .unwrap_or(false);
+            if !sent {
+                self.show_notice("保存未发起——LOK 会话不可用（详见应用日志）".into(), cx);
+                return SaveOutcome::Unmodified;
+            }
+            self.show_notice("保存中（LOK 内核写盘——完成后自动提示）".into(), cx);
+            return SaveOutcome::Saved;
         }
         if is_pdf {
             let tab_path = self.tabs.get(idx).map(|tab| tab.path.clone());
@@ -2052,6 +2079,18 @@ impl ShellApp {
                     cx.reveal_path(&reveal);
                 }
             }
+            // #107 P1 批⑦：树面手动刷新（报告 P1① 后半——mtime 轮询
+            // 未立项前的手动面；工作区根整树重读——#595 光标路径重绑定
+            // 既有语义背书零新语义；无工作区时空操作）。
+            (MenuOrigin::FileTree, "ft-refresh") => {
+                if let Some(tree) = &self.workspace {
+                    let root = tree.read(cx).root().to_path_buf();
+                    tree.update(cx, |tree, cx| {
+                        tree.reload(&root);
+                        cx.notify();
+                    });
+                }
+            }
             (MenuOrigin::FileTree, "ft-open") => {
                 // 只对文件有效（菜单构建时目录项已灰显——防御面再验一道）。
                 if let Some(target) = target.filter(|p| !p.is_dir()) {
@@ -2285,6 +2324,34 @@ impl ShellApp {
         self.menu_bar_open = None;
         self.focus_active(window, cx);
         use menu_bar::MenuAction as Act;
+        // #50 C3（#176 翻新）：docx 页面态——剪贴板/Cmd 编辑动作分流到
+        // 页视图编辑通道（同键位域 dispatch_edit_key 一条链）。undo/
+        // redo/cut/copy/paste 页面已可编辑（PR #217 后置灰原因退役；
+        // 查找/替换/面板是编辑器浮层仍置灰——menu_bar 门控区分对待）。
+        if self.docx_page_view_active(cx) {
+            if let Some((_, entity)) = self.docx_pages.clone() {
+                let mut consumed = false;
+                entity.update(cx, |view, cx| {
+                    consumed = match action {
+                        Act::EditorCmd(crate::editor::commands::Cmd::Undo) => {
+                            view.dispatch_edit_key("z", true, false, window, cx);
+                            true
+                        }
+                        Act::EditorCmd(crate::editor::commands::Cmd::Redo) => {
+                            view.dispatch_edit_key("y", true, false, window, cx);
+                            true
+                        }
+                        Act::Cut => view.dispatch_edit_key("x", true, false, window, cx),
+                        Act::Copy => view.dispatch_edit_key("c", true, false, window, cx),
+                        Act::Paste => view.dispatch_edit_key("v", true, false, window, cx),
+                        _ => false,
+                    };
+                });
+                if consumed {
+                    return;
+                }
+            }
+        }
         match action {
             Act::EditorCmd(cmd) => self.dispatch_editor_cmd(cmd, window, cx),
             // 剪贴板三件：Cmd 枚举无剪贴板项——Editor 菜单方法（右键
@@ -2332,7 +2399,19 @@ impl ShellApp {
             // 与标题栏 × 钮同一条 cx.quit 既有路径（该路径不经
             // on_should_close 脏确认——× 钮现状同此，行为对齐不超范围
             // 修补；统一走脏确认建议另开 issue）。
-            Act::Quit => cx.quit(),
+            Act::Quit => {
+                // #114 批②：退出前窗口矩形先存（跨重启恢复——关窗
+                // 无条件先存语义的退出链面；非优雅退出不保，边界
+                // 如实——窗口 WM 摩擦场景下次启动回默认）。
+                let b = window.bounds();
+                crate::settings::save_window_bounds(
+                    b.origin.x.as_f32(),
+                    b.origin.y.as_f32(),
+                    b.size.width.as_f32(),
+                    b.size.height.as_f32(),
+                );
+                cx.quit();
+            }
             // 关于：既有提示横幅承载（层 3 可发现性验收项——版本信息
             // 面向用户可见）。
             Act::About => self.show_notice(
@@ -2422,6 +2501,8 @@ impl ShellApp {
                     self.tabs.len(),
                     self.active
                 );
+                // #114 批①：开标签落盘（会话恢复数据源）。
+                self.persist_session_tabs();
                 // F2：文件树高亮同步（工作区打开时）。
                 if let Some(tree) = &self.workspace {
                     tree.update(cx, |tree, cx| {
@@ -2468,6 +2549,62 @@ impl ShellApp {
     }
 
     /// F3：激活标签（点击标签 / 重复打开既有文件 / 循环切换落地）。
+    /// #114 批①：启动会话恢复（settings 读 → 逐路径 open_document_tab
+    /// 既有链——报告 D1 约束：不动 docx/pdf/xlsx 编辑器构造链）。
+    /// 上限 20（防炸开）；已删文件静默跳过（Q-IDE 同语义）+ 恢复
+    /// 证据行；激活标签末位恢复（索引越界钳到尾）。返回恢复数。
+    pub fn restore_session_tabs(&mut self, cx: &mut Context<Self>) -> usize {
+        let (paths, active) = crate::settings::load_session_tabs();
+        if paths.is_empty() {
+            return 0;
+        }
+        let mut restored = 0;
+        for path in paths.into_iter().take(20) {
+            if !path.is_file() {
+                eprintln!("session-restore: 已删跳过 {}", path.display());
+                continue;
+            }
+            if self.tabs.iter().any(|t| t.path == path) {
+                continue; // 启动初始标签去重（CLI 直开同文件）
+            }
+            if self.open_document_tab(path, cx).is_some() {
+                restored += 1;
+            }
+        }
+        // 激活恢复（存档索引越界/文件被跳 → 钳到有效尾）。
+        let idx = active.min(self.tabs.len().saturating_sub(1));
+        let _ = self.activate_tab_focus(idx, cx);
+        eprintln!("session-restore: 恢复 {restored} 标签（active {idx}）");
+        restored
+    }
+
+    /// #114 P1④：关窗先存统一面（on_window_should_close 钩内调用——
+    /// 窗口矩形（#230）+ 会话标签（批①）两键无条件落存；非优雅退出
+    /// 物理边界不保）。
+    pub(crate) fn persist_on_close(&self, window: &mut Window) {
+        let b = window.bounds();
+        crate::settings::save_window_bounds(
+            b.origin.x.as_f32(),
+            b.origin.y.as_f32(),
+            b.size.width.as_f32(),
+            b.size.height.as_f32(),
+        );
+        self.persist_session_tabs();
+    }
+
+    /// #114 P1④：关窗钩读面（main 钩内 shell.update 用——快照
+    /// 只读，不引 Context）。
+    pub(crate) fn tabs_paths_snapshot(&self) -> Vec<std::path::PathBuf> {
+        self.tabs.iter().map(|t| t.path.clone()).collect()
+    }
+
+    /// #114 批①：会话标签列表落盘（open/close/activate 三时机统一面
+    /// ——跨重启恢复的数据源；光标不恢复——Q-IDE 亦不立）。
+    fn persist_session_tabs(&self) {
+        let paths: Vec<std::path::PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        crate::settings::save_session_tabs(&paths, self.active);
+    }
+
     pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.activate_tab_focus(idx, cx) {
             window.focus(&focus, cx);
@@ -2478,6 +2615,8 @@ impl ShellApp {
     fn activate_tab_focus(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<FocusHandle> {
         let tab = self.tabs.get(idx)?.clone();
         self.active = idx;
+        // #114 批①：激活切换落盘（会话恢复——激活索引随变更即存）。
+        self.persist_session_tabs();
         // #571：激活编辑器变更 → 大纲面板换绑。
         self.sync_outline(cx);
         // #289-④：pdf 标签 → 页视图随标签落位（同路径复用，异路径重建）。
@@ -2634,6 +2773,8 @@ impl ShellApp {
             self.tabs.len(),
             self.active
         );
+        // #114 批①：关标签落盘（会话恢复——标签集即变更即存）。
+        self.persist_session_tabs();
         // #289-④：新活动标签若是 pdf → 页视图随标签重建。
         self.ensure_pdf_pages(cx);
         // #389 阶段 1：新活动标签若是 xlsx → 网格视图随标签重建。
@@ -9817,6 +9958,30 @@ mod settings_lifecycle_tests {
                 "折叠态 toggle_git：双置直达"
             );
         });
+    }
+
+    /// #114 P1④：关窗先存链——标签快照面 + settings session_tabs/
+    /// window_bounds 双键落盘一致性（钩注册面在 main——本测验证钩内
+    /// 落存调用的数据面：快照 = tabs 真实序）。
+    #[gpui::test]
+    fn close_persist_snapshot_matches_tabs(cx: &mut gpui::TestAppContext) {
+        let tmp = std::env::temp_dir().join(format!("mclose-persist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let file = tmp.join("sess-a.md");
+        std::fs::write(&file, "# 会话标签 A").unwrap();
+        let (shell, _window) = shell_window(cx);
+        // 快照只读面（关窗钩读——shell 实体直读）。
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tabs_paths_snapshot().len(), 0, "初始零标签快照");
+            assert_eq!(shell.active_index(), 0);
+        });
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #120（批②）验收 ④：开合态跨「重启」恢复——收起右栏/左栏 →

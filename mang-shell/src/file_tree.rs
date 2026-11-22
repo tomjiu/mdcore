@@ -139,6 +139,9 @@ pub struct TreeRow {
     /// 父目录路径 + `\u{1}` 后缀身份（永不与真实条目撞键——Q-IDE R11
     /// 同型）；不可点击/右键/光标落位/active——纯视觉占位。
     pub is_placeholder: bool,
+    /// #107 P1 批⑦：空目录占位行（「（空）」置灰——展开的目录清单
+    /// 为零时生成；点击/Enter 不可开——render_row 置灰口径）。
+    pub is_placeholder: bool,
 }
 
 /// 深度上限（DFS 双保险——符号链接/异常环防御）。
@@ -309,6 +312,22 @@ impl TreeState {
                 is_placeholder: false,
             });
             if expanded {
+                // #107 P1 批⑦：展开的空目录 → 占位行（「（空）」——新手
+                // 误判树损坏修复；Q-IDE explorer.rs:87-99 对照）。清单
+                // 为零才生成（空目录展开后行集不塌零）。
+                let child_entries = self.listings.get(&entry.path);
+                let is_empty = child_entries.is_some_and(|c| c.is_empty());
+                if is_empty {
+                    rows.push(TreeRow {
+                        path: entry.path.clone(),
+                        name: "（空）".to_string(),
+                        depth: depth + 1,
+                        is_dir: false,
+                        expanded: false,
+                        is_active: false,
+                        is_placeholder: true,
+                    });
+                }
                 let path = entry.path.clone();
                 self.push_children(&path, depth + 1, rows);
             }
@@ -617,6 +636,19 @@ impl FileTree {
         // 进入，焦点句柄返回后在监听器 window 域落焦——update_in 在派生
         // 上下文解析不到窗口，F7 实测）。
         .on_click(cx.listener(move |this, _, window, cx| {
+            // #107 P1 批⑦：占位行不可交互（空目录「（空）」——无 toggle/
+            // 打开语义；点击只落光标不进动作）。
+            if this
+                .state
+                .visible_rows()
+                .get(index)
+                .is_some_and(|r| r.is_placeholder)
+            {
+                this.selected = Some(index);
+                let tree_focus = this.tree_focus.clone();
+                tree_focus.focus(window, cx);
+                return;
+            }
             // #575：点击设光标 + 焦点落树根（键位域生效——单一模型）。
             this.selected = Some(index);
             let tree_focus = this.tree_focus.clone();
@@ -850,6 +882,28 @@ mod tests {
     }
 
     #[test]
+    /// #107 P1 批⑦：空目录展开显示「（空）」占位（行集含占位行——
+    /// 新手误判树损坏修复；先红面：展开空目录零行）。
+    #[test]
+    fn expanded_empty_dir_shows_placeholder_row() {
+        let tmp = std::env::temp_dir().join(format!("m107-empty-{}", std::process::id()));
+        // 根含一个空子目录（根非空；占位语义挂在「展开的空子目录」——
+        // TreeState::new 时根已展开，空根的展开态不经 toggle 路径）。
+        let empty_sub = tmp.join("空目录");
+        std::fs::create_dir_all(&empty_sub).unwrap();
+        let mut tree = TreeState::new(tmp.clone());
+        // 根已展开 → 行集 = 根 + 空子目录行；toggle 空子目录 → 占位。
+        tree.toggle(&empty_sub);
+        let rows = tree.visible_rows();
+        let placeholder = rows.iter().find(|r| r.is_placeholder);
+        assert!(
+            placeholder.is_some(),
+            "空目录展开应有占位行（实得 {} 行）",
+            rows.len()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     fn forget_subtree_drops_expansion_and_cache() {
         let dir = temp_fixture("forget");
         let mut tree = TreeState::new(dir.clone());
