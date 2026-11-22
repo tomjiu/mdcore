@@ -1082,6 +1082,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// shutdown 优雅退出标记（#50 收口批修）：dispatch 处理 shutdown op 时
+/// 置位；`handle_frame` 回 ok 帧后检查，走 `loop_exit` 语义退出——
+/// bye 终态帧必达（宿主 `Died` 终态数据源），对齐外杀/管道断路径。
+static SHUTDOWN_REQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 把 stdin 从 fd 0 上「偷走」：dup 到新 fd，fd 0 换成空设备。
 /// 返回接管协议流的文件句柄（失败时退回普通 stdin——LO 未抢时不影响）。
 ///
@@ -1697,6 +1702,12 @@ fn handle_frame(ctx: &mut LoopCtx, frame: Vec<u8>) {
     if ctx.tx.send(ToWriter::Frame(frame)).is_err() {
         hard_exit(4);
     }
+    // shutdown 优雅退出（#50 收口批修）：ok/err 帧已回宿主，
+    // 随后走 loop_exit——bye 终态帧 + Quit + 硬退（与 stdin-eof 路径
+    // 同一退出序列，宿主 request 收到应答、事件通道收到 bye）。
+    if SHUTDOWN_REQ.load(std::sync::atomic::Ordering::SeqCst) {
+        loop_exit(ctx, 0, "shutdown-request");
+    }
 }
 
 /// 主循环退出（runLoop 返回 / 对端关闭 / reader 消失）：关文档 + bye +
@@ -1916,9 +1927,16 @@ fn dispatch(state: &mut WorkerState, op: &str, v: &Value) -> DispatchResult {
             state.op_export_pdf(&url, from, to, notes, changes)
         }
         "shutdown" => {
+            // 优雅关闭契约（#50 收口批修）：关文档，回 ok 帧（主循环
+            // 1692 行面统一回帧），**退出走 loop_exit 语义**——bye 终态帧
+            // + Quit + 硬退。原实现直接 hard_exit(0) 绕过 bye 发射：
+            // 产品层 `docx_lok_session` 会话线程靠 `Event::Life{kind:"bye"}`
+            // → `SessionReply::Died` 驱动宿主终态（close/dirty prompt 链
+            // 的会话层地基），优雅 shutdown 却收不到终态帧——只有外杀/
+            // 管道断路径发 bye。标记位交主循环退出（见 SHUTDOWN_REQ）。
             let _ = state.op_close();
-            let _ = std::io::stdout().flush();
-            hard_exit(0);
+            SHUTDOWN_REQ.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"closed": true}))
         }
         _ => Err((codes::BAD_REQUEST, format!("未知 op：{op}"))),
     }

@@ -117,8 +117,7 @@ pub struct MenuContext {
 /// 跟踪，留在代码注释里）。
 /// 编辑类（撤销/重做/剪切/复制/粘贴/替换）——read_only 灰显本就在，
 /// 页面态补原因说明。
-pub const REASON_PAGE_EDIT: &str =
-    "页面视图为只读渲染——切换到文本视图后可编辑（状态栏「切换到文本视图」）";
+pub const REASON_PAGE_EDIT: &str = "页面视图尚未就绪（LOK 会话建立后可编辑）——稍候或切换到文本视图";
 /// 查找/替换（编辑器浮层——页面态编辑器不在树内，开了也看不见）。
 pub const REASON_PAGE_FIND: &str = "页面视图暂不支持查找/替换——切换到文本视图后使用";
 /// 命令面板（编辑器浮层，同上）。
@@ -356,34 +355,37 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                     // #176 Lead 补齐：菜单禁用以**当前显示面**为准——
                     // 页面态下文本编辑器不在树内（其 read_only/选区不可
                     // 作为页面态可用性判据），作用于 Editor 的动作一律
-                    // 禁用 + 原因（不进死路）。
-                    .with_enabled(writable && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态可编辑已接——shell
+                    // activate_menu_action 分流到 dispatch_edit_key（与
+                    // 键位域同一条链）。undo/redo/cut/copy/paste 页面态
+                    // 启用；就绪卫在 dispatch 内（未就绪零动作不假绿）。
+                    .with_enabled(writable || ctx.docx_page_view),
                 // dispatch_key 的 redo 实际绑定是 Ctrl+Shift+Z（z if
                 // ctrl && shift 臂）与 Ctrl+Y 双臂——标签取前者。
                 MenuEntry::item("edit-redo", "重做")
                     .shortcut_for("redo")
                     .act(MenuAction::EditorCmd(Cmd::Redo))
-                    .with_enabled(writable && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // 同 undo（#50 C3 翻新——页面态启用）。
+                    .with_enabled(writable || ctx.docx_page_view),
                 MenuEntry::Separator,
                 MenuEntry::item("edit-cut", "剪切")
                     .shortcut_for("cut")
                     .act(MenuAction::Cut)
-                    .with_enabled(writable && ctx.has_selection && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态 cut 走 LOK（TextOf 读
+                    // 选区 + Cut——选区有无内核裁决，无选区零效果非死路）。
+                    .with_enabled((writable && ctx.has_selection) || ctx.docx_page_view),
                 MenuEntry::item("edit-copy", "复制")
                     .shortcut_for("copy")
                     .act(MenuAction::Copy)
-                    // 复制同判（Lead 复验：页面态隐藏选区不得启用
-                    // copy——选区判定不可跨显示面）。
-                    .with_enabled(doc && ctx.has_selection && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态 copy 走 LOK TextOf +
+                    // 剪贴板写（无选区 = 写空串，内核裁决）。
+                    .with_enabled((doc && ctx.has_selection) || ctx.docx_page_view),
                 MenuEntry::item("edit-paste", "粘贴")
                     .shortcut_for("paste")
                     .act(MenuAction::Paste)
-                    .with_enabled(writable && !ctx.docx_page_view)
-                    .with_page_reason(ctx, REASON_PAGE_EDIT),
+                    // #50 C3（#176 翻新）：页面态 paste 走剪贴板读 +
+                    // type_text（空剪贴板零效果）。
+                    .with_enabled(writable || ctx.docx_page_view),
                 MenuEntry::Separator,
                 // #176：查找/替换/命令面板是编辑器浮层——页面态编辑器
                 // 不在树内，点了也不可见；置灰 + 原因（不进死路）。
@@ -790,7 +792,9 @@ mod tests {
         ctx.docx_page_view = true;
         let menus = build_menus(&ctx);
 
-        // 编辑类：本就 read_only 灰显，页面态补原因说明。
+        // #50 C3（#176 翻新）：编辑类页面态**启用**——shell
+        // activate_menu_action 分流到 dispatch_edit_key（LOK 真实
+        // 派发；就绪卫在 dispatch 内——read_only 快照不跨显示面生效）。
         for id in [
             "edit-undo",
             "edit-redo",
@@ -799,12 +803,8 @@ mod tests {
             "edit-paste",
         ] {
             let spec = find(&menus[1].entries, id).unwrap_or_else(|| panic!("{id} 缺失"));
-            assert!(!spec.enabled, "页面态 {id} 应灰显");
-            assert_eq!(
-                spec.disabled_reason,
-                Some(REASON_PAGE_EDIT),
-                "页面态 {id} 灰显须带原因（不静默）"
-            );
+            assert!(spec.enabled, "页面态 {id} 应启用（LOK 编辑通道已接）");
+            assert_eq!(spec.disabled_reason, None, "页面态 {id} 启用不挂禁用原因");
         }
 
         // 编辑器浮层类（查找/替换/命令面板）：页面态编辑器不在树内，
@@ -892,8 +892,10 @@ mod tests {
         ctx.docx_page_view = true;
         let menus = build_menus(&ctx);
 
-        // Lead 反例五项：撤销/重做/剪切/复制/粘贴——修前 undo/redo/
-        // paste 为 (true, None)（无禁用原因的启用态——真实缺陷形态）。
+        // #50 C3（#176 翻新）：Lead 反例五项的「正确行为」随产品
+        // 前进重钉——页面可编辑已接（PR #217 编辑面 + shell 分流），
+        // 撤销/重做/剪切/复制/粘贴页面态**启用**（hidden Editor 的
+        // read_only/选区不再跨显示面禁用——LOK 通道裁决真实可用性）。
         for id in [
             "edit-undo",
             "edit-redo",
@@ -903,13 +905,12 @@ mod tests {
         ] {
             let spec = find(&menus[1].entries, id).unwrap_or_else(|| panic!("{id} 缺失"));
             assert!(
-                !spec.enabled,
-                "可编辑 docx 页面态 {id} 必须禁用（以当前显示面为准）"
+                spec.enabled,
+                "可编辑 docx 页面态 {id} 应启用（LOK 编辑通道已接——#176 置灰退役）"
             );
             assert_eq!(
-                spec.disabled_reason,
-                Some(REASON_PAGE_EDIT),
-                "可编辑 docx 页面态 {id} 禁用须带原因（不静默）"
+                spec.disabled_reason, None,
+                "可编辑 docx 页面态 {id} 启用不挂禁用原因"
             );
         }
         // 对照组：shell 级动作不受影响（保存/另存为/导出/退出）。

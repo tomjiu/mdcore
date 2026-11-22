@@ -491,6 +491,21 @@ impl WorkerClient {
         }
     }
 
+    /// 收割已死的子进程（#50 收口批修：优雅退出路径的僵尸规避）。
+    ///
+    /// worker 自退（shutdown op → loop_exit → hard_exit）时宿主侧死亡
+    /// 由读线程 EOF → `mark_dead` 判定——但**没人 wait 子进程**：进程
+    /// 退出后成僵尸（Z 态占 pid 表，`kill(pid,0)` 恒 0），pid 活性断言
+    /// 与孤儿检测全部失真。`kill()` 内的 `child.wait()` 只覆盖强杀路径。
+    /// 本方法非阻塞收割（`try_wait`）：已死则收，未死不动。
+    pub fn reap(&self) {
+        if self.is_dead() {
+            if let Ok(mut child) = self.child.lock() {
+                let _ = child.try_wait();
+            }
+        }
+    }
+
     fn fail_all_pending(&self) {
         if let Ok(mut p) = self.pending.lock() {
             let map: HashMap<u64, Sender<Value>> = std::mem::take(&mut *p);
@@ -1136,11 +1151,36 @@ impl DocSession {
         self.client.request("close", json!({}))
     }
 
-    /// 结束会话：close + kill（SIGKILL 兜底；跳过 LO atexit——
-    /// `SfxBaseModel` teardown abort 规避，产物只认 saveAs 落盘）。
+    /// 结束会话：**优雅 shutdown 协议**（#50 收口批修）+ kill 兜底。
+    ///
+    /// 原实现 = `close` + 立即 `kill()`（SIGKILL）——绕过 worker 的
+    /// 优雅退出链：**bye 终态帧永远不达**。产品层 `docx_lok_session`
+    /// 会话线程消费 `Event::Life{kind:"bye"}` → `SessionReply::Died`
+    /// 驱动宿主终态（close/dirty prompt 链的会话层地基），粗暴 kill
+    /// 路径下宿主只能靠 `is_dead` 轮询发现死亡，收不到正常终态。
+    ///
+    /// 现语义：发 `shutdown` op → worker 回 ok 帧后走 `loop_exit`
+    /// （bye 帧 + Quit + 硬退，对齐 stdin-eof 路径）→ 宿主读线程 EOF →
+    /// `mark_dead` → `is_dead`。等优雅完成（上限 2s：worker 退出链
+    /// sleep 200ms + 写线程 flush，余量足够）；超时 → SIGKILL 兜底
+    /// （LO atexit abort 规避不变——产物只认 saveAs 落盘）。
     pub fn shutdown(self) {
-        let _ = self.close();
-        self.client.kill();
+        if !self.client.is_dead() {
+            let _ = self
+                .client
+                .request_with_timeout("shutdown", json!({}), Duration::from_secs(2));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !self.client.is_dead() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        if !self.client.is_dead() {
+            self.client.kill();
+        }
+        // 收割（#50 收口批修）：优雅路径 worker 自退后无人 wait → 僵尸
+        // 占 pid（kill(pid,0) 恒 0）——孤儿检测/pid 活性断言失真。非阻塞
+        // try_wait（kill 路径内部已 wait，此处幂等无害）。
+        self.client.reap();
     }
 }
 

@@ -164,6 +164,13 @@ pub(crate) trait TileSession: Send {
     fn edit_save_as(&mut self, _seq: u64, _url: &str, _format: &str) -> bool {
         false
     }
+    /// #50 C5：页几何查询（`getPartPageRectangles`——跳页/翻页 tile 的
+    /// 页矩形坐标源；默认未接线返回 false，mock 未实现时调用面如实
+    /// 「不可跳页」不假绿。真链消费 = real_chain_c5_matrix_parity；
+    /// 产品翻页呈现接后续批次）。
+    fn edit_page_geometry(&mut self, _seq: u64) -> bool {
+        false
+    }
     /// #179 三分收回执：`Reply` / `Empty` / `Disconnected`——通道
     /// 断开与暂时无消息分流（旧 `try_recv` 同貌 None——会话线程无终态
     /// 回执退出时视图永挂，无从诊断）。默认实现 = `try_recv` 的
@@ -195,6 +202,14 @@ impl TileSession for DocxLokSession {
     /// 语义由会话线程内部承担，宿主传 OS 路径）。
     fn edit_save_as(&mut self, seq: u64, url: &str, format: &str) -> bool {
         self.request_save_as(seq, url, format);
+        true
+    }
+    /// #50 C5：页几何转发（真链通道——C5 表格跨页样本已实证必需：
+    /// 页矩形是跳页 tile 的唯一正确坐标锚）。
+    fn edit_page_geometry(&mut self, _seq: u64) -> bool {
+        // 自分 seq（request_page_geometry 无参形态——trait 臂收 _seq
+        // 只为签名对齐；回执 PageGeometry{seq} 由调用面 drain 对账）。
+        self.request_page_geometry();
         true
     }
     fn request_tile(
@@ -443,6 +458,18 @@ impl DocxPagesView {
     /// 启动状态读数（壳层/测试面）。
     pub fn boot(&self) -> &Boot {
         &self.boot
+    }
+
+    /// 测试辅助：preedit 域读出（IME 测试断言面）。
+    #[cfg(test)]
+    pub(crate) fn preedit_for_test(&self) -> String {
+        self.preedit.clone()
+    }
+
+    /// 测试辅助：编辑/保存在途命令数（终态出清断言面）。
+    #[cfg(test)]
+    pub(crate) fn edit_pending_len_for_test(&self) -> usize {
+        self.edit_pending.len()
     }
 
     /// #50 C3/C4：真实脏位（`EditDone{ok,dirty}` 回执置位；`SaveDone`
@@ -975,6 +1002,10 @@ impl DocxPagesView {
                     self.session = None;
                     self.pending.clear();
                     self.attempts.clear();
+                    // #50 C3：编辑/保存回执通道同亡——在途命令出清
+                    //（终态后 EditDone/TextDone/SaveDone 永不再来，「在途」
+                    // 永挂会让保存发起面误判进行中）。
+                    self.edit_pending.clear();
                     self.boot = Boot::Failed { stage, message };
                     cx.notify();
                 }
@@ -984,11 +1015,19 @@ impl DocxPagesView {
                     self.session = None;
                     self.pending.clear();
                     self.attempts.clear();
+                    // 同上（Failed 分支注释）。
+                    self.edit_pending.clear();
                     self.boot = Boot::Failed {
                         stage: "died",
                         message: detail,
                     };
                     cx.notify();
+                }
+                SessionReply::PageGeometry { seq: _, pages: _ } => {
+                    // #50 C5：页几何回执（跳页坐标源）。本批消费者 =
+                    // 测试真链（real_chain_c5_matrix_parity）；产品
+                    // docx_pages 翻页呈现接后续批次（数据面已通——此
+                    // 处显式分支不静默吞，防将来误当未知回执报警）。
                 }
                 SessionReply::Tile {
                     seq,
@@ -1837,16 +1876,42 @@ impl gpui::EntityInputHandler for DocxPagesView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 提交/替换：preedit 域内改写（range = preedit 的 utf16 子段）。
-        match range {
+        // #50 C3 修正（编辑器 EntityInputHandler 同构语义）：提交 =
+        // 覆写替换 + **立即下发内核**。两形态：
+        // - `Some(range)`：preedit 域内子段替换（拉丁快速键入的裸插入
+        //   兜底——不经 marked 的直接文本）；
+        // - `None`：Windows IME 提交/取消形态——替换整个 marked 域
+        //   （取消 = 空串替换，语义自然正确）。
+        // 提交后清 preedit（`marked = None` 同构）——组合串出清、浮层
+        // 消失、光标域归零。
+        let replacement = match range {
             Some(r) => {
                 let start = utf16_to_char_idx(&self.preedit, r.start);
                 let end = utf16_to_char_idx(&self.preedit, r.end);
                 self.preedit.replace_range(start..end, text);
+                text.to_owned()
             }
-            None => self.preedit.push_str(text),
+            None => {
+                // 提交形态：text 即定稿全文。**取消（空串）= 出清组合
+                // 串 + 零命令**（取消不是编辑——无替换、无 dirty）；非空
+                // = 定稿新串（旧组合串出清弃用，以提交串为准）。
+                let _ = std::mem::take(&mut self.preedit);
+                text.to_owned()
+            }
+        };
+        // 定稿非空 → type_text 下发内核（逐字符 post_key——契约 §10
+        // 产品 IME 通道；取消（空串）零命令）。就绪卫内含（未就绪
+        // accepts_text_input=false，平台不会派发到此处——防御位仍查）。
+        if !replacement.is_empty() && matches!(self.boot, Boot::Ready) {
+            if self.session.is_some() {
+                self.send_edit(
+                    EditKind::Type,
+                    |session, seq| session.edit_type_text(seq, &replacement),
+                    cx,
+                );
+            }
         }
-        self.preedit_commit_if_standalone(cx);
+        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
@@ -1890,12 +1955,12 @@ impl gpui::EntityInputHandler for DocxPagesView {
 }
 
 impl DocxPagesView {
-    /// preedit 提交守卫（无 marked 状态的裸文本插入 = 普通键入语义——
-    /// 键盘字符通道走 `dispatch_edit_key`，此处仅在「文本不带 preedit
-    /// 域」时直接下发（拉丁快速键入不经 IME 标记的场景兜底）。
+    /// #50 C3 IME 提交通道说明（供后续批次读码）：提交语义已并入
+    /// [`Self::replace_text_in_range`]（编辑器 EntityInputHandler
+    /// 同构：替换 + `preedit` 出清 + 定稿 `type_text` 下发——本方法
+    /// 保留为文档锚点，不再承担提交判定（marked_text_range/unmark
+    /// 组合时序已由平台协议保证）。
     fn preedit_commit_if_standalone(&mut self, cx: &mut Context<Self>) {
-        // 当前实现：IME 提交统一经 marked_text_range 判定提交时序
-        //（unmark/replace 组合）——本钩子仅保底，无操作不误发。
         let _ = cx;
     }
 }
@@ -3886,6 +3951,114 @@ mod tests {
                 !matches!(v.boot, Boot::Ready),
                 "未就绪态（boot 卫同判据——键面同 false）"
             );
+        });
+    }
+
+    /// #50 C3 修正：IME 全链——mark 组合（preedit 宿主域）→ None 提交
+    /// （出清 + type_text 下发）→ EditDone 置 dirty。修前病灶：提交
+    /// 文本只堆 preedit 字符串、永不到内核——本测试钉死。
+    #[gpui::test]
+    fn ime_mark_commit_lands_in_kernel(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 组合：replace_and_mark（「中文」进 preedit——不下发）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    v, None, "中文", None, window, cx,
+                );
+            });
+        });
+        view.read_with(cx, |v, _| assert_eq!(v.preedit_for_test(), "中文"));
+        assert!(
+            mock.edits.lock().unwrap().is_empty(),
+            "组合期零命令（preedit 宿主渲染——契约 §10）"
+        );
+        // 提交：replace_text_in_range(None, 定稿)。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(v, None, "中文", window, cx);
+            });
+        });
+        view.read_with(cx, |v, _| {
+            assert!(
+                v.preedit_for_test().is_empty(),
+                "提交后 preedit 出清（浮层消失）"
+            );
+        });
+        assert_eq!(
+            mock.edits.lock().unwrap()[0],
+            "type:中文",
+            "提交定稿经 type_text 下发内核（修前永不到内核的病灶）"
+        );
+        // EditDone 回执 → dirty。
+        let seq = next_edit_seq_for_test();
+        mock.push_edit_done(seq - 1, true, true, 1);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| assert!(v.is_dirty()));
+    }
+
+    /// #50 C3 修正：IME 取消（None + 空串）——出清 preedit、零命令
+    /// （取消不是编辑：无选区替换、无 dirty 置位）。
+    #[gpui::test]
+    fn ime_cancel_clears_preedit_without_commands(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                    v, None, "组合", None, window, cx,
+                );
+            });
+        });
+        // 取消（Windows IME 协议形态：range=None + 空串）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(v, None, "", window, cx);
+            });
+        });
+        view.read_with(cx, |v, _| {
+            assert!(v.preedit_for_test().is_empty(), "取消出清组合串");
+        });
+        assert!(
+            mock.edits.lock().unwrap().is_empty(),
+            "取消零命令（不 type_text 不置 dirty）"
+        );
+        view.read_with(cx, |v, _| assert!(!v.is_dirty()));
+    }
+
+    /// #50 C3 终态清理：Died 回执 → edit_pending 出清（在途命令面
+    /// 归零——保存/编辑「进行中」误判根除）+ 后续键入零 panic。
+    #[gpui::test]
+    fn session_died_clears_edit_pending(cx: &mut gpui::TestAppContext) {
+        let (view, mock, mut visual) = edit_ready_view(cx);
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        // 编辑在途（命令已发、回执未回）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.dispatch_edit_key("a", false, false, window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.edit_pending_len_for_test()), 1);
+        // worker 死亡终态（会话通道回执）。
+        mock.replies.lock().unwrap().push_back(SessionReply::Died {
+            detail: "mock 死亡".into(),
+        });
+        view.update(cx, |v, cx| v.drain_for_test(cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.edit_pending_len_for_test(),
+                0,
+                "终态出清在途编辑命令（回执永不再来）"
+            );
+            assert!(matches!(v.boot, Boot::Failed { .. }), "终态落 Failed 呈现");
+            assert!(!v.is_dirty(), "未确认的编辑不虚报脏位");
+        });
+        // 死后键入：就绪卫拒收（不 panic、不假绿）。
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                assert!(!v.dispatch_edit_key("a", false, false, window, cx));
+            });
         });
     }
 
