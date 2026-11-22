@@ -2102,6 +2102,15 @@ impl ShellApp {
                     cx.reveal_path(&reveal);
                 }
             }
+            // #107 P2：复制路径（右键目标绝对路径 → 系统剪贴板——
+            // form_input.rs 剪贴板先例同型；无目标空操作）。
+            (MenuOrigin::FileTree, "ft-copy-path") => {
+                if let Some(target) = target {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                        target.display().to_string(),
+                    ));
+                }
+            }
             // #107 P1 批⑦：树面手动刷新（报告 P1① 后半——mtime 轮询
             // 未立项前的手动面；工作区根整树重读——#595 光标路径重绑定
             // 既有语义背书零新语义；无工作区时空操作）。

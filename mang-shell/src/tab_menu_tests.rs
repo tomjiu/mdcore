@@ -737,3 +737,34 @@ fn tab_menu_late_dismiss_cannot_close_replacement(cx: &mut gpui::TestAppContext)
     });
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// #107 P2：树面「复制路径」（ft-copy-path——右键目标绝对路径进系统
+/// 剪贴板；tab 菜单早有同能力（「复制路径」——本测试对树面补齐对拍）。
+/// 先红面：ft-copy-path 未接线时菜单项不存在 → 点不到 → 剪贴板为空。
+#[gpui::test]
+fn file_tree_menu_copy_path_to_clipboard(cx: &mut gpui::TestAppContext) {
+    let (shell, window, dir) = setup(cx, "ft-copy");
+    std::fs::write(dir.join("note.md"), "x").unwrap();
+    window
+        .update(cx, |_, window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_file_tree_context_menu(
+                    gpui::point(px(10.), px(70.)),
+                    dir.join("note.md"),
+                    false,
+                    window,
+                    cx,
+                );
+                shell.activate_context_menu_item("ft-copy-path", window, cx);
+            });
+        })
+        .unwrap();
+    cx.update(|app| {
+        assert_eq!(
+            app.read_from_clipboard().unwrap().text(),
+            Some(dir.join("note.md").display().to_string()),
+            "剪贴板应含右键目标绝对路径"
+        );
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
