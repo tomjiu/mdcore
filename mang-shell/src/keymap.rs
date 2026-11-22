@@ -356,6 +356,12 @@ pub enum EditorAction {
     CopyLine,
     /// #111 P2 批⑦：删除行。
     DeleteLine,
+    /// #111 P2 续批②：选区转大写。
+    UpperCaseSelection,
+    /// #111 P2 续批②：选区转小写。
+    LowerCaseSelection,
+    /// #111 P2 续批②：选区词首大写。
+    TitleCaseSelection,
     /// #111 D1：Alt+↓ 行移动下移。
     MoveLineDown,
     /// 跳行框开启（原 Ctrl+G 前置分支；`goto.is_none()` 条件在执行层）。
@@ -491,6 +497,9 @@ impl EditorAction {
             EditorAction::MoveLineUp => "move_line_up",
             EditorAction::CopyLine => "copy_line",
             EditorAction::DeleteLine => "delete_line",
+            EditorAction::UpperCaseSelection => "upper_case_selection",
+            EditorAction::LowerCaseSelection => "lower_case_selection",
+            EditorAction::TitleCaseSelection => "title_case_selection",
             EditorAction::MoveLineDown => "move_line_down",
             EditorAction::MoveKey(MoveDir::Left) => "move_left",
             EditorAction::MoveKey(MoveDir::Right) => "move_right",
@@ -581,7 +590,11 @@ impl EditorAction {
             | EditorAction::MoveLineUp
             | EditorAction::CopyLine
             | EditorAction::DeleteLine
-            | EditorAction::MoveLineDown => false,
+            | EditorAction::MoveLineDown
+            // #111 P2 续批②：选区大小写转换是编辑事务——只读态拒。
+            | EditorAction::UpperCaseSelection
+            | EditorAction::LowerCaseSelection
+            | EditorAction::TitleCaseSelection => false,
         }
     }
 }
@@ -798,6 +811,22 @@ fn default_editor_main() -> Vec<Entry> {
         e(
             Binding::Single(KeyPattern::key("k").with(Yes, Yes, No)),
             A::DeleteLine,
+        ),
+        // #111 P2 续批②：选区大小写转换（Ctrl+Shift+U/L——VS Code
+        // 转大写同键位；T 档词首大写）。
+        e(
+            Binding::Single(KeyPattern::key("u").with(Yes, Yes, No)),
+            A::UpperCaseSelection,
+        ),
+        e(
+            Binding::Single(KeyPattern::key("j").with(Yes, Yes, No)),
+            A::LowerCaseSelection,
+        ),
+        // Title 档：Ctrl+Shift+T 已被 shell 域 ReopenClosedTab 占用
+        // （默认表歧义守卫拦截）——改挂 Alt+Shift+T。
+        e(
+            Binding::Single(KeyPattern::key("t").with(No, Yes, Yes)),
+            A::TitleCaseSelection,
         ),
         e(
             Binding::Single(KeyPattern::key("up").with(No, No, Yes)),
@@ -1841,6 +1870,10 @@ mod tests {
     #[test]
     fn alt_up_down_hit_line_move() {
         editor_hit("up", false, false, true, EditorAction::MoveLineUp);
+        // #111 P2 续批②：选区大小写转换键位（Ctrl+Shift+U/L/T）。
+        editor_hit("u", true, true, false, EditorAction::UpperCaseSelection);
+        editor_hit("j", true, true, false, EditorAction::LowerCaseSelection);
+        editor_hit("t", false, true, true, EditorAction::TitleCaseSelection);
         editor_hit("down", false, false, true, EditorAction::MoveLineDown);
         // 修饰精确性：ctrl+alt+up 不应命中（Any/Yes 约束数——精确者胜，
         // 3 修饰键 = 纯 Alt↑ 条目 ctrl=Any 不匹配 ctrl=Yes 查询……
