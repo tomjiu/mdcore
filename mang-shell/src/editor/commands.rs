@@ -24,6 +24,12 @@ pub enum Cmd {
     CopyLine,
     /// #111 P2 批⑦：删除行（整块含换行——单行文档拒删）。
     DeleteLine,
+    /// #111 P2 续批②：选区转大写。
+    UpperCaseSelection,
+    /// #111 P2 续批②：选区转小写。
+    LowerCaseSelection,
+    /// #111 P2 续批②：选区词首大写（Title Case）。
+    TitleCaseSelection,
     /// #111 D1：行移动下移（Alt+↓）。
     MoveLineDown,
     WordLeft,
@@ -85,6 +91,9 @@ impl Cmd {
         Cmd::Undo,
         Cmd::CopyLine,
         Cmd::DeleteLine,
+        Cmd::UpperCaseSelection,
+        Cmd::LowerCaseSelection,
+        Cmd::TitleCaseSelection,
         Cmd::Redo,
     ];
 
@@ -94,6 +103,7 @@ impl Cmd {
     const NAMES: &[&str] = &[
         "MoveLeft", "MoveRight", "MoveUp", "MoveDown",
         "MoveLineUp", "CopyLine", "DeleteLine", "MoveLineDown",
+        "UpperCaseSelection", "LowerCaseSelection", "TitleCaseSelection",
         "WordLeft", "WordRight", "MoveHome", "MoveEnd",
         "DocStart", "DocEnd",
         "ToggleFold", "FoldCurrent", "UnfoldCurrent", "FoldAll", "UnfoldAll",
@@ -112,6 +122,9 @@ impl Cmd {
             Cmd::MoveLineUp => "move_line_up",
             Cmd::CopyLine => "copy_line",
             Cmd::DeleteLine => "delete_line",
+            Cmd::UpperCaseSelection => "upper_case_selection",
+            Cmd::LowerCaseSelection => "lower_case_selection",
+            Cmd::TitleCaseSelection => "title_case_selection",
             Cmd::MoveLineDown => "move_line_down",
             Cmd::WordLeft => "word_left",
             Cmd::WordRight => "word_right",
@@ -152,6 +165,10 @@ impl Cmd {
             Cmd::MoveLineUp => "行移动：上（Alt+↑）",
             Cmd::CopyLine => "复制行（Ctrl+Shift+D）",
             Cmd::DeleteLine => "删除行（Ctrl+Shift+K）",
+            // #111 P2 续批②：选区大小写转换（编辑类——只读态 exec 侧拒）。
+            Cmd::UpperCaseSelection => "选区转大写（Ctrl+Shift+U）",
+            Cmd::LowerCaseSelection => "选区转小写（Ctrl+Shift+J）",
+            Cmd::TitleCaseSelection => "选区词首大写（Alt+Shift+T）",
             Cmd::MoveLineDown => "行移动：下（Alt+↓）",
             Cmd::WordLeft => "词跳：左",
             Cmd::WordRight => "词跳：右",
@@ -187,6 +204,9 @@ impl Cmd {
             Cmd::MoveLineUp => Some("Alt+↑"),
             Cmd::CopyLine => Some("Ctrl+Shift+D"),
             Cmd::DeleteLine => Some("Ctrl+Shift+K"),
+            Cmd::UpperCaseSelection => Some("Ctrl+Shift+U"),
+            Cmd::LowerCaseSelection => Some("Ctrl+Shift+J"),
+            Cmd::TitleCaseSelection => Some("Alt+Shift+T"),
             Cmd::MoveLineDown => Some("Alt+↓"),
             Cmd::WordLeft => Some("Ctrl+←"),
             Cmd::WordRight => Some("Ctrl+→"),

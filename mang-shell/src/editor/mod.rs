@@ -444,6 +444,14 @@ impl FormatKind {
 }
 
 /// 文档编辑器视图（md 源文本编辑；docx/pdf 只读面后续批接线）。
+/// #111 P2 续批②：大小写转换模式（选区命令参数面）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CaseMode {
+    Upper,
+    Lower,
+    Title,
+}
+
 pub struct Editor {
     buffer: Buffer,
     file_path: Option<PathBuf>,
@@ -1783,6 +1791,25 @@ impl Editor {
             Cmd::DeleteLine => {
                 self.delete_line();
             }
+            // #111 P2 续批②：选区大小写转换（面板/RPC 通道；只读拒）。
+            Cmd::UpperCaseSelection => {
+                if self.transform_selection_case(CaseMode::Upper) {
+                    self.after_edit();
+                    cx.notify();
+                }
+            }
+            Cmd::LowerCaseSelection => {
+                if self.transform_selection_case(CaseMode::Lower) {
+                    self.after_edit();
+                    cx.notify();
+                }
+            }
+            Cmd::TitleCaseSelection => {
+                if self.transform_selection_case(CaseMode::Title) {
+                    self.after_edit();
+                    cx.notify();
+                }
+            }
             Cmd::MoveLineUp => {
                 if self.read_only {
                     return;
@@ -2999,6 +3026,25 @@ impl Editor {
                         cx.notify();
                     }
                 }
+                // #111 P2 续批②：选区大小写转换（键位通道 Ctrl+Shift+U/L/T）。
+                EditorAction::UpperCaseSelection => {
+                    if self.transform_selection_case(CaseMode::Upper) {
+                        self.after_edit();
+                        cx.notify();
+                    }
+                }
+                EditorAction::LowerCaseSelection => {
+                    if self.transform_selection_case(CaseMode::Lower) {
+                        self.after_edit();
+                        cx.notify();
+                    }
+                }
+                EditorAction::TitleCaseSelection => {
+                    if self.transform_selection_case(CaseMode::Title) {
+                        self.after_edit();
+                        cx.notify();
+                    }
+                }
                 EditorAction::MoveLineDown => {
                     if self.read_only {
                         return;
@@ -3371,6 +3417,61 @@ impl Editor {
     /// 围栏/跨语言混批拒绝执行——语义混乱防御，与 indent 的单位语义
     /// 同一纪律）；md 正文（围栏外）本批不覆盖（D2 决策点待 Lead 裁
     /// 块注释形态）。
+    /// #111 P2 续批②：选区大小写转换（Upper/Lower/Title——报告 §3
+    /// P2「两方皆无」超越项）。选区文本整体变换后替换回原位
+    /// （replace_batch 一条历史）；无选区 no-op；CJK 无大小写变换
+    /// 恒等（to_uppercase/to_lowercase 天然不动的 Unicode 语义）。
+    /// Title Case = 每个词（字母数字串）首字符大写、余小写。
+    fn transform_selection_case(&mut self, mode: CaseMode) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(range) = self.buffer.selection() else {
+            return false; // 无选区 no-op（与 copy_line 裸光标语义不同——本命令必选区）
+        };
+        let text = self.buffer.range_text(&range);
+        let transformed = match mode {
+            CaseMode::Upper => text.to_uppercase(),
+            CaseMode::Lower => text.to_lowercase(),
+            CaseMode::Title => {
+                // 词首大写：字母数字序列的首字符大写、其余小写（分词
+                // 边界 = 非字母数字；CJK 不属词字符保持原样）。
+                let mut out = String::with_capacity(text.len());
+                let mut at_word_start = true;
+                for ch in text.chars() {
+                    if ch.is_alphanumeric() {
+                        if at_word_start {
+                            // char::to_uppercase 迭代器（罕见多 char 大写）。
+                            for u in ch.to_uppercase() {
+                                out.push(u);
+                            }
+                        } else {
+                            for l in ch.to_lowercase() {
+                                out.push(l);
+                            }
+                        }
+                        at_word_start = false;
+                    } else {
+                        out.push(ch);
+                        at_word_start = true;
+                    }
+                }
+                out
+            }
+        };
+        if transformed == text {
+            return false; // 恒等（纯 CJK/数字选区）不改历史
+        }
+        let edits = vec![(range.start, range.end, transformed)];
+        let ok = self.buffer.replace_batch(edits) > 0;
+        if ok {
+            // 选区保持（变换前后字符数可能变——多 char 大写如 ß→SS；
+            // 选区端点按编辑后语义自然收缩/扩展，光标留在选区末端）。
+            self.sync_cursors_from_buffer();
+        }
+        ok
+    }
+
     fn toggle_comment(&mut self) {
         // ① 行集收集（indent_key 同型——选区跨行展开 + 裸光标所在行）。
         let mut lines: Vec<usize> = Vec::new();
@@ -6144,6 +6245,58 @@ mod tests {
             e.set_soft_wrap(true);
             assert_eq!(e.soft_wrap_enabled(), true, "再开");
             e.set_soft_wrap(true); // 幂等不炸
+        });
+    }
+
+    /// #111 P2 续批②：选区大小写转换三态（Upper/Lower/Title）+
+    /// 无选区 no-op + CJK 恒等（无大小写变换——不产生编辑历史）。
+    #[gpui::test]
+    fn case_transform_upper_lower_title_roundtrip(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "hello WORLD 世界");
+        // Upper：选区 "hello"（0-5）→ "HELLO"。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(0, 0), p(0, 5));
+            assert!(e.transform_selection_case(CaseMode::Upper));
+            assert_eq!(e.buffer.line(0), "HELLO WORLD 世界", "Upper");
+        });
+        // Lower：选区 "WORLD"（6-11）→ "world"。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(0, 6), p(0, 11));
+            assert!(e.transform_selection_case(CaseMode::Lower));
+            assert_eq!(e.buffer.line(0), "HELLO world 世界", "Lower");
+        });
+        // Title：整行——词首大写（"HELLO world" → "Hello World"；
+        // CJK「世界」非词字符恒等）。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(0, 0), p(0, 17));
+            assert!(e.transform_selection_case(CaseMode::Title));
+            assert_eq!(e.buffer.line(0), "Hello World 世界", "Title");
+        });
+    }
+
+    /// #111 P2 续批②：边界——无选区 no-op（false 不改文本）+ 纯 CJK
+    /// 选区恒等（false 不产生编辑历史）。
+    #[gpui::test]
+    fn case_transform_no_selection_and_cjk_noop(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "世界 abc");
+        // 无选区（裸光标）→ no-op。
+        ed.update(cx, |e, _| {
+            e.buffer.set_cursor(p(0, 0));
+            assert!(!e.transform_selection_case(CaseMode::Upper), "无选区 no-op");
+            assert_eq!(e.buffer.line(0), "世界 abc", "文本未动");
+        });
+        // 纯 CJK 选区 → 恒等 false（to_uppercase 天然不动的 Unicode 语义）。
+        ed.update(cx, |e, _| {
+            e.buffer.set_selection(p(0, 0), p(0, 2));
+            assert!(!e.transform_selection_case(CaseMode::Upper), "CJK 恒等 no-op");
+            assert_eq!(e.buffer.line(0), "世界 abc", "文本未动");
+        });
+        // Title 里 CJK 邻接词（"abc世界" 单词串——世界非词字符重置词界）。
+        let ed2 = md_editor(cx, "abc世界");
+        ed2.update(cx, |e, _| {
+            e.buffer.set_selection(p(0, 0), p(0, 5));
+            assert!(e.transform_selection_case(CaseMode::Upper));
+            assert_eq!(e.buffer.line(0), "ABC世界", "CJK 混选 Upper 只动拉丁");
         });
     }
 
