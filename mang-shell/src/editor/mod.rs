@@ -6143,6 +6143,9 @@ mod tests {
             e.buffer.set_cursor(p(0, 1));
             e.insert_text_multi("[");
             assert_eq!(e.buffer.to_plain_text(), "x[]", "方括号对闭合");
+        });
+    }
+
     /// #111 G2 批⑧：围栏内切换注释——跨行批加（`// ` 前缀）→
     /// 再切幂等往返（去）回原文。
     #[gpui::test]
