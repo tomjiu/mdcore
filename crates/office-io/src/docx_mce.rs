@@ -238,10 +238,19 @@ fn handle_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> AcOutcome 
 /// 命中 → `(重写后 XML, 统计)`；无展开 / 扫描错 → `None`（调用面
 /// 不修）。选中分支内容若含嵌套 AC（分支内部），递归重写（内层切片
 /// 独立扫描——内层扫描错则内层原样）。
+///
+/// **BOM 归一**（ai-bid #176 bump 差分实锤——shanxi 件）：quick-xml
+/// 0.41 切片读面跳过前导 UTF-8 BOM 但 `buffer_position` 不计入 BOM
+/// 字节——含 BOM 部件的全部事件偏移相对「去 BOM 串」，而切片按
+/// 原串下标 → **系统性 -3 错位**（shanxi 实测：`</w:rPr>` 剪成
+/// `</w:r` + `s">` 拼接 → 产物 ill-formed → docx-rs 整件拒读）。
+/// 去 BOM 后解析/切片/输出同串零错位；BOM 非必需（XML 声明前允许
+/// 缺席）且 docx-rs/quick-xml 读面均兼容无 BOM 件。
 fn rewrite_part(xml: &str) -> Option<(String, PartStats)> {
     if !xml.contains("AlternateContent") {
         return None;
     }
+    let xml = xml.strip_prefix('\u{feff}').unwrap_or(xml);
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().allow_unmatched_ends = false;
     let mut stats = PartStats::default();
@@ -439,6 +448,73 @@ xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\">\
             &crate::io::ReadOptions { compat: true },
         )
         .expect("compat read")
+    }
+
+    /// 带 BOM 的 docx 容器（document.xml 前置 UTF-8 BOM——WPS/部分
+    /// 生成器实态，shanxi 件实锚）。zip 条目名注入带 BOM 的变体。
+    fn build_docx_bom(body: &str) -> Vec<u8> {
+        let mut document = String::from("\u{feff}");
+        document.push_str(&document_wrap(body));
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in [
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("word/_rels/document.xml.rels", DOC_RELS),
+            ("word/document.xml", document.as_str()),
+        ] {
+            w.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            use std::io::Write as _;
+            w.write_all(data.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    /// ai-bid #176 bump 差分实锤（shanxi 件）：BOM 前置部件的事件偏移
+    /// 系统性 -3——修复前 MCE 重写把 `</w:rPr>` 剪成 `</w:r` + `s">`
+    /// 拼接，产物 ill-formed → docx-rs 整件拒读（Parse("Failed to read
+    /// xml.")）。BOM 归一后选择语义与无 BOM 件逐字节同构。
+    #[test]
+    fn bom_part_ac_rewrite_wellformed() {
+        // run 级 AC（shanxi 形态边界：rPr 闭合后紧跟 AC——正是修复前
+        // -3 错位把 `</w:rPr>` 剪成 `</w:r`+`s">` 的拼接位点）
+        let bytes = build_docx_bom(&format!(
+            "<w:p><w:r><w:rPr><w:sz w:val=\"24\"/></w:rPr><mc:AlternateContent>{}{}{}</mc:AlternateContent></w:r></w:p>",
+            "<mc:Choice Requires=\"wps\"><w:t>选</w:t></mc:Choice>",
+            "<mc:Choice Requires=\"w14\"><w:t>弃</w:t></mc:Choice>",
+            "<mc:Fallback><w:t>兜</w:t></mc:Fallback>"
+        ));
+        // 修复前：docx-rs 拒读（ill-formed 拼接）
+        let doc = read(&select_mce(&bytes, &mut Vec::new()).unwrap());
+        assert_eq!(
+            top_paras(&doc),
+            vec!["选".to_string()],
+            "BOM 件 run 级 AC 选择语义 = 无 BOM 件（首 Choice 选中）"
+        );
+        // 双保险：重写产物过结构校验（quick-xml 深度平衡）
+        let out = select_mce(&bytes, &mut Vec::new()).unwrap();
+        let mut za = zip::ZipArchive::new(std::io::Cursor::new(out.as_ref())).unwrap();
+        let mut buf = String::new();
+        use std::io::Read as _;
+        za.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut buf)
+            .unwrap();
+        let mut r = quick_xml::Reader::from_str(&buf);
+        let mut depth: i64 = 0;
+        let mut evbuf = Vec::new();
+        use quick_xml::events::Event;
+        loop {
+            match r.read_event_into(&mut evbuf) {
+                Ok(Event::Start(_)) => depth += 1,
+                Ok(Event::End(_)) => depth -= 1,
+                Ok(Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("BOM 件重写产物 ill-formed: {e}"),
+            }
+            evbuf.clear();
+        }
+        assert_eq!(depth, 0, "BOM 件重写产物深度平衡");
     }
 
     #[test]
