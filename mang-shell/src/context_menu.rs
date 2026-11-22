@@ -143,6 +143,9 @@ pub fn file_tree_menu(is_dir: bool) -> Vec<MenuItem> {
         // 项前的手动面；reload 以工作区根为对象，目录/文件右键均可用）。
         MenuItem::action("ft-refresh", "刷新"),
         MenuItem::action("ft-reveal", "在资源管理器中显示"),
+        // #107 P2：复制路径（剪贴板——报告「ft-reveal 系统揭示可部分
+        // 替代」的补口；目录/文件均可用——复制的是右键目标本身）。
+        MenuItem::action("ft-copy-path", "复制路径"),
     ]
 }
 
@@ -160,6 +163,19 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, MenuItem::Action { id, .. } if *id == "ft-refresh"));
             assert!(has, "file_tree_menu({is_dir}) 应含 ft-refresh 刷新项");
+        }
+    }
+
+    /// #107 P2：树面菜单含「复制路径」项（目录与文件均可用——先红面：
+    /// 菜单无此条目）。
+    #[test]
+    fn file_tree_menu_has_copy_path_entry() {
+        for is_dir in [false, true] {
+            let items = file_tree_menu(is_dir);
+            let has = items
+                .iter()
+                .any(|i| matches!(i, MenuItem::Action { id, .. } if *id == "ft-copy-path"));
+            assert!(has, "file_tree_menu({is_dir}) 应含 ft-copy-path 复制路径项");
         }
     }
 
