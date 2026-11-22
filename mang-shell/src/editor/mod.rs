@@ -531,6 +531,10 @@ pub struct Editor {
     /// G3：缩进单位（Tab/Shift+Tab 消费——settings `indent_unit` 键；
     /// 缺省 Spaces4 与既有 Tab 插 4 空格语义一致）。
     indent_unit: IndentUnit,
+    /// #111 P2：软换行开关（settings `soft_wrap` 键——默认开）。
+    /// 关 = 渲染回填段跳过（已有断点清空），显示行回落真实行集；
+    /// 开 = 断点照常按帧宽回填。
+    soft_wrap: bool,
     /// #111 批②：括号/引号自动闭合开关（settings `auto_close_brackets`
     /// 键——默认开；沿 indent_unit 载体先例）。
     auto_close_brackets: bool,
@@ -654,6 +658,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
@@ -722,6 +727,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
@@ -808,6 +814,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
@@ -880,6 +887,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
@@ -960,6 +968,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             scroll: UniformListScrollHandle::new(),
             // xlsx 无围栏语义——fence 恒 false（同 docx 态口径，
@@ -1020,6 +1029,7 @@ impl Editor {
                     .as_deref()
                     .unwrap_or("4"),
             ),
+            soft_wrap: crate::settings::load_soft_wrap().unwrap_or(true),
             auto_close_brackets: crate::settings::load_auto_close_brackets().unwrap_or(true),
             focus: cx.focus_handle(),
             find_focus: cx.focus_handle(),
@@ -3518,6 +3528,23 @@ impl Editor {
         self.indent_unit = unit;
     }
 
+    /// #111 P2：软换行开关（关 = 清已有断点显示行回落 + 后续回填段
+    /// 跳过；开 = 下一帧按帧宽照常回填——has_wrap_points 门自然衔接）。
+    pub fn set_soft_wrap(&mut self, on: bool) {
+        if self.soft_wrap == on {
+            return;
+        }
+        self.soft_wrap = on;
+        if !on {
+            self.display_map.reset_wraps();
+        }
+    }
+
+    /// #111 P2：软换行开关现状（面板态显示用）。
+    pub fn soft_wrap_enabled(&self) -> bool {
+        self.soft_wrap
+    }
+
     /// 多光标退格。
     fn backspace_multi(&mut self) {
         if self.cursors.is_multiple() {
@@ -4901,6 +4928,7 @@ impl Editor {
         // 行/已回填行跳过）。宽度基准 = 上一帧整行宽减 gutter/padding；
         // 首帧无采样 → 跳过（首帧无断点，第二帧起生效）；断点回填后
         // 行数增长在下一帧 uniform_list 生效（一帧收敛，Zed 同款异步）。
+        if self.soft_wrap {
         if let Some(full_w) = *self.last_text_width.borrow() {
             let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
             if target > px(50.) {
@@ -4939,6 +4967,7 @@ impl Editor {
                     self.display_map.set_wrap_points(&self.buffer, line, pts);
                 }
             }
+        }
         }
 
         // r42 阶段 C：光标集 display 化（多光标各头；caret 每处一竖线）
@@ -6083,6 +6112,41 @@ mod tests {
 
     /// 构造一个 md 编辑器，供折叠行为测试驱动（直接调方法面——不经
     /// 命令分发，不触发 persist_folds 落盘）。
+    /// #111 P2：软换行开关行为（关 = 已有断点清空 + 后续回填段跳过；
+    /// 开 = 照常。显示行数随断点集回落真实行数）。
+    #[gpui::test]
+    fn soft_wrap_toggle_clears_and_restores_breaks(cx: &mut gpui::TestAppContext) {
+        let ed = md_editor(cx, "长行甲\n长行乙");
+        // 人工注入断点（模拟渲染回填后的 wraps 态——行 0/1 各一断点，
+        // 显示行 = 2 行 ×2 段 = 4）。
+        ed.update(cx, |e, _| {
+            e.display_map.set_wrap_points(&e.buffer, 0, vec![2]);
+            e.display_map.set_wrap_points(&e.buffer, 1, vec![2]);
+            assert_eq!(
+                e.display_map.display_row_count(&e.buffer),
+                4,
+                "两断点在：2 行 ×2 段"
+            );
+        });
+        // 关软换行：断点清空（显示行回落 2）+ 开关位 false。
+        ed.update(cx, |e, _| {
+            e.set_soft_wrap(false);
+            assert_eq!(e.soft_wrap_enabled(), false, "开关位已关");
+            assert_eq!(
+                e.display_map.display_row_count(&e.buffer),
+                2,
+                "断点清空：显示行回落真实行数"
+            );
+        });
+        // 再开：开关位 true（断点回填由渲染层下一帧照常——此处只验
+        // 开关语义与幂等）。
+        ed.update(cx, |e, _| {
+            e.set_soft_wrap(true);
+            assert_eq!(e.soft_wrap_enabled(), true, "再开");
+            e.set_soft_wrap(true); // 幂等不炸
+        });
+    }
+
     fn md_editor(cx: &mut gpui::TestAppContext, text: &str) -> gpui::Entity<Editor> {
         cx.update(|cx| cx.new(|cx| Editor::new(Some("notes.md".into()), text.to_string(), cx)))
     }

@@ -71,6 +71,7 @@ pub fn settings_modal(
     theme_mode: &'static str,
     font_size: f32,
     indent_unit: IndentUnit,
+    soft_wrap: bool,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -93,7 +94,7 @@ pub fn settings_modal(
         .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
             this.close_settings(cx);
         }))
-        .child(ui_modal(theme_mode, font_size, indent_unit, &colors, cx))
+        .child(ui_modal(theme_mode, font_size, indent_unit, soft_wrap, &colors, cx))
 }
 
 /// 弹窗卡片（#385 批 3：骨架迁 `ui::Modal`——header/section 排版全
@@ -103,6 +104,7 @@ fn ui_modal(
     theme_mode: &'static str,
     font_size: f32,
     indent_unit: IndentUnit,
+    soft_wrap: bool,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
@@ -117,7 +119,7 @@ fn ui_modal(
         .rounded_md()
         .shadow_lg()
         .overflow_y_scroll()
-        .child(modal_body(theme_mode, font_size, indent_unit, colors, cx))
+        .child(modal_body(theme_mode, font_size, indent_unit, soft_wrap, colors, cx))
 }
 
 /// `ui::Modal` 骨架（标题行 + 分区——排版/间距/主题色全组件）。
@@ -125,6 +127,7 @@ fn modal_body(
     theme_mode: &'static str,
     font_size: f32,
     indent_unit: IndentUnit,
+    soft_wrap: bool,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
 ) -> Modal {
@@ -157,6 +160,12 @@ fn modal_body(
                     "sg-indent-row",
                     "缩进单位",
                     indent_choices(indent_unit, colors, cx),
+                ))
+                // #111 P2：软换行开关（双态钮——关 = 长行不折断横向滚动）。
+                .child(control_row(
+                    "sg-soft-wrap-row",
+                    "软换行",
+                    soft_wrap_choices(soft_wrap, colors, cx),
                 )),
         )
         // ── 布局 ───────────────────────────────────────────
@@ -259,6 +268,35 @@ fn font_stepper(
 }
 
 /// 缩进单位三选钮（4 空格/2 空格/Tab）。
+/// #111 P2：软换行双态钮（开/关——沿 indent_choices 语系）。
+fn soft_wrap_choices(
+    soft_wrap: bool,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    let selected = colors.element_selected;
+    h_flex()
+        .id("sg-soft-wrap-choices")
+        .gap_1()
+        .child(choice_button(
+            "sg-soft-wrap-on",
+            "开",
+            soft_wrap,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_soft_wrap_all(true, cx)),
+        ))
+        .child(choice_button(
+            "sg-soft-wrap-off",
+            "关",
+            !soft_wrap,
+            hover,
+            selected,
+            cx.listener(|this, _, _, cx| this.set_soft_wrap_all(false, cx)),
+        ))
+}
+
 fn indent_choices(
     indent_unit: IndentUnit,
     colors: &theme::ThemeColors,

@@ -74,6 +74,23 @@ pub fn load_auto_close_brackets() -> Option<bool> {
     load_from(&dir).get("auto_close_brackets")?.as_bool()
 }
 
+/// #111 P2：软换行开关读写（`soft_wrap` 键：bool——默认开；沿
+/// auto_close_brackets 载体先例。软换行实现早已有（display_map
+/// wraps + 渲染回填），本批补的是用户可关面——Q-IDE
+/// settings/window.rs:302-309 对照；报告 §3 P2 末项）。
+pub fn save_soft_wrap(on: bool) {
+    if let Some(dir) = config_dir() {
+        let mut value = load_from(&dir);
+        value["soft_wrap"] = serde_json::Value::Bool(on);
+        save_to(&dir, &value);
+    }
+}
+
+pub fn load_soft_wrap() -> Option<bool> {
+    let dir = config_dir()?;
+    load_from(&dir).get("soft_wrap")?.as_bool()
+}
+
 /// #110 G2：用户主题目录（对齐既有用户配置目录——报告 §5 D2 裁定：
 /// 不做 exe 目录回退；`$XDG_CONFIG_HOME/mang/themes/*.json`）。
 pub fn themes_dir() -> Option<PathBuf> {
@@ -815,6 +832,24 @@ mod tests {
             "写读往返保持"
         );
         // 未知/缺失键 → 消费方 unwrap_or(true) 缺省开（构造面语义）。
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #111 P2：soft_wrap 写读往返（载体面——沿 auto_close_brackets
+    /// roundtrip 同型；缺失键 → 消费方 unwrap_or(true) 缺省开）。
+    #[test]
+    fn soft_wrap_roundtrip() {
+        let dir = temp_config("soft-wrap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = load_from(&dir);
+        value["soft_wrap"] = serde_json::Value::Bool(false);
+        save_to(&dir, &value);
+        let back = load_from(&dir);
+        assert_eq!(
+            back.get("soft_wrap").and_then(|b| b.as_bool()),
+            Some(false),
+            "写读往返保持"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
