@@ -143,10 +143,6 @@ pub fn file_tree_menu(is_dir: bool) -> Vec<MenuItem> {
         // 项前的手动面；reload 以工作区根为对象，目录/文件右键均可用）。
         MenuItem::action("ft-refresh", "刷新"),
         MenuItem::action("ft-reveal", "在资源管理器中显示"),
-        // #107 D1①：外部（非本应用）改动目录内容后的感知手段——
-        // 重读目标目录清单（目录）或父目录（文件）。此前唯一恢复
-        // 方式是重启或重新打开文件夹（2449 报告 §6 顺手缺陷）。
-        MenuItem::action("ft-refresh", "刷新"),
     ]
 }
 
