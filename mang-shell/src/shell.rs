@@ -933,6 +933,27 @@ impl ShellApp {
         cx.notify();
     }
 
+    /// #108 P2③：转到符号——开右栏 + 聚焦大纲过滤框（过滤即符号
+    /// 查找、Enter 跳行——「符号对话框」承接面；参照 Q-IDE outline.rs
+    /// goto 对话框语义，我方以大纲面板过滤框承接，无新 UI）。
+    /// 无大纲（无激活文档）时提示不静默（#176 精神同款）。
+    pub fn goto_symbol(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.right_open {
+            self.right_open = true;
+            self.persist_dock_layout(cx);
+        }
+        match self.outline.as_ref() {
+            Some(panel) => {
+                let focus = panel.read(cx).filter_focus_handle().clone();
+                window.focus(&focus, cx);
+            }
+            None => {
+                self.show_notice("转到符号：当前无文档大纲（先打开 Markdown 文档）".into(), cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// #109：左栏当前是否搜索视图（图标条选中态/菜单勾选共用真源）。
     pub fn search_active(&self, cx: &App) -> bool {
         self.left_dock
@@ -2480,6 +2501,9 @@ impl ShellApp {
             // #109 批②③：项目搜索面板（图标条/菜单同链——Ctrl+Shift+F
             // 键位同接此处）。
             Act::ToggleSearchPanel => self.toggle_search(cx),
+            // #108 P2③：转到符号（Ctrl+Shift+O——开右栏 + 聚焦大纲
+            // 过滤框；无大纲不静默）。
+            Act::GotoSymbol => self.goto_symbol(window, cx),
             // 置灰项不绑动作（无既有命令映射）——正常不可达（灰显挂
             // 不了 on_click、Enter 有 enabled 门）；能到达说明菜单配错，
             // stderr 留痕（右键菜单未接线兜底同款口径）。
@@ -4542,6 +4566,12 @@ impl Render for ShellApp {
                         // 菜单同一 toggle_search 链）。
                         ShellAction::ToggleSearchPanel => {
                             this.toggle_search(cx);
+                            return;
+                        }
+                        // #108 P2③：Ctrl+Shift+O 转到符号（菜单同一
+                        // goto_symbol 链——开右栏 + 聚焦大纲过滤框）。
+                        ShellAction::GotoSymbol => {
+                            this.goto_symbol(window, cx);
                             return;
                         }
                     },
@@ -10536,6 +10566,58 @@ mod confirm_lifecycle_tests {
 #[cfg(test)]
 #[path = "workspace_layout_tests.rs"]
 mod workspace_layout_tests;
+
+/// #108 P2③ GUI 测试（内联域——`workspace_layout_tests.rs` 尾部 append
+/// 的测试曾出现不进 bin 编译产物的现象（同现象复现两次，机制未明），
+/// 收敛为内联 mod 规避）。
+#[cfg(test)]
+mod goto_symbol_108_tests {
+    use super::*;
+
+    /// #108 P2③：转到符号（Ctrl+Shift+O / goto_symbol——开右栏 +
+    /// 大纲过滤框聚焦；无大纲提示不静默）。构造走 `workspace_layout_
+    /// tests::host` 同型（带 editor → 大纲在场）。
+    #[gpui::test]
+    fn goto_symbol_opens_right_and_focuses_outline_filter(cx: &mut gpui::TestAppContext) {
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        visual.update(|_window, app| {
+            shell.update(app, |shell, _| {
+                shell.right_open = false;
+            });
+        });
+        visual.update(|window, app| {
+            shell.update(app, |shell, cx| {
+                shell.goto_symbol(window, cx);
+            });
+        });
+        shell.read_with(&visual, |shell, _| {
+            assert!(shell.right_open, "goto_symbol 开右栏");
+        });
+        visual.update(|window, app| {
+            shell.read_with(app, |shell, _| {
+                let panel = shell.outline.as_ref().expect("带 editor → 大纲在场");
+                let filter = panel.read(app).filter_focus_handle();
+                assert!(
+                    filter.contains_focused(window, app),
+                    "焦点落大纲过滤框（输入即符号过滤）"
+                );
+            });
+        });
+        // 无大纲路径：置空 outline → 提示不静默。
+        visual.update(|window, app| {
+            shell.update(app, |shell, cx| {
+                shell.outline = None;
+                shell.notice_board.clear();
+                shell.goto_symbol(window, cx);
+                let msg = shell.notice_board.message().map(str::to_owned);
+                assert!(
+                    msg.as_deref().is_some_and(|m| m.contains("无文档大纲")),
+                    "无大纲提示不静默：{msg:?}"
+                );
+            });
+        });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // #604：XLSX 统一保存与退出脏检查（#389 阶段 2 收口）——Shell 分流面。

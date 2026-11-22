@@ -184,6 +184,8 @@ pub enum MenuAction {
     /// #109 批②③：切换项目搜索面板（shell `toggle_search`——图标条
     /// 搜索钮/Ctrl+Shift+F 同链）。
     ToggleSearchPanel,
+    /// #108 P2③：转到符号（Ctrl+Shift+O）。
+    GotoSymbol,
     /// 占位（无既有命令可映射——置灰项不绑动作，派发面只留证据行）。
     None,
 }
@@ -460,6 +462,11 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                             .shortcut_for("project_search")
                             .act(MenuAction::ToggleSearchPanel)
                             .checked(ctx.left_open && ctx.search_view),
+                        // #108 P2③：转到符号（右栏大纲承接——过滤框
+                        // 聚焦 + Enter 跳行即符号对话框全链）。
+                        MenuEntry::item("view-goto-symbol", "转到符号")
+                            .shortcut_for("goto_symbol")
+                            .act(MenuAction::GotoSymbol),
                     ],
                 ),
                 MenuEntry::Separator,
