@@ -516,6 +516,215 @@ impl<R: std::io::Read> std::io::Read for CountingReader<'_, R> {
     }
 }
 
+/// XML 1.0 非法控制字节判定（门 3 ctrl 扫描单一真源——仅 #x9/#xA/#xD
+/// 与 #x20 起合法；UTF-8 原始面与 UTF-16 解码字符面共用）。
+fn is_xml_ctrl(b: u8) -> bool {
+    matches!(b, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F)
+}
+
+// ---------------------------------------------------------------------------
+// 门 3 编码感知（ai-bid #176：WPS customXml UTF-16 部件）
+// ---------------------------------------------------------------------------
+
+/// XML 部件编码判定产物（BOM 探测——OPC 部件允许 UTF-8/UTF-16；
+/// UTF-32 BOM（FF FE 00 00 / 00 00 FE FF）按 UTF-16 误判后续转码
+/// 必然失败 → 部件级错误面吸收，登记边界不单独识别）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XmlPartEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+/// 提取关键部件判定：calamine（xlsx 五面）/ docx 语义层按 UTF-8 字节
+/// 读的部件前缀。这些部件的 UTF-16 形态是**能力边界**（放行 = 静默
+/// 垃圾/空数据的 mal7e 面），两模式恒拒；边缘部件（customXml/、
+/// docProps/）转码校验后放行。
+fn is_extraction_critical(name: &str) -> bool {
+    name.starts_with("xl/")
+        || name.starts_with("word/")
+        || name.starts_with("ppt/")
+        || name == "[Content_Types].xml"
+        || name.starts_with("_rels/")
+        || name.ends_with(".rels")
+}
+
+/// BOM 头窥探：从 CountingReader 直读至多 4 字节（计入尺寸/谎言面，
+/// 不入 ctrl 扫描——UTF-16 高位 NUL 是编码字节）。头部字节由调用面
+/// 经 `Chain(Cursor, …)` 回放进校验流，不重读。
+fn peek_xml_encoding<R: std::io::Read>(
+    r: &mut CountingReader<'_, R>,
+) -> std::io::Result<(XmlPartEncoding, [u8; 4], usize)> {
+    use std::io::Read as _;
+    let mut head = [0u8; 4];
+    let mut n = 0usize;
+    while n < head.len() {
+        match r.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let enc = if n >= 2 && head[0] == 0xFF && head[1] == 0xFE {
+        XmlPartEncoding::Utf16Le
+    } else if n >= 2 && head[0] == 0xFE && head[1] == 0xFF {
+        XmlPartEncoding::Utf16Be
+    } else {
+        XmlPartEncoding::Utf8
+    };
+    Ok((enc, head, n))
+}
+
+/// UTF-16 → UTF-8 流式转码适配器（门 3 校验面专用——非通用解码面）。
+///
+/// 语义边界（登记）：
+/// - 头部单枚 U+FEFF（BOM）跳过；后续 U+FEFF 按零宽不换行符保留
+///   （quick-xml 文本面可容）；
+/// - 代理对配对强制（孤代理 = io::Error InvalidData——fail-loud
+///   不产替换符，部件级错误面吸收）；奇尾字节（截断的码元）同错；
+/// - 解码字符面 ctrl 扫描（与原始面同集——`is_xml_ctrl` 单一真源；
+///   偏移量为**解码字符序**，与 UTF-8 面的字节序同构可比对）。
+struct Utf16Transcoder<R> {
+    inner: R,
+    le: bool,
+    started: bool,
+    /// 已读原始字节序中等待配对的高代理（尾流孤儿面在 EOF 判错）
+    pending_high: Option<u16>,
+    /// 输出缓冲（至少产出一字节即返——小缓冲足释调用方）
+    out: std::collections::VecDeque<u8>,
+    ctrl_at: Option<u64>,
+    decoded: u64,
+}
+
+impl<R: std::io::Read> Utf16Transcoder<R> {
+    fn new(inner: R, le: bool) -> Self {
+        Self {
+            inner,
+            le,
+            started: false,
+            pending_high: None,
+            out: std::collections::VecDeque::new(),
+            ctrl_at: None,
+            decoded: 0,
+        }
+    }
+
+    /// 读一个 16 位码元。`Ok(None)` = 干净 EOF；`Ok(Some(u))` = 码元；
+    /// 奇尾字节 = Err（截断码元）。Interrupted 在各字节位独立重试。
+    fn next_unit(&mut self) -> std::io::Result<Option<u16>> {
+        let mut b = [0u8; 2];
+        loop {
+            match self.inner.read(&mut b[..1]) {
+                Ok(0) => return Ok(None),
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        loop {
+            match self.inner.read(&mut b[1..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "UTF-16 stream truncated mid code unit (odd byte length)",
+                    ))
+                }
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Some(if self.le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        }))
+    }
+
+    /// 解码一个码元 → 字符压栈；代理对跨码元状态在 `pending_high`。
+    fn decode_push(&mut self, unit: u16) -> std::io::Result<()> {
+        let ch = match (self.pending_high.take(), unit) {
+            (None, u) if (0xD800..=0xDBFF).contains(&u) => {
+                self.pending_high = Some(u);
+                return Ok(());
+            }
+            (None, u) if (0xDC00..=0xDFFF).contains(&u) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("UTF-16 lone low surrogate U+{u:04X}"),
+                ));
+            }
+            (None, u) => char::from_u32(u as u32),
+            (Some(high), low) if (0xDC00..=0xDFFF).contains(&low) => {
+                let cp = 0x1_0000 + (((high as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
+                char::from_u32(cp)
+            }
+            (Some(high), _) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("UTF-16 unpaired high surrogate U+{high:04X}"),
+                ));
+            }
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("UTF-16 invalid code point from unit U+{unit:04X}"),
+            )
+        })?;
+        // 头部 BOM 跳过；后续字符照常（含 U+FEFF 零宽不换行）
+        if !self.started {
+            self.started = true;
+            if ch == '\u{FEFF}' {
+                return Ok(());
+            }
+        }
+        // 解码字符面 ctrl 扫描（首例登记；与原始面同集）
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if self.ctrl_at.is_none() {
+            if let Some(b0) = s.as_bytes().first() {
+                if is_xml_ctrl(*b0) {
+                    self.ctrl_at = Some(self.decoded);
+                }
+            }
+        }
+        self.decoded += 1;
+        self.out.extend(s.as_bytes().iter().copied());
+        Ok(())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Utf16Transcoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.out.is_empty() {
+            match self.next_unit()? {
+                None => {
+                    if let Some(high) = self.pending_high.take() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("UTF-16 stream ends with unpaired surrogate U+{high:04X}"),
+                        ));
+                    }
+                    return Ok(0); // 干净 EOF
+                }
+                Some(unit) => self.decode_push(unit)?,
+            }
+            // 防无限循环保险（decode_push 可能只压 pending）：循环条件
+            // out.is_empty() 已覆盖——pending 态下一轮必然消费或报错。
+        }
+        let n = self.out.len().min(buf.len());
+        for i in 0..n {
+            buf[i] = self.out.pop_front().unwrap();
+        }
+        Ok(n)
+    }
+}
+
 /// 门 3 流式结构校验：quick-xml 拉取解析 + 自有深度/根追踪。
 ///
 /// 校验面（全部结构级，非 DTD/实体级——GeneralRef 透传不展开，
@@ -807,14 +1016,20 @@ impl GridScan {
 /// 门 2+3 融合单趟：逐条目有界读取计数（实际 > 声明即拒——谎言头
 /// 闭环）+ .xml/.rels 部件的良构性流式校验（`validate_parts` 开关）。
 ///
-/// 成本结构（与 xlsx-r1 相比零额外解压）：门 2 本就读全量一次，
-/// 门 3 校验在同一趟的字节流上过 quick-xml（结构级拉取解析）。
+/// 门 3 编码感知（ai-bid #176 / WPS 真实件）：XML 部件允许 UTF-16
+///（OPC 合法形态——WPS customXml 常态）。BOM 探测后转码再校验；
+/// **提取关键部件**（xl/ word/ ppt/ [Content_Types].xml _rels——
+/// calamine/语义层按 UTF-8 字节读）的 UTF-16 形态两模式恒拒
+///（能力边界而非良构判断——放行 = 静默垃圾数据的 mal7e 面）。
+/// customXml/（calamine 不消费的边缘元数据）良构失败两模式恒降级
+/// 结构化警告——不可信部件跳过留痕，不整件拒收。
 fn verify_pass<R: std::io::Read + std::io::Seek>(
     za: &mut zip::ZipArchive<R>,
     validate_parts: bool,
     strict: bool,
     warnings: &mut Vec<CompatibilityWarning>,
 ) -> Result<(), ReadError> {
+    use std::io::Read as _;
     let n = za.len();
     for i in 0..n {
         let mut zf = za
@@ -838,17 +1053,82 @@ fn verify_pass<R: std::io::Read + std::io::Seek>(
             });
         }
         let is_xml = validate_parts && (name.ends_with(".xml") || name.ends_with(".rels"));
-        let mut counting = CountingReader::new(&mut zf, declared, is_xml);
+        // BOM 头窥探在 CountingReader 上直接读（不入 ctrl 扫描面——
+        // UTF-16 的 NUL 高位字节是编码字节不是非法控制符；探测后才按
+        // 编码决定原始面 ctrl 扫描开否）。头部字节经 Chain 回放进校验流。
+        let mut counting = CountingReader::new(&mut zf, declared, false);
         if is_xml {
             let mut grid = GridScan::new();
-            let mut br = std::io::BufReader::new(&mut counting);
-            let parse = validate_xml_structure(&mut br, &mut grid);
+            let (enc, head, head_len) = peek_xml_encoding(&mut counting)
+                .map_err(|e| ReadError::ContainerCorrupt(format!("{e}")))?;
+            let head_bytes: &[u8] = &head[..head_len];
+            let mut utf16_ctrl: Option<u64> = None;
+            let parse = match enc {
+                XmlPartEncoding::Utf8 => {
+                    // 原始字节 ctrl 扫描开（头部 4 字节外全量扫描；头部
+                    // 是 BOM/`<?x` 形态无 ctrl 面——手动补扫完整）
+                    counting.scan_ctrl = true;
+                    for (i, &b) in head_bytes.iter().enumerate() {
+                        if is_xml_ctrl(b) && counting.ctrl_at.is_none() {
+                            counting.ctrl_at = Some(i as u64);
+                        }
+                    }
+                    let mut br = std::io::BufReader::new(
+                        std::io::Cursor::new(head_bytes).chain(&mut counting),
+                    );
+                    let p = validate_xml_structure(&mut br, &mut grid);
+                    // 排空错误（含 zip 层 CRC 校验）传播为容器损坏——
+                    // 原语义保持（吞掉 = 坏条目漏网到下游 docx-rs panic 面）
+                    if let Err(e) = drain_bounded(&mut br) {
+                        return Err(ReadError::ContainerCorrupt(format!("{e}")));
+                    }
+                    p
+                }
+                enc16 => {
+                    if is_extraction_critical(&name) {
+                        return Err(ReadError::InvalidPart {
+                            part: name.clone(),
+                            detail: format!(
+                                "UTF-16 encoded part not supported by extraction layer \
+                                 ({} endian)",
+                                match enc16 {
+                                    XmlPartEncoding::Utf16Le => "little",
+                                    _ => "big",
+                                }
+                            ),
+                        });
+                    }
+                    // 边缘部件（customXml/docProps）：转码后校验；ctrl
+                    // 扫描面移到解码字符流（转码器内）。
+                    let le = matches!(enc16, XmlPartEncoding::Utf16Le);
+                    let mut tr = Utf16Transcoder::new(
+                        std::io::Cursor::new(head_bytes).chain(&mut counting),
+                        le,
+                    );
+                    let mut tbr = std::io::BufReader::new(&mut tr);
+                    let p = validate_xml_structure(&mut tbr, &mut grid);
+                    // 排空错误传播同 UTF-8 面（parse 已败时部件错误面已
+                    // 定—— InvalidPart/peripheral 警告优先，不重复报容器）
+                    if p.is_ok() {
+                        if let Err(e) = drain_bounded(&mut tbr) {
+                            return Err(ReadError::ContainerCorrupt(format!("{e}")));
+                        }
+                    } else {
+                        let _ = drain_bounded(&mut tbr);
+                    }
+                    // 解码字符面 ctrl 扫描结果回传（tr 随臂块 drop 后
+                    // 由 counting 合并进统一警告面）
+                    utf16_ctrl = tr.ctrl_at;
+                    p
+                }
+            };
+            // UTF-16 面：解码字符流 ctrl 扫描结果并入统一警告面
+            //（原始面扫描对该编码关闭——NUL 高位是编码字节非控制符）
+            if counting.ctrl_at.is_none() {
+                counting.ctrl_at = utf16_ctrl;
+            }
             // 解析中止（错误）时未读尽：补完谎言检查（有界——lied
             // 即停；成功路径 BufReader 已到 EOF 为 no-op）。
-            let drain = drain_bounded(&mut br);
-            if let Err(e) = drain {
-                return Err(ReadError::ContainerCorrupt(format!("{e}")));
-            }
             if counting.lied {
                 return Err(ReadError::PrescanRejected {
                     reason: "actual size exceeds declared (lie header)",
@@ -868,7 +1148,12 @@ fn verify_pass<R: std::io::Read + std::io::Seek>(
             match parse {
                 Ok(()) => {}
                 Err(detail) => {
-                    if strict {
+                    // customXml/ 边缘部件（calamine 零消费）：良构失败
+                    // 恒降级警告（ai-bid #176——不可信部件跳过留痕，
+                    // 不整件拒收）；安全面（门 1/2、深度、稠密面积）
+                    // 已在上游恒拒，不随本降级放松。
+                    let peripheral = name.starts_with("customXml/");
+                    if strict && !peripheral {
                         return Err(ReadError::InvalidPart {
                             part: name.clone(),
                             detail,
@@ -877,7 +1162,11 @@ fn verify_pass<R: std::io::Read + std::io::Seek>(
                     warnings.push(CompatibilityWarning {
                         part: name.clone(),
                         kind: WarningKind::MalformedXml,
-                        detail: format!("compat mode: malformed XML tolerated: {detail}"),
+                        detail: if peripheral {
+                            format!("peripheral part (customXml) tolerated: {detail}")
+                        } else {
+                            format!("compat mode: malformed XML tolerated: {detail}")
+                        },
                     });
                 }
             }
@@ -1761,6 +2050,169 @@ mod tests {
             book.warnings
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- 门 3 编码感知（ai-bid #176：WPS customXml UTF-16 部件） ----
+
+    /// UTF-16LE 编码辅助：带 BOM 的码元序列。
+    fn utf16le(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    /// UTF-16BE 编码辅助（BOM + 大端码元）。
+    fn utf16be(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFE, 0xFF];
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_be_bytes());
+        }
+        out
+    }
+
+    /// WPS 形态 customXml part（woProps/woBookProps——ai-bid #176 真实件
+    /// B-unicom-ry-详细评审表.xlsx 的 item1.xml 同构）。
+    const WPS_CUSTOMXML: &str = concat!(
+        r#"<?xml version="1.0" standalone="yes"?><woProps xmlns="https://web.wps.cn/et/2018/main">"#,
+        r#"<woBookProps isMergeTasksAutoUpdate="0" isInsertPicAsAttachment="0"/></woProps>"#
+    );
+
+    /// 真实件主形态：customXml/item1.xml 为 UTF-16LE（内容良构）——
+    /// 修复前按 UTF-8 读 → 「truncated: N unclosed element(s)」整件拒收；
+    /// 修复后转码校验通过，严格模式零警告加载。
+    #[test]
+    fn utf16le_customxml_part_loads_strict_clean() {
+        let p = tmp("u16cx");
+        let mut entries = minimal_xlsx("hello");
+        entries.push(("customXml/item1.xml".into(), utf16le(WPS_CUSTOMXML)));
+        write_zip(&p, &entries);
+        let book = read_book(&p).expect("UTF-16LE customXml 良构件应加载");
+        assert_eq!(book.sheet_names(), vec!["S1"]);
+        assert_eq!(book.non_empty_cells(), 1);
+        assert!(
+            !book
+                .warnings
+                .iter()
+                .any(|w| w.part == "customXml/item1.xml"),
+            "良构 UTF-16 部件不应产任何警告：{:?}",
+            book.warnings
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// UTF-16BE 变体同放行（BOM 探测双端）。
+    #[test]
+    fn utf16be_customxml_part_loads_strict_clean() {
+        let p = tmp("u16be");
+        let mut entries = minimal_xlsx("hello");
+        entries.push(("customXml/item1.xml".into(), utf16be(WPS_CUSTOMXML)));
+        write_zip(&p, &entries);
+        let book = read_book(&p).expect("UTF-16BE customXml 良构件应加载");
+        assert_eq!(book.non_empty_cells(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// customXml 真截断（良构失败）：两模式恒降级结构化警告——不可信
+    /// 边缘部件跳过留痕，不整件拒收（ai-bid #176 任务书原文）。
+    #[test]
+    fn truncated_customxml_warns_never_rejects() {
+        let p = tmp("u16cut");
+        let mut entries = minimal_xlsx("hello");
+        // 良构 UTF-16 内容拦腰截断（保留 BOM + 前半——EOF 未闭合）
+        let full = utf16le(WPS_CUSTOMXML);
+        entries.push((
+            "customXml/item1.xml".into(),
+            full[..full.len() * 2 / 3].to_vec(),
+        ));
+        write_zip(&p, &entries);
+        // 严格模式：Ok + peripheral 警告（不再整件拒收）
+        let book = read_book(&p).expect("customXml 截断不应整件拒收（严格模式）");
+        assert_eq!(book.non_empty_cells(), 1, "数据照常提取");
+        assert!(
+            book.warnings.iter().any(|w| {
+                w.kind == WarningKind::MalformedXml
+                    && w.part == "customXml/item1.xml"
+                    && w.detail.contains("peripheral part (customXml) tolerated")
+            }),
+            "截断 customXml 应有 peripheral 警告：{:?}",
+            book.warnings
+        );
+        // 兼容模式：同 Ok（peripheral 恒降级——不随模式变脸）
+        let book2 =
+            read_book_with_options(&p, &ReadOptions { compat: true }).expect("兼容模式同 Ok");
+        assert!(book2
+            .warnings
+            .iter()
+            .any(|w| w.part == "customXml/item1.xml" && w.kind == WarningKind::MalformedXml));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 提取关键部件（worksheet）的 UTF-16 形态：能力边界——两模式恒拒
+    ///（放行 = calamine 按 UTF-8 读出静默垃圾/空表 = mal7e 面）。
+    #[test]
+    fn utf16_worksheet_part_rejected_both_modes() {
+        let p = tmp("u16ws");
+        let sheet = r#"<?xml version="1.0" encoding="UTF-16" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row></sheetData></worksheet>"#;
+        let mut entries = minimal_xlsx("unused");
+        for (n, d) in entries.iter_mut() {
+            if n == "xl/worksheets/sheet1.xml" {
+                *d = utf16le(sheet);
+            }
+        }
+        write_zip(&p, &entries);
+        for (label, opts) in [
+            ("严格", ReadOptions { compat: false }),
+            ("兼容", ReadOptions { compat: true }),
+        ] {
+            match read_book_with_options(&p, &opts) {
+                Err(ReadError::InvalidPart { part, detail }) => {
+                    assert_eq!(part, "xl/worksheets/sheet1.xml", "{label}模式部件名");
+                    assert!(
+                        detail.contains("UTF-16 encoded part not supported"),
+                        "{label}模式根因文案：{detail}"
+                    );
+                }
+                other => panic!("{label}模式应恒拒（非安全类能力边界），got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 转码器单元面：BOM 跳过 / BMP / 代理对（非 BMP 汉字）/ 孤代理
+    /// fail-loud / 奇尾字节截断。
+    #[test]
+    fn utf16_transcoder_unit_semantics() {
+        use std::io::Read as _;
+        // 字节级 BOM（helper 前缀 FF FE）+ ASCII + BMP 汉字 + 非 BMP
+        //（surrogate 对 𝔹 U+1D539）——BOM 跳过后全字符面保真
+        let src = utf16le("ab包𝔹");
+        let mut tr = Utf16Transcoder::new(src.as_slice(), true);
+        let mut out = String::new();
+        tr.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "ab包𝔹", "BOM 跳过 + 全字符面保真");
+        assert!(tr.ctrl_at.is_none());
+        // 孤低代理：fail-loud
+        let mut bad = vec![0xFFu8, 0xFE];
+        bad.extend_from_slice(&0xDC00u16.to_le_bytes());
+        let mut tr2 = Utf16Transcoder::new(bad.as_slice(), true);
+        let mut sink = String::new();
+        assert!(
+            tr2.read_to_string(&mut sink).is_err(),
+            "孤低代理必须 Err（不产替换符）"
+        );
+        // 奇尾字节（截断码元）：BOM + 完整 '<' 码元 + 半个码元
+        let odd = vec![0xFFu8, 0xFE, b'<', 0x00, b'?'];
+        let mut tr3 = Utf16Transcoder::new(odd.as_slice(), true);
+        let mut sink2 = String::new();
+        assert!(tr3.read_to_string(&mut sink2).is_err(), "奇尾字节必须 Err");
+        // 解码字符面 ctrl 扫描（U+0001 在文本位）
+        let ctrl_src = utf16le("\u{0001}x");
+        let mut tr4 = Utf16Transcoder::new(ctrl_src.as_slice(), true);
+        let mut sink3 = String::new();
+        let _ = tr4.read_to_string(&mut sink3);
+        assert_eq!(tr4.ctrl_at, Some(0), "解码后 ctrl 字符应登记");
     }
 
     #[test]
