@@ -149,6 +149,12 @@ impl OutlinePanel {
     }
 
     /// 行集是否为空（left_panel 沿用「无标题不渲染分组」的批 5a 前语义）。
+    /// #108 P2③：过滤框聚焦句柄（goto 符号链——开右栏后聚焦此处，
+    /// 用户输入即符号过滤、Enter 跳行——「符号对话框」承接面）。
+    pub fn filter_focus_handle(&self) -> &FocusHandle {
+        &self.filter_focus
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

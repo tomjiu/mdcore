@@ -9,7 +9,7 @@ impl Render for Host {
     }
 }
 
-fn host(cx: &mut TestAppContext) -> (Entity<ShellApp>, VisualTestContext) {
+pub(crate) fn host(cx: &mut TestAppContext) -> (Entity<ShellApp>, VisualTestContext) {
     cx.update(|app| {
         theme::init(theme::LoadThemes::JustBase, app);
         theme::set_theme_settings_provider(Box::new(crate::settings::ShellThemeSettings), app);
@@ -369,4 +369,5 @@ fn layout_holds_at_hidpi_scale_factor_and_returns(cx: &mut TestAppContext) {
     same("editor-tabs", &tb0, &tb1);
     same("editor-content", &e0, &e1);
     same("right-panel", &r0, &r1);
+
 }
