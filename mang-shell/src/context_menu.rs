@@ -139,6 +139,9 @@ pub fn file_tree_menu(is_dir: bool) -> Vec<MenuItem> {
         MenuItem::action("ft-rename", "重命名").with_shortcut("F2"),
         MenuItem::action("ft-delete", "删除").with_shortcut("Delete"),
         MenuItem::Separator,
+        // #107 P1 批⑦：树面手动刷新（报告 P1① 后半——mtime 轮询未立
+        // 项前的手动面；reload 以工作区根为对象，目录/文件右键均可用）。
+        MenuItem::action("ft-refresh", "刷新"),
         MenuItem::action("ft-reveal", "在资源管理器中显示"),
         // #107 D1①：外部（非本应用）改动目录内容后的感知手段——
         // 重读目标目录清单（目录）或父目录（文件）。此前唯一恢复
@@ -150,6 +153,19 @@ pub fn file_tree_menu(is_dir: bool) -> Vec<MenuItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #107 P1 批⑦：树面菜单含「刷新」项（对目录与文件均可用——
+    /// reload 以工作区根为对象；先红面：菜单无此条目）。
+    #[test]
+    fn file_tree_menu_has_refresh_entry() {
+        for is_dir in [false, true] {
+            let items = file_tree_menu(is_dir);
+            let has = items
+                .iter()
+                .any(|i| matches!(i, MenuItem::Action { id, .. } if *id == "ft-refresh"));
+            assert!(has, "file_tree_menu({is_dir}) 应含 ft-refresh 刷新项");
+        }
+    }
 
     #[test]
     fn editor_menu_disables_cut_without_selection() {

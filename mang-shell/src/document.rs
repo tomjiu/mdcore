@@ -90,16 +90,61 @@ pub enum OpenedDocument {
 }
 
 /// 打开一个文件（分派 + 读取）。
+/// #107 批④：文本字节按探测编码解码为 `String`。
+///
+/// 探测复用 [`crate::status_info::detect_encoding`]（BOM → UTF-8 →
+/// GBK 结构启发式；`None` = 探测不出——不猜，与该函数的诚实边界
+/// 一致，此处原样透传 `None`）。UTF-8（含 BOM 剥离）直通零成本；
+/// UTF-16LE/BE 与 GBK 经 encoding_rs 解码（WHATWG 标准 GBK 超集
+/// 表——GB18030 全兼容面）。
+fn decode_text_bytes(bytes: &[u8]) -> Option<String> {
+    use crate::status_info::{Encoding, detect_encoding};
+    match detect_encoding(bytes)? {
+        Encoding::Utf8 => std::str::from_utf8(bytes).ok().map(str::to_string),
+        Encoding::Utf8Bom => std::str::from_utf8(&bytes[3..]).ok().map(str::to_string),
+        Encoding::Utf16Le => Some(
+            encoding_rs::UTF_16LE
+                .decode_with_bom_removal(bytes)
+                .0
+                .into_owned(),
+        ),
+        Encoding::Utf16Be => Some(
+            encoding_rs::UTF_16BE
+                .decode_with_bom_removal(bytes)
+                .0
+                .into_owned(),
+        ),
+        Encoding::Gbk => Some(
+            encoding_rs::GBK
+                .decode_without_bom_handling(bytes)
+                .0
+                .into_owned(),
+        ),
+    }
+}
+
 pub fn open(path: &Path) -> OpenedDocument {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "md" | "markdown" | "txt" => match std::fs::read_to_string(path) {
-            Ok(content) => OpenedDocument::EditableText {
-                path: path.to_path_buf(),
-                content,
+        // #107 批④（2449 D3）：编码探测——读 bytes 后经
+        // `status_info::detect_encoding`（既有纯函数：BOM → UTF-8 →
+        // GBK 结构启发式），UTF-8 直通；UTF-16LE/BE 与 GBK 经
+        // encoding_rs 解码（lock 既有 0.8.42 传递依赖，显式声明
+        // 零新增 crate）。探测不出（None）→ 保持旧错误口径
+        //（不猜——与 detect_encoding 的诚实边界一致）。
+        "md" | "markdown" | "txt" => match std::fs::read(path) {
+            Ok(bytes) => match decode_text_bytes(&bytes) {
+                Some(content) => OpenedDocument::EditableText {
+                    path: path.to_path_buf(),
+                    content,
+                },
+                None => OpenedDocument::OpenError {
+                    path: path.to_path_buf(),
+                    message: format!("无法判定文本编码（既非 UTF-8，也非结构合法的 GBK/UTF-16）"),
+                },
             },
             Err(err) => OpenedDocument::OpenError {
                 path: path.to_path_buf(),
@@ -321,6 +366,77 @@ fn unsupported_message(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #107 批④（2449 D3）：GBK/UTF-16/UTF-8BOM 文档探测解码。
+    /// GBK 中文 .md 与带 BOM 的 UTF-16 .txt 此前全落 OpenError
+    /// （read_to_string UTF-8 假定——Q-IDE 参照面探测后正常打开）；
+    /// UTF-8 BOM 此前剥 BOM 字符进内容。三面 + UTF-8 主路径回归。
+    #[test]
+    fn open_gbk_utf16_utf8bom_decode() {
+        let dir = std::env::temp_dir().join(format!("mang-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // "中文文档" 的 GBK 字节（D6 D0 CE C4 CE C4 B5 B5——手工钉死，
+        // 不经运行时编码器——测试自证前提）。
+        let gbk_bytes: &[u8] = &[0xD6, 0xD0, 0xCE, 0xC4, 0xCE, 0xC4, 0xB5, 0xB5];
+        let gbk_path = dir.join("gbk.md");
+        std::fs::write(&gbk_path, gbk_bytes).unwrap();
+
+        // "中文文档" 的 UTF-16LE + BOM（码位 4E2D 6587 6587 6563——
+        // 首版手写字节错位致解码得「中攀噧攣」，此为正确码位）。
+        let utf16_bytes: &[u8] = &[0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65, 0x87, 0x65, 0x63, 0x68];
+        let utf16_path = dir.join("utf16.txt");
+        std::fs::write(&utf16_path, utf16_bytes).unwrap();
+
+        // 绿断言（#107 批④解码面实施后）：两者正常打开且内容正确。
+        match open(&gbk_path) {
+            OpenedDocument::EditableText { content, .. } => {
+                assert_eq!(content, "中文文档", "GBK 文档解码正确（先红：OpenError）");
+            }
+            other => assert!(
+                matches!(other, OpenedDocument::EditableText { .. }),
+                "GBK 文档应 EditableText"
+            ),
+        }
+        match open(&utf16_path) {
+            OpenedDocument::EditableText { content, .. } => {
+                assert_eq!(
+                    content, "中文文档",
+                    "UTF-16LE 文档解码正确（先红：OpenError）"
+                );
+            }
+            other => assert!(
+                matches!(other, OpenedDocument::EditableText { .. }),
+                "UTF-16LE 文档应 EditableText"
+            ),
+        }
+        // UTF-8 带 BOM：内容剥离 BOM（EditableText 内容不含 EF BB BF）。
+        let utf8bom_path = dir.join("utf8bom.md");
+        std::fs::write(&utf8bom_path, b"\xEF\xBB\xBFhello").unwrap();
+        match open(&utf8bom_path) {
+            OpenedDocument::EditableText { content, .. } => {
+                assert_eq!(content, "hello", "UTF-8 BOM 剥离后内容正确");
+            }
+            other => assert!(
+                matches!(other, OpenedDocument::EditableText { .. }),
+                "UTF-8 BOM 文档应 EditableText"
+            ),
+        }
+        // 纯 ASCII/UTF-8 主路径不回退（回归面）。
+        let utf8_path = dir.join("utf8.md");
+        std::fs::write(&utf8_path, "中英 mixed").unwrap();
+        match open(&utf8_path) {
+            OpenedDocument::EditableText { content, .. } => {
+                assert_eq!(content, "中英 mixed", "UTF-8 主路径直通不回退");
+            }
+            other => assert!(
+                matches!(other, OpenedDocument::EditableText { .. }),
+                "UTF-8 文档应 EditableText"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// F1→G6：不支持文案分叉——.xls（已知未接）与未知类型各走各的
     /// 口径；.xlsx 自 G6 起接只读渲染，不再落「已知未接」文案。

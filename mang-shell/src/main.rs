@@ -86,14 +86,20 @@ use gpui_platform::application;
 
 mod activity_bar;
 mod assets;
+mod button_ext;
 mod canvas_view;
 mod document;
 mod editor;
 mod file_tree;
 mod git_panel;
+// #109 批②③：项目搜索面板实体（lib.rs `pub mod search_panel;` 双根
+// 同文件复用——file_tree/git_panel 同款声明）。
+mod search_panel;
+// #109 批①：项目级搜索/替换纯逻辑层（lib 双根同款）。
 mod git_repo;
 mod outline_panel;
 mod panels;
+mod project_search;
 mod recent;
 // doc_events：文档变更事件总线（#111 订阅模式）——editor 的编辑收尾
 //（after_edit）无条件调用 publish（RPC 禁用时静默丢弃），故不做
@@ -429,6 +435,13 @@ fn main() {
         .run(move |cx: &mut App| {
             theme::init(theme::LoadThemes::JustBase, cx);
             theme::set_theme_settings_provider(Box::new(settings::ShellThemeSettings), cx);
+            // #110 G2：用户主题装载（磁盘 themes/*.json → registry——
+            // 报告 §3 G2「引擎在线但无装载函数」补口；对齐既有用户
+            // 配置目录（§5 D2 裁定）；坏文件跳过 + stderr 证据行不炸启动）。
+            let loaded = settings::load_user_themes(cx);
+            if loaded > 0 {
+                eprintln!("theme-loader: {loaded} 个用户主题装载完成");
+            }
 
             // #385 批 4：ui::ContextMenu 族的键盘导航激活面——组件的
             // on_action（menu::Cancel/SelectNext/Confirm…）依赖宿主 app
@@ -502,10 +515,15 @@ fn main() {
             let remembered_workspace =
                 settings::remembered_workspace().filter(|root| root.is_dir());
 
+            // #114 批②：窗口矩形跨重启恢复（settings window_bounds——
+            // 坏数据校验回退默认 96,64,1280,800；最小 760×480 钳制
+            // 在读面完成）。报告 §6 M7：用户拖大窗口重启不再回硬编码。
+            let (bx, by, bw, bh) = settings::load_window_bounds()
+                .unwrap_or((96., 64., 1280., 800.));
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: point(px(96.), px(64.)),
-                    size: size(px(1280.), px(800.)),
+                    origin: point(px(bx), px(by)),
+                    size: size(px(bw), px(bh)),
                 })),
                 titlebar: Some(TitlebarOptions {
                     title: Some("mang".into()),
@@ -536,7 +554,36 @@ fn main() {
             // （EX_SOFTWARE）——替代原 .expect 的裸 panic（exit 101 裸
             // 错误链，桌面双击启动时 stderr 无处落 ≈ 静默失败）。
             let window_handle = match cx.open_window(options, |window, cx| {
-                cx.new(|cx| shell::ShellApp::new(editor_entity, remembered_workspace, window, cx))
+                // #114 P1④：关窗无条件先存（impl Window 钩子——返回
+                // true 放行关窗；窗口矩形 + 会话标签统一落存；非优雅
+                // 退出物理边界不保）。闭包首注册（shell 建立后拿实体面
+                // ——落存走 settings 直写，无需 shell 实体）。
+                cx.new(|cx| {
+                    let shell_entity =
+                        shell::ShellApp::new(editor_entity, remembered_workspace, window, cx);
+                    let weak = cx.entity().downgrade();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        // 关窗钩：窗口矩形（当前窗面）+ 会话标签（shell
+                        // 弱引用读 tabs）双键先存——返回 true 放行。
+                        let b = _window.bounds();
+                        settings::save_window_bounds(
+                            b.origin.x.as_f32(),
+                            b.origin.y.as_f32(),
+                            b.size.width.as_f32(),
+                            b.size.height.as_f32(),
+                        );
+                        if let Some(shell) = weak.upgrade() {
+                            shell.update(cx, |shell, _cx| {
+                                let paths: Vec<std::path::PathBuf> =
+                                    shell.tabs_paths_snapshot();
+                                let active = shell.active_index();
+                                settings::save_session_tabs(&paths, active);
+                            });
+                        }
+                        true
+                    });
+                    shell_entity
+                })
             }) {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -578,6 +625,15 @@ fn main() {
                     std::process::exit(70);
                 }
             };
+
+            // #114 批①：会话恢复（上次打开标签列表 + 激活标签——
+            // settings 读 → 逐路径 open_document_tab 既有链；已删静默
+            // 跳过 + 上限 20 + 恢复证据行；F2 工作区恢复后接续）。
+            window_handle.update(cx, |shell, _window, cx| {
+                shell.restore_session_tabs(cx);
+            });
+
+
 
             // #104 任务 2：本机控制通道启动（默认开；失败降级不致命——
             // 端点被占/绑定失败只损失 RPC 能力，桌面本体照常）。服务

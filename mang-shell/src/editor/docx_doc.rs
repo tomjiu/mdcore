@@ -1151,8 +1151,11 @@ fn pad_cell(s: &str, width: usize) -> String {
 /// PageDown / Esc 清选区 / Ctrl+A 全选 / Ctrl+C 复制 / Ctrl+F 查找。
 /// 拒绝：输入 / 删除 / 回车 / Tab / Ctrl+X / Ctrl+V / Ctrl+Z / Ctrl+Y /
 /// Ctrl+S（可打印字符经 `key_char` 兜底分支——非放行键一律拒绝）。
-pub fn readonly_allows(key: &str, ctrl: bool) -> bool {
+pub fn readonly_allows(key: &str, ctrl: bool, alt: bool) -> bool {
     match key {
+        // #111 D1：Alt+↑/↓ 是行移动（编辑命令）——只读态拒；
+        // 裸/ctrl/shift+方向键是光标移动（浏览）——放行如故。
+        "up" | "down" if alt => false,
         "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" | "escape" => {
             true
         }
@@ -1379,29 +1382,42 @@ mod tests {
         for key in [
             "left", "right", "up", "down", "home", "end", "pageup", "pagedown", "escape",
         ] {
-            assert!(readonly_allows(key, false), "{key} 应放行");
+            assert!(readonly_allows(key, false, false), "{key} 应放行");
         }
-        assert!(readonly_allows("a", true), "Ctrl+A 全选放行");
-        assert!(readonly_allows("c", true), "Ctrl+C 复制放行");
-        assert!(readonly_allows("f", true), "Ctrl+F 查找放行");
-        assert!(readonly_allows("g", true), "G2：Ctrl+G 跳行放行（导航类）");
-        assert!(!readonly_allows("g", false), "无 Ctrl 的 g 不放行");
+        assert!(readonly_allows("a", true, false), "Ctrl+A 全选放行");
+        assert!(readonly_allows("c", true, false), "Ctrl+C 复制放行");
+        assert!(readonly_allows("f", true, false), "Ctrl+F 查找放行");
         assert!(
-            readonly_allows("tab", true),
+            readonly_allows("g", true, false),
+            "G2：Ctrl+G 跳行放行（导航类）"
+        );
+        // #111 D1：Alt+↑/↓ 行移动是编辑命令——只读态拒（裸方向键放行如故）。
+        assert!(!readonly_allows("up", false, true), "Alt+↑ 行移动只读态拒");
+        assert!(
+            !readonly_allows("down", false, true),
+            "Alt+↓ 行移动只读态拒"
+        );
+        assert!(readonly_allows("up", false, false), "裸 ↑ 光标移动放行");
+        assert!(!readonly_allows("g", false, false), "无 Ctrl 的 g 不放行");
+        assert!(
+            readonly_allows("tab", true, false),
             "F3：Ctrl+Tab 标签循环导航放行"
         );
         // 变更面拒绝。
-        assert!(!readonly_allows("enter", false));
-        assert!(!readonly_allows("backspace", false));
-        assert!(!readonly_allows("delete", false));
-        assert!(!readonly_allows("tab", false));
-        assert!(!readonly_allows("z", true), "Ctrl+Z 撤销拒绝");
-        assert!(!readonly_allows("y", true), "Ctrl+Y 重做拒绝");
-        assert!(!readonly_allows("x", true), "Ctrl+X 剪切拒绝");
-        assert!(!readonly_allows("v", true), "Ctrl+V 粘贴拒绝");
-        assert!(!readonly_allows("s", true), "Ctrl+S 保存拒绝");
-        assert!(!readonly_allows("s", false), "可打印字符插入拒绝");
-        assert!(!readonly_allows("f", false), "无 Ctrl 的 f 是输入——拒绝");
+        assert!(!readonly_allows("enter", false, false));
+        assert!(!readonly_allows("backspace", false, false));
+        assert!(!readonly_allows("delete", false, false));
+        assert!(!readonly_allows("tab", false, false));
+        assert!(!readonly_allows("z", true, false), "Ctrl+Z 撤销拒绝");
+        assert!(!readonly_allows("y", true, false), "Ctrl+Y 重做拒绝");
+        assert!(!readonly_allows("x", true, false), "Ctrl+X 剪切拒绝");
+        assert!(!readonly_allows("v", true, false), "Ctrl+V 粘贴拒绝");
+        assert!(!readonly_allows("s", true, false), "Ctrl+S 保存拒绝");
+        assert!(!readonly_allows("s", false, false), "可打印字符插入拒绝");
+        assert!(
+            !readonly_allows("f", false, false),
+            "无 Ctrl 的 f 是输入——拒绝"
+        );
     }
 
     #[test]

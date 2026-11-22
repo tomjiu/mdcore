@@ -50,9 +50,11 @@ use crate::editor::{Editor, SaveOutcome};
 use crate::editor::buffer::IndentUnit;
 use crate::file_tree::FileTree;
 use crate::git_panel::GitPanel;
+// #109 批②③：项目搜索面板（左栏 dock 均面板——工作区打开时物化）。
 use crate::menu_bar;
 use crate::menu_bar_view;
 use crate::outline_panel::OutlinePanel;
+use crate::search_panel::{SearchPanel, SearchPanelHooks};
 // #217：键位表（shell 键钩子的单一事实源——默认表 = 原分支精确镜像）。
 use crate::keymap::{self, ShellAction};
 use crate::panels;
@@ -115,6 +117,13 @@ enum ConfirmAction {
     /// #166：永久删除文件树目标（确认后不可恢复——无回收站 API，
     /// gpui 闭包未暴露 trash 面）。
     DeletePath { path: PathBuf },
+    /// #109 批③：项目搜索全部替换（预览确认后执行——replace_all +
+    /// 打开标签 mtime 重载善后）。
+    SearchReplaceAll {
+        pattern: String,
+        replacement: String,
+        options: crate::project_search::SearchOptions,
+    },
 }
 
 /// F4：确认框状态。
@@ -182,6 +191,8 @@ pub struct ShellApp {
     workspace: Option<Entity<FileTree>>,
     /// F7：git 面板（工作区打开即建——非 git 目录走面板内提示态）。
     git_panel: Option<Entity<GitPanel>>,
+    /// #109 批②③：项目搜索面板实体（工作区打开时物化；无工作区 = None）。
+    search_panel: Option<Entity<SearchPanel>>,
     /// #119（mdc-dock 批①）：左栏 dock 实体——文件树/git 视图切换经
     /// 统一激活协议（`git_view` 布尔退役）。面板未物化（无工作区）时
     /// `activate_key` 记录预物化意图，渲染面据 `active_key` 呈占位视图
@@ -381,9 +392,18 @@ impl ShellApp {
             // 证据通道（与 open_workspace 的 "workspace: <路径>" 区分）。
             eprintln!("workspace(restored): {}", root.display());
         }
-        let workspace = workspace_root.map(|root| {
+        let workspace = workspace_root.clone().map(|root| {
             let shell = cx.entity().downgrade();
-            cx.new(|cx| FileTree::new(root, Self::file_tree_hooks(shell), cx))
+            cx.new(|cx| FileTree::new(root.clone(), Self::file_tree_hooks(shell.clone()), cx))
+        });
+        // #109 批②③：启动恢复的工作区同步建搜索面板（root 换绑在内）。
+        let search_panel = workspace_root.map(|root| {
+            let shell = cx.entity().downgrade();
+            cx.new(|cx| {
+                let mut panel = SearchPanel::new(Self::search_panel_hooks(shell), cx);
+                panel.set_root(Some(root), cx);
+                panel
+            })
         });
         // F3：启动文档 → 首个标签（未命名草稿取合成身份——CLI 无参
         // 不构造实体，实际不可达；防御完整）。
@@ -491,6 +511,7 @@ impl ShellApp {
             closed_tabs: Vec::new(),
             workspace,
             git_panel: None,
+            search_panel: search_panel.clone(),
             outline: None,
             // #119（mdc-dock 批①）：左栏激活协议实体；#120（批②）：
             // 布局恢复在构造尾（面板注册之后——见下）。
@@ -564,6 +585,13 @@ impl ShellApp {
         if let Some(tree) = this.workspace.clone() {
             this.left_dock.update(cx, |dock, cx| {
                 dock.add_panel(&tree, cx);
+            });
+        }
+        // #109 批②③：启动工作区的搜索面板同批注册（不激活——视图
+        // 归用户记忆/缺省文件树；激活键激活时面板可聚焦查询框）。
+        if let Some(search) = this.search_panel.clone() {
+            this.left_dock.update(cx, |dock, cx| {
+                dock.add_panel(&search, cx);
             });
         }
         // #120（批②）：布局恢复——**面板注册之后**（记忆对已物化面板
@@ -644,7 +672,18 @@ impl ShellApp {
             tab.editor.read(cx).is_modified()
                 || self.xlsx_dirty_at(&tab.path, cx)
                 || self.pdf_view_dirty(cx, &tab.path)
+                // #50 C3/C4：docx 页面视图脏（EditDone 回执驱动的真实
+                // 脏位——关闭确认/退出确认从此对 LOK 编辑生效）。
+                || self.docx_page_dirty(cx, &tab.path)
         })
+    }
+
+    /// #50 C3/C4：指定路径的 docx 页面视图是否脏（Shell 持有的
+    /// `docx_pages` 槽按路径匹配——无页视图/路径不匹配 = 不脏）。
+    fn docx_page_dirty(&self, cx: &App, path: &Path) -> bool {
+        self.docx_pages
+            .as_ref()
+            .is_some_and(|(owned, entity)| *owned == path && entity.read(cx).is_dirty())
     }
 
     /// #386：指定路径的 pdf 页视图是否有未落盘批注（Shell 持有的
@@ -725,16 +764,32 @@ impl ShellApp {
                     .filter(|(owned, _)| *owned == tab.path)
                     .map(|_| tab.path.clone())
             });
-        if let Some(_owned) = docx_page_owned {
-            // #176 验收②：页面态保存不再静默——明确告知只读渲染无修改可存
-            // （outcome 仍 Unmodified：关闭/退出流程消费三态语义零变化，
-            // 零写盘保证也零变化）。
-            self.show_notice(
-                "DOCX 页面视图为只读渲染，没有可保存的修改——编辑请先切换到文本视图（状态栏「切换到文本视图」）"
-                    .into(),
-                cx,
-            );
-            return SaveOutcome::Unmodified;
+        if let Some(owned) = docx_page_owned {
+            // #50 C3/C4：页面态保存改走 LOK 会话（saveAs 回源路径 +
+            // 修订号对账清 dirty——C1 时期的只读提示退役：编辑面已接）。
+            // 干净态短路（Unmodified——关闭/退出三态语义保持）；脏态发
+            // `request_save`（异步回执 SaveDone——对账后自动清 dirty +
+            // toast；本调用返回 Saved 表「保存已发起」——失败面经回执
+            // toast 显式示警，不静默不假绿）。
+            let dirty = self
+                .docx_pages
+                .as_ref()
+                .is_some_and(|(o, e)| *o == owned && e.read(cx).is_dirty());
+            if !dirty {
+                return SaveOutcome::Unmodified;
+            }
+            let sent = self
+                .docx_pages
+                .as_ref()
+                .map(|(_, e)| e.clone())
+                .map(|entity| entity.update(cx, |view, cx| view.request_save(cx)))
+                .unwrap_or(false);
+            if !sent {
+                self.show_notice("保存未发起——LOK 会话不可用（详见应用日志）".into(), cx);
+                return SaveOutcome::Unmodified;
+            }
+            self.show_notice("保存中（LOK 内核写盘——完成后自动提示）".into(), cx);
+            return SaveOutcome::Saved;
         }
         if is_pdf {
             let tab_path = self.tabs.get(idx).map(|tab| tab.path.clone());
@@ -854,6 +909,32 @@ impl ShellApp {
         self.left_dock.read(cx).is_open()
     }
 
+    /// #109 批②③：项目搜索面板视图切换（图标条搜索钮——与文件树/git
+    /// 钮同构的统一激活协议入口；已开且在搜索视图时折叠左栏，再开切回）。
+    pub fn toggle_search(&mut self, cx: &mut Context<Self>) {
+        if self.left_open(cx) && self.search_active(cx) {
+            let dock = self.left_dock.clone();
+            dock.update(cx, |dock, cx| dock.set_open(false, cx));
+        } else {
+            let dock = self.left_dock.clone();
+            dock.update(cx, |dock, cx| dock.set_open(true, cx));
+            self.activate_left_view(crate::search_panel::SEARCH_PANEL_KEY, cx);
+        }
+        self.persist_dock_layout(cx);
+        cx.notify();
+    }
+
+    /// #109：左栏当前是否搜索视图（图标条选中态/菜单勾选共用真源）。
+    pub fn search_active(&self, cx: &App) -> bool {
+        self.left_dock
+            .read(cx)
+            .active_is(crate::search_panel::SEARCH_PANEL_KEY)
+            || self
+                .right_dock
+                .read(cx)
+                .active_is(crate::search_panel::SEARCH_PANEL_KEY)
+    }
+
     /// #119（mdc-dock 批①）：左栏当前是否 git 视图（dock 激活键裁决
     /// ——含预物化意图口径；菜单勾选/图标条选中态/渲染面共用）。
     pub fn git_active(&self, cx: &App) -> bool {
@@ -960,6 +1041,56 @@ impl ShellApp {
                 });
             }),
             // Esc → 焦点还激活编辑器（#571 大纲面板同语义）。
+            escape: Arc::new(move |window, cx| {
+                let _ = shell.update(cx, |shell, cx| shell.focus_active(window, cx));
+            }),
+        }
+    }
+
+    /// #109 批②③：SearchPanel 的 ShellApp 面收口（lib 化钩子注入——
+    /// open_hit = open_document_tab + 编辑器跳行；replace_all = 预览 +
+    /// 确认 + 执行 + 善后整链；escape = 焦点还编辑器）。
+    fn search_panel_hooks(shell: gpui::WeakEntity<Self>) -> SearchPanelHooks {
+        use std::sync::Arc;
+        let open_shell = shell.clone();
+        let replace_shell = shell.clone();
+        SearchPanelHooks {
+            // 命中点击 → 打开文件 + 跳行（文件树 open_file 同链 + 行定位）。
+            open_hit: Arc::new(move |path, line, window, cx| {
+                if let Some(focus) = open_shell
+                    .update(cx, |shell, cx| {
+                        shell.open_document_tab(path.to_path_buf(), cx)
+                    })
+                    .ok()
+                    .flatten()
+                {
+                    window.focus(&focus, cx);
+                    // 跳行（open 后才有效——新开或既有标签都跳）。
+                    if let Some(shell) = open_shell.upgrade() {
+                        shell.update(cx, |shell, cx| {
+                            if let Some(tab) = shell.tabs.get(shell.active) {
+                                tab.editor
+                                    .update(cx, |ed, _| ed.jump_to_line(line.saturating_sub(1)));
+                            }
+                        });
+                    }
+                }
+            }),
+            // 全部替换（批③整链：预览计数 → 确认框 → 执行 → 善后 → toast）。
+            replace_all: Arc::new(move |pattern, replacement, options, window, cx| {
+                if let Some(shell) = replace_shell.upgrade() {
+                    shell.update(cx, |shell, cx| {
+                        shell.request_search_replace(
+                            pattern.to_string(),
+                            replacement.to_string(),
+                            options.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            }),
+            // Esc → 焦点还激活编辑器（面板键盘域退出——同语义）。
             escape: Arc::new(move |window, cx| {
                 let _ = shell.update(cx, |shell, cx| shell.focus_active(window, cx));
             }),
@@ -1967,6 +2098,18 @@ impl ShellApp {
                     cx.reveal_path(&reveal);
                 }
             }
+            // #107 P1 批⑦：树面手动刷新（报告 P1① 后半——mtime 轮询
+            // 未立项前的手动面；工作区根整树重读——#595 光标路径重绑定
+            // 既有语义背书零新语义；无工作区时空操作）。
+            (MenuOrigin::FileTree, "ft-refresh") => {
+                if let Some(tree) = &self.workspace {
+                    let root = tree.read(cx).root().to_path_buf();
+                    tree.update(cx, |tree, cx| {
+                        tree.reload(&root);
+                        cx.notify();
+                    });
+                }
+            }
             (MenuOrigin::FileTree, "ft-open") => {
                 // 只对文件有效（菜单构建时目录项已灰显——防御面再验一道）。
                 if let Some(target) = target.filter(|p| !p.is_dir()) {
@@ -2073,6 +2216,8 @@ impl ShellApp {
             theme_mode: self.theme_mode,
             left_open: self.left_open(cx),
             git_view: self.git_active(cx),
+            // #109：搜索视图态（侧栏菜单勾选——dock 激活键真源）。
+            search_view: self.search_active(cx),
             // #307：「导出为 PDF」门槛（仅 docx 形态提供；md/pdf/xlsx/
             // canvas 标签上灰显）。
             active_is_docx: tab.is_some_and(|t| t.editor.read(cx).doc_kind() == "docx"),
@@ -2198,6 +2343,34 @@ impl ShellApp {
         self.menu_bar_open = None;
         self.focus_active(window, cx);
         use menu_bar::MenuAction as Act;
+        // #50 C3（#176 翻新）：docx 页面态——剪贴板/Cmd 编辑动作分流到
+        // 页视图编辑通道（同键位域 dispatch_edit_key 一条链）。undo/
+        // redo/cut/copy/paste 页面已可编辑（PR #217 后置灰原因退役；
+        // 查找/替换/面板是编辑器浮层仍置灰——menu_bar 门控区分对待）。
+        if self.docx_page_view_active(cx) {
+            if let Some((_, entity)) = self.docx_pages.clone() {
+                let mut consumed = false;
+                entity.update(cx, |view, cx| {
+                    consumed = match action {
+                        Act::EditorCmd(crate::editor::commands::Cmd::Undo) => {
+                            view.dispatch_edit_key("z", true, false, window, cx);
+                            true
+                        }
+                        Act::EditorCmd(crate::editor::commands::Cmd::Redo) => {
+                            view.dispatch_edit_key("y", true, false, window, cx);
+                            true
+                        }
+                        Act::Cut => view.dispatch_edit_key("x", true, false, window, cx),
+                        Act::Copy => view.dispatch_edit_key("c", true, false, window, cx),
+                        Act::Paste => view.dispatch_edit_key("v", true, false, window, cx),
+                        _ => false,
+                    };
+                });
+                if consumed {
+                    return;
+                }
+            }
+        }
         match action {
             Act::EditorCmd(cmd) => self.dispatch_editor_cmd(cmd, window, cx),
             // 剪贴板三件：Cmd 枚举无剪贴板项——Editor 菜单方法（右键
@@ -2245,7 +2418,19 @@ impl ShellApp {
             // 与标题栏 × 钮同一条 cx.quit 既有路径（该路径不经
             // on_should_close 脏确认——× 钮现状同此，行为对齐不超范围
             // 修补；统一走脏确认建议另开 issue）。
-            Act::Quit => cx.quit(),
+            Act::Quit => {
+                // #114 批②：退出前窗口矩形先存（跨重启恢复——关窗
+                // 无条件先存语义的退出链面；非优雅退出不保，边界
+                // 如实——窗口 WM 摩擦场景下次启动回默认）。
+                let b = window.bounds();
+                crate::settings::save_window_bounds(
+                    b.origin.x.as_f32(),
+                    b.origin.y.as_f32(),
+                    b.size.width.as_f32(),
+                    b.size.height.as_f32(),
+                );
+                cx.quit();
+            }
             // 关于：既有提示横幅承载（层 3 可发现性验收项——版本信息
             // 面向用户可见）。
             Act::About => self.show_notice(
@@ -2274,6 +2459,9 @@ impl ShellApp {
             Act::FontReset => self.apply_font_size(px(15.), cx),
             Act::ToggleFileTreePanel => self.toggle_left(cx),
             Act::ToggleGitPanel => self.toggle_git(cx),
+            // #109 批②③：项目搜索面板（图标条/菜单同链——Ctrl+Shift+F
+            // 键位同接此处）。
+            Act::ToggleSearchPanel => self.toggle_search(cx),
             // 置灰项不绑动作（无既有命令映射）——正常不可达（灰显挂
             // 不了 on_click、Enter 有 enabled 门）；能到达说明菜单配错，
             // stderr 留痕（右键菜单未接线兜底同款口径）。
@@ -2332,6 +2520,8 @@ impl ShellApp {
                     self.tabs.len(),
                     self.active
                 );
+                // #114 批①：开标签落盘（会话恢复数据源）。
+                self.persist_session_tabs();
                 // F2：文件树高亮同步（工作区打开时）。
                 if let Some(tree) = &self.workspace {
                     tree.update(cx, |tree, cx| {
@@ -2378,6 +2568,62 @@ impl ShellApp {
     }
 
     /// F3：激活标签（点击标签 / 重复打开既有文件 / 循环切换落地）。
+    /// #114 批①：启动会话恢复（settings 读 → 逐路径 open_document_tab
+    /// 既有链——报告 D1 约束：不动 docx/pdf/xlsx 编辑器构造链）。
+    /// 上限 20（防炸开）；已删文件静默跳过（Q-IDE 同语义）+ 恢复
+    /// 证据行；激活标签末位恢复（索引越界钳到尾）。返回恢复数。
+    pub fn restore_session_tabs(&mut self, cx: &mut Context<Self>) -> usize {
+        let (paths, active) = crate::settings::load_session_tabs();
+        if paths.is_empty() {
+            return 0;
+        }
+        let mut restored = 0;
+        for path in paths.into_iter().take(20) {
+            if !path.is_file() {
+                eprintln!("session-restore: 已删跳过 {}", path.display());
+                continue;
+            }
+            if self.tabs.iter().any(|t| t.path == path) {
+                continue; // 启动初始标签去重（CLI 直开同文件）
+            }
+            if self.open_document_tab(path, cx).is_some() {
+                restored += 1;
+            }
+        }
+        // 激活恢复（存档索引越界/文件被跳 → 钳到有效尾）。
+        let idx = active.min(self.tabs.len().saturating_sub(1));
+        let _ = self.activate_tab_focus(idx, cx);
+        eprintln!("session-restore: 恢复 {restored} 标签（active {idx}）");
+        restored
+    }
+
+    /// #114 P1④：关窗先存统一面（on_window_should_close 钩内调用——
+    /// 窗口矩形（#230）+ 会话标签（批①）两键无条件落存；非优雅退出
+    /// 物理边界不保）。
+    pub(crate) fn persist_on_close(&self, window: &mut Window) {
+        let b = window.bounds();
+        crate::settings::save_window_bounds(
+            b.origin.x.as_f32(),
+            b.origin.y.as_f32(),
+            b.size.width.as_f32(),
+            b.size.height.as_f32(),
+        );
+        self.persist_session_tabs();
+    }
+
+    /// #114 P1④：关窗钩读面（main 钩内 shell.update 用——快照
+    /// 只读，不引 Context）。
+    pub(crate) fn tabs_paths_snapshot(&self) -> Vec<std::path::PathBuf> {
+        self.tabs.iter().map(|t| t.path.clone()).collect()
+    }
+
+    /// #114 批①：会话标签列表落盘（open/close/activate 三时机统一面
+    /// ——跨重启恢复的数据源；光标不恢复——Q-IDE 亦不立）。
+    fn persist_session_tabs(&self) {
+        let paths: Vec<std::path::PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        crate::settings::save_session_tabs(&paths, self.active);
+    }
+
     pub fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.activate_tab_focus(idx, cx) {
             window.focus(&focus, cx);
@@ -2388,6 +2634,8 @@ impl ShellApp {
     fn activate_tab_focus(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<FocusHandle> {
         let tab = self.tabs.get(idx)?.clone();
         self.active = idx;
+        // #114 批①：激活切换落盘（会话恢复——激活索引随变更即存）。
+        self.persist_session_tabs();
         // #571：激活编辑器变更 → 大纲面板换绑。
         self.sync_outline(cx);
         // #289-④：pdf 标签 → 页视图随标签落位（同路径复用，异路径重建）。
@@ -2544,6 +2792,8 @@ impl ShellApp {
             self.tabs.len(),
             self.active
         );
+        // #114 批①：关标签落盘（会话恢复——标签集即变更即存）。
+        self.persist_session_tabs();
         // #289-④：新活动标签若是 pdf → 页视图随标签重建。
         self.ensure_pdf_pages(cx);
         // #389 阶段 1：新活动标签若是 xlsx → 网格视图随标签重建。
@@ -2556,6 +2806,168 @@ impl ShellApp {
     }
 
     /// F4：确认框按钮激活（键盘 Enter / 鼠标点击）。`choice`：
+    /// #109 批③：全部替换请求（面板钩子入口）：预览计数 → 确认框
+    /// （复用 #166 删除确认双选形态：0 全部替换 / 1 取消）。
+    fn request_search_replace(
+        &mut self,
+        pattern: String,
+        replacement: String,
+        options: crate::project_search::SearchOptions,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.workspace_root(cx) else {
+            self.show_notice("未打开工作区——先打开文件夹（Ctrl+K Ctrl+O）".into(), cx);
+            return;
+        };
+        // 预览数据面（批① preview_replace：文件清单 + 处数——后台跑，
+        // 主线程只弹确认）。
+        let root_clone = root.clone();
+        let pattern_clone = pattern.clone();
+        let options_clone = options.clone();
+        cx.spawn(async move |this, cx| {
+            let preview = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::project_search::preview_replace(
+                        &root_clone,
+                        &pattern_clone,
+                        &options_clone,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                match preview {
+                    Ok(list) if list.is_empty() => {
+                        shell.show_notice("无匹配可替换".into(), cx);
+                    }
+                    Ok(list) => {
+                        let files = list.len();
+                        let count: usize = list.iter().map(|(_, n)| n).sum();
+                        // 确认框（detail = 文件数/处数概览——首批文件清单
+                        // 摘要，防超长）。
+                        let mut detail = list
+                            .iter()
+                            .take(8)
+                            .map(|(p, n)| {
+                                let rel = p
+                                    .strip_prefix(&root)
+                                    .map(|r| r.display().to_string())
+                                    .unwrap_or_else(|_| p.display().to_string());
+                                format!("{rel}（{n} 处）")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if files > 8 {
+                            detail.push_str(&format!("\n…等 {files} 个文件"));
+                        }
+                        shell.confirm = Some(ConfirmState {
+                            message: "在打开的工作区全部替换？".into(),
+                            detail: format!("共 {files} 个文件 / {count} 处将替换\n{detail}"),
+                            action: ConfirmAction::SearchReplaceAll {
+                                pattern,
+                                replacement,
+                                options,
+                            },
+                            selected: 1,
+                            buttons: vec!["全部替换", "取消"],
+                        });
+                        // 模态焦点接管由既有确认框渲染层承担（confirm_focus）。
+                        cx.notify();
+                    }
+                    Err(message) => {
+                        shell.show_notice(format!("替换预览失败：{message}"), cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// #109 批③：确认后的执行（写盘 + 善后 + toast 报数）。
+    fn search_replace_confirmed(
+        &mut self,
+        pattern: &str,
+        replacement: &str,
+        options: &crate::project_search::SearchOptions,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.workspace_root(cx) else {
+            return;
+        };
+        // 执行前快照打开标签的 mtime（替换写盘后比对——精确善后判定）。
+        let before: Vec<(usize, Option<std::time::SystemTime>)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                (
+                    i,
+                    std::fs::metadata(&tab.path).and_then(|m| m.modified()).ok(),
+                )
+            })
+            .collect();
+        let root_c = root.clone();
+        let pattern_c = pattern.to_string();
+        let replacement_c = replacement.to_string();
+        let options_c = options.clone();
+        cx.spawn(async move |this, cx| {
+            let report = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::project_search::replace_all(
+                        &root_c,
+                        &pattern_c,
+                        &replacement_c,
+                        &options_c,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                match report {
+                    Ok(rep) => {
+                        // 善后：打开标签 mtime 变化 → 重载（#134 reload_tab
+                        // 完整编辑链；未变/mtime 不可得跳过——写失败另 toast）。
+                        let mut reloaded = 0;
+                        for (i, before_m) in &before {
+                            let Some(tab) = shell.tabs.get(*i) else {
+                                continue;
+                            };
+                            let now_m =
+                                std::fs::metadata(&tab.path).and_then(|m| m.modified()).ok();
+                            if now_m.is_some() && *before_m != now_m {
+                                if shell.reload_tab(*i, cx) {
+                                    reloaded += 1;
+                                }
+                            }
+                        }
+                        shell.show_notice(
+                            format!(
+                                "已替换 {} 处（{} 个文件）· 重载 {reloaded} 个打开标签",
+                                rep.replacements, rep.files_changed
+                            ),
+                            cx,
+                        );
+                        if rep.failed > 0 {
+                            shell.show_notice(
+                                format!("{} 个文件写盘失败——详见应用日志", rep.failed),
+                                cx,
+                            );
+                        }
+                        // 搜索面板结果重扫（内容已变——面板自刷新）。
+                        if let Some(panel) = shell.search_panel.clone() {
+                            panel.update(cx, |p, cx| p.rerun_after_replace(cx));
+                        }
+                    }
+                    Err(message) => {
+                        shell.show_notice(format!("替换失败：{message}"), cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 0 保存 / 1 不保存 / 2 取消。
     fn resolve_confirm(&mut self, choice: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(confirm) = self.confirm.take() else {
@@ -2614,6 +3026,15 @@ impl ShellApp {
             // #166：删除确认（0 删除 / 1 取消——默认停取消侧）。
             ConfirmAction::DeletePath { path } => match choice {
                 0 => self.delete_path_confirmed(&path, window, cx),
+                _ => {}
+            },
+            // #109 批③：全部替换确认（0 全部替换 / 1 取消）。
+            ConfirmAction::SearchReplaceAll {
+                pattern,
+                replacement,
+                options,
+            } => match choice {
+                0 => self.search_replace_confirmed(&pattern, &replacement, &options, cx),
                 _ => {}
             },
         }
@@ -2725,6 +3146,19 @@ impl ShellApp {
     /// #134：工作区根目录（RPC FS 命令的沙箱边界；无工作区 = `None`
     /// ——FS 命令一律拒绝）。返回的是 FileTree 持有的原始根路径，
     /// 符号链接摊平（canonicalize）由 rpc::resolve_sandboxed 完成。
+    /// #107 D1①批②：标题栏「刷新」钮动作——文件树全树重读（外部
+    /// 改动范围未知时不猜目标：整树已缓存清单过一遍，根必命中——
+    /// TreeState::new 即读根且展开态常驻；展开态不动，不折叠用户
+    /// 已展开目录）。无工作区时无操作（无树可刷）。
+    pub fn refresh_file_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(ws) = self.workspace.as_ref().cloned() {
+            ws.update(cx, |tree, cx| {
+                tree.reload_root();
+                cx.notify();
+            });
+        }
+    }
+
     pub fn workspace_root(&self, cx: &Context<Self>) -> Option<PathBuf> {
         self.workspace
             .as_ref()
@@ -3656,8 +4090,14 @@ impl ShellApp {
         self.workspace = Some(tree.clone());
         // F7：git 面板（工作区打开即建——非 git 目录/缺 git 走提示态，
         // 不崩溃不拦截）。
-        let git = cx.new(|cx| GitPanel::new(root.clone(), Self::git_panel_hooks(shell), cx));
+        let git =
+            cx.new(|cx| GitPanel::new(root.clone(), Self::git_panel_hooks(shell.clone()), cx));
         self.git_panel = Some(git.clone());
+        // #109 批②③：项目搜索面板（工作区打开即建——面板实体承载
+        // 输入/后台扫描/结果/替换链；无工作区引导文案在面板内）。
+        let search = cx.new(|cx| SearchPanel::new(Self::search_panel_hooks(shell), cx));
+        search.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
+        self.search_panel = Some(search.clone());
         // #119（mdc-dock 批①）：面板注册进左栏 dock——旧面板撤注、新面
         // 板入列、激活键承接（无历史激活 → 文件树缺省；旧 git 态/预物化
         // 意图经 add_panel 与 activate_key 自动兑现——与旧 git_view 保
@@ -3672,8 +4112,10 @@ impl ShellApp {
         dock.update(cx, |dock, cx| {
             dock.remove_panel_by_key(crate::file_tree::FILE_TREE_PANEL_KEY, cx);
             dock.remove_panel_by_key(crate::git_panel::GIT_PANEL_KEY, cx);
+            dock.remove_panel_by_key(crate::search_panel::SEARCH_PANEL_KEY, cx);
             dock.add_panel(&tree, cx);
             dock.add_panel(&git, cx);
+            dock.add_panel(&search, cx);
             dock.set_open(prev_open, cx);
             match prev_view {
                 Some(key) => {
@@ -4063,6 +4505,12 @@ impl Render for ShellApp {
                         ShellAction::PromptOpenFile => {
                             this.prompt_open_file(window, cx);
                         }
+                        // #109 批②③：Ctrl+Shift+F 项目搜索面板（图标条/
+                        // 菜单同一 toggle_search 链）。
+                        ShellAction::ToggleSearchPanel => {
+                            this.toggle_search(cx);
+                            return;
+                        }
                     },
                 }
 
@@ -4145,9 +4593,10 @@ impl Render for ShellApp {
                         self.left_open(cx),
                         self.git_active(cx),
                         self.settings_open,
-                        // #176：docx 页面视图下搜索钮置灰 + 原因
-                        //（编辑器浮层死路——与菜单「查找」同判定源）。
-                        self.docx_page_view_active(cx),
+                        // #109 批②③：搜索钮改接项目搜索面板（R8 口径）——
+                        // 面板不依赖编辑器浮层，docx 页面视图/无文档均可用
+                        //（置灰口径退役；Ctrl+F 编辑器内查找不受影响）。
+                        false,
                         cx,
                     ))
                     .when(self.left_open(cx), |el| {
@@ -9528,6 +9977,30 @@ mod settings_lifecycle_tests {
                 "折叠态 toggle_git：双置直达"
             );
         });
+    }
+
+    /// #114 P1④：关窗先存链——标签快照面 + settings session_tabs/
+    /// window_bounds 双键落盘一致性（钩注册面在 main——本测验证钩内
+    /// 落存调用的数据面：快照 = tabs 真实序）。
+    #[gpui::test]
+    fn close_persist_snapshot_matches_tabs(cx: &mut gpui::TestAppContext) {
+        let tmp = std::env::temp_dir().join(format!("mclose-persist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let file = tmp.join("sess-a.md");
+        std::fs::write(&file, "# 会话标签 A").unwrap();
+        let (shell, _window) = shell_window(cx);
+        // 快照只读面（关窗钩读——shell 实体直读）。
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tabs_paths_snapshot().len(), 0, "初始零标签快照");
+            assert_eq!(shell.active_index(), 0);
+        });
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #120（批②）验收 ④：开合态跨「重启」恢复——收起右栏/左栏 →
