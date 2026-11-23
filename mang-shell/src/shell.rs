@@ -117,6 +117,9 @@ enum ConfirmAction {
     /// #166：永久删除文件树目标（确认后不可恢复——无回收站 API，
     /// gpui 闭包未暴露 trash 面）。
     DeletePath { path: PathBuf },
+    /// #107 P1②：拖拽移动文件树目标（确认后 fs::rename + 前缀重写
+    /// 打开标签路径）。
+    MovePath { old: PathBuf, new: PathBuf },
     /// #109 批③：项目搜索全部替换（预览确认后执行——replace_all +
     /// 打开标签 mtime 重载善后）。
     SearchReplaceAll {
@@ -1151,6 +1154,7 @@ impl ShellApp {
         use std::sync::Arc;
         let open_shell = shell.clone();
         let menu_shell = shell.clone();
+        let move_shell = shell.clone();
         crate::file_tree::FileTreeHooks {
             // 文件点击 → open_document_tab + 焦点落位（原链原样）。
             open_file: Arc::new(move |path, window, cx| {
@@ -1166,6 +1170,12 @@ impl ShellApp {
             context_menu: Arc::new(move |pos, path, is_dir, window, cx| {
                 let _ = menu_shell.update(cx, |shell, cx| {
                     shell.open_file_tree_context_menu(pos, path, is_dir, window, cx)
+                });
+            }),
+            // #107 P1②：拖拽移动（树内拖→目录行放——确认→前缀重写链）。
+            move_file: Arc::new(move |old, new_dir, window, cx| {
+                let _ = move_shell.update(cx, |shell, cx| {
+                    shell.confirm_move_path(old, new_dir, window, cx);
                 });
             }),
             // Esc → 焦点还激活编辑器（#571 大纲面板同语义）。
@@ -3171,6 +3181,11 @@ impl ShellApp {
                 0 => self.delete_path_confirmed(&path, window, cx),
                 _ => {}
             },
+            // #107 P1②：移动确认（0 移动 / 1 取消——默认取消侧）。
+            ConfirmAction::MovePath { old, new } => match choice {
+                0 => self.move_path_confirmed(&old, &new, cx),
+                _ => {}
+            },
             // #109 批③：全部替换确认（0 全部替换 / 1 取消）。
             ConfirmAction::SearchReplaceAll {
                 pattern,
@@ -3465,6 +3480,79 @@ impl ShellApp {
             Err(err) => {
                 self.show_notice(
                     format!("重命名失败（{} → {}）：{err}", old.display(), new.display()),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// #107 P1②：拖拽移动确认（二选一——默认「取消」危险侧；
+    /// 守卫：目标已存在/移进自身拒前置 toast 不弹窗）。
+    pub fn confirm_move_path(&mut self, old: PathBuf, new: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if new == old {
+            return; // 同路径无操作。
+        }
+        if new.starts_with(&old) {
+            self.show_notice("移动无效：目标在被移动目标内部".into(), cx);
+            return;
+        }
+        if new.exists() {
+            self.show_notice(format!("移动无效：目标已存在（{}）", new.display()), cx);
+            return;
+        }
+        let name = old
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| old.display().to_string());
+        let dir_name = new
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.confirm = Some(ConfirmState {
+            message: format!("移动「{name}」"),
+            detail: format!("到 {}（标签路径随之改写）", dir_name),
+            action: ConfirmAction::MovePath { old, new },
+            selected: 1,
+            buttons: vec!["移动", "取消"],
+        });
+        window.focus(&self.confirm_focus.clone(), cx);
+        cx.notify();
+    }
+
+    /// #107 P1②：移动执行（fs::rename + **前缀重写**打开标签路径——
+    /// 目录移动时 starts_with(old) 全量 plan（D2：前缀重写面牵连多
+    /// 标签）；文件移动精确匹配）+ 树同步 + mtime 基线刷新（防轮询
+    /// 误报）+ toast。
+    fn move_path_confirmed(&mut self, old: &Path, new: &Path, cx: &mut Context<Self>) {
+        match std::fs::rename(old, new) {
+            Ok(()) => {
+                eprintln!("file-tree: 移动 {} → {}", old.display(), new.display());
+                // 前缀重写 plan：目录 → starts_with 全量；文件 → 精确。
+                let plan: Vec<(usize, PathBuf)> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.path.starts_with(old))
+                    .map(|(i, t)| {
+                        let rel = t.path.strip_prefix(old).unwrap_or(std::path::Path::new(""));
+                        (i, new.join(rel))
+                    })
+                    .collect();
+                let n = plan.len();
+                self.apply_tab_renames(&plan, cx);
+                // 标签路径已变 → mtime 基线同步重置（防轮询误报）。
+                self.mtime_baselines.clear();
+                self.sync_tree_after_fs(old, true, cx);
+                self.sync_tree_after_fs(new, false, cx);
+                self.sync_tree_active(cx);
+                self.show_notice(
+                    format!("已移动（{} 个打开标签路径改写）", if old.is_dir() { n } else { n.max(1) }),
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.show_notice(
+                    format!("移动失败（{} → {}）：{err}", old.display(), new.display()),
                     cx,
                 );
             }
@@ -10751,6 +10839,107 @@ mod confirm_lifecycle_tests {
 #[cfg(test)]
 #[path = "workspace_layout_tests.rs"]
 mod workspace_layout_tests;
+
+/// #107 P1② 测试（内联域）：拖拽移动全链（rename + 前缀重写 + 守卫）。
+#[cfg(test)]
+mod drag_move_tests {
+    use super::*;
+
+    fn temp_ws(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mang-move-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        std::fs::write(dir.join("sub").join("b.md"), "# B\n").unwrap();
+        dir
+    }
+
+    /// 文件移动：rename + 打开标签路径精确重写 + toast。
+    #[gpui::test]
+    fn move_file_rewrites_open_tab_path(cx: &mut gpui::TestAppContext) {
+        let ws = temp_ws("file");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let a = ws.join("a.md");
+        let shell2 = shell.clone();
+        let p = a.clone();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.open_document_tab(p, cx);
+            });
+        });
+        // 直测 move_path_confirmed（confirm 面另测）。
+        let new = ws.join("sub").join("a.md");
+        let shell3 = shell.clone();
+        let (o, n) = (a.clone(), new.clone());
+        visual.update(|_window, app| {
+            shell3.update(app, |shell, cx| {
+                shell.move_path_confirmed(&o, &n, cx);
+            });
+        });
+        assert!(!a.exists(), "旧路径消失（已 rename）");
+        assert!(new.exists(), "新路径在场");
+        shell.read_with(&visual, |shell, _| {
+            let idx = shell.tabs.iter().position(|t| t.path == new).unwrap();
+            assert_eq!(shell.tabs[idx].path, new, "标签路径重写");
+        });
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 目录移动：其下打开标签**前缀重写**（D2 语义）。
+    #[gpui::test]
+    fn move_dir_rewrites_tab_path_prefixes(cx: &mut gpui::TestAppContext) {
+        let ws = temp_ws("dir");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let b = ws.join("sub").join("b.md");
+        let shell2 = shell.clone();
+        let p = b.clone();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.open_document_tab(p, cx);
+            });
+        });
+        // 移动 sub → sub2（其下 b.md 标签路径前缀重写）。
+        let old = ws.join("sub");
+        let new = ws.join("sub2");
+        let shell3 = shell.clone();
+        let (o, n) = (old.clone(), new.clone());
+        visual.update(|_window, app| {
+            shell3.update(app, |shell, cx| {
+                shell.move_path_confirmed(&o, &n, cx);
+            });
+        });
+        assert!(new.join("b.md").exists(), "目录内容随迁");
+        shell.read_with(&visual, |shell, _| {
+            assert!(
+                shell.tabs.iter().any(|t| t.path == new.join("b.md")),
+                "前缀重写：标签路径 = sub2/b.md（实得 {:?}）",
+                shell.tabs.iter().map(|t| t.path.clone()).collect::<Vec<_>>()
+            );
+        });
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// confirm 守卫：目标已存在拒（不弹确认不 rename）。
+    #[gpui::test]
+    fn move_guard_rejects_existing_target(cx: &mut gpui::TestAppContext) {
+        let ws = temp_ws("guard");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let a = ws.join("a.md");
+        let new = ws.join("sub"); // 已存在目录。
+        let shell2 = shell.clone();
+        let (o, n) = (a.clone(), new.clone());
+        visual.update(|window, app| {
+            shell2.update(app, |shell, cx| {
+                shell.confirm_move_path(o, n, window, cx);
+            });
+        });
+        shell.read_with(&visual, |shell, _| {
+            assert!(shell.confirm.is_none(), "守卫拒——不弹确认");
+            assert!(a.exists(), "未 rename（原位保持）");
+        });
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
 
 /// #107 P1① 测试（内联域）：mtime 轮询单步面三分流。
 #[cfg(test)]
