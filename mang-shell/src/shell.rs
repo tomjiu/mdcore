@@ -10840,6 +10840,107 @@ mod confirm_lifecycle_tests {
 #[path = "workspace_layout_tests.rs"]
 mod workspace_layout_tests;
 
+/// #107 P1② 测试（内联域）：拖拽移动全链（rename + 前缀重写 + 守卫）。
+#[cfg(test)]
+mod drag_move_tests {
+    use super::*;
+
+    fn temp_ws(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mang-move-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+        std::fs::write(dir.join("sub").join("b.md"), "# B\n").unwrap();
+        dir
+    }
+
+    /// 文件移动：rename + 打开标签路径精确重写 + toast。
+    #[gpui::test]
+    fn move_file_rewrites_open_tab_path(cx: &mut gpui::TestAppContext) {
+        let ws = temp_ws("file");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let a = ws.join("a.md");
+        let shell2 = shell.clone();
+        let p = a.clone();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.open_document_tab(p, cx);
+            });
+        });
+        // 直测 move_path_confirmed（confirm 面另测）。
+        let new = ws.join("sub").join("a.md");
+        let shell3 = shell.clone();
+        let (o, n) = (a.clone(), new.clone());
+        visual.update(|_window, app| {
+            shell3.update(app, |shell, cx| {
+                shell.move_path_confirmed(&o, &n, cx);
+            });
+        });
+        assert!(!a.exists(), "旧路径消失（已 rename）");
+        assert!(new.exists(), "新路径在场");
+        shell.read_with(&visual, |shell, _| {
+            let idx = shell.tabs.iter().position(|t| t.path == new).unwrap();
+            assert_eq!(shell.tabs[idx].path, new, "标签路径重写");
+        });
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 目录移动：其下打开标签**前缀重写**（D2 语义）。
+    #[gpui::test]
+    fn move_dir_rewrites_tab_path_prefixes(cx: &mut gpui::TestAppContext) {
+        let ws = temp_ws("dir");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let b = ws.join("sub").join("b.md");
+        let shell2 = shell.clone();
+        let p = b.clone();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.open_document_tab(p, cx);
+            });
+        });
+        // 移动 sub → sub2（其下 b.md 标签路径前缀重写）。
+        let old = ws.join("sub");
+        let new = ws.join("sub2");
+        let shell3 = shell.clone();
+        let (o, n) = (old.clone(), new.clone());
+        visual.update(|_window, app| {
+            shell3.update(app, |shell, cx| {
+                shell.move_path_confirmed(&o, &n, cx);
+            });
+        });
+        assert!(new.join("b.md").exists(), "目录内容随迁");
+        shell.read_with(&visual, |shell, _| {
+            assert!(
+                shell.tabs.iter().any(|t| t.path == new.join("b.md")),
+                "前缀重写：标签路径 = sub2/b.md（实得 {:?}）",
+                shell.tabs.iter().map(|t| t.path.clone()).collect::<Vec<_>>()
+            );
+        });
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// confirm 守卫：目标已存在拒（不弹确认不 rename）。
+    #[gpui::test]
+    fn move_guard_rejects_existing_target(cx: &mut gpui::TestAppContext) {
+        let ws = temp_ws("guard");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let a = ws.join("a.md");
+        let new = ws.join("sub"); // 已存在目录。
+        let shell2 = shell.clone();
+        let (o, n) = (a.clone(), new.clone());
+        visual.update(|window, app| {
+            shell2.update(app, |shell, cx| {
+                shell.confirm_move_path(o, n, window, cx);
+            });
+        });
+        shell.read_with(&visual, |shell, _| {
+            assert!(shell.confirm.is_none(), "守卫拒——不弹确认");
+            assert!(a.exists(), "未 rename（原位保持）");
+        });
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
 /// #107 P1① 测试（内联域）：mtime 轮询单步面三分流。
 #[cfg(test)]
 mod mtime_poll_tests {
