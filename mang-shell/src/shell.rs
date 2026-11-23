@@ -3534,7 +3534,7 @@ impl ShellApp {
                     .enumerate()
                     .filter(|(_, t)| t.path.starts_with(old))
                     .map(|(i, t)| {
-                        let rel = t.path.strip_prefix(old).unwrap_or_default();
+                        let rel = t.path.strip_prefix(old).unwrap_or(std::path::Path::new(""));
                         (i, new.join(rel))
                     })
                     .collect();
