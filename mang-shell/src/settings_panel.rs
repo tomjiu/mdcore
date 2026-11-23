@@ -72,7 +72,7 @@ pub fn settings_modal(
     font_size: f32,
     indent_unit: IndentUnit,
     soft_wrap: bool,
-    custom_theme_draft: [String; 6],
+    custom_theme_draft: [String; 31],
     color_slot_focus: Vec<gpui::FocusHandle>,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
@@ -116,7 +116,7 @@ fn ui_modal(
     font_size: f32,
     indent_unit: IndentUnit,
     soft_wrap: bool,
-    custom_theme_draft: [String; 6],
+    custom_theme_draft: [String; 31],
     color_slot_focus: Vec<gpui::FocusHandle>,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
@@ -150,7 +150,7 @@ fn modal_body(
     font_size: f32,
     indent_unit: IndentUnit,
     soft_wrap: bool,
-    custom_theme_draft: [String; 6],
+    custom_theme_draft: [String; 31],
     color_slot_focus: Vec<gpui::FocusHandle>,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
@@ -262,7 +262,7 @@ fn theme_choices(
 /// 6 高频槽与 G2 装载器同源（background/surface/editor/foreground/
 /// accent/border）；空槽初值 = 当前主题实际色（所见即所改）。
 fn custom_theme_editor(
-    custom_theme_draft: [String; 6],
+    custom_theme_draft: [String; 31],
     color_slot_focus: Vec<gpui::FocusHandle>,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
@@ -294,8 +294,9 @@ fn custom_theme_editor(
         .gap_1()
         .children(slot_labels.iter().enumerate().map(|(i, (key, label))| {
             let raw = &draft[i];
+            let cur = ShellApp::custom_theme_slot_current(i, colors);
             let parsed = if raw.is_empty() {
-                Some(current[i])
+                Some(cur)
             } else {
                 crate::settings::parse_hsla(raw)
             };
@@ -303,6 +304,28 @@ fn custom_theme_editor(
             let swatch = parsed.unwrap_or(gpui::hsla(0., 0., 0.5, 1.));
             let error_color = colors.border;
             h_flex()
+                // #110 G1 批A：组界组头（0/6/11/17/22/27 六组——行首组
+                // 标签，31 槽分组的视觉锚）。
+                .when(matches!(i, 0 | 6 | 11 | 17 | 22 | 27), |el| {
+                    let group = match i {
+                        0 => "高频六槽（G2 键）",
+                        6 => "边框族",
+                        11 => "元素族",
+                        17 => "幽灵族（透明系）",
+                        22 => "文本与面板",
+                        _ => "图标族与主色",
+                    };
+                    el.mt_1().child(
+                        div()
+                            .id(SharedString::from(format!("sg-color-group-{i}")))
+                            .w_full()
+                            .child(
+                                Label::new(group)
+                                    .size(LabelSize::XSmall)
+                                    .color(ui::Color::Muted),
+                            ),
+                    )
+                })
                 .id(SharedString::from(format!("sg-color-slot-{key}")))
                 .gap_2()
                 .items_center()
@@ -376,9 +399,9 @@ fn custom_theme_editor(
                                 // 空槽显示当前主题实际色 hex（初值语义）。
                                 format!(
                                     "#{:02x}{:02x}{:02x}",
-                                    ((gpui::Rgba::from(current[i]).r * 255.0).round() as u8),
-                                    (gpui::Rgba::from(current[i]).g * 255.0).round() as u8,
-                                    (gpui::Rgba::from(current[i]).b * 255.0).round() as u8
+                                    ((gpui::Rgba::from(cur).r * 255.0).round() as u8),
+                                    (gpui::Rgba::from(cur).g * 255.0).round() as u8,
+                                    (gpui::Rgba::from(cur).b * 255.0).round() as u8
                                 )
                             } else {
                                 raw.clone()

@@ -215,7 +215,7 @@ pub struct ShellApp {
     /// #110 G4：自定义主题色草稿（6 高频槽 hex 文本——设置弹窗
     /// 「自定义主题色」子区状态；空串 = 未编辑（渲染时取当前主题
     /// 实际色为初值））。
-    custom_theme_draft: [String; 6],
+    custom_theme_draft: [String; 31],
     /// #110 G4：六槽输入焦点句柄池（键捕获范式——构造时一槽一句柄）。
     color_slot_focus: Vec<gpui::FocusHandle>,
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
@@ -532,7 +532,7 @@ impl ShellApp {
             search_panel: search_panel.clone(),
             outline: None,
             custom_theme_draft: Default::default(),
-            color_slot_focus: (0..6).map(|_| cx.focus_handle()).collect(),
+            color_slot_focus: (0..31).map(|_| cx.focus_handle()).collect(),
             // #119（mdc-dock 批①）：左栏激活协议实体；#120（批②）：
             // 布局恢复在构造尾（面板注册之后——见下）。
             left_dock: cx.new(|cx| mdc_dock::Dock::new(mdc_dock::DockPosition::Left, cx)),
@@ -964,12 +964,90 @@ impl ShellApp {
     }
 
     /// #110 G4：草稿访问（渲染面初值与校验共用）。
-    pub fn custom_theme_draft(&self) -> &[String; 6] {
+    pub fn custom_theme_draft(&self) -> &[String; 31] {
         &self.custom_theme_draft
     }
 
     /// #110 G4：草稿槽写入（hex 文本输入 on_change——行内校验在渲染
     /// 面（parse_hsla 复用），本面只存原文；坏色不炸不写盘）。
+    /// #110 G1 批A：31 槽位表（(JSON 键, 中文标签, 当前色取自 ThemeColors 的
+    /// 闭包)——编辑器 UI 行序与 effective_slots 键序的唯一事实源；G2 六键
+    /// 前置（老主题文件兼容 + 高频易用），后续按组排）。
+    pub fn custom_theme_slot_table() -> [(&'static str, &'static str); 31] {
+        [
+            ("background", "背景"),
+            ("surface", "面板"),
+            ("editor", "编辑器"),
+            ("foreground", "前景"),
+            ("accent", "强调"),
+            ("border", "边框"),
+            ("border_variant", "边框弱"),
+            ("border_focused", "边框聚焦"),
+            ("border_selected", "边框选中"),
+            ("border_transparent", "边框透明"),
+            ("border_disabled", "边框禁用"),
+            ("element_background", "元素底"),
+            ("element_hover", "元素悬停"),
+            ("element_active", "元素激活"),
+            ("element_selected", "元素选中"),
+            ("element_selection_background", "选区底"),
+            ("element_disabled", "元素禁用"),
+            ("ghost_element_background", "幽灵底"),
+            ("ghost_element_hover", "幽灵悬停"),
+            ("ghost_element_active", "幽灵激活"),
+            ("ghost_element_selected", "幽灵选中"),
+            ("ghost_element_disabled", "幽灵禁用"),
+            ("surface_background", "面板平"),
+            ("text_muted", "文字弱"),
+            ("text_placeholder", "文字占位"),
+            ("text_disabled", "文字禁用"),
+            ("text_accent", "文字强调"),
+            ("icon", "图标"),
+            ("icon_muted", "图标弱"),
+            ("icon_disabled", "图标禁用"),
+            // text 主色与 text_muted 同源（G2 级联）——表尾补齐 31 位。
+            ("text", "文字"),
+        ]
+    }
+
+    /// #110 G1 批A：槽位当前实际色（空槽初值/预览底——ThemeColors 槽取值）。
+    pub fn custom_theme_slot_current(slot: usize, colors: &theme::ThemeColors) -> gpui::Hsla {
+        let c = &colors;
+        match Self::custom_theme_slot_table().get(slot).map(|t| t.0) {
+            Some("background") => c.background,
+            Some("surface") => c.elevated_surface_background,
+            Some("editor") => c.editor_background,
+            Some("foreground") | Some("text") => c.text,
+            Some("accent") => c.element_active,
+            Some("border") => c.border,
+            Some("border_variant") => c.border_variant,
+            Some("border_focused") => c.border_focused,
+            Some("border_selected") => c.border_selected,
+            Some("border_transparent") => c.border_transparent,
+            Some("border_disabled") => c.border_disabled,
+            Some("element_background") => c.element_background,
+            Some("element_hover") => c.element_hover,
+            Some("element_active") => c.element_active,
+            Some("element_selected") => c.element_selected,
+            Some("element_selection_background") => c.element_selection_background,
+            Some("element_disabled") => c.element_disabled,
+            Some("ghost_element_background") => c.ghost_element_background,
+            Some("ghost_element_hover") => c.ghost_element_hover,
+            Some("ghost_element_active") => c.ghost_element_active,
+            Some("ghost_element_selected") => c.ghost_element_selected,
+            Some("ghost_element_disabled") => c.ghost_element_disabled,
+            Some("surface_background") => c.surface_background,
+            Some("text_muted") => c.text_muted,
+            Some("text_placeholder") => c.text_placeholder,
+            Some("text_disabled") => c.text_disabled,
+            Some("text_accent") => c.text_accent,
+            Some("icon") => c.icon,
+            Some("icon_muted") => c.icon_muted,
+            Some("icon_disabled") => c.icon_disabled,
+            _ => c.background,
+        }
+    }
+
     pub fn set_custom_theme_slot(&mut self, slot: usize, value: String) {
         if let Some(cell) = self.custom_theme_draft.get_mut(slot) {
             *cell = value;
@@ -983,27 +1061,19 @@ impl ShellApp {
     /// None（任一槽坏整体拒保存——行内报错另有面）。
     fn custom_theme_effective_slots(&self, cx: &App) -> Option<Vec<(String, String)>> {
         let colors = cx.theme().colors();
-        let current = [
-            colors.background,
-            colors.elevated_surface_background,
-            colors.editor_background,
-            colors.text,
-            colors.element_active,
-            colors.border,
-        ];
+        let table = Self::custom_theme_slot_table();
         let mut out = Vec::new();
-        for (i, key) in ["background", "surface", "editor", "foreground", "accent", "border"]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, (key, _)) in table.iter().enumerate() {
             let raw = self.custom_theme_draft[i].trim().to_string();
             if raw.is_empty() {
-                // 空槽：当前主题实际色（hex 化——Rgba 通道取整）。
+                // 空槽：当前主题实际色（hex 化——Rgba 通道取整；
+                // #110 G1 批A 31 槽位表驱动）。
+                let cur = Self::custom_theme_slot_current(i, &colors);
                 let hex = format!(
                     "#{:02x}{:02x}{:02x}",
-                    (gpui::Rgba::from(current[i]).r * 255.0).round() as u8,
-                    (gpui::Rgba::from(current[i]).g * 255.0).round() as u8,
-                    (gpui::Rgba::from(current[i]).b * 255.0).round() as u8
+                    (gpui::Rgba::from(cur).r * 255.0).round() as u8,
+                    (gpui::Rgba::from(cur).g * 255.0).round() as u8,
+                    (gpui::Rgba::from(cur).b * 255.0).round() as u8
                 );
                 out.push((key.to_string(), hex));
             } else {
