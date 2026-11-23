@@ -1,0 +1,39 @@
+{
+ "note": "嵌入 Liberation Sans 后（新语料 rotated_90.pdf p0）——poppler 版本差与参照差归零，引擎间差降至 AA 级",
+ "grid_matrix": {
+  "P160(linux-pdfium-160.0.8165)": {
+   "L25(poppler25.03)": 0.0537,
+   "L26(poppler26.09)": 0.0537,
+   "S(静态网格)": 0.0536
+  },
+  "L25(poppler25.03)": {
+   "L26(poppler26.09)": 0.0,
+   "S(静态网格)": 0.0
+  },
+  "L26(poppler26.09)": {
+   "S(静态网格)": 0.0
+  }
+ },
+ "before": {
+  "poppler 版本差 (L25 vs L26)": 0.8247,
+  "引擎间差 (P160 vs L25)": 0.1831,
+  "引擎间差 (P160 vs L26)": 0.8247,
+  "Windows 静态门路径 (W vs S)": 0.2569,
+  "PDFium 平台差 (W vs P160)": 0.1732
+ },
+ "after": {
+  "poppler 版本差 (L25 vs L26)": 0.0,
+  "引擎间差 (P160 vs L25)": 0.0537,
+  "引擎间差 (P160 vs L26)": 0.0537,
+  "参照复现性 (L25 vs S)": 0.0
+ },
+ "conclusion": "字形随语料走后：静态网格对 poppler 版本完全无关（25.03≡26.09≡静态逐位一致）；跨端残差 = PDFium AA 级（≤0.054+build 间 0.03 < 容差带 0.10/0.15）——Windows 静态门预计稳定绿（DLL 端重验留给 Lead/#48 真机走查）",
+ "baseline_engine_8086": {
+  "note": "基线引擎还原（bin/lib = bblanchon chromium/8086 linux-x64，SHA e995a89f… 与历史基线工件逐字节一致）",
+  "引擎间差 (P8086 vs L25)": 0.0537,
+  "引擎间差 (P8086 vs L26)": 0.0537,
+  "静态门路径 (P8086 vs S)": 0.0536,
+  "build 间差 (P8086 vs P160)": 0.0,
+  "build 间差结论": "嵌入字体后 8086≡160（同数 0.0537）——旧语料的 build 间差 0.03 本质也是替代字形选择差；Windows 产品 DLL（同 8086 线，ci-deps-v1 pinned）与静态网格的残差预计 ≈0.054±AA < 容差带 0.10（真机验证留 Lead/#48）"
+ }
+}
