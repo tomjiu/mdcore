@@ -209,6 +209,12 @@ pub struct ShellApp {
     /// #571：大纲面板实体（批 7——激活标签的键盘导航结构树；
     /// 换绑判据见 [`Self::sync_outline`]）。
     outline: Option<Entity<OutlinePanel>>,
+    /// #110 G4：自定义主题色草稿（6 高频槽 hex 文本——设置弹窗
+    /// 「自定义主题色」子区状态；空串 = 未编辑（渲染时取当前主题
+    /// 实际色为初值））。
+    custom_theme_draft: [String; 6],
+    /// #110 G4：六槽输入焦点句柄池（键捕获范式——构造时一槽一句柄）。
+    color_slot_focus: Vec<gpui::FocusHandle>,
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
     /// 左条设置钮/菜单「设置」打开，Esc/点遮罩/关闭钮关闭）。
     settings_open: bool,
@@ -516,6 +522,8 @@ impl ShellApp {
             git_panel: None,
             search_panel: search_panel.clone(),
             outline: None,
+            custom_theme_draft: Default::default(),
+            color_slot_focus: (0..6).map(|_| cx.focus_handle()).collect(),
             // #119（mdc-dock 批①）：左栏激活协议实体；#120（批②）：
             // 布局恢复在构造尾（面板注册之后——见下）。
             left_dock: cx.new(|cx| mdc_dock::Dock::new(mdc_dock::DockPosition::Left, cx)),
@@ -931,6 +939,88 @@ impl ShellApp {
         }
         self.persist_dock_layout(cx);
         cx.notify();
+    }
+
+    /// #110 G4：六槽焦点句柄池访问（渲染面 track_focus 捕获用）。
+    pub fn color_slot_focus_handles(&self) -> &[gpui::FocusHandle] {
+        &self.color_slot_focus
+    }
+
+    /// #110 G4：设置面板 toast 收口（show_notice 跨模块公开面——
+    /// 保存结果提示）。
+    pub fn notice_message(&mut self, message: String, cx: &mut Context<Self>) {
+        self.show_notice(message, cx);
+    }
+
+    /// #110 G4：草稿访问（渲染面初值与校验共用）。
+    pub fn custom_theme_draft(&self) -> &[String; 6] {
+        &self.custom_theme_draft
+    }
+
+    /// #110 G4：草稿槽写入（hex 文本输入 on_change——行内校验在渲染
+    /// 面（parse_hsla 复用），本面只存原文；坏色不炸不写盘）。
+    pub fn set_custom_theme_slot(&mut self, slot: usize, value: String) {
+        if let Some(cell) = self.custom_theme_draft.get_mut(slot) {
+            *cell = value;
+        }
+    }
+
+    /// #110 G4：草稿有效槽集（**hex 原文**——保真落盘：不经 Hsla
+    /// 往返；parse_hsla 是 G2 装载的灰度近似语义，色值往返会漂移
+    /// （#1a2b3c → #2b2b2b 教训），保存链只做**合法性校验**+原文
+    /// 透传）。空槽 → 当前主题实际色 hex（所见即所改初值）；坏槽 →
+    /// None（任一槽坏整体拒保存——行内报错另有面）。
+    fn custom_theme_effective_slots(&self, cx: &App) -> Option<Vec<(String, String)>> {
+        let colors = cx.theme().colors();
+        let current = [
+            colors.background,
+            colors.elevated_surface_background,
+            colors.editor_background,
+            colors.text,
+            colors.element_active,
+            colors.border,
+        ];
+        let mut out = Vec::new();
+        for (i, key) in ["background", "surface", "editor", "foreground", "accent", "border"]
+            .into_iter()
+            .enumerate()
+        {
+            let raw = self.custom_theme_draft[i].trim().to_string();
+            if raw.is_empty() {
+                // 空槽：当前主题实际色（hex 化——Rgba 通道取整）。
+                let hex = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    (gpui::Rgba::from(current[i]).r * 255.0).round() as u8,
+                    (gpui::Rgba::from(current[i]).g * 255.0).round() as u8,
+                    (gpui::Rgba::from(current[i]).b * 255.0).round() as u8
+                );
+                out.push((key.to_string(), hex));
+            } else {
+                // 校验（坏色拒）+ 原文透传（保真）。
+                crate::settings::parse_hsla(&raw)?;
+                out.push((key.to_string(), raw));
+            }
+        }
+        Some(out)
+    }
+
+    /// #110 G4：保存自定义主题（D3 一期收口）：
+    /// 草稿 6 槽 → `themes_dir/my-theme.json`（G2 格式）→ **立即装载**
+    /// （load_user_themes 入 registry）→ **立即切换**（GlobalTheme::
+    /// update_theme——不走 base_theme/mode 三态链，自定义主题对三态
+    /// 钮的语义=「新基准」；mode 保持，保存后切回三态钮可再切回派生）。
+    /// 返回写盘路径（调用方 toast 提示）；None = 槽全坏或写盘失败。
+    pub fn save_custom_theme(&mut self, cx: &mut App) -> Option<std::path::PathBuf> {
+        let slots: Vec<(String, String)> = self.custom_theme_effective_slots(cx)?;
+        let path = crate::settings::save_user_theme_file("my-theme", &slots, cx)?;
+        // 即时装载（registry insert——下次启动 load_user_themes 同源）。
+        crate::settings::load_user_themes(cx);
+        // 即时切换：从 registry 取回装载后的实体。
+        let registry = theme::ThemeRegistry::default_global(cx);
+        let loaded = registry.get("my-theme").ok()?;
+        theme::GlobalTheme::update_theme(cx, loaded);
+        cx.refresh_windows();
+        Some(path)
     }
 
     /// #108 P2③：转到符号——开右栏 + 聚焦大纲过滤框（过滤即符号
@@ -4731,6 +4821,8 @@ impl Render for ShellApp {
                     self.font_size,
                     self.indent_unit,
                     self.soft_wrap,
+                    self.custom_theme_draft.clone(),
+                    self.color_slot_focus.clone(),
                     cx,
                 ))
             })
@@ -10566,6 +10658,74 @@ mod confirm_lifecycle_tests {
 #[cfg(test)]
 #[path = "workspace_layout_tests.rs"]
 mod workspace_layout_tests;
+
+/// #110 G4 测试（内联域）：save_custom_theme 全链 + 坏槽拒。
+#[cfg(test)]
+mod g4_custom_theme_tests {
+    use super::*;
+
+    /// 空草稿 → 槽默认当前主题实际色 → 写盘 + 装载 + 全局主题切换。
+    #[gpui::test]
+    fn save_custom_theme_writes_loads_and_switches(cx: &mut gpui::TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("mang-g4-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        // 空草稿（初建）→ 保存应成功：6 槽全默认当前色。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                let path = shell.save_custom_theme(cx);
+                assert!(path.is_some(), "空草稿保存成功（槽默认当前色）");
+                let p = path.unwrap();
+                assert!(p.ends_with("my-theme.json"), "文件名：{:?}", p);
+            });
+        });
+        // 全局主题已切到 my-theme（GlobalTheme 名）。
+        visual.update(|_window, app| {
+            let name = theme::GlobalTheme::theme(app).name.clone();
+            assert_eq!(name.as_ref(), "my-theme", "全局主题切换 my-theme");
+        });
+        // 坏槽 → None 拒。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_custom_theme_slot(0, "#zzzzz".into()); // 坏 hex（6 字）
+                assert!(
+                    shell.save_custom_theme(cx).is_none(),
+                    "坏槽拒保存（行内报错同源判定）"
+                );
+            });
+        });
+        // XDG 还原。
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    /// 草稿合法自定义值 → 写盘内容带槽色（读回 JSON 验）。
+    #[gpui::test]
+    fn save_custom_theme_reflects_draft(cx: &mut gpui::TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("mang-g4-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_custom_theme_slot(0, "#1a2b3c".into());
+                let path = shell.save_custom_theme(cx).expect("合法草稿保存成功");
+                let text = std::fs::read_to_string(&path).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["background"], "#1a2b3c", "草稿背景槽落盘");
+            });
+        });
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+}
 
 /// #108 P2③ GUI 测试（内联域——`workspace_layout_tests.rs` 尾部 append
 /// 的测试曾出现不进 bin 编译产物的现象（同现象复现两次，机制未明），
