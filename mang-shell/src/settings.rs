@@ -203,8 +203,32 @@ fn parse_user_theme(text: &str, base: &theme::Theme) -> Option<theme::Theme> {
     Some(theme)
 }
 
+/// #110 G4：写用户主题文件（themes_dir/<name>.json——G2 装载格式：
+/// name + appearance + 6 高频槽；取色器「保存为主题」收口）。
+/// 返回 Some(路径) = 写盘成功（调用方据此提示/装载）。
+pub fn save_user_theme_file(
+    name: &str,
+    slots: &[(String, String)],
+    cx: &mut gpui::App,
+) -> Option<std::path::PathBuf> {
+    let dir = themes_dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let mut value = serde_json::json!({"name": name});
+    // hex 原文透传（保真——调用方已校验合法；#110 G4：色值 Hsla 往返
+    // 漂移教训（parse_hsla 是装载侧灰度近似语义，不作保存中转））。
+    for (key, hex) in slots {
+        value[key.as_str()] = serde_json::json!(hex);
+    }
+    let path = dir.join(format!("{name}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&value).ok()?)
+        .ok()?;
+    let _ = cx.refresh_windows();
+    Some(path)
+}
+
 /// hex（#rrggbb / #rgb）或 hsla 数组 → Hsla（坏值 None）。
-fn parse_hsla(s: &str) -> Option<gpui::Hsla> {
+/// #110 G4 起 pub(crate)：设置弹窗草稿校验复用（行内报错判定）。
+pub(crate) fn parse_hsla(s: &str) -> Option<gpui::Hsla> {
     let t = s.trim();
     if let Some(hex) = t.strip_prefix('#') {
         let (r, g, b) = match hex.len() {
@@ -814,6 +838,62 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #110 G4：save_user_theme_file 写读往返（写盘 → load_user_themes
+    /// 装载 → registry 取回验名与槽色；hex 往返 6 槽）。
+    #[gpui::test]
+    fn user_theme_save_roundtrip(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        // 指定用户主题目录（temp——config_dir 同源语义由 themes_dir
+        // 读 XDG；测试用 env 重定向）。
+        let tmp = std::env::temp_dir().join(format!("mang-g4-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let themes = tmp.join("mang").join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let slots: Vec<(String, String)> = [
+            ("background", "#1a1a1a"),
+            ("surface", "#1f1f1f"),
+            ("editor", "#242424"),
+            ("foreground", "#e6e6e6"),
+            ("accent", "#808080"),
+            ("border", "#4d4d4d"),
+        ]
+        .into_iter()
+        .map(|(k, hex)| (k.to_string(), hex.to_string()))
+        .collect();
+        cx.update(|cx| {
+            let path = super::save_user_theme_file("g4-test", &slots, cx);
+            let path = path.expect("写盘成功");
+            assert!(path.ends_with("g4-test.json"), "文件名：{:?}", path);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["name"], "g4-test");
+            assert_eq!(v["background"], "#1a1a1a", "hex 往返 background");
+            // 装载链：load_user_themes 入 registry。
+            let loaded = super::load_user_themes(cx);
+            assert_eq!(loaded, 1, "装载 1 个");
+            let registry = theme::ThemeRegistry::default_global(cx);
+            let t = registry.get("g4-test").expect("registry 可取");
+            assert_eq!(t.name.as_ref(), "g4-test");
+        });
+        // XDG 还原（G2 测试同型）。
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #110 G4：坏色拒（parse_hsla 坏值 None——行内报错同源判定）。
+    #[test]
+    fn parse_hsla_rejects_bad_hex() {
+        assert!(super::parse_hsla("#1a2").is_some(), "#1a2 是 #rgb 短格式");
+        assert!(super::parse_hsla("#1a2b3c").is_some());
+        assert!(super::parse_hsla("#zzzzzz").is_none(), "坏 hex 拒");
+        assert!(super::parse_hsla("1a2b3c").is_none(), "缺 # 拒（一期口径）");
+        assert!(super::parse_hsla("").is_none(), "空拒");
     }
 
     /// #111 批②：auto_close_brackets 写读往返（load_from/save_to 私有
