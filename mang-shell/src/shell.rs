@@ -216,6 +216,9 @@ pub struct ShellApp {
     /// 「自定义主题色」子区状态；空串 = 未编辑（渲染时取当前主题
     /// 实际色为初值））。
     custom_theme_draft: [String; 31],
+    /// #110 G1 批B：主题名输入框草稿（「保存为主题」用——空 = my-theme
+    /// 旧行为兼容；输入名即 themes/<name>.json 文件名与 registry 名）。
+    theme_name_input: String,
     /// #110 G4：六槽输入焦点句柄池（键捕获范式——构造时一槽一句柄）。
     color_slot_focus: Vec<gpui::FocusHandle>,
     /// #289-⑤：设置弹窗开关（模态——并替代旧 `settings_view` 右栏视图；
@@ -288,7 +291,8 @@ pub struct ShellApp {
     /// F5：最近打开（文件 20 / 工作区 10——空态引导页呈现 + 写穿透落盘）。
     recent: RecentStore,
     /// F6：主题模式（system/light/dark——Ctrl+Alt+T 循环；持久化）。
-    theme_mode: &'static str,
+    /// #110 G1 批B：四态轴（"system"/"light"/"dark"/"user:<name>"——String）。
+    theme_mode: String,
     /// F6：主题蓝本（启动时的全局主题 = One Dark——浅色派生与切回的
     /// 基准；运行期不追改）。
     base_theme: Arc<Theme>,
@@ -458,8 +462,19 @@ impl ShellApp {
         }
         // F6：主题模式（settings 记忆 → 应用）+ 蓝本捕获 + 字号。
         let base_theme = theme::GlobalTheme::theme(cx).clone();
-        let theme_mode = theme_switch::parse_mode(crate::settings::load_theme_mode().as_deref());
-        theme_switch::apply_mode(theme_mode, &base_theme, cx);
+        // #110 G1 批B：四态持久化（三态键或 user:<name>——坏值回 system）。
+        let theme_mode_raw = crate::settings::load_theme_mode()
+            .unwrap_or_else(|| theme_switch::MODE_SYSTEM.to_string());
+        let theme_mode = if theme_switch::is_user_mode(&theme_mode_raw)
+            || theme_mode_raw == theme_switch::MODE_SYSTEM
+            || theme_mode_raw == theme_switch::MODE_LIGHT
+            || theme_mode_raw == theme_switch::MODE_DARK
+        {
+            theme_mode_raw
+        } else {
+            theme_switch::MODE_SYSTEM.to_string()
+        };
+        theme_switch::apply_mode(&theme_mode, &base_theme, cx);
         let font_size = crate::settings::load_font_size().unwrap_or(15.);
         if !recent.recent_files().is_empty() || !recent.recent_workspaces().is_empty() {
             eprintln!(
@@ -532,6 +547,7 @@ impl ShellApp {
             search_panel: search_panel.clone(),
             outline: None,
             custom_theme_draft: Default::default(),
+            theme_name_input: String::new(),
             color_slot_focus: (0..31).map(|_| cx.focus_handle()).collect(),
             // #119（mdc-dock 批①）：左栏激活协议实体；#120（批②）：
             // 布局恢复在构造尾（面板注册之后——见下）。
@@ -564,7 +580,7 @@ impl ShellApp {
                 cx.focus_handle().tab_stop(true),
             ],
             recent,
-            theme_mode,
+            theme_mode: theme_mode.clone(),
             base_theme,
             font_size,
             indent_unit: crate::settings::load_indent_unit()
@@ -968,6 +984,22 @@ impl ShellApp {
         &self.custom_theme_draft
     }
 
+    /// #110 G1 批B：主题名输入框取值。
+    pub fn theme_name_input(&self) -> &str {
+        &self.theme_name_input
+    }
+
+    /// #110 G1 批B：主题名键入（键捕获范式——panel 名框；非法字符
+    /// 拒（路径安全：/ 与控制字符）+ 长度界 40）。
+    pub fn set_theme_name_input(&mut self, value: String) {
+        let clean: String = value
+            .chars()
+            .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+            .take(40)
+            .collect();
+        self.theme_name_input = clean;
+    }
+
     /// #110 G4：草稿槽写入（hex 文本输入 on_change——行内校验在渲染
     /// 面（parse_hsla 复用），本面只存原文；坏色不炸不写盘）。
     /// #110 G1 批A：31 槽位表（(JSON 键, 中文标签, 当前色取自 ThemeColors 的
@@ -1092,16 +1124,80 @@ impl ShellApp {
     /// 钮的语义=「新基准」；mode 保持，保存后切回三态钮可再切回派生）。
     /// 返回写盘路径（调用方 toast 提示）；None = 槽全坏或写盘失败。
     pub fn save_custom_theme(&mut self, cx: &mut App) -> Option<std::path::PathBuf> {
+        // #110 G1 批B：名泛化——输入名优先（空 = my-theme 旧行为）；
+        // 保存成功即切「user:<name>」四态轴（三态钮与具名下拉联动）。
+        let name = {
+            let n = self.theme_name_input.trim();
+            if n.is_empty() { "my-theme".to_string() } else { n.to_string() }
+        };
         let slots: Vec<(String, String)> = self.custom_theme_effective_slots(cx)?;
-        let path = crate::settings::save_user_theme_file("my-theme", &slots, cx)?;
+        let path = crate::settings::save_user_theme_file(&name, &slots, cx)?;
         // 即时装载（registry insert——下次启动 load_user_themes 同源）。
         crate::settings::load_user_themes(cx);
-        // 即时切换：从 registry 取回装载后的实体。
+        // 即时切换：从 registry 取回装载后的实体 + 四态轴落位。
         let registry = theme::ThemeRegistry::default_global(cx);
-        let loaded = registry.get("my-theme").ok()?;
+        let loaded = registry.get(&name).ok()?;
         theme::GlobalTheme::update_theme(cx, loaded);
+        self.theme_mode = theme_switch::user_mode(&name);
+        crate::settings::save_theme_mode(&self.theme_mode);
         cx.refresh_windows();
         Some(path)
+    }
+
+    /// #110 G1 批B：删除用户主题（下拉选中项的「删除」链）：
+    /// 磁盘文件删 + registry 移除 + 若当前正用该主题 → 回退 dark 三态。
+    /// 返回 true = 删了；false = 无该主题（键入名不存在/无磁盘文件）。
+    pub fn delete_user_theme(&mut self, name: &str, cx: &mut App) -> bool {
+        let registry = theme::ThemeRegistry::default_global(cx);
+        if registry.get(name).is_err() {
+            return false;
+        }
+        // 磁盘文件（themes_dir/<name>.json）。
+        let mut disk_removed = false;
+        if let Some(dir) = crate::settings::themes_dir() {
+            let path = dir.join(format!("{name}.json"));
+            if path.exists() {
+                disk_removed = std::fs::remove_file(&path).is_ok();
+                if !disk_removed {
+                    eprintln!("theme-delete: 删盘失败 {}", path.display());
+                }
+            }
+        }
+        // registry 侧（ThemeMeta 名集）。
+        registry.remove_user_themes(&[name.into()]);
+        // 当前正用 → 回退 dark（三态轴回位 + 全窗重绘）。
+        if theme_switch::parse_user_mode(&self.theme_mode) == Some(name) {
+            self.theme_mode = theme_switch::MODE_DARK.to_string();
+            theme_switch::apply_mode(theme_switch::MODE_DARK, &self.base_theme, cx);
+            crate::settings::save_theme_mode(theme_switch::MODE_DARK);
+        }
+        cx.refresh_windows();
+        disk_removed || true
+    }
+
+    /// #110 G1 批B：registry 用户主题名集（下拉数据源——
+    /// themes_dir 装载的 user-* 名；内置主题不列，下拉只做用户面）。
+    pub fn user_theme_names(&self, _cx: &mut App) -> Vec<String> {
+        // #110 G1 批B：磁盘直读（themes_dir/*.json 文件名——registry 枚举
+        // 要 &mut App，渲染期 ShellApp 已在 update 内嵌套炸（gpui
+        // entity_map 164——settings_lifecycle 两测试实证）；磁盘读零
+        // gpui 依赖，渲染与测试双安全。名字 = 文件名去 .json（与
+        // save_user_theme_file/load_user_themes 同一命名面）。
+        let mut names: Vec<String> = Vec::new();
+        if let Some(dir) = crate::settings::themes_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) == Some("json") {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            names.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
     }
 
     /// #108 P2③：转到符号——开右栏 + 聚焦大纲过滤框（过滤即符号
@@ -2430,7 +2526,7 @@ impl ShellApp {
                     .is_some_and(|(s, e)| s < e)
             }),
             font_size: self.font_size,
-            theme_mode: self.theme_mode,
+            theme_mode: self.theme_mode.clone(),
             left_open: self.left_open(cx),
             git_view: self.git_active(cx),
             // #109：搜索视图态（侧栏菜单勾选——dock 激活键真源）。
@@ -4378,11 +4474,12 @@ impl ShellApp {
 
     /// #182：设置主题模式（设置面板三态钮触发——立即应用 + 持久化；
     /// 与 Ctrl+T 循环同一生效链，不重写主题逻辑）。
-    pub fn set_theme_mode(&mut self, mode: &'static str, cx: &mut Context<Self>) {
+    /// #110 G1 批B：四态泛化（&str——三态键或 user:<name>；写盘 String）。
+    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         if self.theme_mode == mode {
             return;
         }
-        self.theme_mode = mode;
+        self.theme_mode = mode.to_string();
         theme_switch::apply_mode(mode, &self.base_theme, cx);
         crate::settings::save_theme_mode(mode);
         eprintln!("theme: {}（{mode}）", theme_switch::mode_label(mode));
@@ -4437,8 +4534,8 @@ impl ShellApp {
     /// F6：循环主题（Ctrl+T——system → light → dark → system；
     /// 应用 + 持久化 + 通知）。
     pub fn cycle_theme(&mut self, cx: &mut Context<Self>) {
-        let next = theme_switch::next_mode(self.theme_mode);
-        self.theme_mode = next;
+        let next = theme_switch::next_mode(&self.theme_mode);
+        self.theme_mode = next.to_string();
         theme_switch::apply_mode(next, &self.base_theme, cx);
         crate::settings::save_theme_mode(next);
         eprintln!("theme: {}（{next}）", theme_switch::mode_label(next));
@@ -5068,11 +5165,12 @@ impl Render for ShellApp {
             // 互斥，两弹窗不同时开）。
             .when(self.settings_open, |el| {
                 el.child(settings_panel::settings_modal(
-                    self.theme_mode,
+                    &self.theme_mode,
                     self.font_size,
                     self.indent_unit,
                     self.soft_wrap,
                     self.custom_theme_draft.clone(),
+                    self.theme_name_input.clone(),
                     self.color_slot_focus.clone(),
                     cx,
                 ))
@@ -11129,6 +11227,147 @@ mod mtime_poll_tests {
 #[cfg(test)]
 mod g4_custom_theme_tests {
     use super::*;
+
+    /// #110 G1 批B：四态轴——具名态切换（user:<name>）与回退（dark）。
+    #[gpui::test]
+    fn user_mode_switch_and_fallback(cx: &mut gpui::TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("mang-g1b-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        // 保存一个具名主题（名输入框驱动——B 批链）。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_theme_name_input("g1b-alpha".into());
+                let path = shell.save_custom_theme(cx);
+                assert!(path.is_some(), "具名保存成功");
+                assert!(
+                    path.unwrap().ends_with("g1b-alpha.json"),
+                    "文件名按输入名"
+                );
+                // 保存即切 user: 态（B 批语义）。
+                assert_eq!(shell.theme_mode, "user:g1b-alpha", "保存后四态落位");
+            });
+        });
+        // 全局主题名 = g1b-alpha。
+        visual.update(|_window, app| {
+            let name = theme::GlobalTheme::theme(app).name.clone();
+            assert_eq!(name.as_ref(), "g1b-alpha", "全局主题切到具名");
+        });
+        // set_theme_mode 切回 dark（三态轴并存——坏名回退同链）。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_theme_mode("dark", cx);
+                assert_eq!(shell.theme_mode, "dark");
+            });
+        });
+        // 再切回 user:（apply_mode 具名分支 registry 命中）。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_theme_mode("user:g1b-alpha", cx);
+                assert_eq!(shell.theme_mode, "user:g1b-alpha");
+                let name = theme::GlobalTheme::theme(cx).name.clone();
+                assert_eq!(name.as_ref(), "g1b-alpha", "registry 命中即切");
+            });
+        });
+        // 坏名 user:不存在（apply_mode 回退三态轴——mode 不变坏名，
+        // GlobalTheme 走 base 三态）。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_theme_mode("user:no-such", cx);
+                // mode 落位仍是坏名（持久化原样），但主题回 base（不炸）。
+                assert_eq!(shell.theme_mode, "user:no-such", "mode 原样记录");
+                let name = theme::GlobalTheme::theme(cx).name.clone();
+                assert_ne!(name.as_ref(), "no-such", "坏名不炸（回退非具名）");
+            });
+        });
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    /// #110 G1 批B：删除链——删盘 + registry 移除 + 正用回退 dark。
+    #[gpui::test]
+    fn delete_user_theme_chain(cx: &mut gpui::TestAppContext) {
+        let xdg = std::env::temp_dir().join(format!("mang-g1b-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        // 建两个主题（alpha + beta），选中 alpha。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                shell.set_theme_name_input("g1b-alpha".into());
+                assert!(shell.save_custom_theme(cx).is_some());
+                shell.set_theme_name_input("g1b-beta".into());
+                assert!(shell.save_custom_theme(cx).is_some());
+                // beta 保存即选中——切回 alpha 再删 alpha？不：删「当前正用」
+                // 的回退链才是断言重点。当前 = user:g1b-beta。
+                assert_eq!(shell.theme_mode, "user:g1b-beta");
+            });
+        });
+        // 枚举面：两主题都在。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                let names = shell.user_theme_names(cx);
+                assert!(names.contains(&"g1b-alpha".to_string()), "alpha 在列");
+                assert!(names.contains(&"g1b-beta".to_string()), "beta 在列");
+            });
+        });
+        // 删 alpha（非当前）——mode 不动。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                assert!(shell.delete_user_theme("g1b-alpha", cx));
+                assert_eq!(shell.theme_mode, "user:g1b-beta", "删非当前不动 mode");
+                assert!(!shell.user_theme_names(cx).contains(&"g1b-alpha".to_string()));
+            });
+        });
+        // 删 beta（当前正用）——回退 dark + registry 无 beta。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                assert!(shell.delete_user_theme("g1b-beta", cx));
+                assert_eq!(shell.theme_mode, "dark", "删当前回退深色");
+                let names = shell.user_theme_names(cx);
+                assert!(!names.contains(&"g1b-beta".to_string()), "registry 无 beta");
+                let mode_saved = crate::settings::load_theme_mode();
+                assert_eq!(mode_saved.as_deref(), Some("dark"), "回退写盘");
+            });
+        });
+        // 删不存在 → false。
+        visual.update(|_window, app| {
+            shell.update(app, |shell, cx| {
+                assert!(!shell.delete_user_theme("g1b-none", cx), "无该主题 false");
+            });
+        });
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    /// #110 G1 批B：名输入过滤（非法字符拒 + 40 界）。
+    #[gpui::test]
+    fn theme_name_input_filters(cx: &mut gpui::TestAppContext) {
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        visual.update(|_window, app| {
+            shell.update(app, |shell, _cx| {
+                shell.set_theme_name_input("good-name".into());
+                assert_eq!(shell.theme_name_input(), "good-name");
+                // 路径分隔符拒（磁盘安全）。
+                shell.set_theme_name_input("bad/name".into());
+                assert_eq!(shell.theme_name_input(), "badname", "斜杠滤除");
+                // 控制字符拒。
+                shell.set_theme_name_input("a\u{1}b".into());
+                assert_eq!(shell.theme_name_input(), "ab", "控制符滤除");
+                // 40 界。
+                let long = "x".repeat(60);
+                shell.set_theme_name_input(long.clone());
+                assert_eq!(shell.theme_name_input().chars().count(), 40, "40 界");
+            });
+        });
+    }
 
     /// 空草稿 → 槽默认当前主题实际色 → 写盘 + 装载 + 全局主题切换。
     #[gpui::test]
