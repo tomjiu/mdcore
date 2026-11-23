@@ -349,9 +349,18 @@ pub fn save_user_theme_file(
     for (key, hex) in slots {
         value[key.as_str()] = serde_json::json!(hex);
     }
+    // #110 G1 批C：replace_saved 原子语义——同名重存走 tmp+rename
+    // （崩溃/并发窗口不产半截 JSON；装载侧 load_user_themes 永远读
+    // 整文件）。registry 侧由调用方 save_custom_theme 同名 insert
+    // 即时替换（ThemeMeta 同名覆盖——非另存副本）。
     let path = dir.join(format!("{name}.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(&value).ok()?)
+    let tmp = dir.join(format!("{name}.json.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&value).ok()?)
         .ok()?;
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
     let _ = cx.refresh_windows();
     Some(path)
 }
@@ -1085,6 +1094,85 @@ mod tests {
                 "ghost disabled l 分量：{got} vs {want}（G2 灰度语义）"
             );
         });
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #110 G1 批C：replace_saved 原子重存语义——同名两存：
+    /// 盘上单文件（新值覆盖旧值，无 .tmp 残留）+ registry 单份实体
+    ///（BTreeMap insert 同名 upsert——非另存副本）+ 装载计数不涨（1→1）。
+    #[gpui::test]
+    fn user_theme_replace_saved_roundtrip(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        let tmp = std::env::temp_dir().join(format!("mang-g1c-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let themes = tmp.join("mang").join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+
+        // 第一存：background #112233。
+        cx.update(|cx| {
+            let slots = [("background".to_string(), "#112233".to_string())];
+            let path = save_user_theme_file("g1c-replace", &slots, cx);
+            assert!(path.is_some(), "第一存成功");
+        });
+        assert_eq!(
+            cx.update(|cx| load_user_themes(cx)),
+            1,
+            "装载 1 份"
+        );
+        // 第二存（同名新值 #445566）——replace_saved：覆盖非副本。
+        cx.update(|cx| {
+            let slots = [("background".to_string(), "#445566".to_string())];
+            let path = save_user_theme_file("g1c-replace", &slots, cx);
+            assert!(path.is_some(), "重存成功");
+            // registry 同名单份（insert upsert——旧实体被替换）。
+            let registry = theme::ThemeRegistry::default_global(cx);
+            let names: Vec<String> = registry
+                .list_names()
+                .iter()
+                .map(|n| n.to_string())
+                .filter(|n| n == "g1c-replace")
+                .collect();
+            assert_eq!(names.len(), 1, "registry 单份（同名 upsert）");
+            // 取回实体 = 新值（背景亮度近似判定——#445566 ≠ #112233）。
+            let t = registry.get("g1c-replace").expect("重存后可取");
+            assert_ne!(
+                t.styles.colors.background.l,
+                0.,
+                "背景已装载（非零）"
+            );
+        });
+        // 盘上单文件 + 无 .tmp 残留（原子 rename 收尾干净）。
+        let entries: Vec<String> = std::fs::read_dir(&themes)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries.iter().filter(|n| n.as_str() == "g1c-replace.json").count(),
+            1,
+            "盘上单 json"
+        );
+        assert!(
+            entries.iter().all(|n| !n.contains(".tmp-")),
+            "无 tmp 残留（原子 rename）"
+        );
+        // JSON 内容 = 新值（读回验）。
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(themes.join("g1c-replace.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk["background"], "#445566", "盘上是重存后的新值");
+        // 再装载（模拟下次启动）——计数仍 1（单文件单实体）。
+        assert_eq!(
+            cx.update(|cx| load_user_themes(cx)),
+            1,
+            "再装载仍 1 份（无副本堆积）"
+        );
+
         unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
         let _ = std::fs::remove_dir_all(&tmp);
     }
