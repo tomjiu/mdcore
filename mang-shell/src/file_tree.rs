@@ -72,6 +72,30 @@ pub struct FileTreeHooks {
     pub open_file: OpenFileHook,
     pub context_menu: ContextMenuHook,
     pub escape: EscapeHook,
+    /// #107 P1②：拖拽移动（树内拖→目录行放=移动进该目录——
+    /// confirm_move_path 确认链）。
+    pub move_file: MoveFileHook,
+}
+
+/// #107 P1②：拖拽移动钩子（old, new_dir——new = new_dir/old_name）。
+pub type MoveFileHook =
+    Arc<dyn Fn(PathBuf, PathBuf, &mut Window, &mut App) + Send + Sync>;
+
+/// #107 P1②：拖拽跟随幽灵（渲染被拖文件名——最小视觉）。
+#[derive(Clone)]
+pub struct DragGhost;
+
+impl gpui::Render for DragGhost {
+    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        ui::Label::new("移动中…").size(ui::LabelSize::XSmall)
+    }
+}
+
+/// #107 P1②：拖拽载荷（树行 on_drag——DragPanel #121 批③b 同型）。
+#[derive(Clone, Debug)]
+pub struct DraggedFile {
+    pub path: PathBuf,
+    pub is_dir: bool,
 }
 
 /// 目录条目。
