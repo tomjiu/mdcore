@@ -315,7 +315,37 @@ run_palette() { # $1 = light|dark
 echo "[8/9] 命令面板开/关三帧采集（A4）"
 run_palette light
 
-echo "[9/9] PPM 像素断言（E-1 + E-2 + A4 菜单/右键/面板）"
+# 批次 10（#110 G1 批C）：--smoke-custom-theme 三帧（A=5.8s 自定义色
+# 应用 / B=7.6s dark 切换后 / C=9.4s dark 稳态；--smoke-sec 12 配套）。
+run_custom_theme() {
+  local home="/tmp/theme-smoke-home-ct"
+  local log="$OUT/ct.log"
+  rm -rf "$home"; mkdir -p "$home"
+  echo "  [ct] 启动（--smoke-custom-theme --smoke-sec 12）"
+  HOME="$home" "$BIN" --smoke-custom-theme --smoke-sec 12 "$FIXTURE" >"$log" 2>&1 &
+  local app_pid=$!
+  sleep 3.5
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/ct-a.ppm" -y
+  sleep 2.6
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/ct-b.ppm" -y
+  sleep 2.8
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${W}x${H}" \
+    -i "$DISPLAY" -frames:v 1 -pix_fmt rgb24 "$OUT/ct-c.ppm" -y
+  ffmpeg -hide_banner -loglevel error -i "$OUT/ct-c.ppm" "$OUT/ct-c.png" -y
+  wait "$app_pid" || { echo "  [ct] 应用退出码非 0" >&2; return 1; }
+  grep -q "custom-theme-smoke: script done" "$log" \
+    || { echo "  [ct] 缺 custom-theme-smoke 证据行" >&2; return 1; }
+  grep -q "smoke: quit reached" "$log" \
+    || { echo "  [ct] 缺 smoke: quit reached" >&2; return 1; }
+  echo "  [ct] 三帧采集 ✓"
+}
+
+echo "[9/10] 自定义主题三帧采集（#110 G1 批C）"
+run_custom_theme
+
+echo "[10/10] PPM 像素断言（E-1 + E-2 + A4 菜单/右键/面板 + #110 自定义主题）"
 # 断言链容错：单项失败记录到 FAILURES 不中止——全部跑完统一判定
 #（set -o pipefail 下 tee 管道会传递检查脚本退出码）。
 run_check() { # $@ = 检查脚本 + 参数
@@ -347,6 +377,10 @@ for mode in light; do
   run_check python3 mang-shell/tests/palette_check.py \
     "$OUT/pal-$mode-a.ppm" "$OUT/pal-$mode-b.ppm" "$OUT/pal-$mode-c.ppm"
 done
+
+# #110 G1 批C：自定义主题三帧断言（C1-C5）。
+run_check python3 mang-shell/tests/custom_theme_check.py \
+  "$OUT/ct-a.ppm" "$OUT/ct-b.ppm" "$OUT/ct-c.ppm" "$OUT/ct.log"
 
 if [ "${CHECK_FAILED:-0}" = "1" ]; then
   echo "存在失败断言（详见 $OUT/evidence.txt 的 CHECK-FAILED 行）" >&2
