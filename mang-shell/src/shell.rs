@@ -260,6 +260,12 @@ pub struct ShellApp {
     ocr_rx: Option<std::sync::mpsc::Receiver<OcrProgressMsg>>,
     /// #306 ①：OCR 轮询循环在跑（Done 消费即停——防重复起循环）。
     ocr_polling: bool,
+    /// #107 P1①：mtime 轮询在跑标记（tabs 非空期启动；空则停——
+    /// 外部变更感知面 D1 后半）。
+    mtime_polling: bool,
+    /// #107 P1①：各标签磁盘 mtime 基线（轮询比对——打开/重载/保存后
+    /// 刷新；None = 不可得（跳过该标签比对））。
+    mtime_baselines: Vec<Option<std::time::SystemTime>>,
     /// #164 1c：首帧计时基点（ShellApp 构造时置 = perf::boot()，首个
     /// render 呈现时消费——`perf: first-frame` 证据行；MANG_PERF 未开
     /// 恒 None，零开销）。
@@ -535,6 +541,8 @@ impl ShellApp {
             pdf_thumbs: None,
             ocr_rx: None,
             ocr_polling: false,
+            mtime_polling: false,
+            mtime_baselines: Vec::new(),
             pdf_view_mode: true,
             pdf_view_snapshots: std::collections::HashMap::new(),
             docx_pages: None,
@@ -2643,6 +2651,9 @@ impl ShellApp {
                     editor,
                 });
                 self.active = self.tabs.len() - 1;
+                // #107 P1①：mtime 轮询启动（tabs 非空——外部变更感知；
+                // 首步建基线，2s 周期比对）。
+                self.spawn_mtime_poll_loop(cx);
                 // #571：激活编辑器变更 → 大纲面板换绑。
                 self.sync_outline(cx);
                 self.notice_board.clear();
@@ -3872,6 +3883,88 @@ impl ShellApp {
             self.ocr_polling = true;
             Self::spawn_ocr_progress_loop(window, cx);
         }
+    }
+
+    /// #107 P1①：mtime 单步轮询（2s 周期的循环体——pub 测试面）：
+    /// 比对各标签磁盘 mtime 与基线 → 干净标签自动重载（#134 reload_tab
+    /// 链）+ toast；脏标签**不自动覆盖**（脏缓冲冲突策略——防丢用户
+    /// 未保存编辑，toast 警示交还决策权）；不可重载态（只读渲染/
+    /// docx 行模型）跳过。返回变化的标签数（循环日志用）。
+    pub fn poll_mtimes_once(&mut self, cx: &mut Context<Self>) -> usize {
+        if self.tabs.is_empty() {
+            return 0;
+        }
+        // 基线尺寸对齐（打开/关闭标签后首步补齐）。
+        if self.mtime_baselines.len() != self.tabs.len() {
+            self.mtime_baselines = self
+                .tabs
+                .iter()
+                .map(|tab| std::fs::metadata(&tab.path).and_then(|m| m.modified()).ok())
+                .collect();
+            return 0; // 首步只建基线（不比对——防打开即误报）。
+        }
+        let mut changed = 0;
+        let mut notices: Vec<String> = Vec::new();
+        for i in 0..self.tabs.len() {
+            let now_m = std::fs::metadata(&self.tabs[i].path)
+                .and_then(|m| m.modified())
+                .ok();
+            let baseline = self.mtime_baselines.get(i).copied().flatten();
+            if now_m.is_none() || now_m == baseline || Some(now_m) == Some(baseline) && baseline.is_some() {
+                continue;
+            }
+            changed += 1;
+            // 基线即时推进（本轮已感知——重载/警示后的新基线）。
+            self.mtime_baselines[i] = now_m;
+            if self.tab_is_modified(i, cx).unwrap_or(false) {
+                // 脏标签：不自动覆盖——警示交还决策权。
+                notices.push(format!(
+                    "{} 在磁盘已被外部修改——未保存编辑在前（保存将覆盖外部改动）",
+                    self.tabs[i].path.display()
+                ));
+            } else if self.tab_can_reload(i, cx) {
+                if self.reload_tab(i, cx) {
+                    notices.push(format!(
+                        "检测到外部修改并已重载：{}",
+                        self.tabs[i].path.display()
+                    ));
+                }
+            }
+            // 不可重载态（只读渲染/docx 行模型）：静默跳过——
+            // 重载确认链在该态无语义（页视图保存另有 C4 面）。
+        }
+        for n in notices {
+            self.show_notice(n, cx);
+        }
+        if changed > 0 {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// #107 P1①：mtime 轮询循环（2s 周期——tabs 非空期常驻；空则停）。
+    fn spawn_mtime_poll_loop(&mut self, cx: &mut Context<Self>) {
+        if self.mtime_polling {
+            return;
+        }
+        self.mtime_polling = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                let mut stop = false;
+                let _ = this.update(cx, |shell, cx| {
+                    shell.poll_mtimes_once(cx);
+                    if shell.tabs.is_empty() {
+                        shell.mtime_polling = false;
+                        stop = true;
+                    }
+                });
+                if stop {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// #306 ①：OCR 进度轮询循环（16ms 定时 drain——pdf_pages 搜索索引
@@ -10658,6 +10751,120 @@ mod confirm_lifecycle_tests {
 #[cfg(test)]
 #[path = "workspace_layout_tests.rs"]
 mod workspace_layout_tests;
+
+/// #107 P1① 测试（内联域）：mtime 轮询单步面三分流。
+#[cfg(test)]
+mod mtime_poll_tests {
+    use super::*;
+
+    fn temp_md(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mang-mtime-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("note.md");
+        std::fs::write(&p, "# 起步\n旧内容\n").unwrap();
+        p
+    }
+
+    /// 干净标签：外部改 → 自动重载 + toast。
+    #[gpui::test]
+    fn mtime_poll_reloads_clean_tab(cx: &mut gpui::TestAppContext) {
+        let path = temp_md("clean");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        // host() 自带 editor（layout.md）——用真文件开标签（走 open_document_tab
+        /// 链含基线建立）：
+        let shell2 = shell.clone();
+        let p2 = path.clone();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.open_document_tab(p2, cx);
+            });
+        });
+        // 首步建基线：
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let n = shell.poll_mtimes_once(cx);
+                assert_eq!(n, 0, "首步建基线——零变化");
+            });
+        });
+        // 外部改写（mtime 变 + 内容变）。
+        std::fs::write(&path, "# 起步\n外部新内容\n").unwrap();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let n = shell.poll_mtimes_once(cx);
+                assert_eq!(n, 1, "感知 1 个变化");
+            });
+        });
+        visual.update(|_window, app| {
+            shell2.read_with(app, |shell, _| {
+                let idx = shell.tabs.iter().position(|t| t.path == path).unwrap();
+                let text = shell.tab_editor(idx).unwrap().read(app).buffer_line(1);
+                assert!(text.contains("外部新内容"), "重载后内容同步：{text:?}");
+                let msg = shell.notice_board.message().map(str::to_owned);
+                assert!(
+                    msg.as_deref().is_some_and(|m| m.contains("已重载")),
+                    "toast：{msg:?}"
+                );
+            });
+        });
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 脏标签：外部改 → 不自动重载（警示交还决策权）。
+    #[gpui::test]
+    fn mtime_poll_warns_not_overwrites_dirty_tab(cx: &mut gpui::TestAppContext) {
+        let path = temp_md("dirty");
+        let (shell, mut visual) = super::workspace_layout_tests::host(cx);
+        let shell2 = shell.clone();
+        let p2 = path.clone();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.open_document_tab(p2, cx);
+            });
+        });
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let _ = shell.poll_mtimes_once(cx);
+            });
+        });
+        // 用户编辑（脏）——insert_text_at 先例（dirty_close 测试同法）。
+        let dirty_idx = shell2
+            .read_with(&visual, |shell, _| {
+                shell.tabs.iter().position(|t| t.path == path).unwrap()
+            });
+        shell2.update(&mut visual, |shell, cx| {
+            let ed = shell.tab_editor(dirty_idx).unwrap().clone();
+            ed.update(cx, |ed, cx| {
+                ed.insert_text_at(0, 2, "X", cx);
+            });
+            assert!(
+                shell.tab_is_modified(dirty_idx, cx).unwrap_or(false),
+                "前置：编辑后标签脏"
+            );
+        });
+        // 外部改写。
+        std::fs::write(&path, "# 外部覆盖\n").unwrap();
+        visual.update(|_window, app| {
+            shell2.update(app, |shell, cx| {
+                let n = shell.poll_mtimes_once(cx);
+                assert_eq!(n, 1, "感知变化");
+            });
+        });
+        visual.update(|_window, app| {
+            shell2.read_with(app, |shell, _| {
+                // 不自动重载（脏保护——Buffer 仍是用户编辑态）。
+                let text = shell.tab_editor(dirty_idx).unwrap().read(app).buffer_line(0);
+                assert!(text.contains("X") || text.contains("起步"), "未被外部覆盖：{text:?}");
+                let msg = shell.notice_board.message().map(str::to_owned);
+                assert!(
+                    msg.as_deref().is_some_and(|m| m.contains("外部修改")),
+                    "警示 toast：{msg:?}"
+                );
+            });
+        });
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
 
 /// #110 G4 测试（内联域）：save_custom_theme 全链 + 坏槽拒。
 #[cfg(test)]
