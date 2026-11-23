@@ -24,6 +24,7 @@ use crate::editor::Editor;
 use crate::editor::docx_doc::{self, DocxPayload, EditablePayload};
 use crate::editor::pdf_doc::{self, PdfPayload};
 use crate::editor::xlsx_doc::{self, XlsxPayload};
+use crate::status_info::Encoding;
 
 /// #164 1c：实体构造计时包装（editor-built 段——六形态统一口径；
 /// MANG_PERF 未开时 `since` 为 None，零开销直通）。
@@ -67,7 +68,14 @@ fn doc_units(opened: &OpenedDocument) -> usize {
 /// 打开结果。
 pub enum OpenedDocument {
     /// 可编辑文本文档（md / txt）。
-    EditableText { path: PathBuf, content: String },
+    /// #111 G1 写回半：`encoding` = 打开时探测的源编码——随文档携带
+    /// 到保存链（`save`/`save_as` 按原编码写回），不再是解码后即丢的
+    /// 一次性信息。`Utf8` 为直通缺省（无 BOM）。
+    EditableText {
+        path: PathBuf,
+        content: String,
+        encoding: Encoding,
+    },
     /// docx 只读渲染（批 3）：mdc-office-io 解析 + 行模型转换产物。
     ReadOnlyDocx { path: PathBuf, payload: DocxPayload },
     /// #115：docx **可编辑**装载（行模型 + 编辑桥 + 引擎窄面；桥 `None`
@@ -89,40 +97,6 @@ pub enum OpenedDocument {
     OpenError { path: PathBuf, message: String },
 }
 
-/// 打开一个文件（分派 + 读取）。
-/// #107 批④：文本字节按探测编码解码为 `String`。
-///
-/// 探测复用 [`crate::status_info::detect_encoding`]（BOM → UTF-8 →
-/// GBK 结构启发式；`None` = 探测不出——不猜，与该函数的诚实边界
-/// 一致，此处原样透传 `None`）。UTF-8（含 BOM 剥离）直通零成本；
-/// UTF-16LE/BE 与 GBK 经 encoding_rs 解码（WHATWG 标准 GBK 超集
-/// 表——GB18030 全兼容面）。
-fn decode_text_bytes(bytes: &[u8]) -> Option<String> {
-    use crate::status_info::{Encoding, detect_encoding};
-    match detect_encoding(bytes)? {
-        Encoding::Utf8 => std::str::from_utf8(bytes).ok().map(str::to_string),
-        Encoding::Utf8Bom => std::str::from_utf8(&bytes[3..]).ok().map(str::to_string),
-        Encoding::Utf16Le => Some(
-            encoding_rs::UTF_16LE
-                .decode_with_bom_removal(bytes)
-                .0
-                .into_owned(),
-        ),
-        Encoding::Utf16Be => Some(
-            encoding_rs::UTF_16BE
-                .decode_with_bom_removal(bytes)
-                .0
-                .into_owned(),
-        ),
-        Encoding::Gbk => Some(
-            encoding_rs::GBK
-                .decode_without_bom_handling(bytes)
-                .0
-                .into_owned(),
-        ),
-    }
-}
-
 pub fn open(path: &Path) -> OpenedDocument {
     let ext = path
         .extension()
@@ -130,16 +104,18 @@ pub fn open(path: &Path) -> OpenedDocument {
         .unwrap_or_default();
     match ext.as_str() {
         // #107 批④（2449 D3）：编码探测——读 bytes 后经
-        // `status_info::detect_encoding`（既有纯函数：BOM → UTF-8 →
-        // GBK 结构启发式），UTF-8 直通；UTF-16LE/BE 与 GBK 经
-        // encoding_rs 解码（lock 既有 0.8.42 传递依赖，显式声明
-        // 零新增 crate）。探测不出（None）→ 保持旧错误口径
+        // `status_info::decode_text`（BOM → UTF-8 → GBK 结构启发式 +
+        // encoding_rs 解码，UTF-8 直通零成本；lock 既有 0.8.42 传递
+        // 依赖，显式声明零新增 crate）。#111 G1 写回半：探测出的编码
+        // 随 `EditableText.encoding` 携带（保存链写回原编码），不再是
+        // 解码后即丢。探测不出（None）→ 保持旧错误口径
         //（不猜——与 detect_encoding 的诚实边界一致）。
         "md" | "markdown" | "txt" => match std::fs::read(path) {
-            Ok(bytes) => match decode_text_bytes(&bytes) {
-                Some(content) => OpenedDocument::EditableText {
+            Ok(bytes) => match crate::status_info::decode_text(&bytes) {
+                Some((content, encoding)) => OpenedDocument::EditableText {
                     path: path.to_path_buf(),
                     content,
+                    encoding,
                 },
                 None => OpenedDocument::OpenError {
                     path: path.to_path_buf(),
@@ -233,9 +209,16 @@ pub fn open_editor(path: &Path, cx: &mut App) -> OpenOutcome {
     // #164 1c：editor-built 分段计时（实体构造段——六形态统一走 build_ed）。
     let since_build = crate::perf::on().then(std::time::Instant::now);
     match opened {
-        OpenedDocument::EditableText { path, content } => {
+        OpenedDocument::EditableText {
+            path,
+            content,
+            encoding,
+        } => {
             OpenOutcome::Opened(build_ed(since_build, cx, |cx| {
                 let mut ed = Editor::new(Some(path), content, cx);
+                // #111 G1 写回半：源编码随文档携带（save/save_as 按原
+                // 编码写回）。
+                ed.set_file_encoding(encoding);
                 // #427：折叠持久化**读侧**接线——文档装载完成即恢复已
                 // 落盘折叠（写侧 persist_folds 挂在折叠命令路径，此前
                 // 只写不读，重启即丢）。时机语义 = 装载即恢复（无渲染
@@ -390,9 +373,14 @@ mod tests {
         std::fs::write(&utf16_path, utf16_bytes).unwrap();
 
         // 绿断言（#107 批④解码面实施后）：两者正常打开且内容正确。
+        // #111 G1 写回半：探测编码随 EditableText 携带（不再是解码后
+        // 即丢——保存链写回的源头）。
         match open(&gbk_path) {
-            OpenedDocument::EditableText { content, .. } => {
+            OpenedDocument::EditableText {
+                content, encoding, ..
+            } => {
                 assert_eq!(content, "中文文档", "GBK 文档解码正确（先红：OpenError）");
+                assert_eq!(encoding, Encoding::Gbk, "GBK 探测编码随文档携带");
             }
             other => assert!(
                 matches!(other, OpenedDocument::EditableText { .. }),
@@ -400,11 +388,14 @@ mod tests {
             ),
         }
         match open(&utf16_path) {
-            OpenedDocument::EditableText { content, .. } => {
+            OpenedDocument::EditableText {
+                content, encoding, ..
+            } => {
                 assert_eq!(
                     content, "中文文档",
                     "UTF-16LE 文档解码正确（先红：OpenError）"
                 );
+                assert_eq!(encoding, Encoding::Utf16Le, "UTF-16LE 编码随文档携带");
             }
             other => assert!(
                 matches!(other, OpenedDocument::EditableText { .. }),
@@ -415,8 +406,11 @@ mod tests {
         let utf8bom_path = dir.join("utf8bom.md");
         std::fs::write(&utf8bom_path, b"\xEF\xBB\xBFhello").unwrap();
         match open(&utf8bom_path) {
-            OpenedDocument::EditableText { content, .. } => {
+            OpenedDocument::EditableText {
+                content, encoding, ..
+            } => {
                 assert_eq!(content, "hello", "UTF-8 BOM 剥离后内容正确");
+                assert_eq!(encoding, Encoding::Utf8Bom, "BOM 态随文档携带");
             }
             other => assert!(
                 matches!(other, OpenedDocument::EditableText { .. }),
@@ -427,8 +421,11 @@ mod tests {
         let utf8_path = dir.join("utf8.md");
         std::fs::write(&utf8_path, "中英 mixed").unwrap();
         match open(&utf8_path) {
-            OpenedDocument::EditableText { content, .. } => {
+            OpenedDocument::EditableText {
+                content, encoding, ..
+            } => {
                 assert_eq!(content, "中英 mixed", "UTF-8 主路径直通不回退");
+                assert_eq!(encoding, Encoding::Utf8, "UTF-8 编码随文档携带");
             }
             other => assert!(
                 matches!(other, OpenedDocument::EditableText { .. }),

@@ -168,6 +168,125 @@ fn looks_like_gbk(bytes: &[u8]) -> bool {
     saw_multibyte
 }
 
+// ---------------------------------------------------------------------------
+// #111 G1 写回半：探测解码/按原编码写回的共用核心。
+//
+// `detect_encoding` 只给「盘上字节是哪种编码」；打开与保存是两条独立
+// 路径（document::open / rpc read_file / reload_from_disk 读、editor
+// save/save_as 写），编码判定必须与写回编码对称——否则打开探测出的
+// GBK 文档一保存就变 UTF-8（#221 探测半的收益静默失效）。本节把
+// 「解码（并返回编码）」与「按编码写回」收进共用纯函数，三条读路径
+// 与两条写路径同一口径，round-trip 由测试钉死。
+// ---------------------------------------------------------------------------
+
+/// 按探测编码解码文本字节。
+///
+/// 返回 `(内容, 探测编码)`——编码随内容一起上交，供打开链携带到
+/// 保存链（写回原编码）。探测复用 [`detect_encoding`]（BOM → UTF-8 →
+/// GBK 结构启发式）；`None` = 探测不出——不猜（与该函数的诚实边界
+/// 一致）。UTF-8（含 BOM 剥离）直通零成本；UTF-16LE/BE 与 GBK 经
+/// encoding_rs 解码（WHATWG 标准 GBK 超集表——GB18030 全兼容面）。
+pub fn decode_text(bytes: &[u8]) -> Option<(String, Encoding)> {
+    match detect_encoding(bytes)? {
+        Encoding::Utf8 => std::str::from_utf8(bytes)
+            .ok()
+            .map(|s| (s.to_string(), Encoding::Utf8)),
+        Encoding::Utf8Bom => std::str::from_utf8(&bytes[3..])
+            .ok()
+            .map(|s| (s.to_string(), Encoding::Utf8Bom)),
+        Encoding::Utf16Le => Some((
+            encoding_rs::UTF_16LE
+                .decode_with_bom_removal(bytes)
+                .0
+                .into_owned(),
+            Encoding::Utf16Le,
+        )),
+        Encoding::Utf16Be => Some((
+            encoding_rs::UTF_16BE
+                .decode_with_bom_removal(bytes)
+                .0
+                .into_owned(),
+            Encoding::Utf16Be,
+        )),
+        Encoding::Gbk => Some((
+            encoding_rs::GBK
+                .decode_without_bom_handling(bytes)
+                .0
+                .into_owned(),
+            Encoding::Gbk,
+        )),
+    }
+}
+
+/// 写回编码失败原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeError {
+    /// GBK 编码器装不下（如 emoji）——拒绝静默替换：替换字符会把
+    /// 用户内容变成乱码，比「保存失败」严重得多。
+    GbkUnmappable,
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::GbkUnmappable => {
+                write!(
+                    f,
+                    "存在 GBK 无法表示的字符——拒绝以替换字符写回（另存为 UTF-8 可保存全部内容）"
+                )
+            }
+        }
+    }
+}
+
+/// 按原编码把文本编码为磁盘字节（[`decode_text`] 的对称面）。
+///
+/// - [`Encoding::Utf8`]：直通（无 BOM——与探测口径对称）；
+/// - [`Encoding::Utf8Bom`]：EF BB BF 前缀 + UTF-8 体；
+/// - [`Encoding::Utf16Le`] / [`Encoding::Utf16Be`]：BOM + 编码单元
+///   （探测面靠 BOM 识别 UTF-16——无 BOM 的 UTF-16 探测不出，写回
+///   自然也带 BOM 保持可重开）；
+/// - [`Encoding::Gbk`]：encoding_rs GBK 编码；不可映射字符 →
+///   [`EncodeError::GbkUnmappable`]（拒绝静默替换造乱码——保存失败
+///   交用户决策，缓冲区内容不受影响）。
+///
+/// round-trip 不变量（测试钉死）：`decode_text(encode_text(t, e))`
+/// = `(t, e)`——保存后重开再探测必须得回同一编码。
+pub fn encode_text(content: &str, enc: Encoding) -> Result<Vec<u8>, EncodeError> {
+    match enc {
+        Encoding::Utf8 => Ok(content.as_bytes().to_vec()),
+        Encoding::Utf8Bom => {
+            let mut out = Vec::with_capacity(content.len() + 3);
+            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            out.extend_from_slice(content.as_bytes());
+            Ok(out)
+        }
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            let mut out = Vec::with_capacity(content.len() * 2 + 2);
+            out.extend_from_slice(if enc == Encoding::Utf16Le {
+                &[0xFF, 0xFE]
+            } else {
+                &[0xFE, 0xFF]
+            });
+            for unit in content.encode_utf16() {
+                if enc == Encoding::Utf16Le {
+                    out.extend_from_slice(&unit.to_le_bytes());
+                } else {
+                    out.extend_from_slice(&unit.to_be_bytes());
+                }
+            }
+            Ok(out)
+        }
+        Encoding::Gbk => {
+            let (bytes, _, had_errors) = encoding_rs::GBK.encode(content);
+            if had_errors {
+                return Err(EncodeError::GbkUnmappable);
+            }
+            Ok(bytes.into_owned())
+        }
+    }
+}
+
 /// 选区信息（状态栏「选中 N 字 / M 行」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectionInfo {
@@ -404,6 +523,137 @@ pub fn docx_toggle_label(page_view: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #111 G1 写回半：decode_text / encode_text 对称面 ─────────────
+
+    /// "中文文档" 各编码手工钉死字节（与 document.rs 探测红测同源，
+    /// 不经运行时编码器自证）。
+    const ZHONGWEN: &str = "中文文档";
+    const GBK_ZHONGWEN: &[u8] = &[0xD6, 0xD0, 0xCE, 0xC4, 0xCE, 0xC4, 0xB5, 0xB5];
+    const UTF16LE_ZHONGWEN: &[u8] = &[0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65, 0x87, 0x65, 0x63, 0x68];
+    const UTF16BE_ZHONGWEN: &[u8] = &[0xFE, 0xFF, 0x4E, 0x2D, 0x65, 0x87, 0x65, 0x87, 0x68, 0x63];
+
+    #[test]
+    fn decode_text_returns_encoding_with_content() {
+        // GBK：内容 + 编码成对上交（此前 decode_text_bytes 只给内容、
+        // 编码即丢——写回半的缺口根源）。
+        assert_eq!(
+            decode_text(GBK_ZHONGWEN),
+            Some((ZHONGWEN.to_string(), Encoding::Gbk))
+        );
+        assert_eq!(
+            decode_text(UTF16LE_ZHONGWEN),
+            Some((ZHONGWEN.to_string(), Encoding::Utf16Le))
+        );
+        assert_eq!(
+            decode_text(UTF16BE_ZHONGWEN),
+            Some((ZHONGWEN.to_string(), Encoding::Utf16Be))
+        );
+        // UTF-8 BOM：剥 BOM 上交 + 编码标注。
+        let bom: &[u8] = &[0xEF, 0xBB, 0xBF];
+        assert_eq!(
+            decode_text(&[bom, "中文".as_bytes()].concat()),
+            Some(("中文".to_string(), Encoding::Utf8Bom))
+        );
+        // 纯 UTF-8 直通；探测不出（不猜）保持 None。
+        assert_eq!(
+            decode_text("中文".as_bytes()),
+            Some(("中文".to_string(), Encoding::Utf8))
+        );
+        assert_eq!(decode_text(&[0x81, 0x40, 0xFF]), None);
+    }
+
+    #[test]
+    fn encode_text_roundtrips_through_detect() {
+        // round-trip 不变量：encode → detect → decode 恒等（保存后重开
+        // 再探测 = 同编码）。混合 ASCII/CJK/换行/CRLF。
+        let content = "标题 Heading\n第二行 line2\r\n尾行无换行";
+        for enc in [
+            Encoding::Utf8,
+            Encoding::Utf8Bom,
+            Encoding::Utf16Le,
+            Encoding::Utf16Be,
+            Encoding::Gbk,
+        ] {
+            let bytes = encode_text(content, enc).expect("常规内容必须可编码");
+            assert_eq!(
+                detect_encoding(&bytes),
+                Some(enc),
+                "{enc:?} 写回字节必须被自家探测认回"
+            );
+            assert_eq!(
+                decode_text(&bytes),
+                Some((content.to_string(), enc)),
+                "{enc:?} round-trip 恒等"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_text_ascii_gbk_bytes_equal_utf8_honest_boundary() {
+        // 诚实边界：纯 ASCII/空内容的 GBK 写回字节与 UTF-8 完全相同，
+        // 重探测报 UTF-8——字节级零差异，无任何可观察影响（GB 双字节
+        // 才有独立字节形态；空文件没有「另一半」信息）。
+        let bytes = encode_text("plain ascii", Encoding::Gbk).unwrap();
+        assert_eq!(bytes, b"plain ascii");
+        assert_eq!(
+            decode_text(&bytes),
+            Some(("plain ascii".into(), Encoding::Utf8))
+        );
+    }
+
+    #[test]
+    fn encode_text_gbk_unmappable_rejected() {
+        // emoji 不在 GBK 表内 → Err，拒绝静默替换造乱码。
+        assert_eq!(
+            encode_text("\u{1F600}中文", Encoding::Gbk),
+            Err(EncodeError::GbkUnmappable)
+        );
+        assert_eq!(
+            encode_text("中文😀", Encoding::Gbk),
+            Err(EncodeError::GbkUnmappable)
+        );
+        // 其余编码全部装得下（UTF-16 surrogate pair / UTF-8 四字节）。
+        for enc in [
+            Encoding::Utf8,
+            Encoding::Utf8Bom,
+            Encoding::Utf16Le,
+            Encoding::Utf16Be,
+        ] {
+            assert!(
+                encode_text("\u{1F600}", enc).is_ok(),
+                "{enc:?} 应能编码增补平面字符"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_text_byte_forms_are_exact() {
+        // 精确字节形态（手工钉死，防「换了个等价但不同的编码器」漂移）。
+        assert_eq!(encode_text(ZHONGWEN, Encoding::Gbk).unwrap(), GBK_ZHONGWEN);
+        assert_eq!(
+            encode_text(ZHONGWEN, Encoding::Utf16Le).unwrap(),
+            UTF16LE_ZHONGWEN
+        );
+        assert_eq!(
+            encode_text(ZHONGWEN, Encoding::Utf16Be).unwrap(),
+            UTF16BE_ZHONGWEN
+        );
+        // BOM 前缀 + UTF-8 体；UTF-8 直通零 BOM。
+        let mut bom_want = vec![0xEF, 0xBB, 0xBF];
+        bom_want.extend_from_slice(ZHONGWEN.as_bytes());
+        assert_eq!(encode_text(ZHONGWEN, Encoding::Utf8Bom).unwrap(), bom_want);
+        assert_eq!(
+            encode_text(ZHONGWEN, Encoding::Utf8).unwrap(),
+            ZHONGWEN.as_bytes()
+        );
+        // 空串各编码不炸（BOM 态仍带 BOM——空 BOM 文件可重开识别）。
+        assert_eq!(
+            encode_text("", Encoding::Utf8Bom).unwrap(),
+            &[0xEF, 0xBB, 0xBF]
+        );
+        assert_eq!(encode_text("", Encoding::Utf16Le).unwrap(), &[0xFF, 0xFE]);
+    }
 
     // ── #585 残余①：视图切换钮文案映射（穷尽两态）────────────
 

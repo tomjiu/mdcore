@@ -1468,6 +1468,27 @@ fn dir_entry_json(entry: &std::fs::DirEntry, canon_root: &Path) -> serde_json::V
     })
 }
 
+/// #111 G1 写回半：`read_file` 载荷解码核心（纯函数——与 document::open
+/// 同一探测口径；browse 面不再是「UTF-8 专属」：GBK/UTF-16/BOM 文档
+/// 可读。p4tr 报告 §6 双读路径边界备忘的同步面）。探测不出 = Err——
+/// 二进制/未知编码边界不猜（与 detect_encoding 诚实边界一致）。
+///
+/// 截断语义：探测解码先于截断（字节面截断会把 GBK 双字节/UTF-16
+/// 单元劈半，残字节探测不出反而误伤）；截断落在解码后文本的
+/// UTF-8 字节面上（JSON 载荷按字节计），多字节字符边界退让。
+/// 返回 `(text, truncated)`；Err 为面向用户的原因（不含路径——调用方拼）。
+fn decode_read_payload(bytes: &[u8], cap: usize) -> Result<(String, bool), String> {
+    let (text, _) = crate::status_info::decode_text(bytes).ok_or_else(|| {
+        "无法判定文本编码（非 UTF-8/GBK/UTF-16）——二进制文件不支持读取".to_string()
+    })?;
+    let truncated = text.len() > cap;
+    let mut end = text.len().min(cap);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok((text[..end].to_string(), truncated))
+}
+
 fn cmd_read_file(
     shell: &mut ShellApp,
     cx: &mut Context<ShellApp>,
@@ -1477,15 +1498,8 @@ fn cmd_read_file(
     let path = resolve_sandboxed(&root, Path::new(path))?;
     let bytes = std::fs::read(&path).map_err(|e| format!("读取失败（{}）：{e}", path.display()))?;
     let total = bytes.len();
-    let truncated = total > READ_FILE_CAP_BYTES;
-    let mut slice = &bytes[..total.min(READ_FILE_CAP_BYTES)];
-    // 截断退到 UTF-8 字符边界（多字节字符不劈半）；未截断时此循环
-    // 不进——整体合法性由随后的 from_utf8 判定。
-    while !slice.is_empty() && std::str::from_utf8(slice).is_err() {
-        slice = &slice[..slice.len() - 1];
-    }
-    let text = std::str::from_utf8(slice)
-        .map_err(|_| format!("非 UTF-8 文本（{}）——二进制文件不支持读取", path.display()))?;
+    let (text, truncated) = decode_read_payload(&bytes, READ_FILE_CAP_BYTES)
+        .map_err(|e| format!("{e}（{}）", path.display()))?;
     Ok(serde_json::json!({
         "path": path.display().to_string(),
         "size": total,
@@ -2142,6 +2156,58 @@ fn point_json(p: Point) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------- #111 G1 写回半：read_file 载荷解码 ----------------
+
+    #[test]
+    fn read_payload_decodes_gbk_utf16_bom() {
+        // GBK / UTF-16LE（BOM）/ UTF-8 BOM 文档 browse 面可读（先红：
+        // 旧实现 from_utf8 直拒——p4tr §6 双读路径备忘的缺口）。
+        let gbk: &[u8] = &[0xD6, 0xD0, 0xCE, 0xC4, 0xCE, 0xC4, 0xB5, 0xB5];
+        assert_eq!(
+            decode_read_payload(gbk, 1024).unwrap(),
+            ("中文文档".to_string(), false)
+        );
+        let u16le: &[u8] = &[0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65];
+        assert_eq!(
+            decode_read_payload(u16le, 1024).unwrap(),
+            ("中文".to_string(), false)
+        );
+        // BOM 剥离（旧实现把 U+FEFF 留在 text 首位——新实现与打开链
+        // 同口径）。
+        let bom_utf8: &[u8] = &[0xEF, 0xBB, 0xBF, b'a', b'b'];
+        assert_eq!(
+            decode_read_payload(bom_utf8, 1024).unwrap(),
+            ("ab".to_string(), false)
+        );
+        // 纯 UTF-8 直通；二进制/未知编码拒绝不猜。
+        assert_eq!(
+            decode_read_payload(b"plain", 1024).unwrap(),
+            ("plain".to_string(), false)
+        );
+        assert!(decode_read_payload(&[0x81, 0x40, 0xFF], 1024).is_err());
+    }
+
+    #[test]
+    fn read_payload_truncates_on_decoded_char_boundary() {
+        // 截断落在解码后 UTF-8 字节面（载荷按字节计）且不劈多字节字符。
+        // 「中文ab」解码后 = 3+3+1+1 = 8 字节：cap=6 恰好落在 a 的起点
+        // → 「中文」；cap=5 落在「文」末字节 → 退让到 3（「文」起点）→
+        // 「中」。cap 在此按解码文本计（UTF-16 源 10 字节也截同一处）。
+        let text = "中文ab";
+        let bytes: Vec<u8> = {
+            let mut v = vec![0xFF, 0xFE]; // UTF-16LE 装载同一段文本
+            for unit in text.encode_utf16() {
+                v.extend_from_slice(&unit.to_le_bytes());
+            }
+            v
+        };
+        let (out, truncated) = decode_read_payload(&bytes, 6).unwrap();
+        assert!(truncated, "解码文本超 cap 应标记截断");
+        assert_eq!(out, "中文", "cap=6 落在字符边界——完整保留两个汉字");
+        let (out5, _) = decode_read_payload(&bytes, 5).unwrap();
+        assert_eq!(out5, "中", "cap=5 劈在「文」中——退让到字符起点");
+    }
 
     // ---------------- 协议解析 ----------------
 
