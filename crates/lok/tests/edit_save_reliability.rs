@@ -64,9 +64,7 @@ fn settle_document_contains(s: &mut DocSession, needles: &[&str]) {
     for _round in 0..6 {
         s.uno(".uno:SelectAll", None).expect("全选以读全文");
         for _ in 0..20 {
-            let (_, t) = s
-                .text_selection("text/plain;charset=utf-8")
-                .expect("选区");
+            let (_, t) = s.text_selection("text/plain;charset=utf-8").expect("选区");
             if needles.iter().all(|n| t.contains(n)) {
                 return;
             }
@@ -88,9 +86,7 @@ fn search_and_settle(s: &mut DocSession, anchor: &str) {
         s.uno_query(".uno:ExecuteSearch", Some(&search_args(anchor)))
             .expect("定位锚点");
         for _ in 0..20 {
-            let (_, sel) = s
-                .text_selection("text/plain;charset=utf-8")
-                .expect("选区");
+            let (_, sel) = s.text_selection("text/plain;charset=utf-8").expect("选区");
             if sel.contains(anchor) {
                 return;
             }
@@ -196,10 +192,7 @@ fn undo_redo_dirty_and_repaint_consistency() {
     // 建立已绘制视图，后面的重绘一致性断言才有意义。
     let (w, h) = {
         let (wt, ht) = s.size().expect("文档尺寸");
-        (
-            (wt / 15).min(1024) as usize,
-            (ht / 15).min(1024) as usize,
-        )
+        ((wt / 15).min(1024) as usize, (ht / 15).min(1024) as usize)
     };
     s.paint(w, h, 0, 0, w as i32, h as i32).expect("首帧绘制");
     // 排空首帧绘制产生的回调（events 已在上面 take_events 取走，

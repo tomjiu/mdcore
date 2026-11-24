@@ -80,7 +80,7 @@ use crate::sha256::sha256_hex;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
