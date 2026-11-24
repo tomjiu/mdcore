@@ -316,3 +316,164 @@ fn form_platform_goto_query_does_not_edit(cx: &mut gpui::TestAppContext) {
     })
     .unwrap();
 }
+
+/// #47 A4 面板浮层点击面（agent-xt11 2026-11-23 首批红测）：
+/// 浮层**非输入区**的点击不得穿透到文档面。此前行为：点击面板列表
+/// 区 → 事件冒泡到 editor-surface → dispatch_mouse_down 无条件
+/// focus_document_input（夺走输入焦点）+ hit_test 移动文档光标
+/// （焦点落在浮层底下的正文）；右键同穿（dispatch_context_menu
+/// 同样夺焦点移光标）。行为守恒基线：面板选中仍是键盘 ↑↓ 驱动
+/// （palette_view 行为守恒注释），点击不执行不关闭；Esc 关闭语义
+/// 不变。
+fn palette_click(
+    w: gpui::WindowHandle<Host>,
+    cx: &mut gpui::TestAppContext,
+    ed: &gpui::Entity<Editor>,
+    button: gpui::MouseButton,
+    below_input: f32,
+) {
+    let b = cx
+        .update_window(w.into(), |_host, _window, cx| {
+            ed.update(cx, |ed, _| {
+                let (_, b) = ed
+                    .form_bounds
+                    .borrow()
+                    .iter()
+                    .find(|(f, _)| *f == FormField::Palette)
+                    .expect("面板输入框已绘制（form_bounds 观测面）")
+                    .clone();
+                b
+            })
+        })
+        .expect("编辑器在场");
+    // 实测输入框 bounds——点击点在输入框正下方 `below_input` px 处
+    // （浮层列表区：面板容器内、查询输入框外）。
+    let pos = gpui::point(
+        b.origin.x + gpui::px(20.),
+        b.origin.y + b.size.height + gpui::px(below_input),
+    );
+    let down = gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+        button,
+        position: pos,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    let up = gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+        button,
+        position: pos,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    cx.update_window(w.into(), |_, window, cx| {
+        window.dispatch_event(down, cx);
+        window.dispatch_event(up, cx);
+    })
+    .expect("浮层点击派发");
+}
+
+#[gpui::test]
+fn form_platform_palette_overlay_click_does_not_leak_to_document(cx: &mut gpui::TestAppContext) {
+    let (ed, w) = setup(cx);
+    let revision = ed.read_with(cx, |ed, _| ed.buffer.revision());
+    dispatch(w, cx, "ctrl-shift-p");
+    w.update(cx, |_, window, cx| {
+        assert!(ed.read(cx).palette_focus.is_focused(window));
+    })
+    .unwrap();
+    palette_click(w, cx, &ed, gpui::MouseButton::Left, 24.);
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "点击浮层列表区不得关闭面板");
+            assert!(
+                ed.palette_focus.is_focused(window),
+                "点击浮层列表区不得夺走输入焦点"
+            );
+            assert_eq!(
+                ed.buffer.cursor(),
+                Point::new(0, 0),
+                "点击浮层列表区不得移动文档光标（点击穿透）"
+            );
+        })
+    })
+    .unwrap();
+    ed.read_with(cx, |ed, _| unchanged(ed, revision));
+    // 右键同面：浮层内右键不得触发文档光标移动/焦点夺走
+    //（真实窗口里还会弹文档右键菜单——menu_opener 面）。
+    palette_click(w, cx, &ed, gpui::MouseButton::Right, 24.);
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "浮层右键不得关闭面板");
+            assert!(
+                ed.palette_focus.is_focused(window),
+                "浮层右键不得夺走输入焦点"
+            );
+            assert_eq!(
+                ed.buffer.cursor(),
+                Point::new(0, 0),
+                "浮层右键不得移动文档光标（右键穿透）"
+            );
+        })
+    })
+    .unwrap();
+    ed.read_with(cx, |ed, _| unchanged(ed, revision));
+}
+
+#[gpui::test]
+fn form_platform_palette_esc_two_stage_and_enter_restore(cx: &mut gpui::TestAppContext) {
+    let (ed, w) = setup(cx);
+    let revision = ed.read_with(cx, |ed, _| ed.buffer.revision());
+    dispatch(w, cx, "ctrl-shift-p");
+    // 查询非空 → Esc 第一段：清查询（面板保持开、焦点不动）
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, cx| {
+            ed.replace_text_in_range(None, "查", window, cx);
+            assert_eq!(ed.palette.as_ref().unwrap().query, "查");
+        })
+    })
+    .unwrap();
+    dispatch(w, cx, "escape");
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "查询非空 Esc 只清查询不关面板");
+            assert_eq!(ed.palette.as_ref().unwrap().query, "");
+            assert!(
+                ed.palette_focus.is_focused(window),
+                "清查询后焦点保持在输入框"
+            );
+        })
+    })
+    .unwrap();
+    // 查询空 → Esc 第二段：关面板回文档焦点
+    dispatch(w, cx, "escape");
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "查询空 Esc 关面板");
+            assert!(ed.focus.is_focused(window), "关闭后面板焦点回文档");
+        })
+    })
+    .unwrap();
+    ed.read_with(cx, |ed, _| unchanged(ed, revision));
+    // Enter 执行链：面板 → 执行选中命令 → 面板关 + 后续表单焦点成立
+    //（「查」唯一命中 Cmd::OpenFind——执行后查找框获得焦点）。
+    dispatch(w, cx, "ctrl-shift-p");
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, cx| {
+            ed.replace_text_in_range(None, "查", window, cx);
+            assert_eq!(ed.palette.as_ref().unwrap().items, vec![Cmd::OpenFind]);
+        })
+    })
+    .unwrap();
+    dispatch(w, cx, "enter");
+    w.update(cx, |_, window, cx| {
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "Enter 执行后面板关闭");
+            assert!(
+                ed.find.is_some() && ed.find_focus.is_focused(window),
+                "Enter 执行 OpenFind 后查找框获得焦点（终裁焦点链）"
+            );
+        })
+    })
+    .unwrap();
+    ed.read_with(cx, |ed, _| unchanged(ed, revision));
+}

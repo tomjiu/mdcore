@@ -4631,6 +4631,22 @@ impl Editor {
                         .flex_col()
                         .gap_2()
                         .text_size(px(13.))
+                        // #47 A4（agent-xt11 2026-11-23 首批）：浮层点击面
+                        // 阻断——面板内非输入区（列表/提示行）的左/右键点击
+                        // 不得穿透到文档面。此前：事件冒泡到 editor-surface
+                        // → dispatch_mouse_down / dispatch_context_menu
+                        // 无条件 focus_document_input + hit_test 移光标——
+                        // 点击浮层列表反而夺焦点、移动浮层底下正文光标。
+                        // 输入框自身的选中/焦点逻辑在更内层先跑（冒泡序），
+                        // 不受本层阻断影响。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
                         .child(
                             Popover::new().child(
                                 div()
@@ -4691,6 +4707,16 @@ impl Editor {
                         .flex_col()
                         .gap_2()
                         .text_size(px(13.))
+                        // #47 A4：同面板浮层——goto 盒内点击阻断穿透
+                        //（标题行/提示行此前同样漏到文档面）。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
                         .child(
                             Popover::new().child(
                                 div()
@@ -5030,45 +5056,46 @@ impl Editor {
         // 首帧无采样 → 跳过（首帧无断点，第二帧起生效）；断点回填后
         // 行数增长在下一帧 uniform_list 生效（一帧收敛，Zed 同款异步）。
         if self.soft_wrap {
-        if let Some(full_w) = *self.last_text_width.borrow() {
-            let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
-            if target > px(50.) {
-                let row_end = visible
-                    .end
-                    .min(self.display_map.display_row_count(&self.buffer));
-                for row in visible.start..row_end {
-                    let Some((line, seg)) = self.display_map.row_source(&self.buffer, row) else {
-                        continue;
-                    };
-                    if seg == display_map::FOLD_SEG || self.display_map.has_wrap_points(line) {
-                        continue;
+            if let Some(full_w) = *self.last_text_width.borrow() {
+                let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
+                if target > px(50.) {
+                    let row_end = visible
+                        .end
+                        .min(self.display_map.display_row_count(&self.buffer));
+                    for row in visible.start..row_end {
+                        let Some((line, seg)) = self.display_map.row_source(&self.buffer, row)
+                        else {
+                            continue;
+                        };
+                        if seg == display_map::FOLD_SEG || self.display_map.has_wrap_points(line) {
+                            continue;
+                        }
+                        let text = self.buffer.line(line);
+                        let n = text.chars().count();
+                        if n == 0 {
+                            self.display_map.set_wrap_points(&self.buffer, line, vec![]);
+                            continue;
+                        }
+                        let run = text_style.to_run(text.len());
+                        let font_size = text_style.font_size.to_pixels(window.rem_size());
+                        let shaped = window.text_system().shape_line(
+                            text.as_str().into(),
+                            font_size,
+                            &[run],
+                            None,
+                        );
+                        let advances: Vec<f32> = (1..=n)
+                            .map(|i| {
+                                let b = buffer::char_to_byte_pub(&text, i);
+                                f32::from(shaped.x_for_index(b))
+                            })
+                            .collect();
+                        let pts =
+                            display_map::wrap_points_from_advances(&advances, n, f32::from(target));
+                        self.display_map.set_wrap_points(&self.buffer, line, pts);
                     }
-                    let text = self.buffer.line(line);
-                    let n = text.chars().count();
-                    if n == 0 {
-                        self.display_map.set_wrap_points(&self.buffer, line, vec![]);
-                        continue;
-                    }
-                    let run = text_style.to_run(text.len());
-                    let font_size = text_style.font_size.to_pixels(window.rem_size());
-                    let shaped = window.text_system().shape_line(
-                        text.as_str().into(),
-                        font_size,
-                        &[run],
-                        None,
-                    );
-                    let advances: Vec<f32> = (1..=n)
-                        .map(|i| {
-                            let b = buffer::char_to_byte_pub(&text, i);
-                            f32::from(shaped.x_for_index(b))
-                        })
-                        .collect();
-                    let pts =
-                        display_map::wrap_points_from_advances(&advances, n, f32::from(target));
-                    self.display_map.set_wrap_points(&self.buffer, line, pts);
                 }
             }
-        }
         }
 
         // r42 阶段 C：光标集 display 化（多光标各头；caret 每处一竖线）
@@ -6288,7 +6315,10 @@ mod tests {
         // 纯 CJK 选区 → 恒等 false（to_uppercase 天然不动的 Unicode 语义）。
         ed.update(cx, |e, _| {
             e.buffer.set_selection(p(0, 0), p(0, 2));
-            assert!(!e.transform_selection_case(CaseMode::Upper), "CJK 恒等 no-op");
+            assert!(
+                !e.transform_selection_case(CaseMode::Upper),
+                "CJK 恒等 no-op"
+            );
             assert_eq!(e.buffer.line(0), "世界 abc", "文本未动");
         });
         // Title 里 CJK 邻接词（"abc世界" 单词串——世界非词字符重置词界）。
