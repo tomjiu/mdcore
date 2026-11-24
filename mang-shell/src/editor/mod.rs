@@ -51,6 +51,8 @@ pub mod buffer;
 // #132 任务 2：Buffer 的正则查找面（分离 impl——不碰 buffer.rs 主体）。
 mod buffer_find;
 pub mod commands;
+// #111 G3：词补全——纯函数核心（候选源 + 前缀提取 + 过滤）。
+pub mod completion;
 pub mod display_map; // r42 阶段 B（#68）：buffer <-> 显示行列映射（软换行 + 折叠）
 pub mod docx_doc;
 pub mod docx_edit_bridge; // #115：docx 可编辑化——Buffer ↔ DocxEditor 可逆映射
@@ -108,7 +110,7 @@ use crate::keymap::{self, EditorAction, KeyQuery};
 use mouse::ClickKind;
 use theme::ThemeColors;
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize, Popover, Tooltip};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, ListItem, Popover, Tooltip};
 
 use buffer::{Buffer, FenceDirty, IndentUnit, Point};
 use docx_doc::{DocxPayload, DocxProps, EditablePayload, HeadingEntry};
@@ -158,6 +160,23 @@ struct PaletteState {
     /// 分组内最近用过靠前——与渲染的段列表同一数据源，键盘 selected
     /// 与可见行一一对应；不再用裸搜索序，否则选中项与所见行错位）。
     items: Vec<Cmd>,
+}
+
+/// #111 G3：词补全弹窗状态（`None` = 关闭）。
+///
+/// 与命令面板/跳行框同族的面板态，但**无输入框**——「查询」就是
+/// 光标前的词前缀（随打字实时变化，`after_edit` 后重算）；选中项
+/// 与可见行一一对应（`selected` 直接索引 `items`）。
+#[derive(Clone, Debug)]
+struct CompletionState {
+    /// 当前过滤后的候选（≤ [`completion::MAX_ITEMS`]）。
+    items: Vec<String>,
+    /// 键盘选中行（0 基——↑↓ 移动，Enter/Tab 接受）。
+    selected: usize,
+    /// 触发时的词前缀（接受时替换 `prefix_start..cursor` 这段）。
+    prefix: String,
+    /// 前缀锚点（行内 char 列——接受替换的起点）。
+    prefix_start: Point,
 }
 
 /// G2：跳转到行输入框状态（Ctrl+G——复用面板输入交互形态：
@@ -518,6 +537,22 @@ pub struct Editor {
     palette_recent: RecentRing,
     /// G2：跳转到行输入框（`None` = 关闭；Ctrl+G 开）。
     goto: Option<GotoState>,
+    /// #111 G3：词补全弹窗（`None` = 关闭；词前缀 ≥ 阈值时自动开）。
+    completion: Option<CompletionState>,
+    /// #111 G3：接受补全后的一次性抑制（接受本身是编辑事务 →
+    /// `after_edit` 会重评估触发；不抑制则「接受 structure 后候选
+    /// structural 又弹出」——接受后的这次刷新不重开，下次编辑恢复）。
+    completion_hold: bool,
+    /// #111 G3：上次触发评估时的 Buffer revision（**编辑事务门**：
+    /// `dispatch_key_inner` 尾部对每个匹配键统一 `after_edit`——移动
+    /// 键也走，纯导航的重复刷新若无此门会用旧前缀重开弹窗；
+    /// revision 未变 = 无编辑事务 → 现态即终态，不评估开窗）。
+    completion_rev: Option<u64>,
+    /// #111 G3：文档词表缓存（键 = Buffer revision——`after_edit`
+    /// 每次触发时全表重提取是 O(全文)，标书体量下按 revision 守卫
+    /// 只在变更事务后首触发重算，纯光标移动零物化；char_count_cache
+    /// 同款模式）。
+    completion_words_cache: RefCell<Option<(u64, Vec<String>)>>,
     /// IME 预编辑段（全文 UTF16 偏移区间）。
     marked: Option<Range<usize>>,
     /// 本帧可见行 bounds（行内 canvas prepaint 记录——鼠标 hit-test 行
@@ -693,6 +728,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -764,6 +803,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -849,6 +892,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -923,6 +970,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -971,6 +1022,10 @@ impl Editor {
             find: None,
             find_saved: FindState::default(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             indent_unit: IndentUnit::from_setting(
                 crate::settings::load_indent_unit()
                     .as_deref()
@@ -1066,6 +1121,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -1978,6 +2037,9 @@ impl Editor {
     /// G2：面板/命令面入口（Cmd::GotoLine——同 Ctrl+G 开框）。
     fn open_goto(&mut self, cx: &mut Context<Self>) {
         let count = self.buffer.line_count();
+        // #111 G3：跳行框接管键域——补全弹窗先关（双浮层并存 = 键域
+        // 与视觉双打架）。
+        self.completion = None;
         self.goto = Some(GotoState {
             input: FormInput::default(),
             hint: goto_hint("", count),
@@ -2673,6 +2735,9 @@ impl Editor {
     /// 扁平序，与渲染同源）。
     pub fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = if self.palette.is_none() {
+            // #111 G3：面板接管键域——补全弹窗先关（双浮层并存 = 键域
+            // 与视觉双打架）。
+            self.completion = None;
             Some(PaletteState {
                 query: FormInput::default(),
                 selected: 0,
@@ -2948,6 +3013,9 @@ impl Editor {
         {
             if self.goto.is_none() {
                 let count = self.buffer.line_count();
+                // #111 G3：跳行框接管键域——补全弹窗先关（open_goto
+                // 同款；此分支持 window 走 focus_form，不经 open_goto）。
+                self.completion = None;
                 self.goto = Some(GotoState {
                     input: FormInput::default(),
                     hint: goto_hint("", count),
@@ -2972,6 +3040,51 @@ impl Editor {
             *perf_rejected = true; // #164：拒绝路径独立证据行（key-rejected）
             cx.notify();
             return;
+        }
+
+        // #111 G3：词补全弹窗键拦截（只读门之后、主表之前——弹窗只在
+        // 可编辑态存续；只读态残留态直接关门不吞，键照常走）。
+        if self.completion.is_some() {
+            if self.read_only {
+                self.completion = None; // 兜底（正常流不可达——refresh 守卫先关）
+            } else {
+                let plain = !ctrl && !ks.modifiers.alt;
+                match key.as_str() {
+                    // 导航（吞——↑↓ 归弹窗，不移动光标）。
+                    "up" | "down" if plain => {
+                        if let Some(c) = self.completion.as_mut() {
+                            if key == "up" {
+                                c.selected = c.selected.saturating_sub(1);
+                            } else if !c.items.is_empty() {
+                                c.selected = (c.selected + 1).min(c.items.len() - 1);
+                            }
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 接受（吞——Enter/Tab 不落正文换行/缩进）。
+                    "enter" | "tab" if plain => {
+                        self.accept_completion(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 关（吞——Esc 归弹窗，不落正文）。
+                    "escape" => {
+                        self.completion = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 光标移动键：关弹窗**不吞**（锚前缀已失效——照常
+                    // 移动；下次编辑重评估）。
+                    "left" | "right" | "home" | "end" | "pageup" | "pagedown" => {
+                        self.completion = None;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // #217：主层查表（原 `ctrl_k_pending` 预处理 + match 主体 →
@@ -3713,6 +3826,136 @@ impl Editor {
         {
             self.locked_notice = None;
         }
+        // #111 G3：补全触发重评估（单点接线——键入/退格/撤销/行移动/
+        // RPC 编辑事务统一经 after_edit 走此刷新；纯光标移动不经此，
+        // 弹窗由键拦截面的导航键关门）。
+        self.refresh_completion();
+    }
+
+    /// #111 G3：补全触发重评估（after_edit 尾部单点）。
+    ///
+    /// 开门条件（全过才开）：可编辑**纯文本态**（md/txt——docx/
+    /// docx_edit/pdf/xlsx/canvas 容器态无此面）+ 无选区（选区语义与
+    /// 「替换光标前前缀」冲突）+ 非 IME 预编辑中（候选弹窗与 IME
+    /// 组合窗打架）+ 光标前词前缀 ≥ [`completion::MIN_PREFIX_CHARS`]
+    /// + 候选非空。任一不过 → 关（`None`）。
+    ///
+    /// 前缀不变时保选中项（同前缀重算——词池变化场景不跳选中行）；
+    /// 前缀变化（打字细化/换位）复位 0。接受补全后的首次刷新被
+    /// `completion_hold` 吞掉（见字段文档）。
+    fn refresh_completion(&mut self) {
+        // ── 关门守卫面（始终生效——含纯导航路径的尾钩子刷新）──
+        if self.read_only
+            || self.marked.is_some()
+            || self.buffer.selection().is_some()
+            || self.docx.is_some()
+            || self.docx_edit.is_some()
+            || self.pdf.is_some()
+            || self.xlsx.is_some()
+            || self.canvas.is_some()
+        {
+            self.completion = None;
+            return;
+        }
+        // ── 接受补全后的一次性抑制（记录 revision——接受也计入
+        //「已评估」，后续纯导航不重开）──
+        if self.completion_hold {
+            self.completion_hold = false;
+            self.completion = None;
+            self.completion_rev = Some(self.buffer.revision());
+            return;
+        }
+        // ── 编辑事务门：revision 未变 = 无编辑（纯导航尾钩子/重复
+        // after_edit）→ 现态即终态（已关不重开，已开保持）──
+        let rev = self.buffer.revision();
+        if self.completion_rev == Some(rev) {
+            return;
+        }
+        let cursor = self.buffer.cursor();
+        let line = self.buffer.line(cursor.line);
+        let prefix = completion::word_prefix(&line, cursor.col);
+        if prefix.chars().count() < completion::MIN_PREFIX_CHARS {
+            self.completion = None;
+            self.completion_rev = Some(rev);
+            return;
+        }
+        // 候选池 = 文档词表（revision 守卫缓存）+ 关键词池（文档词
+        // 未含的补后——文档词优先，关键词不抢占首现序）。
+        let cache = self.completion_words_cache.borrow_mut().take();
+        let pool = match cache {
+            Some((cached_rev, pool)) if cached_rev == rev => pool,
+            _ => {
+                let mut pool = completion::extract_words(&self.buffer.to_plain_text());
+                for kw in completion::keyword_pool() {
+                    if !pool.contains(&kw) {
+                        pool.push(kw);
+                    }
+                }
+                pool
+            }
+        };
+        let items = completion::candidates(&pool, &prefix, completion::MAX_ITEMS);
+        self.completion_words_cache
+            .borrow_mut()
+            .replace((rev, pool));
+        self.completion_rev = Some(rev);
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        // 前缀锚点 = 光标列回退前缀字符数（word_prefix 同口径行内
+        // char 列——Point::col 语义一致）。
+        let prefix_start = Point::new(cursor.line, cursor.col - prefix.chars().count());
+        // 同前缀：保选中项（若仍在候选内）；新前缀：复位 0。
+        let kept = self
+            .completion
+            .as_ref()
+            .filter(|c| c.prefix == prefix)
+            .and_then(|c| {
+                c.items
+                    .get(c.selected)
+                    .and_then(|w| items.iter().position(|i| i == w))
+            });
+        let selected = kept.unwrap_or(0);
+        self.completion = Some(CompletionState {
+            items,
+            selected,
+            prefix,
+            prefix_start,
+        });
+    }
+
+    /// #111 G3：接受当前选中候选（Enter/Tab）。
+    ///
+    /// 前缀段 `prefix_start..cursor` 整体替换为完整词——**用户编辑
+    /// 同链**（`replace_range` 一次事务 + `after_edit` 收尾 → undo
+    /// 一键复原）；接受后一次性抑制重开（`completion_hold`）。
+    /// 锚点防御：替换前校验锚段文本 == 触发前缀（光标被外部移动 /
+    /// 文本漂移时弃权 `false`——不造错替）。
+    fn accept_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(state) = self.completion.clone() else {
+            return false;
+        };
+        let Some(word) = state.items.get(state.selected).cloned() else {
+            return false;
+        };
+        let end = self.buffer.cursor();
+        // 锚点防御：锚段必须是触发时的前缀（漂移/外改 → 弃权关窗）。
+        if self.buffer.range_text(&(state.prefix_start..end)) != state.prefix {
+            self.completion = None;
+            cx.notify();
+            return false;
+        }
+        self.buffer.replace_range(state.prefix_start, end, &word);
+        self.sync_cursors_from_buffer();
+        self.completion = None;
+        self.completion_hold = true;
+        self.after_edit(); // 收尾链（缓存/滚动/事件——refresh 被 hold 吞）
+        cx.notify();
+        true
     }
 
     /// #111 订阅模式：收割 Buffer 待发变更并发布事件（一次收尾一条；
@@ -4077,6 +4320,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.focus_document_input(window, cx);
+        // #111 G3：鼠标单击移动光标——补全弹窗锚定前缀失效，关
+        //（键面同款：left/right/home/end 关不重开）。
+        self.completion = None;
         let hit = self.hit_test(event.position, window);
         let kind = mouse::click_kind(event.click_count);
         // r42 阶段 C：Alt+拖 = 列选择（仅单击粒度启动；双/三击 Alt 忽略）
@@ -4746,6 +4992,55 @@ impl Editor {
                         ),
                 )
             })
+            // #111 G3：词补全弹窗（词前缀 ≥ 阈值自动开；底部固定锚位
+            // ——光标像素定位随 IME 候选框精化一并登记，见
+            // bounds_for_range 的批 1 备忘）。浮层视觉壳与 palette/
+            // goto 同法（ui::Popover——elevation_2 主题化浮层语系）。
+            .when_some(self.completion.clone(), |el, comp| {
+                let colors = cx.theme().colors().clone();
+                el.child(
+                    div()
+                        .id("completion-popup")
+                        .absolute()
+                        .bottom(px(8.))
+                        .left(px(80.))
+                        .w(px(320.))
+                        .child(
+                            Popover::new().child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .text_size(px(13.))
+                                    .child(
+                                        div()
+                                            .id("completion-title")
+                                            .text_size(px(11.))
+                                            .text_color(colors.text_muted)
+                                            .child(format!(
+                                                "补全 · {}（前缀 {}）",
+                                                comp.items.len(),
+                                                comp.prefix
+                                            )),
+                                    )
+                                    .children(comp.items.iter().enumerate().map(|(i, w)| {
+                                        ListItem::new(SharedString::from(format!(
+                                            "completion-row-{i}"
+                                        )))
+                                        .inset(true)
+                                        .toggle_state(i == comp.selected)
+                                        .child(div().text_color(colors.text).child(w.clone()))
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(colors.text_muted)
+                                            .child("↑↓ 选择 · Enter/Tab 补全 · Esc 关闭"),
+                                    ),
+                            ),
+                        ),
+                )
+            })
             .when(!focused, |el| {
                 // 未聚焦时提示层（点击任意处聚焦）
                 el.child(
@@ -5030,45 +5325,46 @@ impl Editor {
         // 首帧无采样 → 跳过（首帧无断点，第二帧起生效）；断点回填后
         // 行数增长在下一帧 uniform_list 生效（一帧收敛，Zed 同款异步）。
         if self.soft_wrap {
-        if let Some(full_w) = *self.last_text_width.borrow() {
-            let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
-            if target > px(50.) {
-                let row_end = visible
-                    .end
-                    .min(self.display_map.display_row_count(&self.buffer));
-                for row in visible.start..row_end {
-                    let Some((line, seg)) = self.display_map.row_source(&self.buffer, row) else {
-                        continue;
-                    };
-                    if seg == display_map::FOLD_SEG || self.display_map.has_wrap_points(line) {
-                        continue;
+            if let Some(full_w) = *self.last_text_width.borrow() {
+                let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
+                if target > px(50.) {
+                    let row_end = visible
+                        .end
+                        .min(self.display_map.display_row_count(&self.buffer));
+                    for row in visible.start..row_end {
+                        let Some((line, seg)) = self.display_map.row_source(&self.buffer, row)
+                        else {
+                            continue;
+                        };
+                        if seg == display_map::FOLD_SEG || self.display_map.has_wrap_points(line) {
+                            continue;
+                        }
+                        let text = self.buffer.line(line);
+                        let n = text.chars().count();
+                        if n == 0 {
+                            self.display_map.set_wrap_points(&self.buffer, line, vec![]);
+                            continue;
+                        }
+                        let run = text_style.to_run(text.len());
+                        let font_size = text_style.font_size.to_pixels(window.rem_size());
+                        let shaped = window.text_system().shape_line(
+                            text.as_str().into(),
+                            font_size,
+                            &[run],
+                            None,
+                        );
+                        let advances: Vec<f32> = (1..=n)
+                            .map(|i| {
+                                let b = buffer::char_to_byte_pub(&text, i);
+                                f32::from(shaped.x_for_index(b))
+                            })
+                            .collect();
+                        let pts =
+                            display_map::wrap_points_from_advances(&advances, n, f32::from(target));
+                        self.display_map.set_wrap_points(&self.buffer, line, pts);
                     }
-                    let text = self.buffer.line(line);
-                    let n = text.chars().count();
-                    if n == 0 {
-                        self.display_map.set_wrap_points(&self.buffer, line, vec![]);
-                        continue;
-                    }
-                    let run = text_style.to_run(text.len());
-                    let font_size = text_style.font_size.to_pixels(window.rem_size());
-                    let shaped = window.text_system().shape_line(
-                        text.as_str().into(),
-                        font_size,
-                        &[run],
-                        None,
-                    );
-                    let advances: Vec<f32> = (1..=n)
-                        .map(|i| {
-                            let b = buffer::char_to_byte_pub(&text, i);
-                            f32::from(shaped.x_for_index(b))
-                        })
-                        .collect();
-                    let pts =
-                        display_map::wrap_points_from_advances(&advances, n, f32::from(target));
-                    self.display_map.set_wrap_points(&self.buffer, line, pts);
                 }
             }
-        }
         }
 
         // r42 阶段 C：光标集 display 化（多光标各头；caret 每处一竖线）
@@ -6288,7 +6584,10 @@ mod tests {
         // 纯 CJK 选区 → 恒等 false（to_uppercase 天然不动的 Unicode 语义）。
         ed.update(cx, |e, _| {
             e.buffer.set_selection(p(0, 0), p(0, 2));
-            assert!(!e.transform_selection_case(CaseMode::Upper), "CJK 恒等 no-op");
+            assert!(
+                !e.transform_selection_case(CaseMode::Upper),
+                "CJK 恒等 no-op"
+            );
             assert_eq!(e.buffer.line(0), "世界 abc", "文本未动");
         });
         // Title 里 CJK 邻接词（"abc世界" 单词串——世界非词字符重置词界）。
@@ -7798,5 +8097,245 @@ mod palette_goto_interaction_tests {
                 .all(|e| e.highlights.is_empty()),
             "空查询零高亮"
         );
+    }
+}
+// ---------------------------------------------------------------------------
+// #111 G3：词补全交互面（编辑器级——触发/接受/键拦截/关门守卫）。
+// 纯函数面（词表/前缀/过滤）见 completion.rs 模块内测试。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod completion_interaction_tests {
+    use super::*;
+    use gpui::{Entity, PlatformInput};
+
+    /// 键事件构造（ime_composition_tests::plain_key 同款——两模块
+    /// 私有互不可见，本地副本）。
+    fn plain_key(key: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: key.into(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// 键路由宿主（InputRouteHost 同款本地副本——焦点 + on_key_down
+    /// → dispatch_key，全窗口真实键派发面）。
+    struct CompletionKeyHost {
+        ed: Entity<Editor>,
+    }
+
+    impl Render for CompletionKeyHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let ed = self.ed.clone();
+            gpui::div()
+                .track_focus(&ed.read(cx).focus)
+                .on_key_down(move |event, window, cx| {
+                    ed.update(cx, |ed, cx| ed.dispatch_key(event, window, cx));
+                })
+        }
+    }
+
+    /// 触发面文档（两行词 + 光标行）：insert "st" 于行 2 → 前缀 "st"，
+    /// 文档词候选 = structure / structural（"st" 自身排除）。
+    const TRIGGER_DOC: &str = "structure\nstructural\n";
+
+    /// 触发：光标行打入 ≥ 阈值前缀 → 弹窗开（文档词 + 关键词池过滤）。
+    #[gpui::test]
+    fn completion_triggers_on_two_char_prefix(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, TRIGGER_DOC.into(), cx)));
+        // 行 2 打入 "st"（用户键入同链——insert_text_at → after_edit）。
+        cx.update(|cx| ed.update(cx, |ed, cx| ed.insert_text_at(2, 0, "st", cx)));
+        let state = ed.read_with(cx, |ed, _| ed.completion.clone());
+        let Some(c) = state else {
+            panic!("G3 先红：前缀 st 应触发补全弹窗（现实现无此面——None）");
+        };
+        assert_eq!(c.prefix, "st", "触发前缀 = 光标前词尾段");
+        assert_eq!(c.prefix_start, Point::new(2, 0), "前缀锚点 = 行内词首列");
+        assert!(
+            c.items.iter().any(|w| w == "structure"),
+            "文档词 structure 在候选：{:?}",
+            c.items
+        );
+        assert!(
+            c.items.iter().any(|w| w == "structural"),
+            "文档词 structural 在候选：{:?}",
+            c.items
+        );
+        assert_eq!(c.selected, 0, "触发时选中复位首行");
+        assert!(c.items.len() <= completion::MAX_ITEMS, "候选截断上限");
+    }
+
+    /// 阈值下不触发：1 字符前缀 = 噪声源，不开。
+    #[gpui::test]
+    fn completion_no_trigger_below_threshold(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, TRIGGER_DOC.into(), cx)));
+        cx.update(|cx| ed.update(cx, |ed, cx| ed.insert_text_at(2, 0, "s", cx)));
+        assert!(
+            ed.read_with(cx, |ed, _| ed.completion.is_none()),
+            "单字符前缀不达阈值（MIN_PREFIX_CHARS=2）——不弹"
+        );
+    }
+
+    /// 接受：前缀段整体替换为完整词（用户编辑同链——undo 一键复原），
+    /// 接受后不立即重开（hold）。
+    #[gpui::test]
+    fn completion_accept_edits_via_user_chain(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, TRIGGER_DOC.into(), cx)));
+        cx.update(|cx| ed.update(cx, |ed, cx| ed.insert_text_at(2, 0, "st", cx)));
+        // 选中文档词 structure（默认 selected=0）。
+        let accepted = cx.update(|cx| ed.update(cx, |ed, cx| ed.accept_completion(cx)));
+        assert!(accepted, "接受成功（先红：空壳恒 false）");
+        assert_eq!(
+            ed.read_with(cx, |ed, _| ed.buffer.line(2)),
+            "structure",
+            "前缀段替换为完整词"
+        );
+        assert_eq!(
+            ed.read_with(cx, |ed, _| ed.buffer.cursor()),
+            Point::new(2, 9),
+            "光标落词尾（英文 9 字符）"
+        );
+        assert!(
+            ed.read_with(cx, |ed, _| ed.completion.is_none()),
+            "接受后弹窗关 + hold 抑制重开（structure 的候选 structural 不再弹出）"
+        );
+        // undo 一键复原（replace_range 单事务）。
+        let undone = cx.update(|cx| ed.update(cx, |ed, _| ed.undo_edit()));
+        assert!(undone, "接受进撤销栈");
+        assert_eq!(
+            ed.read_with(cx, |ed, _| ed.buffer.line(2)),
+            "st",
+            "undo 复原到触发前缀态"
+        );
+    }
+
+    /// 只读态永不触发（insert 拒 → completion 恒 None）。
+    #[gpui::test]
+    fn completion_readonly_never_opens(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new_readonly(None, TRIGGER_DOC.into(), cx)));
+        // 只读门禁拦下插入（insert_text_at None）——补全面无从触发。
+        let inserted = cx.update(|cx| ed.update(cx, |ed, cx| ed.insert_text_at(2, 0, "st", cx)));
+        assert!(inserted.is_none(), "只读插入被拒（前置口径）");
+        assert!(
+            ed.read_with(cx, |ed, _| ed.completion.is_none()),
+            "只读态无补全面"
+        );
+    }
+
+    /// 关门守卫（钉测——实现后守住不回归）：选区中 / IME 预编辑中，
+    /// 即使前缀达标也不开。
+    #[gpui::test]
+    fn completion_guards_selection_and_ime(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, TRIGGER_DOC.into(), cx)));
+        // ① 选区中：refresh 直接评估（守卫面单测——不经编辑链）。
+        cx.update(|cx| {
+            ed.update(cx, |ed, _| {
+                ed.buffer.set_selection(Point::new(0, 0), Point::new(0, 3));
+                ed.refresh_completion();
+            })
+        });
+        assert!(
+            ed.read_with(cx, |ed, _| ed.completion.is_none()),
+            "选区中不开（替换前缀与选区语义冲突）"
+        );
+        // ② IME 预编辑中：先清选区（隔离变量——只测 IME 守卫面），
+        // 候选弹窗与组合窗打架——不开。
+        cx.update(|cx| {
+            ed.update(cx, |ed, _| {
+                ed.buffer.set_cursor(Point::new(0, 0));
+                ed.marked = Some(0..1);
+                ed.refresh_completion();
+            })
+        });
+        assert!(
+            ed.read_with(cx, |ed, _| ed.completion.is_none()),
+            "IME 预编辑中不开"
+        );
+        // ③ 预编辑结束 + 前缀达标 → 正常开（守卫只挡预编辑期；
+        // replace_range 后 buffer 光标落插入尾部——与键入链同口径）。
+        cx.update(|cx| {
+            ed.update(cx, |ed, _| {
+                ed.marked = None;
+                ed.buffer
+                    .replace_range(Point::new(2, 0), Point::new(2, 0), "st");
+                ed.sync_cursors_from_buffer();
+                ed.refresh_completion();
+            })
+        });
+        assert!(
+            ed.read_with(cx, |ed, _| ed.completion.is_some()),
+            "预编辑结束 + 前缀 st → 正常触发"
+        );
+    }
+
+    /// 键拦截（真窗口全键派发面）：↑↓ 导航、Enter 接受、Esc 关、
+    /// 光标移动键关且不吞（照常移动）。
+    #[gpui::test]
+    fn completion_key_interception_full_window(cx: &mut gpui::TestAppContext) {
+        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, TRIGGER_DOC.into(), cx)));
+        let ed_host = ed.clone();
+        let window = cx.add_window(move |window, cx| {
+            ed_host.read(cx).focus.clone().focus(window, cx);
+            CompletionKeyHost { ed: ed_host }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            // 触发（键入面）。
+            ed.update(cx, |ed, cx| ed.insert_text_at(2, 0, "st", cx));
+            let items = ed
+                .read(cx)
+                .completion
+                .as_ref()
+                .map(|c| c.items.clone())
+                .expect("先红：键拦截面以触发为前置");
+            assert!(items.contains(&"structure".to_string()));
+
+            // ↓×2 ↑：导航到 selected=1（structural）。
+            window.dispatch_event(PlatformInput::KeyDown(plain_key("down")), cx);
+            window.dispatch_event(PlatformInput::KeyDown(plain_key("down")), cx);
+            window.dispatch_event(PlatformInput::KeyDown(plain_key("up")), cx);
+            assert_eq!(
+                ed.read(cx).completion.as_ref().unwrap().selected,
+                1,
+                "↑↓ 归弹窗导航（光标不移动）"
+            );
+            assert_eq!(
+                ed.read(cx).completion.as_ref().unwrap().items[1],
+                "structural"
+            );
+            // 光标未动（↑↓ 被吞）。
+            assert_eq!(ed.read(cx).buffer.cursor().line, 2);
+
+            // Enter：接受 selected=1 → structural。
+            window.dispatch_event(PlatformInput::KeyDown(plain_key("enter")), cx);
+            assert_eq!(ed.read(cx).buffer.line(2), "structural", "Enter 接受候选");
+            assert!(ed.read(cx).completion.is_none(), "接受后弹窗关");
+            // Enter 不落正文换行（被吞）——行数不变（"structure\n
+            // structural\n" = 3 行，行 2 被补全改写）。
+            assert_eq!(ed.read(cx).buffer.line_count(), 3);
+
+            // Esc 阶段：重新触发（行 2 续打）后 Esc 只关不落编辑。
+            ed.update(cx, |ed, cx| ed.insert_text_at(2, 9, " ", cx));
+            ed.update(cx, |ed, cx| ed.insert_text_at(2, 10, "st", cx));
+            assert!(ed.read(cx).completion.is_some(), "重新触发");
+            window.dispatch_event(PlatformInput::KeyDown(plain_key("escape")), cx);
+            assert!(ed.read(cx).completion.is_none(), "Esc 关弹窗");
+
+            // 光标移动键：关 + 不吞（照常移动）。
+            ed.update(cx, |ed, cx| ed.insert_text_at(2, 12, "r", cx));
+            assert!(ed.read(cx).completion.is_some(), "三打触发（str）");
+            let col_before = ed.read(cx).buffer.cursor().col;
+            window.dispatch_event(PlatformInput::KeyDown(plain_key("left")), cx);
+            assert!(ed.read(cx).completion.is_none(), "left 关弹窗");
+            assert_eq!(
+                ed.read(cx).buffer.cursor().col,
+                col_before - 1,
+                "left 未被吞——光标照常左移"
+            );
+        });
     }
 }
