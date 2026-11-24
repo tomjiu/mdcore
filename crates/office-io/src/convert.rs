@@ -314,15 +314,19 @@ pub fn docx_to_pdf_with_timeout(docx: &[u8], timeout: Duration) -> Result<Vec<u8
     }
 }
 
-/// stderr 截尾（末 400 字符——诊断面够用，不膨胀错误对象）。
+/// stderr 截尾（末 400 **字符**——诊断面够用，不膨胀错误对象）。
+/// #264：按 chars 截（此前 `&t[t.len()-400..]` 是字节切——CJK stderr
+/// 超 400B 时切在 char 边界中间 panic（错误路径自杀）。char 语义对齐
+/// 本注释的原始意图。
 fn stderr_tail(path: &Path) -> String {
     std::fs::read_to_string(path)
         .map(|s| {
             let t = s.trim();
             if t.is_empty() {
                 "(无 stderr)".to_string()
-            } else if t.len() > 400 {
-                format!("…{}", &t[t.len() - 400..])
+            } else if t.chars().count() > 400 {
+                let skip = t.chars().count() - 400;
+                format!("…{}", t.chars().skip(skip).collect::<String>())
             } else {
                 t.to_string()
             }
@@ -380,6 +384,56 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #264 红→绿：stderr_tail 对 CJK 长串按**字符**截尾，不得字节切
+    /// 非 char 边界 panic（「中」×300=900B 旧实现在错误路径自杀）。
+    #[test]
+    fn stderr_tail_cjk_long_no_panic_char_semantics() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("office_io_264_cjk_stderr.log");
+        std::fs::write(&p, "中".repeat(500)).unwrap(); // 500 字符 / 1500 字节
+        let tail = stderr_tail(&p);
+        let _ = std::fs::remove_file(&p);
+        // 末 400 **字符**（不是字节）；前置省略号。
+        assert!(tail.starts_with('…'), "应有前置省略号: {tail:?}");
+        assert_eq!(tail.chars().count(), 401, "…+400 字符: {tail:?}");
+    }
+
+    /// #264 回归：400 字符边界两侧不截断（边界语义钉测）。
+    #[test]
+    fn stderr_tail_cjk_boundary_at_400() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("office_io_264_cjk400_stderr.log");
+        std::fs::write(&p, "中".repeat(400)).unwrap(); // 恰 400 字符
+        let tail = stderr_tail(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(tail.chars().count(), 400, "恰好 400 字符不截断: {tail:?}");
+    }
+
+    /// #264 回归：ASCII 长串末 400 字符直通（含省略号）。
+    #[test]
+    fn stderr_tail_ascii_long_regression() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("office_io_264_ascii_stderr.log");
+        std::fs::write(&p, "x".repeat(500)).unwrap();
+        let tail = stderr_tail(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(tail.chars().count(), 401);
+        assert!(tail.ends_with(&"x".repeat(400)));
+    }
+
+    /// #264 回归：短串与缺文件路径不受影响（trim 语义 / 不可读降级）。
+    #[test]
+    fn stderr_tail_short_and_empty() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("office_io_264_short_stderr.log");
+        std::fs::write(&p, "  short message  ").unwrap();
+        assert_eq!(stderr_tail(&p), "short message"); // trim 语义保持
+        let _ = std::fs::remove_file(&p);
+        let e = dir.join("office_io_264_absent_stderr.log");
+        let _ = std::fs::remove_file(&e);
+        assert_eq!(stderr_tail(&e), "(stderr 不可读)");
+    }
 
     #[test]
     fn version_parse() {
