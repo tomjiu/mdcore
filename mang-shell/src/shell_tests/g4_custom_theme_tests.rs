@@ -1,7 +1,5 @@
 //! #47 巨石拆解批③：原 shell.rs 内嵌 `g4_custom_theme_tests` 纯迁出（零行为变化）。
 
-use super::*;
-
 /// #110 G1 批B：四态轴——具名态切换（user:<name>）与回退（dark）。
 #[gpui::test]
 fn user_mode_switch_and_fallback(cx: &mut gpui::TestAppContext) {
