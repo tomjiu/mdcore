@@ -483,7 +483,7 @@ fn custom_theme_editor(
         .map(|s| s.trim().to_string())
         .collect();
     let slot_handles: Vec<gpui::FocusHandle> = color_slot_focus;
-    let current = [
+    let _current = [
         colors.background,
         colors.elevated_surface_background,
         colors.editor_background,

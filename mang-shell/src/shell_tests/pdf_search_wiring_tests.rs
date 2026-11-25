@@ -1535,7 +1535,7 @@ fn open_workspace_click_tree_opens_tab(cx: &mut gpui::TestAppContext) {
         click_wiring_at(&window, cx, 150.0, y);
         let tabs = window
             .update(cx, |_host, _window, cx| {
-                shell.update(cx, |shell, cx| shell.tab_count())
+                shell.update(cx, |shell, _cx| shell.tab_count())
             })
             .expect("读标签数");
         if tabs > 0 {

@@ -972,7 +972,7 @@ mod tests {
         let cur = editor.read_with(&visual, |ed, _| ed.cursor_point().line);
         assert_eq!(cur, 0, "前置：光标在第 0 行");
         // 光标移到「尾段」（行 3——## B 之后的段内）。
-        editor.update(&mut visual, |ed, cx| {
+        editor.update(&mut visual, |ed, _cx| {
             ed.jump_to_line(3);
         });
         visual.update(|window, app| window.draw(app).clear(app));

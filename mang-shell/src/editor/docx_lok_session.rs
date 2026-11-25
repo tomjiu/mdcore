@@ -1189,7 +1189,7 @@ mod tests {
             let _ = std::fs::remove_file(&work);
             return;
         }
-        let ref_png = tmp.join("ref-1.ppm");
+        let _ref_png = tmp.join("ref-1.ppm");
         let rast = std::process::Command::new(pdftoppm.clone().unwrap())
             .arg("-r")
             .arg("96")

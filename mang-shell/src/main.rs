@@ -1920,7 +1920,7 @@ async fn run_palette_script(
 ) {
     use gpui::{Modifiers, MouseMoveEvent, PlatformInput, point, px};
 
-    let park = |x: f32, y: f32| {
+    let _park = |x: f32, y: f32| {
         PlatformInput::MouseMove(MouseMoveEvent {
             position: point(px(x), px(y)),
             pressed_button: None,

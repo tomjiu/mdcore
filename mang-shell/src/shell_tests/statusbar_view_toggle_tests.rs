@@ -414,7 +414,7 @@ fn drag_git_panel_to_right_via_real_mouse(cx: &mut gpui::TestAppContext) {
     }
     cx.update(|app| {
         let shell = shell.clone();
-        app.new(|cx| {
+        app.new(|_cx| {
             let _ = &shell; // 实体已建——走 shell 方法面
         });
     });

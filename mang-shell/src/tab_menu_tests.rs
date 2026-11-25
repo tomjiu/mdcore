@@ -358,7 +358,7 @@ fn tab_menu_focus_restore_and_late_frames_do_not_steal_modal(cx: &mut gpui::Test
     })
     .unwrap();
     cx.run_until_parked();
-    cx.update_window(window.into(), |_, window, cx| {
+    cx.update_window(window.into(), |_, window, _cx| {
         assert!(
             alternate.is_focused(window),
             "outside focus is not stolen back"

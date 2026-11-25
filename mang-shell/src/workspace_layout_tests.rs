@@ -134,7 +134,7 @@ fn file_tree_open_and_reopen_use_real_shell_without_entity_reentry(cx: &mut Test
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, app| window.draw(app).clear(app));
     for _ in 0..2 {
-        let panel = visual
+        let _panel = visual
             .debug_bounds("left-panel")
             .expect("real file tree is visible");
         // Root row is followed by the only file in this real temporary workspace.

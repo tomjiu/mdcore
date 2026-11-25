@@ -1350,7 +1350,7 @@ impl ShellApp {
             let escape_shell = shell.clone();
             let ed = editor.clone();
             // #289-④：pdf 页面视图下激活行随页滚动（书签链同款）。
-            let hook = move |line: usize, window: &mut Window, cx: &mut App| {
+            let hook = move |line: usize, _window: &mut Window, cx: &mut App| {
                 if let Some(page) = ed.read(cx).pdf_page_for_line(line) {
                     if let Some(shell) = shell.upgrade() {
                         let _ = shell.update(cx, |shell, cx| shell.scroll_pdf_to_page(page, cx));
@@ -1554,7 +1554,7 @@ impl ShellApp {
         &self,
         dock: &Entity<mdc_dock::Dock>,
         key: &'static str,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> impl IntoElement {
         let payload = mdc_dock::DraggedPanel {
             source_dock: dock.entity_id(),
@@ -1581,7 +1581,7 @@ impl ShellApp {
     ) {
         self.drag_zone = None;
         // 源 dock：面板当前所在（dragged.source_dock 对应侧实体）。
-        let (source_dock, target_dock, target_pos) = (
+        let (source_dock, target_dock, _target_pos) = (
             if dragged.source_dock == self.left_dock.entity_id() {
                 self.left_dock.clone()
             } else {
@@ -4530,7 +4530,7 @@ impl ShellApp {
             Ok(Ok(None)) => {}
             Ok(Err(err)) => {
                 let message = format!("另存为对话框不可用：{err}");
-                let _ = this.update_in(cx, |shell, window, cx| {
+                let _ = this.update_in(cx, |shell, _window, cx| {
                     shell.show_notice(message, cx);
                 });
             }

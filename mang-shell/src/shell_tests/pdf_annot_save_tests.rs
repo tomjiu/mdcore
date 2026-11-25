@@ -267,7 +267,7 @@ fn pdf_annotate_dirty_blocks_quit_confirm(cx: &mut gpui::TestAppContext) {
         "#386：批注脏 → should-close 返回 false（窗口关闭被拦）"
     );
     vcx.update(|_window, cx| {
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             let confirm = shell.confirm.as_ref().expect("退出前确认弹出");
             assert!(
                 matches!(confirm.action, ConfirmAction::Quit),

@@ -140,7 +140,7 @@ fn md_runtime_labels_six_segments_real_values(cx: &mut gpui::TestAppContext) {
 /// 无文档就绪态：全部数据段 None + 就绪提示语（零占位纪律）。
 #[gpui::test]
 fn no_doc_ready_state_all_segments_none(cx: &mut gpui::TestAppContext) {
-    let dir = fixture_dir("ready");
+    let _dir = fixture_dir("ready");
     let (_shell, window) = shell_window(cx);
     let _ = window.update(cx, |_host, _window, cx| {
         let labels: StatusBarLabels = status_bar_labels(None, None, None, cx);

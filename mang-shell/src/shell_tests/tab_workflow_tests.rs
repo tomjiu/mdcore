@@ -161,7 +161,7 @@ fn three_tabs_switch_preserves_state(cx: &mut gpui::TestAppContext) {
         open(&shell, cx, a.clone());
         open(&shell, cx, b.clone());
         open(&shell, cx, c.clone());
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert_eq!(shell.tab_count(), 3, "三文档并存");
             assert_eq!(shell.active, 2, "新开即激活");
         });
@@ -254,21 +254,21 @@ fn same_file_reopen_dedupes_to_existing_tab(cx: &mut gpui::TestAppContext) {
     let _ = window.update(cx, |_host, _window, cx| {
         // 相对形态首开：落一个标签，身份 = 绝对化结果。
         open(&shell, cx, rel_a.clone());
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert_eq!(shell.tab_count(), 1);
             assert_eq!(shell.tab_path(0), Some(abs_a.clone()), "相对入参绝对化");
         });
 
         // 绝对形态开 b → 两标签。
         open(&shell, cx, abs_b.clone());
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert_eq!(shell.tab_count(), 2);
             assert_eq!(shell.active, 1);
         });
 
         // 同文件绝对形态重开 → 激活既有标签，不增。
         open(&shell, cx, abs_a.clone());
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert_eq!(shell.tab_count(), 2, "绝对形态重开不重复开会话");
             assert_eq!(shell.active, 0, "重开 = 激活既有");
             assert_eq!(shell.tab_index_by_path(&abs_a), Some(0));
@@ -276,7 +276,7 @@ fn same_file_reopen_dedupes_to_existing_tab(cx: &mut gpui::TestAppContext) {
 
         // 同文件相对形态重开 → 同样去重（两形态同身份）。
         open(&shell, cx, rel_a.clone());
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert_eq!(shell.tab_count(), 2, "相对形态重开不重复开会话");
             assert_eq!(shell.active, 0);
             assert_eq!(shell.tab_index_by_path(&rel_a), Some(0));
@@ -556,7 +556,7 @@ fn close_neighbor_rule_and_last_tab_empty_state(cx: &mut gpui::TestAppContext) {
     // 空态后可继续开新文档（生命周期闭环）。
     let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert_eq!(shell.tab_count(), 1, "空态后再开正常");
         });
     });
@@ -940,7 +940,7 @@ fn docx_dirty_quit_confirm_saves_docx_bytes(cx: &mut gpui::TestAppContext) {
     let closed = vcx.simulate_close();
     assert!(!closed, "脏 docx → should-close 返回 false（退出被拦）");
     vcx.update(|_window, cx| {
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             let confirm = shell.confirm.as_ref().expect("退出前确认弹出");
             assert!(
                 matches!(confirm.action, ConfirmAction::Quit),
@@ -1280,7 +1280,7 @@ fn md_quit_write_failure_keeps_retry_confirmation(cx: &mut gpui::TestAppContext)
     let closed = vcx.simulate_close();
     assert!(!closed, "脏 md → should-close 返回 false（退出被拦）");
     vcx.update(|_window, cx| {
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             assert!(
                 matches!(
                     shell.confirm.as_ref().map(|c| &c.action),

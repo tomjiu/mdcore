@@ -284,7 +284,7 @@ fn xlsx_close_confirm_save_persists_cancel_keeps_dirty(cx: &mut gpui::TestAppCon
     press_key(cx, &window, "w", None, true);
     window
         .update(cx, |_host, _window, cx| {
-            shell.update(cx, |shell, cx| {
+            shell.update(cx, |shell, _cx| {
                 let confirm = shell.confirm.as_ref().expect("会话脏关闭必弹确认");
                 assert!(
                     matches!(confirm.action, ConfirmAction::CloseTab { idx: 0, .. }),
@@ -314,7 +314,7 @@ fn xlsx_close_confirm_save_persists_cancel_keeps_dirty(cx: &mut gpui::TestAppCon
     press_key(cx, &window, "enter", None, false);
     window
         .update(cx, |_host, _window, cx| {
-            shell.update(cx, |shell, cx| {
+            shell.update(cx, |shell, _cx| {
                 assert_eq!(shell.tab_count(), 0, "保存后关标签");
                 assert!(shell.confirm.is_none());
                 assert!(shell.xlsx_grid.is_none(), "标签关 → 网格槽清空");
@@ -350,7 +350,7 @@ fn xlsx_close_confirm_discard_keeps_file(cx: &mut gpui::TestAppContext) {
     press_key(cx, &window, "enter", None, false);
     window
         .update(cx, |_host, _window, cx| {
-            shell.update(cx, |shell, cx| {
+            shell.update(cx, |shell, _cx| {
                 assert_eq!(shell.tab_count(), 0, "不保存 = 关标签");
                 assert!(shell.confirm.is_none());
             });
@@ -391,7 +391,7 @@ fn xlsx_dirty_quit_confirm_blocks_and_saves_all(cx: &mut gpui::TestAppContext) {
         "#604：会话脏 → should-close 返回 false（关闭被拦）"
     );
     vcx.update(|_window, cx| {
-        shell.update(cx, |shell, cx| {
+        shell.update(cx, |shell, _cx| {
             let confirm = shell.confirm.as_ref().expect("退出前确认弹出");
             assert!(
                 matches!(confirm.action, ConfirmAction::Quit),

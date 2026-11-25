@@ -552,7 +552,7 @@ mod tests {
         // ① 首开：隔离配置为空 → 无历史折叠。
         let a = match cx.update(|cx| open_editor(&doc, cx)) {
             OpenOutcome::Opened(ed) => ed,
-            other => panic!("首开应成功（实得非 Opened 形态）"),
+            _other => panic!("首开应成功（实得非 Opened 形态）"),
         };
         let fresh = cx.update(|cx| a.read(cx).fold_ranges());
         assert!(fresh.is_empty(), "隔离配置下首开应无折叠（实得 {fresh:?}）");
@@ -572,7 +572,7 @@ mod tests {
         //    零调用方，重启即丢）。
         let b = match cx.update(|cx| open_editor(&doc, cx)) {
             OpenOutcome::Opened(ed) => ed,
-            other => panic!("重开应成功（实得非 Opened 形态）"),
+            _other => panic!("重开应成功（实得非 Opened 形态）"),
         };
         let restored = cx.update(|cx| b.read(cx).fold_ranges());
         assert_eq!(restored, folded, "重开后折叠集应与关闭前一致");
@@ -581,7 +581,7 @@ mod tests {
         crate::settings::save_folds(&key, &[1, 9]);
         let c = match cx.update(|cx| open_editor(&doc, cx)) {
             OpenOutcome::Opened(ed) => ed,
-            other => panic!("三开应成功（实得非 Opened 形态）"),
+            _other => panic!("三开应成功（实得非 Opened 形态）"),
         };
         let dropped = cx.update(|cx| c.read(cx).fold_ranges());
         assert!(dropped.is_empty(), "失效头应全部弃权（实得 {dropped:?}）");

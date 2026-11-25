@@ -267,7 +267,7 @@ fn dock_open_states_persist_across_restart(cx: &mut gpui::TestAppContext) {
     let root = std::env::temp_dir().join(format!("mdock-ws-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&root);
     shell.update(cx, |shell, cx| shell.open_workspace(root, cx));
-    shell.update(cx, |shell, cx| {
+    shell.update(cx, |shell, _cx| {
         let left = f32::from(shell.left_width);
         assert_eq!(left, 305., "验收③：预物化树宽在物化后兑现并同步渲染宽");
         assert!(

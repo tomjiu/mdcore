@@ -1367,7 +1367,7 @@ mod keyboard_tests {
     #[gpui::test]
     fn empty_dir_shows_placeholder_then_retires(cx: &mut gpui::TestAppContext) {
         let root = temp_fixture("ft107-b3-empty");
-        let empty_dir = root.join("sub").join("deep"); // 夹具 deep 无文件？有 d.md——自建真空目录
+        let _empty_dir = root.join("sub").join("deep"); // 夹具 deep 无文件？有 d.md——自建真空目录
         let truly_empty = root.join("vacuous");
         std::fs::create_dir_all(&truly_empty).unwrap();
         let (tree, mut visual) = tree_window(cx, root.clone(), Arc::default());
