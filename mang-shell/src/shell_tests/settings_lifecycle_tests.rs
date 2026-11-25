@@ -215,6 +215,8 @@ fn left_git_toggle_branches(cx: &mut gpui::TestAppContext) {
 /// 落存调用的数据面：快照 = tabs 真实序）。
 #[gpui::test]
 fn close_persist_snapshot_matches_tabs(cx: &mut gpui::TestAppContext) {
+    // XDG 全局窗口互斥（见 test_env 模块头）。
+    let _xdg = crate::test_env::xdg_lock();
     let tmp = std::env::temp_dir().join(format!("mclose-persist-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let prev = std::env::var_os("XDG_CONFIG_HOME");
@@ -239,6 +241,8 @@ fn close_persist_snapshot_matches_tabs(cx: &mut gpui::TestAppContext) {
 /// 临时 XDG_CONFIG_HOME（settings.json 全落临时区，测试结束还原）。
 #[gpui::test]
 fn dock_open_states_persist_across_restart(cx: &mut gpui::TestAppContext) {
+    // XDG 全局窗口互斥（见 test_env 模块头）。
+    let _xdg = crate::test_env::xdg_lock();
     let tmp = std::env::temp_dir().join(format!("mdock-restart-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let prev = std::env::var_os("XDG_CONFIG_HOME");

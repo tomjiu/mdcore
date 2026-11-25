@@ -1112,6 +1112,8 @@ mod tests {
     ///（BTreeMap insert 同名 upsert——非另存副本）+ 装载计数不涨（1→1）。
     #[gpui::test]
     fn user_theme_replace_saved_roundtrip(cx: &mut gpui::TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头——并行族互踩致间歇红）。
+        let _xdg = crate::test_env::xdg_lock();
         cx.update(|cx| {
             theme::init(theme::LoadThemes::JustBase, cx);
         });

@@ -3,6 +3,8 @@
 /// #110 G1 批B：四态轴——具名态切换（user:<name>）与回退（dark）。
 #[gpui::test]
 fn user_mode_switch_and_fallback(cx: &mut gpui::TestAppContext) {
+    // XDG 全局窗口互斥（见 test_env 模块头）。
+    let _xdg = crate::test_env::xdg_lock();
     let xdg = std::env::temp_dir().join(format!("mang-g1b-mode-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&xdg);
     std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
@@ -60,6 +62,8 @@ fn user_mode_switch_and_fallback(cx: &mut gpui::TestAppContext) {
 /// #110 G1 批B：删除链——删盘 + registry 移除 + 正用回退 dark。
 #[gpui::test]
 fn delete_user_theme_chain(cx: &mut gpui::TestAppContext) {
+    // XDG 全局窗口互斥（见 test_env 模块头）。
+    let _xdg = crate::test_env::xdg_lock();
     let xdg = std::env::temp_dir().join(format!("mang-g1b-del-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&xdg);
     std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
@@ -145,6 +149,8 @@ fn theme_name_input_filters(cx: &mut gpui::TestAppContext) {
 /// 空草稿 → 槽默认当前主题实际色 → 写盘 + 装载 + 全局主题切换。
 #[gpui::test]
 fn save_custom_theme_writes_loads_and_switches(cx: &mut gpui::TestAppContext) {
+    // XDG 全局窗口互斥（见 test_env 模块头）。
+    let _xdg = crate::test_env::xdg_lock();
     let xdg = std::env::temp_dir().join(format!("mang-g4-save-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&xdg);
     std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();
@@ -184,6 +190,8 @@ fn save_custom_theme_writes_loads_and_switches(cx: &mut gpui::TestAppContext) {
 /// 草稿合法自定义值 → 写盘内容带槽色（读回 JSON 验）。
 #[gpui::test]
 fn save_custom_theme_reflects_draft(cx: &mut gpui::TestAppContext) {
+    // XDG 全局窗口互斥（见 test_env 模块头）。
+    let _xdg = crate::test_env::xdg_lock();
     let xdg = std::env::temp_dir().join(format!("mang-g4-draft-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&xdg);
     std::fs::create_dir_all(xdg.join("mang").join("themes")).unwrap();

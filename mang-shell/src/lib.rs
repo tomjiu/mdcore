@@ -42,6 +42,8 @@ pub mod context_menu;
 /// 外壳设置面（编辑器构造读缩进单位/面板宽度——src/settings.rs 同源）。
 #[path = "settings.rs"]
 pub mod settings;
+#[cfg(test)]
+mod test_env;
 
 /// #209：顶部菜单栏模型层（菜单结构/Cmd 映射/灰显与勾选快照）——纯数据
 /// 零 GPUI 依赖，与 context_menu 同分层进 lib 树（桥接层 menu_bar_view.rs

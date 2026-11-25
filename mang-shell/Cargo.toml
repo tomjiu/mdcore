@@ -118,6 +118,8 @@ smallvec = "1"
 wayland-client = "0.31"
 
 [dev-dependencies]
+# test_env 的 flock 互斥（XDG_CONFIG_HOME 并行测试互踩修复——纯测试面）。
+libc = "0.2"
 # #169：Cmd::ALL 运行时执行面——gpui TestAppContext（真实实体/窗口/
 # 上下文，无头）。test-support 仅测试编译期生效（feature 在 dev 与
 # normal 依赖间不 unify——shipped 依赖图不变）；拉入 proptest 等

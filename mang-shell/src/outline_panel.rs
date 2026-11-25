@@ -728,6 +728,8 @@ mod tests {
     /// （候选 = 有更深子级的头行——与渲染 foldable 同源判定）。
     #[gpui::test]
     fn fold_all_and_unfold_all_toggle_full_set(cx: &mut TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头）。
+        let _xdg = crate::test_env::xdg_lock();
         let tmp = std::env::temp_dir().join(format!("m108-foldall-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
@@ -897,6 +899,8 @@ mod tests {
     /// 不污染真实 config——批③落盘面接入后的测试隔离窗）。
     #[gpui::test]
     fn section_fold_hides_children_keeps_head(cx: &mut TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头）。
+        let _xdg = crate::test_env::xdg_lock();
         let xdg = std::env::temp_dir().join(format!("moutline-fold-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&xdg);
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -932,6 +936,8 @@ mod tests {
     /// 外层；两级语义正交）。#108 批③：XDG 临时区 guard 同型。
     #[gpui::test]
     fn section_fold_nested_h2_independent(cx: &mut TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头）。
+        let _xdg = crate::test_env::xdg_lock();
         let xdg = std::env::temp_dir().join(format!("moutline-nested-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&xdg);
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");

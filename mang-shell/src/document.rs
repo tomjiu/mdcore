@@ -526,6 +526,8 @@ mod tests {
     /// 登记不假装零）。
     #[gpui::test]
     fn fold_persistence_roundtrip_on_reopen(cx: &mut gpui::TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头）。
+        let _xdg = crate::test_env::xdg_lock();
         let cfg = std::env::temp_dir().join(format!("mang-fold-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cfg);
         std::fs::create_dir_all(&cfg).expect("建隔离配置目录");

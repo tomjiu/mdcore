@@ -3225,6 +3225,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "libc",
  "lopdf",
  "mdc-canvas",
  "mdc-dock",
