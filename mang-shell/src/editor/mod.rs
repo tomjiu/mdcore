@@ -4388,6 +4388,11 @@ impl Editor {
         // #111 G3：鼠标单击移动光标——补全弹窗锚定前缀失效，关
         //（键面同款：left/right/home/end 关不重开）。
         self.completion = None;
+        // #47 A4 残面：外点击关面板——编辑区点击后焦点已在文档，
+        // 键入却被 palette 键域拦截（「面板开着但键盘不知去哪」
+        // 歧义态）。与补全弹窗同款关闭语义（VS Code/IntelliJ
+        // 对照：外点击 = 关浮层）。
+        self.palette = None;
         let hit = self.hit_test(event.position, window);
         let kind = mouse::click_kind(event.click_count);
         // r42 阶段 C：Alt+拖 = 列选择（仅单击粒度启动；双/三击 Alt 忽略）
@@ -7890,6 +7895,47 @@ mod palette_goto_interaction_tests {
         });
         ed.update(cx, |ed, _| {
             assert!(ed.palette.is_none(), "第二记 Esc：关面板");
+        });
+    }
+
+    /// #47 A4 残面（外点击关面板）：palette 打开态下点击编辑区文本
+    /// ——面板应关 + 焦点回文档。此前面板保持开：键入被 palette 键域
+    /// 拦截而焦点已在文档——「面板开着但键盘不知去哪」歧义态
+    /// （VS Code/IntelliJ 对照：外点击 = 关浮层）。
+    #[gpui::test]
+    fn palette_open_click_document_closes_palette(cx: &mut gpui::TestAppContext) {
+        let (ed, window) = pal_window(cx, "# A\nbody\n");
+        // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。
+        let _ = window.update(cx, |_host, window, cx| {
+            let mut e = ctrl("p");
+            e.keystroke.modifiers.shift = true;
+            press(&ed, window, cx, e);
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_some(), "前置：面板开");
+        });
+        // 编辑区单击（方法级直测 dispatch_mouse_down——视图监听链
+        // 绑定的就是它；断言面在面板态与焦点）。
+        let _ = window.update(cx, |_host, window, cx| {
+            let event = MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(px(4.), px(4.)),
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |ed, cx| ed.dispatch_mouse_down(&event, window, cx));
+        });
+        ed.update(cx, |ed, _| {
+            assert!(ed.palette.is_none(), "外点击关面板（歧义态根除）");
+        });
+        // 焦点回文档（关闭语义与 Esc 同款）。
+        let _ = window.update(cx, |_host, window, cx| {
+            let doc_focus = ed.read(cx).focus.clone();
+            assert!(
+                doc_focus.is_focused(window),
+                "焦点回文档输入（不是浮层残留）"
+            );
         });
     }
 
