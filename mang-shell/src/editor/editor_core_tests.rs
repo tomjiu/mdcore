@@ -717,6 +717,7 @@ const CMD_TEST_DOC: &str =
 /// 窗口宿主：Editor 非根视图（ShellApp 才 Render），测试以最小宿主
 /// 开窗取真实 `Window`（exec_command 的焦点面需要——与 rpc.rs
 /// `run_command` 同通道：`ed.update(cx, |ed, cx| ed.run_command(cmd, window, cx))`）。
+#[allow(dead_code)]
 struct EditorHost(gpui::Entity<Editor>);
 
 impl gpui::Render for EditorHost {

@@ -4,6 +4,7 @@ use super::*;
 
 /// 测试宿主（与 tab_workflow_tests 同款——ShellApp 不作根视图，
 /// 空 div 宿主开窗只取真实 `Window`）。
+#[allow(dead_code)]
 struct ShellHost(Entity<ShellApp>);
 
 impl gpui::Render for ShellHost {

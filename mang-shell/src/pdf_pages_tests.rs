@@ -683,6 +683,7 @@ fn pump_until_indexed(cx: &mut gpui::TestAppContext, view: &gpui::Entity<PdfPage
 /// 款——不伪装通过）。
 /// 测试宿主（PdfPagesView 不作根视图——与 shell 测试同款空 div
 /// 宿主；实体经 slot 持有，WindowHandle::update 内 update 不重入）。
+#[allow(dead_code)]
 struct SearchHost(gpui::Entity<PdfPagesView>);
 
 impl gpui::Render for SearchHost {

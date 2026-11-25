@@ -157,6 +157,7 @@ const OCR_POLL_INTERVAL: Duration = Duration::from_millis(16);
 #[derive(Clone, Debug)]
 enum ConfirmAction {
     /// `target` is authoritative; `idx` only records the original prompt position.
+    #[allow(dead_code)]
     CloseTab { idx: usize, target: gpui::EntityId },
     /// 退出应用（存在未保存修改的标签）。
     Quit,
@@ -1015,6 +1016,7 @@ impl ShellApp {
     }
 
     /// #110 G4：六槽焦点句柄池访问（渲染面 track_focus 捕获用）。
+    #[allow(dead_code)]
     pub fn color_slot_focus_handles(&self) -> &[gpui::FocusHandle] {
         &self.color_slot_focus
     }
@@ -1227,6 +1229,7 @@ impl ShellApp {
 
     /// #110 G1 批B：registry 用户主题名集（下拉数据源——
     /// themes_dir 装载的 user-* 名；内置主题不列，下拉只做用户面）。
+    #[allow(dead_code)]
     pub fn user_theme_names(&self, _cx: &mut App) -> Vec<String> {
         // #110 G1 批B：磁盘直读（themes_dir/*.json 文件名——registry 枚举
         // 要 &mut App，渲染期 ShellApp 已在 update 内嵌套炸（gpui
@@ -2464,18 +2467,6 @@ impl ShellApp {
                     ));
                 }
             }
-            // #107 P1 批⑦：树面手动刷新（报告 P1① 后半——mtime 轮询
-            // 未立项前的手动面；工作区根整树重读——#595 光标路径重绑定
-            // 既有语义背书零新语义；无工作区时空操作）。
-            (MenuOrigin::FileTree, "ft-refresh") => {
-                if let Some(tree) = &self.workspace {
-                    let root = tree.read(cx).root().to_path_buf();
-                    tree.update(cx, |tree, cx| {
-                        tree.reload(&root);
-                        cx.notify();
-                    });
-                }
-            }
             (MenuOrigin::FileTree, "ft-open") => {
                 // 只对文件有效（菜单构建时目录项已灰显——防御面再验一道）。
                 if let Some(target) = target.filter(|p| !p.is_dir()) {
@@ -2972,6 +2963,7 @@ impl ShellApp {
     /// #114 P1④：关窗先存统一面（on_window_should_close 钩内调用——
     /// 窗口矩形（#230）+ 会话标签（批①）两键无条件落存；非优雅退出
     /// 物理边界不保）。
+    #[allow(dead_code)]
     pub(crate) fn persist_on_close(&self, window: &mut Window) {
         let b = window.bounds();
         crate::settings::save_window_bounds(

@@ -656,7 +656,7 @@ mod keyboard_tests {
         let hooks = capturing_hooks(opened.clone());
         let panel = cx.update(|cx| {
             cx.new(|cx| {
-                let mut p = GitPanel::new(dir, hooks, cx);
+                let p = GitPanel::new(dir, hooks, cx);
                 // 构造内 refresh 已双拉（changes = 1 条 M src/main.rs）。
                 assert_eq!(p.changes.len(), 1, "真仓库改动行 = 1");
                 p

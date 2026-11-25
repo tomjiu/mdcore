@@ -67,8 +67,10 @@ fn stage_of_open_error(e: &LokError) -> &'static str {
 /// 打开/运行期错误。`NoRuntime` 是「内核缺失」判据（宿主回落文本
 /// 视图的口径——C1 门：内核缺失时明确静态阅读后备）。
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum SessionError {
     /// LibreOffice 运行时未发现（discover 失败原文）。
+    #[allow(dead_code)]
     NoRuntime(String),
     /// worker 可执行/spawn 失败。
     Spawn(String),
@@ -79,6 +81,7 @@ pub enum SessionError {
     /// 就绪后的 op 失败（paint/ping/close）。
     Op { op: &'static str, message: String },
     /// worker 进程死亡（paint 中途/事件 bye）。
+    #[allow(dead_code)]
     Died { detail: String },
 }
 
@@ -157,8 +160,10 @@ pub enum SessionReply {
     /// #50 C5：页几何回执（按页序页矩形——画布坐标 twips；跳页
     /// tile 锚定与页码呈现的数据源）。
     PageGeometry {
+        #[allow(dead_code)]
         seq: u64,
         /// 每页 `(x, y, w, h)`（twips，画布坐标系）。
+        #[allow(dead_code)]
         pages: Vec<(i64, i64, i64, i64)>,
     },
     /// #50 C3：编辑命令完成（TypeText/Uno——回执带内核侧 dirty/revision，

@@ -61,7 +61,7 @@ pub fn menu_titles(
         .children(menus.iter().enumerate().map(|(idx, menu)| {
             let is_open = open_idx == Some(idx);
             // #47 批次 7：证据行标签（listener move 捕获需要 owned）。
-            let trigger_label = menu.label.clone();
+            let trigger_label = menu.label.to_owned();
             div()
                 .id(SharedString::from(format!("menu-title-{}", menu.id)))
                 .h_full()

@@ -84,12 +84,15 @@ struct BlockSlot {
 /// 一次 undo/redo 的结果摘要（Buffer 侧消费：光标落点/事件记录/hook 通报）。
 pub(crate) struct HistoryOutcome {
     /// 建议光标（回放/类 a = 编辑起点；类 b = 传入恢复位）。
+    #[allow(dead_code)]
     pub cursor: Option<Point>,
     /// #205 fence 记账面：Some((line, inserted_lines, pre_lines)) =
     /// 单区间几何（pre_lines = 变更前行数）；None = 多区间/不确定 → Full
     ///（Buffer 侧伴记推导为主，此面为多编辑条目的保守判据）。
+    #[allow(dead_code)]
     pub fence_single: Option<(usize, usize, usize)>,
     /// 该步的 op 数（last_undo_batch_count 口径）。
+    #[allow(dead_code)]
     pub ops: usize,
     /// 投影编辑几何（恰一个单区间时给精确记录；None = 粗粒度）。
     pub precise: Option<(Point, Point, String)>,
@@ -1160,10 +1163,12 @@ impl MdBridge {
         self.core.clear_redo();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_modified(&self, saved_depth: usize) -> bool {
         self.core.undo_depth() != saved_depth
     }
 
+    #[allow(dead_code)]
     pub(crate) fn undo_depth(&self) -> usize {
         self.core.undo_depth()
     }
@@ -1180,6 +1185,7 @@ impl MdBridge {
     /// #163：收割核事件队列，返回本窗口是否产生了**新的 View 条目**
     /// （合并入既有条目 = false——Buffer 侧 entry_ids 镜像只在新条目时
     /// 增补）。队列必须随每次编辑收割（防事件堆积）。
+    #[allow(dead_code)]
     pub(crate) fn take_view_entry_created(&mut self) -> bool {
         self.take_view_events().0
     }
@@ -1203,6 +1209,7 @@ impl MdBridge {
     }
 
     /// #163：纯收割（批量路径——恒新条目由调用方自行记账）。
+    #[allow(dead_code)]
     pub(crate) fn drain_events(&mut self) {
         self.core.take_events();
     }

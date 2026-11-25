@@ -177,13 +177,15 @@ pub type EscapeHook = Arc<dyn Fn(&mut Window, &mut App)>;
 #[derive(Clone)]
 pub struct SearchPanelHooks {
     pub open_hit: OpenHitHook,
+    #[allow(dead_code)]
     pub replace_all: ReplaceAllHook,
+    #[allow(dead_code)]
     pub escape: EscapeHook,
 }
 
 /// 面板态机（输入/选项/结果）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Phase {
+pub enum Phase {
     /// 无查询（初始/清空）。
     Idle,
     /// 后台扫描中。
@@ -440,14 +442,17 @@ impl SearchPanel {
     }
 
     /// 只读面（测试断言用——结果分组/计数）。
+    #[allow(dead_code)]
     pub fn phase(&self) -> Phase {
         self.phase
     }
 
+    #[allow(dead_code)]
     pub fn hit_count(&self) -> usize {
         self.report.hits.len()
     }
 
+    #[allow(dead_code)]
     pub fn hits(&self) -> &[SearchHit] {
         &self.report.hits
     }
@@ -491,6 +496,7 @@ impl SearchPanel {
 
     /// Enter（查询框）：重扫。替换框：发起全部替换（经宿主钩子——
     /// 确认/执行/善后在 shell 侧）。
+    #[allow(dead_code)]
     pub fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.replacement_focus_active(window) {
             let pattern = self.query.text.clone();

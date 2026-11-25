@@ -77,6 +77,7 @@ pub enum OpenedDocument {
         encoding: Encoding,
     },
     /// docx 只读渲染（批 3）：mdc-office-io 解析 + 行模型转换产物。
+    #[allow(dead_code)]
     ReadOnlyDocx { path: PathBuf, payload: DocxPayload },
     /// #115：docx **可编辑**装载（行模型 + 编辑桥 + 引擎窄面；桥 `None`
     /// 时编辑器自动降级只读——原因在 `payload.notice`）。
@@ -538,6 +539,7 @@ mod tests {
 
         // 窗口宿主（run_command 的焦点面需要真实 Window——与 editor
         // 单测同模式：最小宿主开窗）。
+        #[allow(dead_code)]
         struct Host(gpui::Entity<Editor>);
         impl gpui::Render for Host {
             fn render(

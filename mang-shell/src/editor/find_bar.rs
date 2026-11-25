@@ -96,6 +96,7 @@ pub enum FindKeyOutcome {
     FocusSwitched,
 }
 
+#[allow(dead_code)]
 impl FindState {
     pub(super) fn input(&self, replacement: bool) -> &FormInput {
         if replacement {
@@ -217,6 +218,7 @@ impl FindState {
     }
 
     /// 输入光标（char 索引）。
+    #[allow(dead_code)]
     pub fn cursor_col(&self) -> usize {
         self.query.cursor_col()
     }
@@ -257,6 +259,7 @@ impl FindState {
     }
 
     /// G1：替换行输入光标（char 索引）。
+    #[allow(dead_code)]
     pub fn repl_cursor_col(&self) -> usize {
         self.replacement.cursor_col()
     }
@@ -807,7 +810,7 @@ mod g1_replace_tests {
 
     #[test]
     fn open_replace_sets_mode_and_keeps_query_line_focused() {
-        let (b, mut f) = open_replace_foo();
+        let (b, f) = open_replace_foo();
         assert!(f.is_replace_mode());
         assert!(!f.focus_is_replacement(), "打开后光标在 query 行");
         assert_eq!(f.matches().len(), 3, "大小写不敏感 3 处 foo");

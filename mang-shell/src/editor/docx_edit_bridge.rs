@@ -412,11 +412,13 @@ pub struct TableRef {
 
 impl TableRef {
     /// 行数。
+    #[allow(dead_code)]
     pub fn rows(&self) -> usize {
         self.cells.len()
     }
 
     /// 最大栅格列数。
+    #[allow(dead_code)]
     pub fn cols(&self) -> usize {
         self.cells.iter().map(|r| r.len()).max().unwrap_or(0)
     }
@@ -1505,7 +1507,7 @@ mod tests {
     #[test]
     fn cell_rows_refuse_edits_via_locked_only_not_cell() {
         // 单元格行是**可编辑**的（不是 Locked）；只读表格形态用 TableRow。
-        let mut b = bridge(
+        let b = bridge(
             &[
                 (para(0, 0), "正文"),
                 (locked(ReadOnlyLine::TableRow), "a | b"),

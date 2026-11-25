@@ -6,6 +6,7 @@ use crate::editor::buffer::Point;
 use crate::editor::commands::Cmd;
 
 /// 测试宿主（见模块注释）。
+#[allow(dead_code)]
 struct ShellHost(Entity<ShellApp>);
 
 impl gpui::Render for ShellHost {

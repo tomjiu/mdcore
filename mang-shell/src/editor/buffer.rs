@@ -551,6 +551,7 @@ impl Buffer {
         self.refresh_coalesce_window();
     }
 
+    #[allow(dead_code)]
     pub fn take_edit_hook(&mut self) -> Option<Box<dyn EditHook>> {
         self.edit_hook.take()
     }
@@ -563,6 +564,7 @@ impl Buffer {
     }
 
     /// #178：拒改记录窥视（不取走——克隆口径测试/诊断用）。
+    #[allow(dead_code)]
     pub(crate) fn last_reject_note(&self) -> Option<&RejectNotice> {
         self.last_reject.as_ref()
     }
@@ -586,6 +588,7 @@ impl Buffer {
 
     /// #163（验收 8）：合并窗设置（settings `undo_coalesce_ms` → 引擎；
     /// docx 面挂钩期间暂存，摘钩后生效）。
+    #[allow(dead_code)]
     pub fn set_coalesce_ms(&mut self, ms: u64) {
         self.default_coalesce_ms = ms;
         self.refresh_coalesce_window();
@@ -985,6 +988,7 @@ impl Buffer {
     ///
     /// 与 [`Buffer::replace_range`] 同一变更语义，只跳过意图裁决；仍通报
     /// 准确结果与历史身份，防止行归属与撤销栈悄然失同步。
+    #[allow(dead_code)]
     pub fn replace_range_derived(&mut self, start: Point, end: Point, text: &str) -> bool {
         self.replace_range_with_intent(start, end, text, false)
     }
@@ -1001,6 +1005,7 @@ impl Buffer {
     }
 
     /// Tab（md 最小语义：插 4 空格，不引入缩进块模型）。
+    #[allow(dead_code)]
     pub fn tab(&mut self) {
         self.insert("    ");
     }
@@ -1423,6 +1428,7 @@ impl Buffer {
     // ---------------------------------------------------------------------------
 
     /// 全文大小写不敏感查找：返回所有匹配起点（按文档序；空 query 空）。
+    #[allow(dead_code)]
     pub fn find_matches(&self, query: &str) -> Vec<Point> {
         self.find_matches_opts(query, false, false)
     }

@@ -191,6 +191,7 @@ impl PdfAnnotateController {
     }
 
     /// 总页数。
+    #[allow(dead_code)]
     pub fn page_count(&self) -> u32 {
         self.page_count
     }
@@ -330,6 +331,7 @@ impl PdfAnnotateController {
     }
 
     /// 列出批注（模型视图——命令面 `AnnotateList`；页过滤可选）。
+    #[allow(dead_code)]
     pub fn list(&mut self, page: Option<u32>) -> Result<Vec<Annotation>, AnnotateError> {
         let filter = mdc_pdf::command::AnnotationFilter {
             page: page.map(PageIndex),

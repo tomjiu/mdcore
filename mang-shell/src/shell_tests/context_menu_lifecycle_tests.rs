@@ -5,6 +5,7 @@ use super::*;
 use menu as menu_crate;
 
 /// 测试宿主（ShellHost 同款——模块间不共享私有设施，各 10 行）。
+#[allow(dead_code)]
 struct Host(Entity<ShellApp>);
 
 impl gpui::Render for Host {

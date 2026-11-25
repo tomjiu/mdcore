@@ -98,6 +98,7 @@ impl gpui::Render for DragGhost {
 #[derive(Clone, Debug)]
 pub struct DraggedFile {
     pub path: PathBuf,
+    #[allow(dead_code)]
     pub is_dir: bool,
 }
 
@@ -927,7 +928,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     /// #107 P1 批⑦：空目录展开显示「（空）」占位（行集含占位行——
     /// 新手误判树损坏修复；先红面：展开空目录零行）。
     #[test]

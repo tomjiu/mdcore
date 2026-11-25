@@ -742,6 +742,7 @@ mod tests {
         );
     }
 
+    #[allow(invalid_from_utf8)]
     #[test]
     fn encoding_gbk_detected_when_not_utf8() {
         // "中文" 的 GBK 编码：D6 D0 CE C4 —— 不是合法 UTF-8。

@@ -1215,16 +1215,19 @@ impl Editor {
     }
 
     /// docx 可编辑态？（只读 docx / md / pdf / xlsx 均 `false`）
+    #[allow(dead_code)]
     pub fn docx_editable(&self) -> bool {
         self.docx_edit.is_some()
     }
 
     /// #115：docx 回写诊断快照 `(成功, 同值, 失败)`（状态栏/属性面板/RPC）。
+    #[allow(dead_code)]
     pub fn docx_edit_stats(&self) -> Option<(usize, usize, usize)> {
         self.docx_edit.as_ref().map(|e| e.borrow().stats)
     }
 
     /// #115：最近一次回写计划摘要 `(需写段落, 未动段落, 无归属行)`。
+    #[allow(dead_code)]
     pub fn docx_last_plan(&self) -> Option<(usize, usize, usize)> {
         self.docx_last_plan
             .as_ref()
@@ -1277,6 +1280,7 @@ impl Editor {
 
     /// #111 G1 写回半：当前源编码（`None` = 未探测——新文档/只读对照
     /// 视图/容器格式）。
+    #[allow(dead_code)]
     pub fn file_encoding(&self) -> Option<crate::status_info::Encoding> {
         self.file_encoding
     }
@@ -1371,6 +1375,7 @@ impl Editor {
     /// 查找条开合态（#176 测试面：页面视图键守卫「不派发到不可见
     /// 编辑器」的行为证据——find 状态留在编辑器上，页面态不应被
     /// 隐式置开）。
+    #[allow(dead_code)]
     pub fn find_open(&self) -> bool {
         self.find.is_some()
     }
@@ -1761,6 +1766,7 @@ impl Editor {
     }
 
     /// 块文本（行 start..=end 连同行间换行；无尾换行）。#111 D1。
+    #[allow(dead_code)]
     fn block_text(&self, start: usize, end: usize) -> String {
         (start..=end)
             .map(|l| self.buffer.line(l))
@@ -2402,6 +2408,7 @@ impl Editor {
     /// #427 端到端断言通道（折 → 落盘 → 重开 → 恢复的折叠集对照）；
     /// 状态栏/RPC 诊断同类消费可直接复用。与 [`Self::fold_all`] 的
     /// 返回值不同：这是**任意时刻**的区间查询，不是操作。
+    #[allow(dead_code)]
     pub fn fold_ranges(&self) -> Vec<(usize, usize)> {
         self.display_map.fold_ranges()
     }
@@ -3840,6 +3847,7 @@ impl Editor {
     }
 
     /// #111 P2：软换行开关现状（面板态显示用）。
+    #[allow(dead_code)]
     pub fn soft_wrap_enabled(&self) -> bool {
         self.soft_wrap
     }

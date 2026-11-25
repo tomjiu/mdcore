@@ -153,6 +153,7 @@ pub struct GridSheet {
 pub struct XlsxGridModel {
     pub sheets: Vec<GridSheet>,
     /// 触发护栏的表数（状态条提示用）。
+    #[allow(dead_code)]
     pub truncated_sheets: usize,
 }
 
@@ -759,12 +760,14 @@ impl XlsxGridView {
 
     /// 编辑态只读探针（#604 shell 收口回归断言——双击进入/Enter
     /// 提交后确认缓冲生命周期，跨模块只读不触内部结构）。
+    #[allow(dead_code)]
     pub fn editing_active(&self) -> bool {
         self.editing.is_some()
     }
 
     /// 状态条文案只读探针（#604 失败面断言——编辑会话拒因/保存错误
     /// 的非静默示警面，跨模块只读）。
+    #[allow(dead_code)]
     pub fn notice_message(&self) -> Option<String> {
         self.notice.clone()
     }
@@ -846,6 +849,7 @@ impl XlsxGridView {
     }
 
     /// 切换工作表（簿序索引；越界/同表 = 无操作）。
+    #[allow(dead_code)]
     pub fn select_sheet(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.model.sheets.len() || idx == self.sheet_idx {
             return;
@@ -856,11 +860,13 @@ impl XlsxGridView {
     }
 
     /// 当前表索引（状态面）。
+    #[allow(dead_code)]
     pub fn sheet_index(&self) -> usize {
         self.sheet_idx
     }
 
     /// 选中格（显示坐标 (行, 列)——阶段 2 编辑接驳锚）。
+    #[allow(dead_code)]
     pub fn selected_cell(&self) -> Option<(usize, usize)> {
         self.selected
     }
@@ -869,6 +875,7 @@ impl XlsxGridView {
     /// #584 返工：合并区选中 → **原始绝对锚**（左上可在可见盒外
     /// ——空合并格场景锚 E5 而包围盒从 F6 起，不随裁剪漂移）；
     /// 非合并格显示坐标换算不变。
+    #[allow(dead_code)]
     pub fn selected_a1(&self) -> Option<String> {
         let sheet = self.sheet();
         let (r, c) = self.selected?;

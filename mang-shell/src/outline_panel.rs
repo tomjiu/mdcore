@@ -55,7 +55,7 @@ type ActivateHookRef<'a> = Option<&'a dyn Fn(usize, &mut Window, &mut App)>;
 /// 大纲行（渲染数据 + 行焦点句柄）。句柄按条目序号缓存于
 /// [`OutlinePanel::handles`]，line仅用于真实文档跳转。
 #[derive(Clone)]
-struct OutlineRow {
+pub struct OutlineRow {
     label: String,
     level: usize,
     line: usize,
@@ -144,6 +144,7 @@ impl OutlinePanel {
 
     /// 行标签只读序（#47 A1：shell 级标签切换测试的断言面——右栏
     /// 内容随当前视图的运行时证据；同 `editor()` 先例：面板只读面）。
+    #[allow(dead_code)]
     pub fn row_labels(&self) -> Vec<&str> {
         self.rows.iter().map(|r| r.label.as_str()).collect()
     }
@@ -160,6 +161,7 @@ impl OutlinePanel {
     }
 
     /// #108 D1：设置过滤查询（实时——每键入即时生效；空恢复全行）。
+    #[allow(dead_code)]
     pub fn set_filter(&mut self, query: String) {
         self.filter = query;
     }
@@ -325,6 +327,7 @@ impl OutlinePanel {
             .next_back()
     }
 
+    #[allow(dead_code)]
     pub fn visible_labels(&self) -> Vec<&str> {
         self.visible_rows_indexed()
             .iter()

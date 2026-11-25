@@ -175,6 +175,7 @@ impl PdfThumbnailsView {
     }
 
     /// 总页数（行数与跳页钳制同源）。
+    #[allow(dead_code)]
     pub fn page_count(&self) -> usize {
         self.page_count
     }
@@ -193,12 +194,14 @@ impl PdfThumbnailsView {
     }
 
     /// 就绪判定（懒加载断言读面——测试与 shell 同源）。
+    #[allow(dead_code)]
     pub fn thumb_ready(&self, page: usize) -> bool {
         self.cache
             .contains(&(page as u32, self.thumb_request_width()))
     }
 
     /// 当前高亮行（联动断言读面）。
+    #[allow(dead_code)]
     pub fn highlighted_page(&self) -> usize {
         self.highlighted
     }

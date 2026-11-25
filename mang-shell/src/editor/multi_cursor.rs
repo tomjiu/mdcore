@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn add_next_word_match_advances() {
         let b = Buffer::from_plain_text("foo bar foo baz foo");
-        let mut c = Cursors::single(p(0, 0)); // foo 内
+        let c = Cursors::single(p(0, 0)); // foo 内
         let c2 = Cursors::add_next_word_match(&b, &c).expect("下一个 foo 在 bar 后");
         assert_eq!(c2.len(), 2);
         assert_eq!(c2.entries()[1].1, p(0, 11), "第二个 foo 尾（8..11）");

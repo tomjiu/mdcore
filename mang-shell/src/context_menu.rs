@@ -34,6 +34,7 @@ pub enum MenuItem {
     /// 分隔线。
     Separator,
     /// 子菜单（点开后横向飞出；本批只做一层）。
+    #[allow(dead_code)]
     Submenu { label: String, items: Vec<MenuItem> },
 }
 

@@ -100,6 +100,7 @@ impl IconButton36 {
     /// 显式选中态（toggle_state）：图标切 `Color::Selected`；底色见
     /// [`Self::selected_style`]（缺省维持 Subtle 底——精确色注入边界
     /// 见模块文档「已知边界」）。不调用本方法的普通动作不报告pressed属性。
+    #[allow(dead_code)]
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = Some(selected);
         self
@@ -115,12 +116,14 @@ impl IconButton36 {
 
     /// hover 底色精确注入（IconButton 既有 builder——经渲染拦截保留）。
     /// 现自绘 bar_button 的 `element_hover` 注入模式在此续用。
+    #[allow(dead_code)]
     pub fn hover_background(mut self, background: Hsla) -> Self {
         self.hover_background = Some(background);
         self
     }
 
     /// 按下（active）底色精确注入（同上）。
+    #[allow(dead_code)]
     pub fn active_background(mut self, background: Hsla) -> Self {
         self.active_background = Some(background);
         self
@@ -129,6 +132,7 @@ impl IconButton36 {
     /// 选中底色的样式交换（zed 官方选中模式：
     /// `selected_style(ButtonStyle::Tinted(TintColor::Accent))`——
     /// ToggleButton 同款）。
+    #[allow(dead_code)]
     pub fn selected_style(mut self, style: ButtonStyle) -> Self {
         self.selected_style = Some(style);
         self
@@ -136,12 +140,14 @@ impl IconButton36 {
 
     /// 禁用态（ButtonLike 机制：on_click 不注册 + 光标 not-allowed +
     /// 图标 `Color::Disabled`）。
+    #[allow(dead_code)]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
     }
 
     /// 读屏标签（缺省回落 tooltip 文本）。
+    #[allow(dead_code)]
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
         self

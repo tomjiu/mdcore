@@ -1034,6 +1034,7 @@ impl PdfPagesView {
     /// #51 D3 测试读数：当前**设备像素**光栅宽（pending 键宽同口径——
     /// HiDPI 测试窗口 sf≠1 时与逻辑宽不同域，断言面必用本读数）。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn device_raster_width_for_test(&self) -> u32 {
         let (vw, vh) = self.viewport_size;
         self.device_raster_width(vw, vh)
@@ -1048,6 +1049,7 @@ impl PdfPagesView {
     /// #634 测试读数：缓存（已用字节, 条目数）——预算受限不变量断言
     /// （LRU 逐出语义的单元面在 crates/pdf cache 单测）。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn cache_stats_for_test(&self) -> (usize, usize) {
         (self.cache.bytes(), self.cache.len())
     }
@@ -1055,6 +1057,7 @@ impl PdfPagesView {
     /// #51 D3 测试读数：在飞作业键宽族——陈旧取消面断言（缩放风暴后
     /// pending 只应含当前设备宽键；empty = 无在飞）。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn pending_widths_for_test(&self) -> Vec<u32> {
         self.pending.values().map(|(k, _)| k.1).collect()
     }
@@ -1063,6 +1066,7 @@ impl PdfPagesView {
     /// 截停在飞面，已落缓存条目交 LRU 自然逐出——本读数断言「旧宽
     /// 不新增」的基线差分）。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn cache_widths_for_test(&self) -> Vec<u32> {
         self.cache
             .entries()
@@ -1073,6 +1077,7 @@ impl PdfPagesView {
 
     /// #634 测试读数：引擎面错误（坏文件视图态断言——面板明示面同源）。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn error_for_test(&self) -> Option<String> {
         self.error.clone()
     }
@@ -1105,6 +1110,7 @@ impl PdfPagesView {
     /// 实测尺寸逐项相等（键控缓存的基本契约：命中即该宽该高该 rev
     /// 的位图）。空 = 全一致。
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn cache_key_product_mismatches_for_test(&self) -> Vec<(u32, u32, u32, u32)> {
         self.cache
             .entries()
