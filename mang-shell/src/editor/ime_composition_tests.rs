@@ -62,7 +62,7 @@ fn input_sequence_shell_keys_propagate(cx: &mut gpui::TestAppContext) {
         ed_host.read(cx).focus.clone().focus(window, cx);
         InputRouteHost { ed: ed_host }
     });
-    cx.update_window(window.into(), |_, window, cx| {
+    let _ = cx.update_window(window.into(), |_, window, cx| {
         window.draw(cx).clear(cx);
         for key in ["s", "w", "tab", "k", "o"] {
             let mut event = plain_key(key, None);
@@ -84,7 +84,7 @@ fn input_sequence_ascii_once(cx: &mut gpui::TestAppContext) {
         ed_host.read(cx).focus.clone().focus(window, cx);
         InputRouteHost { ed: ed_host }
     });
-    cx.update_window(window.into(), |_, window, cx| {
+    let _ = cx.update_window(window.into(), |_, window, cx| {
         for ch in ["a", "b", "c"] {
             window.draw(cx).clear(cx);
             let result =
@@ -101,7 +101,7 @@ fn input_sequence_ascii_once(cx: &mut gpui::TestAppContext) {
 fn input_sequence_ime_none_commit(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "X");
     let path = std::env::temp_dir().join(format!("mang-input-ime-{}.md", std::process::id()));
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.file_path = Some(path.clone());
             ed.replace_and_mark_text_in_range(None, "zh", Some(1..1), window, cx);
@@ -122,7 +122,7 @@ fn input_sequence_ime_none_commit(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn input_sequence_ime_cancel_and_explicit_range(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "😀AB");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.buffer.set_cursor(Point::new(0, 1));
             ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
@@ -141,7 +141,7 @@ fn input_sequence_ime_cancel_and_explicit_range(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn input_sequence_multicursor_callback(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "a\nb");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.cursors.push(Point::new(1, 0), Point::new(1, 0));
             ed.sync_buffer_from_cursors_primary();
@@ -157,7 +157,7 @@ fn input_sequence_multicursor_callback(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn input_sequence_character_preference_preserves_selection(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "AB");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.buffer.set_cursor(Point::new(0, 1));
             ed.sync_cursors_from_buffer();
@@ -176,7 +176,7 @@ fn input_sequence_character_preference_preserves_selection(cx: &mut gpui::TestAp
 fn input_sequence_enter_undo_dirty_save(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "AB");
     let path = std::env::temp_dir().join(format!("mang-input-enter-{}.md", std::process::id()));
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.file_path = Some(path.clone());
             for col in [0, 1, 2] {
@@ -223,7 +223,7 @@ fn input_sequence_enter_undo_dirty_save(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn edit_before_wrap_backfill_editor_level_row_freshness(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "AB");
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         ed.update(cx, |ed, cx| {
             // 前置：不调用任何渲染路径——display_map.wraps 保持空
             //（真实形态：开文件后 0/1 帧内的自动化连打）。
@@ -250,7 +250,7 @@ fn edit_before_wrap_backfill_editor_level_row_freshness(cx: &mut gpui::TestAppCo
 #[gpui::test]
 fn ime_preedit_update_commit_lifecycle(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "AB\n");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         // 组合起：光标处预编辑 "ni"。
         ed.update(cx, |ed, cx| {
             ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
@@ -298,7 +298,7 @@ fn ime_preedit_update_commit_lifecycle(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn ime_commit_via_replace_text_swaps_preedit(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "X\n");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
         });
@@ -325,7 +325,7 @@ fn ime_readonly_rejects_both_channels(cx: &mut gpui::TestAppContext) {
     let window = cx.add_window(move |_window, _cx| ImeHost {
         _ed: ed_for_host.clone(),
     });
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.replace_and_mark_text_in_range(None, "拼", None, window, cx);
             assert_eq!(ed.marked_text_range(window, cx), None, "只读不接预编辑");
@@ -342,7 +342,7 @@ fn ime_readonly_rejects_both_channels(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn ime_composition_guards_printable_keys(cx: &mut gpui::TestAppContext) {
     let (ed, window) = ime_window(cx, "AB\n");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
         });

@@ -157,7 +157,7 @@ fn three_tabs_switch_preserves_state(cx: &mut gpui::TestAppContext) {
     let c = write_md(&dir, "c.md", "C0\nC1\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         open(&shell, cx, b.clone());
         open(&shell, cx, c.clone());
@@ -172,7 +172,7 @@ fn three_tabs_switch_preserves_state(cx: &mut gpui::TestAppContext) {
     // 走 default 起始 + expect 收口——闭包捕获未初始化局部不可编译。）
     let mut cursor_in_tab0 = Point::default();
     let mut selection_in_tab1: Option<(Point, Point)> = None;
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             let ed0 = shell.tab_editor(0).unwrap().clone();
             cursor_in_tab0 = ed0
@@ -192,7 +192,7 @@ fn three_tabs_switch_preserves_state(cx: &mut gpui::TestAppContext) {
     let selection_in_tab1 = selection_in_tab1.expect("tab1 全选有选区");
 
     // 循环切换 2→0（wrap）→1→0（backward）——全程逐项回读保持。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.cycle_tab(true, window, cx);
             assert_eq!(shell.active, 0, "末位 wrap 回首（方向）");
@@ -251,7 +251,7 @@ fn same_file_reopen_dedupes_to_existing_tab(cx: &mut gpui::TestAppContext) {
     };
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         // 相对形态首开：落一个标签，身份 = 绝对化结果。
         open(&shell, cx, rel_a.clone());
         shell.update(cx, |shell, cx| {
@@ -308,7 +308,7 @@ fn scanned_fixture() -> PathBuf {
 fn ocr_payload_face_synthetic(cx: &mut gpui::TestAppContext) {
     let (shell, window) = shell_window(cx);
     let scanned = scanned_fixture();
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, scanned.clone());
     });
     let pending = window
@@ -327,7 +327,7 @@ fn ocr_payload_face_synthetic(cx: &mut gpui::TestAppContext) {
         );
         return;
     }
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             let ed = shell.editor().unwrap().clone();
             // 前置态：暂不支持横幅 + pending + 非 ready。
@@ -424,7 +424,7 @@ fn ocr_scan_gesture_e2e(cx: &mut gpui::TestAppContext) {
     }
     let (shell, window) = shell_window(cx);
     let scanned = scanned_fixture();
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, scanned.clone());
     });
     let pending = window
@@ -441,7 +441,7 @@ fn ocr_scan_gesture_e2e(cx: &mut gpui::TestAppContext) {
         return;
     }
     // 手势：菜单动作（真实菜单同一分派键——activate_menu_action）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.activate_menu_action(crate::menu_bar::MenuAction::OcrPdf, window, cx);
         });
@@ -521,13 +521,13 @@ fn close_neighbor_rule_and_last_tab_empty_state(cx: &mut gpui::TestAppContext) {
     let c = write_md(&dir, "c.md", "C\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         open(&shell, cx, b.clone());
         open(&shell, cx, c.clone());
     });
 
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             // [A,B,C] 激活 1，关 B → C 前移补位，active 仍 1。
             shell.activate_tab(1, window, cx);
@@ -554,7 +554,7 @@ fn close_neighbor_rule_and_last_tab_empty_state(cx: &mut gpui::TestAppContext) {
     });
 
     // 空态后可继续开新文档（生命周期闭环）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         shell.update(cx, |shell, cx| {
             assert_eq!(shell.tab_count(), 1, "空态后再开正常");
@@ -573,12 +573,12 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
     let a = write_md(&dir, "a.md", "L0\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
     });
 
     // 干净标签：直接关，无确认框。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert!(shell.confirm.is_none(), "干净标签关闭不弹确认");
@@ -587,7 +587,7 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
     });
 
     // 重开并置脏（L0 → L0X）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         shell.update(cx, |shell, cx| {
             shell.tab_editor(0).unwrap().update(cx, |ed, cx| {
@@ -598,7 +598,7 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
     });
 
     // 关脏标签 → 确认框（文案/按钮/动作/默认选中）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             let confirm = shell.confirm.as_ref().expect("脏标签关闭弹确认");
@@ -617,7 +617,7 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
     });
 
     // 取消：原标签与内容原样保留，确认框清除。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.resolve_confirm(2, window, cx);
             assert!(shell.confirm.is_none(), "取消清确认框");
@@ -629,7 +629,7 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
     });
 
     // 保存（choice 0）：落盘 + 关标签；盘上带 X。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert!(shell.confirm.is_some());
@@ -645,7 +645,7 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
 
     // 重开：内容带 X 且干净；再置脏（L0X → L0XY）后不保存（choice 1）：
     // 直接关、盘上仍是无 Y 的版本。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         shell.update(cx, |shell, cx| {
             let ed = shell.tab_editor(0).unwrap().clone();
@@ -656,7 +656,7 @@ fn dirty_close_confirm_cancel_save_discard(cx: &mut gpui::TestAppContext) {
             });
         });
     });
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             shell.resolve_confirm(1, window, cx);
@@ -731,10 +731,10 @@ fn docx_tab_lifecycle_close_confirm_saves_docx_bytes(cx: &mut gpui::TestAppConte
     let (shell, window) = shell_window(cx);
 
     // ① 打开（页面视图缺省）→ 页面态保存卫：Unmodified + 零写盘。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, docx.clone());
     });
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             assert_eq!(shell.tab_count(), 1, "docx 标签打开");
             assert!(shell.docx_view_mode, "页面视图缺省");
@@ -758,7 +758,7 @@ fn docx_tab_lifecycle_close_confirm_saves_docx_bytes(cx: &mut gpui::TestAppConte
 
     // ② 重开 → 切文本态（拆 LOK 会话）→ 找锚点段编辑 → 脏 →
     //    关闭确认 → 取消保留。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         open(&shell, cx, docx.clone());
         shell.update(cx, |shell, cx| {
             assert!(shell.docx_pages.is_some(), "页面态缺省建页视图");
@@ -795,7 +795,7 @@ fn docx_tab_lifecycle_close_confirm_saves_docx_bytes(cx: &mut gpui::TestAppConte
     });
 
     // ③ 脏关闭 → 确认框三面 → 取消：标签/内容/脏全保留。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             let confirm = shell.confirm.as_ref().expect("脏 docx 关闭弹确认");
@@ -829,7 +829,7 @@ fn docx_tab_lifecycle_close_confirm_saves_docx_bytes(cx: &mut gpui::TestAppConte
     // ④ 保存（choice 0）：关标签 + 盘上是**合法 docx 字节**——
     //    PK zip 头 + word/document.xml 条目 + 锚点段带编辑标记；
     //    绝不是把行模型文本覆写进 .docx。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert!(shell.confirm.is_some());
@@ -855,7 +855,7 @@ fn docx_tab_lifecycle_close_confirm_saves_docx_bytes(cx: &mut gpui::TestAppConte
 
     // ⑤ 重开 = 盘上内容：编辑标记在场 + 干净；再脏后放弃（choice 1）
     //    = 盘上不动。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         open(&shell, cx, docx.clone());
         shell.update(cx, |shell, cx| {
             assert!(!shell.docx_view_mode, "文本态跨关闭保持（shell 全局）");
@@ -1052,13 +1052,13 @@ fn right_panel_outline_follows_active_tab(cx: &mut gpui::TestAppContext) {
     let b = write_md(&dir, "b.md", "# B1\n正文\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         open(&shell, cx, b.clone());
     });
 
     // ① 开双标签（b 激活）→ 大纲绑定 b 编辑器 + 行集 = B1 单行。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             let ed_b = shell.tab_editor(1).unwrap().clone();
             let panel = shell
@@ -1080,7 +1080,7 @@ fn right_panel_outline_follows_active_tab(cx: &mut gpui::TestAppContext) {
     });
 
     // ② 切回 a → 换绑 a + 行集 = A1/A2。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.activate_tab(0, window, cx);
             let ed_a = shell.tab_editor(0).unwrap().clone();
@@ -1095,7 +1095,7 @@ fn right_panel_outline_follows_active_tab(cx: &mut gpui::TestAppContext) {
     });
 
     // ③ 关 a（活动标签，干净）→ 大纲随新活动标签（b）换绑。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert_eq!(shell.tab_count(), 1, "关 a 后剩 b");
@@ -1115,7 +1115,7 @@ fn right_panel_outline_follows_active_tab(cx: &mut gpui::TestAppContext) {
     });
 
     // ④ 关末标签（b）→ 空态：大纲随清（无标签无绑定）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert_eq!(shell.tab_count(), 0);
@@ -1140,14 +1140,14 @@ fn focus_restore_lands_on_docx_page_view(cx: &mut gpui::TestAppContext) {
     let md = write_md(&dir, "m.md", "M\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, docx.clone());
         open(&shell, cx, md.clone());
     });
 
     // ① 关活动 md（干净）→ docx 成活动标签（页面态）→ 焦点落
     //    LOK 页视图（修复前：落游离编辑器句柄——键事件死）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert_eq!(shell.tab_count(), 1, "关 md 后剩 docx");
@@ -1171,7 +1171,7 @@ fn focus_restore_lands_on_docx_page_view(cx: &mut gpui::TestAppContext) {
 
     // ② 切文本态（焦点落编辑器）→ 切回页面态（ensure 重建页视图）
     //    → 焦点落重建的页视图（toggle 路径同修复）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.toggle_docx_view_mode(window, cx);
             let ed_focus = shell.tab_editor(0).unwrap().read(cx).focus_handle().clone();
@@ -1206,7 +1206,7 @@ fn md_save_failure_keeps_dirty_then_recovers(cx: &mut gpui::TestAppContext) {
     let a = write_md(&dir, "a.md", "L0\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         shell.update(cx, |shell, cx| {
             shell.tab_editor(0).unwrap().update(cx, |ed, cx| {
@@ -1220,7 +1220,7 @@ fn md_save_failure_keeps_dirty_then_recovers(cx: &mut gpui::TestAppContext) {
     std::fs::remove_dir_all(&dir).expect("删目录");
 
     // 确认「保存」→ 保存失败不关标签（脏保留）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             assert!(shell.confirm.is_some(), "脏标签关闭弹确认");
@@ -1240,7 +1240,7 @@ fn md_save_failure_keeps_dirty_then_recovers(cx: &mut gpui::TestAppContext) {
     // 恢复目录 + 夹具 → 重试 → 保存成功关标签 + 盘上 = 编辑后内容。
     std::fs::create_dir_all(&dir).expect("恢复目录");
     std::fs::write(&a, "L0\n").expect("恢复夹具");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             shell.resolve_confirm(0, window, cx);
@@ -1265,7 +1265,7 @@ fn md_quit_write_failure_keeps_retry_confirmation(cx: &mut gpui::TestAppContext)
     let a = write_md(&dir, "a.md", "Q0\n");
 
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         open(&shell, cx, a.clone());
         shell.update(cx, |shell, cx| {
             shell.tab_editor(0).unwrap().update(cx, |ed, cx| {
@@ -1339,7 +1339,7 @@ fn cycle_noop_edges_and_out_of_range_activate(cx: &mut gpui::TestAppContext) {
     let (shell, window) = shell_window(cx);
 
     // 空态循环：no-op 不 panic。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.cycle_tab(true, window, cx);
             shell.cycle_tab(false, window, cx);
@@ -1348,7 +1348,7 @@ fn cycle_noop_edges_and_out_of_range_activate(cx: &mut gpui::TestAppContext) {
         });
     });
 
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         open(&shell, cx, a.clone());
         // 单标签循环：不变（len < 2 短路——shell 级方法验证短路
         // 真的生效，焦点面不炸）。

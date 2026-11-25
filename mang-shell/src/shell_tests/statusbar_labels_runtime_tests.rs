@@ -58,13 +58,13 @@ fn md_runtime_labels_six_segments_real_values(cx: &mut gpui::TestAppContext) {
     let md = write_md(&dir, "状态栏证据.md", "第一行中文\r\n第二行中文\r\n");
     fake_git_root(&dir, "a5-runtime");
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document_tab(md.clone(), cx);
         });
     });
 
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         let ed = shell.read(cx).tab_editor(0).unwrap().clone();
         let labels: StatusBarLabels = status_bar_labels(Some(&ed), Some(dir.clone()), None, cx);
         // ① 左段：文件名 + 行,列 + 字数（真实光标/字数——光标在文件头）。
@@ -105,7 +105,7 @@ fn md_runtime_labels_six_segments_real_values(cx: &mut gpui::TestAppContext) {
     });
 
     // 真实编辑链：insert → 脏标 ●；真实选区 → 选中字数段。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             let ed = shell.tab_editor(0).unwrap().clone();
             ed.update(cx, |ed, cx| {
@@ -114,7 +114,7 @@ fn md_runtime_labels_six_segments_real_values(cx: &mut gpui::TestAppContext) {
             assert!(shell.tab_is_modified(0, cx).unwrap(), "置脏前置");
         });
     });
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         let ed = shell.read(cx).tab_editor(0).unwrap().clone();
         let labels = status_bar_labels(Some(&ed), Some(dir.clone()), None, cx);
         assert!(labels.left.contains('●'), "编辑后脏标：{}", labels.left);
@@ -122,13 +122,13 @@ fn md_runtime_labels_six_segments_real_values(cx: &mut gpui::TestAppContext) {
 
     // 程序化选区（set_selection_range——RPC SetSelection 同链）→
     // 选中字数段真值（含中文正文跨行：字/行双计数）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         let ed = shell.read(cx).tab_editor(0).unwrap().clone();
         ed.update(cx, |ed, cx| {
             ed.set_selection_range(Point { line: 0, col: 0 }, Point { line: 2, col: 0 }, cx);
         });
     });
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         let ed = shell.read(cx).tab_editor(0).unwrap().clone();
         let labels = status_bar_labels(Some(&ed), Some(dir.clone()), None, cx);
         let sel = labels.selection.as_deref().unwrap_or("（缺选区段）");
@@ -142,7 +142,7 @@ fn md_runtime_labels_six_segments_real_values(cx: &mut gpui::TestAppContext) {
 fn no_doc_ready_state_all_segments_none(cx: &mut gpui::TestAppContext) {
     let dir = fixture_dir("ready");
     let (_shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         let labels: StatusBarLabels = status_bar_labels(None, None, None, cx);
         assert_eq!(
             labels.left, "就绪 —— Ctrl+O 打开文件 · Ctrl+K Ctrl+O 打开文件夹",
@@ -162,12 +162,12 @@ fn md_outside_git_repo_branch_segment_none(cx: &mut gpui::TestAppContext) {
     let dir = fixture_dir("nogit");
     let md = write_md(&dir, "裸文件.md", "内容\n");
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document_tab(md, cx);
         });
     });
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         let ed = shell.read(cx).tab_editor(0).unwrap().clone();
         let labels = status_bar_labels(Some(&ed), None, None, cx);
         assert!(

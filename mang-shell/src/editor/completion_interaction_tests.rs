@@ -178,7 +178,7 @@ fn completion_key_interception_full_window(cx: &mut gpui::TestAppContext) {
         ed_host.read(cx).focus.clone().focus(window, cx);
         CompletionKeyHost { ed: ed_host }
     });
-    cx.update_window(window.into(), |_, window, cx| {
+    let _ = cx.update_window(window.into(), |_, window, cx| {
         window.draw(cx).clear(cx);
         // 触发（键入面）。
         ed.update(cx, |ed, cx| ed.insert_text_at(2, 0, "st", cx));

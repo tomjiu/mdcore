@@ -32,7 +32,7 @@ fn shell_window(cx: &mut gpui::TestAppContext) -> (Entity<ShellApp>, gpui::Windo
 #[gpui::test]
 fn context_menu_open_switch_close_lifecycle(cx: &mut gpui::TestAppContext) {
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             // 初始全关。
             assert!(shell.context_menu.is_none());
@@ -97,7 +97,7 @@ fn context_menu_cancel_action_dismisses(cx: &mut gpui::TestAppContext) {
         .expect("宿主窗口更新");
     // 组件公有 cancel 处理器（on_action 同一入口——键盘 Esc 与点外
     // 关闭经 on_blur 归一到这，批 1 组件语义）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         menu.update(cx, |menu, cx| {
             menu.cancel(&menu_crate::Cancel, window, cx);
         });
@@ -119,7 +119,7 @@ fn context_menu_cancel_action_dismisses(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn context_menu_activate_clears_menu_state(cx: &mut gpui::TestAppContext) {
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_editor_context_menu(
                 gpui::Point::new(px(30.), px(30.)),

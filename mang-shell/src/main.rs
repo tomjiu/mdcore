@@ -678,7 +678,7 @@ fn main() {
             // #114 批①：会话恢复（上次打开标签列表 + 激活标签——
             // settings 读 → 逐路径 open_document_tab 既有链；已删静默
             // 跳过 + 上限 20 + 恢复证据行；F2 工作区恢复后接续）。
-            window_handle.update(cx, |shell, _window, cx| {
+            let _ = window_handle.update(cx, |shell, _window, cx| {
                 shell.restore_session_tabs(cx);
             });
 

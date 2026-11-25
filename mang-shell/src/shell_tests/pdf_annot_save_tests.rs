@@ -40,7 +40,7 @@ fn pdf_gesture_dirty_close_confirm_save_persists(cx: &mut gpui::TestAppContext) 
 
     // 开 pdf 标签（缺省页视图模式）+ 构建页视图（生产路径 = 渲染
     // 期 ensure_pdf_pages；测试直调同一函数——同一调用面）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document_tab(pdf.clone(), cx);
             shell.ensure_pdf_pages(cx);
@@ -106,7 +106,7 @@ fn pdf_gesture_dirty_close_confirm_save_persists(cx: &mut gpui::TestAppContext) 
 
     // ① 手势驱动页视图（生产入口 = finish_drag_annotation 收尾同款
     //    commit_annotation——不跳过视图层；缺省工具 = 高亮）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             let (_, entity) = shell.pdf_pages.clone().expect("槽在位");
             entity.update(cx, |v, _| {
@@ -117,7 +117,7 @@ fn pdf_gesture_dirty_close_confirm_save_persists(cx: &mut gpui::TestAppContext) 
     });
     // ② 批注脏计入标签脏判定（tab_is_modified 同源——标题栏脏标/
     //    关闭确认/RPC 同一函数）；文本面自身不脏（只读编辑器）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             assert!(
                 shell.tab_is_modified(0, cx).unwrap(),
@@ -131,7 +131,7 @@ fn pdf_gesture_dirty_close_confirm_save_persists(cx: &mut gpui::TestAppContext) 
         });
     });
     // ③ 关脏标签 → 确认框拦截（不静默丢——验收 3）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_active_tab(window, cx);
             let confirm = shell.confirm.as_ref().expect("批注脏关闭必弹确认");
@@ -144,7 +144,7 @@ fn pdf_gesture_dirty_close_confirm_save_persists(cx: &mut gpui::TestAppContext) 
         });
     });
     // ④ 确认框选「保存」→ 标签关 + 批注增量落盘（save_tab 分流）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.resolve_confirm(0, window, cx);
             assert_eq!(shell.tab_count(), 0, "保存后关标签");
@@ -190,7 +190,7 @@ fn pdf_annotate_dirty_blocks_quit_confirm(cx: &mut gpui::TestAppContext) {
     });
     let shell = slot.expect("宿主构造即置");
 
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document_tab(pdf.clone(), cx);
             shell.ensure_pdf_pages(cx);

@@ -47,7 +47,7 @@ fn pdf_view_ctrl_f_opens_in_page_search(cx: &mut gpui::TestAppContext) {
 
     // 生产同构链：open_document（open_document_tab + 落焦——#422
     // 后页视图态 pdf 标签落焦页视图，键事件可达）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf.clone(), window, cx);
         });
@@ -190,7 +190,7 @@ fn pdf_view_ctrl_c_copies_text_selection(cx: &mut gpui::TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let pdf = dir.join("m.pdf");
-    std::fs::write(&pdf, bytes);
+    let _ = std::fs::write(&pdf, bytes);
 
     cx.update(|app| {
         theme::init(theme::LoadThemes::JustBase, app);
@@ -203,7 +203,7 @@ fn pdf_view_ctrl_c_copies_text_selection(cx: &mut gpui::TestAppContext) {
         WiringHost(shell)
     });
     let shell = slot.expect("宿主构造即置");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf.clone(), window, cx);
         });
@@ -428,7 +428,7 @@ fn pdf_view_ctrl_c_copies_cross_page_selection(cx: &mut gpui::TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let pdf = dir.join("m.pdf");
-    std::fs::write(&pdf, bytes);
+    let _ = std::fs::write(&pdf, bytes);
 
     cx.update(|app| {
         theme::init(theme::LoadThemes::JustBase, app);
@@ -441,7 +441,7 @@ fn pdf_view_ctrl_c_copies_cross_page_selection(cx: &mut gpui::TestAppContext) {
         WiringHost(shell)
     });
     let shell = slot.expect("宿主构造即置");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf.clone(), window, cx);
         });
@@ -706,7 +706,7 @@ fn pdf_view_zoom_pan_navigation(cx: &mut gpui::TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let pdf = dir.join("m.pdf");
-    std::fs::write(&pdf, bytes);
+    let _ = std::fs::write(&pdf, bytes);
 
     cx.update(|app| {
         theme::init(theme::LoadThemes::JustBase, app);
@@ -719,7 +719,7 @@ fn pdf_view_zoom_pan_navigation(cx: &mut gpui::TestAppContext) {
         WiringHost(shell)
     });
     let shell = slot.expect("宿主构造即置");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf.clone(), window, cx);
         });
@@ -964,8 +964,8 @@ fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
     std::fs::create_dir_all(&dir).unwrap();
     let pdf_a = dir.join("a.pdf");
     let pdf_b = dir.join("b.pdf");
-    std::fs::write(&pdf_a, corpus("mixed_features.pdf"));
-    std::fs::write(&pdf_b, corpus("landscape_mixed.pdf"));
+    let _ = std::fs::write(&pdf_a, corpus("mixed_features.pdf"));
+    let _ = std::fs::write(&pdf_b, corpus("landscape_mixed.pdf"));
 
     cx.update(|app| {
         theme::init(theme::LoadThemes::JustBase, app);
@@ -978,7 +978,7 @@ fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
         WiringHost(shell)
     });
     let shell = slot.expect("宿主构造即置");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf_a.clone(), window, cx);
         });
@@ -1059,7 +1059,7 @@ fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
     eprintln!("#51 D4b ✓ ActualSize 档就位（光栅宽 640）");
 
     // ③ 切走：开 B（异路径重建——A 快照落账）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf_b.clone(), window, cx);
         });
@@ -1071,7 +1071,7 @@ fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
     });
 
     // ④ 切回 A：快照回放——顶部页 2 + ActualSize 档原样。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| shell.activate_tab(0, window, cx));
     });
     let view_a2 = cx.read(|app| shell.read(app).pdf_pages.as_ref().map(|(_, e)| e.clone()));
@@ -1087,12 +1087,12 @@ fn pdf_view_state_snapshot_and_page_label(cx: &mut gpui::TestAppContext) {
     eprintln!("#51 D4b ✓ 切标签回放：页 2 + ActualSize 档原样");
 
     // ⑤ 关标签路径快照：关 A → 重开同文件 → 原页原档。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.close_tab_no_confirm(0, window, cx);
         });
     });
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(pdf_a.clone(), window, cx);
         });
@@ -1130,7 +1130,7 @@ fn pdf_view_right_drag_annotate_rotated_and_cropbox(cx: &mut gpui::TestAppContex
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let pdf = dir.join("t.pdf");
-        std::fs::write(&pdf, bytes.clone());
+        let _ = std::fs::write(&pdf, bytes.clone());
 
         cx.update(|app| {
             theme::init(theme::LoadThemes::JustBase, app);
@@ -1143,7 +1143,7 @@ fn pdf_view_right_drag_annotate_rotated_and_cropbox(cx: &mut gpui::TestAppContex
             WiringHost(shell)
         });
         let shell = slot.expect("宿主构造即置");
-        window.update(cx, |_host, window, cx| {
+        let _ = window.update(cx, |_host, window, cx| {
             shell.update(cx, |shell, cx| {
                 shell.open_document(pdf.clone(), window, cx);
             });
@@ -1275,12 +1275,12 @@ fn pdf_view_right_drag_annotate_rotated_and_cropbox(cx: &mut gpui::TestAppContex
         );
 
         // ④ 关标签重开（保存重开）：磁盘字节新会话渲染成功。
-        window.update(cx, |_host, window, cx| {
+        let _ = window.update(cx, |_host, window, cx| {
             shell.update(cx, |shell, cx| {
                 shell.close_tab_no_confirm(0, window, cx);
             });
         });
-        window.update(cx, |_host, window, cx| {
+        let _ = window.update(cx, |_host, window, cx| {
             shell.update(cx, |shell, cx| {
                 shell.open_document(pdf.clone(), window, cx);
             });
@@ -1295,7 +1295,7 @@ fn pdf_view_right_drag_annotate_rotated_and_cropbox(cx: &mut gpui::TestAppContex
 
         // 清场：本档窗口/实体随循环丢弃（下一档新窗口）。
         drop(visual);
-        window.update(cx, |_, window, _| window.remove_window());
+        let _ = window.update(cx, |_, window, _| window.remove_window());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -1320,7 +1320,7 @@ fn md_wiring_window(
         WiringHost(shell)
     });
     let shell = slot.expect("宿主构造即置");
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_document(md.clone(), window, cx);
         });
@@ -1506,7 +1506,7 @@ fn open_workspace_click_tree_opens_tab(cx: &mut gpui::TestAppContext) {
     std::fs::write(&md, "W0\n").unwrap();
 
     let (shell, window) = md_wiring_window_root(cx);
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_workspace(dir.clone(), cx);
         });
@@ -1515,7 +1515,7 @@ fn open_workspace_click_tree_opens_tab(cx: &mut gpui::TestAppContext) {
 
     // ① 工作区就位：文件树（根 = 工作区目录）+ git 面板（非 git
     //    目录同样就位——#183 提示态不崩溃不拦截）。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             let tree = shell.workspace.as_ref().expect("文件树实体在场");
             assert_eq!(tree.read(cx).root(), dir.as_path(), "树根 = 工作区目录");
@@ -1547,7 +1547,7 @@ fn open_workspace_click_tree_opens_tab(cx: &mut gpui::TestAppContext) {
     let hit_y = opened.unwrap_or_else(|| panic!("扫描未命中文件行（y 170→50 未开标签）"));
 
     // ③ 标签 = 工作区文件（路径 + 内容），激活即聚焦。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         shell.update(cx, |shell, cx| {
             assert_eq!(shell.tab_count(), 1, "点击文件行开一标签");
             let path = shell.tab_path(0).unwrap();

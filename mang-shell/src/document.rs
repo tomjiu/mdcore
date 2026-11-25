@@ -560,7 +560,7 @@ mod tests {
         // ② 真实用户链折全部：run_command(FoldAll) → persist_folds 落盘。
         let a_for_host = a.clone();
         let window = cx.add_window(move |_, _| Host(a_for_host.clone()));
-        window.update(cx, |_host, window, cx| {
+        let _ = window.update(cx, |_host, window, cx| {
             a.update(cx, |ed, cx| {
                 ed.run_command(crate::editor::commands::Cmd::FoldAll, window, cx)
             });

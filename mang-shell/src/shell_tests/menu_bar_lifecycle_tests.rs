@@ -32,7 +32,7 @@ fn shell_window(cx: &mut gpui::TestAppContext) -> (Entity<ShellApp>, gpui::Windo
 #[gpui::test]
 fn menu_bar_open_switch_close_lifecycle(cx: &mut gpui::TestAppContext) {
     let (shell, window) = shell_window(cx);
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         shell.update(cx, |shell, cx| {
             // 初始全关。
             assert_eq!(shell.menu_bar_open, None);
@@ -93,7 +93,7 @@ fn menu_bar_cancel_action_dismisses(cx: &mut gpui::TestAppContext) {
         .expect("宿主窗口更新");
     // 组件公有的 cancel 处理器（on_action 同一入口——键盘 Esc 经
     // KeyBinding 到达的就是它，批 4 的 bind_keys 注册面）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         menu.update(cx, |menu, cx| {
             menu.cancel(&menu_crate::Cancel, window, cx);
         });

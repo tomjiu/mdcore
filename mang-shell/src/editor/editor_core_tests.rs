@@ -829,13 +829,13 @@ fn runtime_every_cmd_in_all_executes(cx: &mut gpui::TestAppContext) {
     // 不受干扰（exec 直达，不走键路由）；折叠类先 fold 后 unfold
     // 自愈；Save 无前置（未脏时写当前内容亦安全）。
     for &cmd in Cmd::ALL {
-        window.update(cx, |_host, window, cx| {
+        let _ = window.update(cx, |_host, window, cx| {
             ed.update(cx, |ed, cx| ed.run_command(cmd, window, cx));
         });
     }
 
     // 收尾存活（缓冲仍可读 = 未 panic 未崩溃）+ 清理。
-    window.update(cx, |_host, _window, cx| {
+    let _ = window.update(cx, |_host, _window, cx| {
         ed.update(cx, |ed, _| {
             assert!(ed.buffer.cursor().line < ed.buffer.line_count());
         });
@@ -848,7 +848,7 @@ fn runtime_every_cmd_in_all_executes(cx: &mut gpui::TestAppContext) {
 fn runtime_navigation_and_selection_change_state(cx: &mut gpui::TestAppContext) {
     let (ed, window) = editor_window(cx, None);
 
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.run_command(Cmd::DocStart, window, cx);
             assert_eq!(
@@ -897,7 +897,7 @@ fn runtime_fold_panels_undo_save_change_state(cx: &mut gpui::TestAppContext) {
 
     // ① 折叠：FoldAll 收起两个同级一级标题块 → heads=2；UnfoldAll → 0
     //    （二级小节嵌套在一级块内，不另立 head——heading_span 语义）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.run_command(Cmd::FoldAll, window, cx);
             assert_eq!(
@@ -911,7 +911,7 @@ fn runtime_fold_panels_undo_save_change_state(cx: &mut gpui::TestAppContext) {
     });
 
     // ② 面板：OpenFind / OpenReplace / GotoLine 打开对应态。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             ed.run_command(Cmd::OpenFind, window, cx);
             assert!(ed.find.is_some(), "OpenFind 应打开查找条");
@@ -924,7 +924,7 @@ fn runtime_fold_panels_undo_save_change_state(cx: &mut gpui::TestAppContext) {
 
     // ③ 撤销/重做：真实编辑 → Undo 复原 → Redo 重做。
     // ④ 保存：脏内容落盘（文件 == 当前文本）。
-    window.update(cx, |_host, window, cx| {
+    let _ = window.update(cx, |_host, window, cx| {
         ed.update(cx, |ed, cx| {
             let before = ed.buffer.to_plain_text();
             ed.insert_text_at(0, 0, "X", cx);
