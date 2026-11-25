@@ -168,8 +168,8 @@ fn save_options_whitelist_take_ownership() {
         return;
     }
     let dir = tmp_dir("saveopts");
-    let mut s = DocSession::open(None, &dir.join("s"), &file_url(&work_fixture(&dir)), None)
-        .expect("open");
+    let mut s =
+        DocSession::open(None, &dir.join("s"), &file_url(&work_fixture(&dir)), None).expect("open");
     s.type_text("白名单").expect("编辑置脏");
     assert!(s.is_dirty(), "编辑后必脏");
 

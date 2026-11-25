@@ -85,7 +85,7 @@ pub struct MenuContext {
     /// 当前编辑器字号（px——字号子菜单的域界灰显，8-32）。
     pub font_size: f32,
     /// 当前主题模式（主题子菜单的勾选标记）。
-    pub theme_mode: &'static str,
+    pub theme_mode: String,
     /// 左栏开合（侧栏子菜单勾选标记）。
     pub left_open: bool,
     /// 左栏当前是 git 视图（侧栏子菜单勾选标记）。
@@ -184,6 +184,8 @@ pub enum MenuAction {
     /// #109 批②③：切换项目搜索面板（shell `toggle_search`——图标条
     /// 搜索钮/Ctrl+Shift+F 同链）。
     ToggleSearchPanel,
+    /// #108 P2③：转到符号（Ctrl+Shift+O）。
+    GotoSymbol,
     /// 占位（无既有命令可映射——置灰项不绑动作，派发面只留证据行）。
     None,
 }
@@ -415,13 +417,13 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                     vec![
                         MenuEntry::item("view-theme-system", "跟随系统")
                             .act(MenuAction::SetTheme(THEME_SYSTEM))
-                            .checked(ctx.theme_mode == THEME_SYSTEM),
+                            .checked(ctx.theme_mode.as_str() == THEME_SYSTEM),
                         MenuEntry::item("view-theme-light", "浅色")
                             .act(MenuAction::SetTheme(THEME_LIGHT))
-                            .checked(ctx.theme_mode == THEME_LIGHT),
+                            .checked(ctx.theme_mode.as_str() == THEME_LIGHT),
                         MenuEntry::item("view-theme-dark", "深色")
                             .act(MenuAction::SetTheme(THEME_DARK))
-                            .checked(ctx.theme_mode == THEME_DARK),
+                            .checked(ctx.theme_mode.as_str() == THEME_DARK),
                     ],
                 ),
                 MenuEntry::submenu(
@@ -460,6 +462,11 @@ pub fn build_menus(ctx: &MenuContext) -> Vec<TopMenu> {
                             .shortcut_for("project_search")
                             .act(MenuAction::ToggleSearchPanel)
                             .checked(ctx.left_open && ctx.search_view),
+                        // #108 P2③：转到符号（右栏大纲承接——过滤框
+                        // 聚焦 + Enter 跳行即符号对话框全链）。
+                        MenuEntry::item("view-goto-symbol", "转到符号")
+                            .shortcut_for("goto_symbol")
+                            .act(MenuAction::GotoSymbol),
                     ],
                 ),
                 MenuEntry::Separator,
@@ -531,7 +538,7 @@ mod tests {
             read_only: false,
             has_selection: true,
             font_size: 15.,
-            theme_mode: THEME_LIGHT,
+            theme_mode: THEME_LIGHT.to_string(),
             left_open: true,
             git_view: false,
             search_view: false,
@@ -554,7 +561,7 @@ mod tests {
             read_only: false,
             has_selection: false,
             font_size: 15.,
-            theme_mode: THEME_SYSTEM,
+            theme_mode: THEME_SYSTEM.to_string(),
             left_open: true,
             git_view: false,
             search_view: false,
@@ -939,7 +946,7 @@ mod tests {
     fn theme_submenu_checks_exactly_one() {
         for mode in [THEME_SYSTEM, THEME_LIGHT, THEME_DARK] {
             let mut ctx = full_ctx();
-            ctx.theme_mode = mode;
+            ctx.theme_mode = mode.to_string();
             let menus = build_menus(&ctx);
             let ids = ["view-theme-system", "view-theme-light", "view-theme-dark"];
             let checked: Vec<bool> = ids

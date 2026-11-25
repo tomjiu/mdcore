@@ -51,6 +51,8 @@ pub mod buffer;
 // #132 任务 2：Buffer 的正则查找面（分离 impl——不碰 buffer.rs 主体）。
 mod buffer_find;
 pub mod commands;
+// #111 G3：词补全——纯函数核心（候选源 + 前缀提取 + 过滤）。
+pub mod completion;
 pub mod display_map; // r42 阶段 B（#68）：buffer <-> 显示行列映射（软换行 + 折叠）
 pub mod docx_doc;
 pub mod docx_edit_bridge; // #115：docx 可编辑化——Buffer ↔ DocxEditor 可逆映射
@@ -68,11 +70,31 @@ use form_input::{FormField, FormInput};
 mod form_input_tests;
 #[cfg(test)]
 mod form_review_tests;
+
+// #47 巨石拆解批②：原内嵌测试 mod 纯迁出（零行为变化）——挂载区。
+#[cfg(test)]
+#[path = "completion_interaction_tests.rs"]
+mod completion_interaction_tests;
+#[cfg(test)]
+#[path = "encoding_writeback_tests.rs"]
+mod encoding_writeback_tests;
 pub mod highlight;
+#[cfg(test)]
+#[path = "ime_composition_tests.rs"]
+mod ime_composition_tests;
 pub mod md_bridge; // #163：mdcore 换芯桥（Buffer ↔ Core：真源/投影/行映射）
 pub mod mouse;
 pub mod multi_cursor; // r42 阶段 C（#68）：多光标 + 列选择（编辑器层；Buffer 单光标契约不变）
+#[cfg(test)]
+#[path = "palette_goto_interaction_tests.rs"]
+mod palette_goto_interaction_tests;
 pub mod pdf_doc;
+#[cfg(test)]
+#[path = "save_outcome_tests.rs"]
+mod save_outcome_tests;
+#[cfg(test)]
+#[path = "editor_core_tests.rs"]
+mod tests;
 pub mod xlsx_doc; // G6（#68）：xlsx 只读渲染——office-io 读面 → 行模型
 
 use std::cell::RefCell;
@@ -108,7 +130,7 @@ use crate::keymap::{self, EditorAction, KeyQuery};
 use mouse::ClickKind;
 use theme::ThemeColors;
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize, Popover, Tooltip};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, ListItem, Popover, Tooltip};
 
 use buffer::{Buffer, FenceDirty, IndentUnit, Point};
 use docx_doc::{DocxPayload, DocxProps, EditablePayload, HeadingEntry};
@@ -158,6 +180,23 @@ struct PaletteState {
     /// 分组内最近用过靠前——与渲染的段列表同一数据源，键盘 selected
     /// 与可见行一一对应；不再用裸搜索序，否则选中项与所见行错位）。
     items: Vec<Cmd>,
+}
+
+/// #111 G3：词补全弹窗状态（`None` = 关闭）。
+///
+/// 与命令面板/跳行框同族的面板态，但**无输入框**——「查询」就是
+/// 光标前的词前缀（随打字实时变化，`after_edit` 后重算）；选中项
+/// 与可见行一一对应（`selected` 直接索引 `items`）。
+#[derive(Clone, Debug)]
+struct CompletionState {
+    /// 当前过滤后的候选（≤ [`completion::MAX_ITEMS`]）。
+    items: Vec<String>,
+    /// 键盘选中行（0 基——↑↓ 移动，Enter/Tab 接受）。
+    selected: usize,
+    /// 触发时的词前缀（接受时替换 `prefix_start..cursor` 这段）。
+    prefix: String,
+    /// 前缀锚点（行内 char 列——接受替换的起点）。
+    prefix_start: Point,
 }
 
 /// G2：跳转到行输入框状态（Ctrl+G——复用面板输入交互形态：
@@ -455,6 +494,11 @@ pub(crate) enum CaseMode {
 pub struct Editor {
     buffer: Buffer,
     file_path: Option<PathBuf>,
+    /// #111 G1 写回半：源文件编码（打开时探测，随文档携带到保存链——
+    /// `save`/`save_as` 按原编码写回；重载时重探测）。`None` = 未探测
+    /// （新文档 / F7 只读对照视图 / 容器格式）——保存按 UTF-8 直通
+    ///（与探测口径对称：纯 ASCII 的 GBK 写回字节同 UTF-8，零差异）。
+    file_encoding: Option<crate::status_info::Encoding>,
     display_name: SharedString,
     /// 编辑区焦点（键盘命令域）。
     focus: FocusHandle,
@@ -518,6 +562,22 @@ pub struct Editor {
     palette_recent: RecentRing,
     /// G2：跳转到行输入框（`None` = 关闭；Ctrl+G 开）。
     goto: Option<GotoState>,
+    /// #111 G3：词补全弹窗（`None` = 关闭；词前缀 ≥ 阈值时自动开）。
+    completion: Option<CompletionState>,
+    /// #111 G3：接受补全后的一次性抑制（接受本身是编辑事务 →
+    /// `after_edit` 会重评估触发；不抑制则「接受 structure 后候选
+    /// structural 又弹出」——接受后的这次刷新不重开，下次编辑恢复）。
+    completion_hold: bool,
+    /// #111 G3：上次触发评估时的 Buffer revision（**编辑事务门**：
+    /// `dispatch_key_inner` 尾部对每个匹配键统一 `after_edit`——移动
+    /// 键也走，纯导航的重复刷新若无此门会用旧前缀重开弹窗；
+    /// revision 未变 = 无编辑事务 → 现态即终态，不评估开窗）。
+    completion_rev: Option<u64>,
+    /// #111 G3：文档词表缓存（键 = Buffer revision——`after_edit`
+    /// 每次触发时全表重提取是 O(全文)，标书体量下按 revision 守卫
+    /// 只在变更事务后首触发重算，纯光标移动零物化；char_count_cache
+    /// 同款模式）。
+    completion_words_cache: RefCell<Option<(u64, Vec<String>)>>,
     /// IME 预编辑段（全文 UTF16 偏移区间）。
     marked: Option<Range<usize>>,
     /// 本帧可见行 bounds（行内 canvas prepaint 记录——鼠标 hit-test 行
@@ -658,6 +718,7 @@ impl Editor {
         };
         let mut this = Self {
             buffer,
+            file_encoding: None,
             file_path: path,
             display_name: SharedString::from(display_name),
             font_size: DEFAULT_FONT_SIZE,
@@ -693,6 +754,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -727,6 +792,7 @@ impl Editor {
         let line_count = buffer.line_count();
         let mut this = Self {
             buffer,
+            file_encoding: None,
             file_path: Some(path),
             display_name: SharedString::from(display_name),
             font_size: DEFAULT_FONT_SIZE,
@@ -764,6 +830,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -814,6 +884,7 @@ impl Editor {
         let bracket_lang = None;
         let mut this = Self {
             buffer,
+            file_encoding: None,
             file_path: Some(path),
             display_name: SharedString::from(display_name),
             font_size: DEFAULT_FONT_SIZE,
@@ -849,6 +920,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -887,6 +962,7 @@ impl Editor {
         let line_count = buffer.line_count();
         let mut this = Self {
             buffer,
+            file_encoding: None,
             file_path: Some(path),
             display_name: SharedString::from(display_name),
             font_size: DEFAULT_FONT_SIZE,
@@ -923,6 +999,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -958,6 +1038,7 @@ impl Editor {
         let line_count = buffer.line_count();
         let mut this = Self {
             buffer,
+            file_encoding: None,
             file_path: Some(path),
             display_name: SharedString::from(display_name),
             font_size: DEFAULT_FONT_SIZE,
@@ -971,6 +1052,10 @@ impl Editor {
             find: None,
             find_saved: FindState::default(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             indent_unit: IndentUnit::from_setting(
                 crate::settings::load_indent_unit()
                     .as_deref()
@@ -1029,6 +1114,7 @@ impl Editor {
         let line_count = buffer.line_count();
         let mut this = Self {
             buffer,
+            file_encoding: None,
             file_path: Some(path),
             display_name: SharedString::from(display_name),
             font_size: DEFAULT_FONT_SIZE,
@@ -1066,6 +1152,10 @@ impl Editor {
             palette: None,
             palette_recent: Self::restore_palette_recent(),
             goto: None,
+            completion: None,
+            completion_hold: false,
+            completion_rev: None,
+            completion_words_cache: RefCell::new(None),
             marked: None,
             row_bounds: Rc::new(RefCell::new(Vec::new())),
             drag: None,
@@ -1177,6 +1267,18 @@ impl Editor {
     /// 文档路径（F3 标签身份——`None` = 未命名草稿）。
     pub fn file_path(&self) -> Option<&Path> {
         self.file_path.as_deref()
+    }
+
+    /// #111 G1 写回半：源编码随文档携带（打开链在构造后设置——
+    /// `save`/`save_as` 按原编码写回；`reload_from_disk` 重探测更新）。
+    pub fn set_file_encoding(&mut self, encoding: crate::status_info::Encoding) {
+        self.file_encoding = Some(encoding);
+    }
+
+    /// #111 G1 写回半：当前源编码（`None` = 未探测——新文档/只读对照
+    /// 视图/容器格式）。
+    pub fn file_encoding(&self) -> Option<crate::status_info::Encoding> {
+        self.file_encoding
     }
 
     /// 光标位置标签（状态栏「行, 列」——1 基显示）。
@@ -1978,6 +2080,9 @@ impl Editor {
     /// G2：面板/命令面入口（Cmd::GotoLine——同 Ctrl+G 开框）。
     fn open_goto(&mut self, cx: &mut Context<Self>) {
         let count = self.buffer.line_count();
+        // #111 G3：跳行框接管键域——补全弹窗先关（双浮层并存 = 键域
+        // 与视觉双打架）。
+        self.completion = None;
         self.goto = Some(GotoState {
             input: FormInput::default(),
             hint: goto_hint("", count),
@@ -2331,7 +2436,20 @@ impl Editor {
                     return SaveOutcome::Unmodified;
                 }
                 let content = self.buffer.to_plain_text();
-                match std::fs::write(path, content) {
+                // #111 G1 写回半：按源编码写回（None = UTF-8 直通，与
+                // 探测口径对称）。GBK 不可映射 → Failed（拒绝静默替换
+                // 造乱码），盘上零改动，缓冲区内容不丢。
+                let bytes = match self.encode_for_save(&content) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        eprintln!(
+                            "mang-shell: 保存拒绝（编码写回：{err}）：{}",
+                            path.display()
+                        );
+                        return SaveOutcome::Failed;
+                    }
+                };
+                match std::fs::write(path, bytes) {
                     Ok(()) => {
                         self.buffer.mark_saved();
                         eprintln!("saved: {}", path.display());
@@ -2347,6 +2465,16 @@ impl Editor {
             // 归入 Failed 交调用方引导「另存为」）。
             None => SaveOutcome::Failed,
         }
+    }
+
+    /// #111 G1 写回半：文本保存字节面——源编码写回，`None` 回落
+    /// UTF-8 直通（新文档/未探测态，与旧行为完全一致）。
+    fn encode_for_save(&self, content: &str) -> Result<Vec<u8>, crate::status_info::EncodeError> {
+        crate::status_info::encode_text(
+            content,
+            self.file_encoding
+                .unwrap_or(crate::status_info::Encoding::Utf8),
+        )
     }
 
     /// #115：docx 保存——「Buffer → 回写计划 → 引擎待落账 → 完整 docx
@@ -2576,7 +2704,20 @@ impl Editor {
             return SaveOutcome::Saved;
         }
         let content = self.buffer.to_plain_text();
-        match std::fs::write(&path, content) {
+        // #111 G1 写回半：另存为沿用源编码（同一份内容的字节形态不变；
+        // 新文档/未探测态 = UTF-8 直通）。GBK 不可映射 → Failed 同
+        // `save` 口径。
+        let bytes = match self.encode_for_save(&content) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!(
+                    "mang-shell: 另存拒绝（编码写回：{err}）：{}",
+                    path.display()
+                );
+                return SaveOutcome::Failed;
+            }
+        };
+        match std::fs::write(&path, bytes) {
             Ok(()) => {
                 self.display_name = SharedString::from(
                     path.file_name()
@@ -2622,10 +2763,16 @@ impl Editor {
                 return false;
             }
         };
-        let Ok(text) = String::from_utf8(bytes) else {
-            eprintln!("mang-shell: 重载拒绝（非 UTF-8）：{}", path.display());
+        // #111 G1 写回半：重载走探测解码同一口径（GBK/UTF-16/BOM 外改
+        // 盘可追上），探测编码同步更新——重载后的保存仍按盘上编码写回。
+        let Some((text, encoding)) = crate::status_info::decode_text(&bytes) else {
+            eprintln!(
+                "mang-shell: 重载拒绝（无法判定文本编码）：{}",
+                path.display()
+            );
             return false;
         };
+        self.file_encoding = Some(encoding);
         let last = self.buffer.line_count().saturating_sub(1);
         let end = Point::new(last, self.buffer.line_len(last));
         self.buffer.replace_range(Point::new(0, 0), end, &text);
@@ -2673,6 +2820,9 @@ impl Editor {
     /// 扁平序，与渲染同源）。
     pub fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = if self.palette.is_none() {
+            // #111 G3：面板接管键域——补全弹窗先关（双浮层并存 = 键域
+            // 与视觉双打架）。
+            self.completion = None;
             Some(PaletteState {
                 query: FormInput::default(),
                 selected: 0,
@@ -2948,6 +3098,9 @@ impl Editor {
         {
             if self.goto.is_none() {
                 let count = self.buffer.line_count();
+                // #111 G3：跳行框接管键域——补全弹窗先关（open_goto
+                // 同款；此分支持 window 走 focus_form，不经 open_goto）。
+                self.completion = None;
                 self.goto = Some(GotoState {
                     input: FormInput::default(),
                     hint: goto_hint("", count),
@@ -2972,6 +3125,51 @@ impl Editor {
             *perf_rejected = true; // #164：拒绝路径独立证据行（key-rejected）
             cx.notify();
             return;
+        }
+
+        // #111 G3：词补全弹窗键拦截（只读门之后、主表之前——弹窗只在
+        // 可编辑态存续；只读态残留态直接关门不吞，键照常走）。
+        if self.completion.is_some() {
+            if self.read_only {
+                self.completion = None; // 兜底（正常流不可达——refresh 守卫先关）
+            } else {
+                let plain = !ctrl && !ks.modifiers.alt;
+                match key.as_str() {
+                    // 导航（吞——↑↓ 归弹窗，不移动光标）。
+                    "up" | "down" if plain => {
+                        if let Some(c) = self.completion.as_mut() {
+                            if key == "up" {
+                                c.selected = c.selected.saturating_sub(1);
+                            } else if !c.items.is_empty() {
+                                c.selected = (c.selected + 1).min(c.items.len() - 1);
+                            }
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 接受（吞——Enter/Tab 不落正文换行/缩进）。
+                    "enter" | "tab" if plain => {
+                        self.accept_completion(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 关（吞——Esc 归弹窗，不落正文）。
+                    "escape" => {
+                        self.completion = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    // 光标移动键：关弹窗**不吞**（锚前缀已失效——照常
+                    // 移动；下次编辑重评估）。
+                    "left" | "right" | "home" | "end" | "pageup" | "pagedown" => {
+                        self.completion = None;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // #217：主层查表（原 `ctrl_k_pending` 预处理 + match 主体 →
@@ -3713,6 +3911,136 @@ impl Editor {
         {
             self.locked_notice = None;
         }
+        // #111 G3：补全触发重评估（单点接线——键入/退格/撤销/行移动/
+        // RPC 编辑事务统一经 after_edit 走此刷新；纯光标移动不经此，
+        // 弹窗由键拦截面的导航键关门）。
+        self.refresh_completion();
+    }
+
+    /// #111 G3：补全触发重评估（after_edit 尾部单点）。
+    ///
+    /// 开门条件（全过才开）：可编辑**纯文本态**（md/txt——docx/
+    /// docx_edit/pdf/xlsx/canvas 容器态无此面）+ 无选区（选区语义与
+    /// 「替换光标前前缀」冲突）+ 非 IME 预编辑中（候选弹窗与 IME
+    /// 组合窗打架）+ 光标前词前缀 ≥ [`completion::MIN_PREFIX_CHARS`]
+    /// + 候选非空。任一不过 → 关（`None`）。
+    ///
+    /// 前缀不变时保选中项（同前缀重算——词池变化场景不跳选中行）；
+    /// 前缀变化（打字细化/换位）复位 0。接受补全后的首次刷新被
+    /// `completion_hold` 吞掉（见字段文档）。
+    fn refresh_completion(&mut self) {
+        // ── 关门守卫面（始终生效——含纯导航路径的尾钩子刷新）──
+        if self.read_only
+            || self.marked.is_some()
+            || self.buffer.selection().is_some()
+            || self.docx.is_some()
+            || self.docx_edit.is_some()
+            || self.pdf.is_some()
+            || self.xlsx.is_some()
+            || self.canvas.is_some()
+        {
+            self.completion = None;
+            return;
+        }
+        // ── 接受补全后的一次性抑制（记录 revision——接受也计入
+        //「已评估」，后续纯导航不重开）──
+        if self.completion_hold {
+            self.completion_hold = false;
+            self.completion = None;
+            self.completion_rev = Some(self.buffer.revision());
+            return;
+        }
+        // ── 编辑事务门：revision 未变 = 无编辑（纯导航尾钩子/重复
+        // after_edit）→ 现态即终态（已关不重开，已开保持）──
+        let rev = self.buffer.revision();
+        if self.completion_rev == Some(rev) {
+            return;
+        }
+        let cursor = self.buffer.cursor();
+        let line = self.buffer.line(cursor.line);
+        let prefix = completion::word_prefix(&line, cursor.col);
+        if prefix.chars().count() < completion::MIN_PREFIX_CHARS {
+            self.completion = None;
+            self.completion_rev = Some(rev);
+            return;
+        }
+        // 候选池 = 文档词表（revision 守卫缓存）+ 关键词池（文档词
+        // 未含的补后——文档词优先，关键词不抢占首现序）。
+        let cache = self.completion_words_cache.borrow_mut().take();
+        let pool = match cache {
+            Some((cached_rev, pool)) if cached_rev == rev => pool,
+            _ => {
+                let mut pool = completion::extract_words(&self.buffer.to_plain_text());
+                for kw in completion::keyword_pool() {
+                    if !pool.contains(&kw) {
+                        pool.push(kw);
+                    }
+                }
+                pool
+            }
+        };
+        let items = completion::candidates(&pool, &prefix, completion::MAX_ITEMS);
+        self.completion_words_cache
+            .borrow_mut()
+            .replace((rev, pool));
+        self.completion_rev = Some(rev);
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        // 前缀锚点 = 光标列回退前缀字符数（word_prefix 同口径行内
+        // char 列——Point::col 语义一致）。
+        let prefix_start = Point::new(cursor.line, cursor.col - prefix.chars().count());
+        // 同前缀：保选中项（若仍在候选内）；新前缀：复位 0。
+        let kept = self
+            .completion
+            .as_ref()
+            .filter(|c| c.prefix == prefix)
+            .and_then(|c| {
+                c.items
+                    .get(c.selected)
+                    .and_then(|w| items.iter().position(|i| i == w))
+            });
+        let selected = kept.unwrap_or(0);
+        self.completion = Some(CompletionState {
+            items,
+            selected,
+            prefix,
+            prefix_start,
+        });
+    }
+
+    /// #111 G3：接受当前选中候选（Enter/Tab）。
+    ///
+    /// 前缀段 `prefix_start..cursor` 整体替换为完整词——**用户编辑
+    /// 同链**（`replace_range` 一次事务 + `after_edit` 收尾 → undo
+    /// 一键复原）；接受后一次性抑制重开（`completion_hold`）。
+    /// 锚点防御：替换前校验锚段文本 == 触发前缀（光标被外部移动 /
+    /// 文本漂移时弃权 `false`——不造错替）。
+    fn accept_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(state) = self.completion.clone() else {
+            return false;
+        };
+        let Some(word) = state.items.get(state.selected).cloned() else {
+            return false;
+        };
+        let end = self.buffer.cursor();
+        // 锚点防御：锚段必须是触发时的前缀（漂移/外改 → 弃权关窗）。
+        if self.buffer.range_text(&(state.prefix_start..end)) != state.prefix {
+            self.completion = None;
+            cx.notify();
+            return false;
+        }
+        self.buffer.replace_range(state.prefix_start, end, &word);
+        self.sync_cursors_from_buffer();
+        self.completion = None;
+        self.completion_hold = true;
+        self.after_edit(); // 收尾链（缓存/滚动/事件——refresh 被 hold 吞）
+        cx.notify();
+        true
     }
 
     /// #111 订阅模式：收割 Buffer 待发变更并发布事件（一次收尾一条；
@@ -4077,6 +4405,14 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.focus_document_input(window, cx);
+        // #111 G3：鼠标单击移动光标——补全弹窗锚定前缀失效，关
+        //（键面同款：left/right/home/end 关不重开）。
+        self.completion = None;
+        // #47 A4 残面：外点击关面板——编辑区点击后焦点已在文档，
+        // 键入却被 palette 键域拦截（「面板开着但键盘不知去哪」
+        // 歧义态）。与补全弹窗同款关闭语义（VS Code/IntelliJ
+        // 对照：外点击 = 关浮层）。
+        self.palette = None;
         let hit = self.hit_test(event.position, window);
         let kind = mouse::click_kind(event.click_count);
         // r42 阶段 C：Alt+拖 = 列选择（仅单击粒度启动；双/三击 Alt 忽略）
@@ -4631,6 +4967,22 @@ impl Editor {
                         .flex_col()
                         .gap_2()
                         .text_size(px(13.))
+                        // #47 A4（agent-xt11 2026-11-23 首批）：浮层点击面
+                        // 阻断——面板内非输入区（列表/提示行）的左/右键点击
+                        // 不得穿透到文档面。此前：事件冒泡到 editor-surface
+                        // → dispatch_mouse_down / dispatch_context_menu
+                        // 无条件 focus_document_input + hit_test 移光标——
+                        // 点击浮层列表反而夺焦点、移动浮层底下正文光标。
+                        // 输入框自身的选中/焦点逻辑在更内层先跑（冒泡序），
+                        // 不受本层阻断影响。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
                         .child(
                             Popover::new().child(
                                 div()
@@ -4691,6 +5043,16 @@ impl Editor {
                         .flex_col()
                         .gap_2()
                         .text_size(px(13.))
+                        // #47 A4：同面板浮层——goto 盒内点击阻断穿透
+                        //（标题行/提示行此前同样漏到文档面）。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
                         .child(
                             Popover::new().child(
                                 div()
@@ -4741,6 +5103,55 @@ impl Editor {
                                             .text_size(px(11.))
                                             .text_color(colors.text_muted)
                                             .child("Enter 跳转 · Esc 关闭"),
+                                    ),
+                            ),
+                        ),
+                )
+            })
+            // #111 G3：词补全弹窗（词前缀 ≥ 阈值自动开；底部固定锚位
+            // ——光标像素定位随 IME 候选框精化一并登记，见
+            // bounds_for_range 的批 1 备忘）。浮层视觉壳与 palette/
+            // goto 同法（ui::Popover——elevation_2 主题化浮层语系）。
+            .when_some(self.completion.clone(), |el, comp| {
+                let colors = cx.theme().colors().clone();
+                el.child(
+                    div()
+                        .id("completion-popup")
+                        .absolute()
+                        .bottom(px(8.))
+                        .left(px(80.))
+                        .w(px(320.))
+                        .child(
+                            Popover::new().child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .text_size(px(13.))
+                                    .child(
+                                        div()
+                                            .id("completion-title")
+                                            .text_size(px(11.))
+                                            .text_color(colors.text_muted)
+                                            .child(format!(
+                                                "补全 · {}（前缀 {}）",
+                                                comp.items.len(),
+                                                comp.prefix
+                                            )),
+                                    )
+                                    .children(comp.items.iter().enumerate().map(|(i, w)| {
+                                        ListItem::new(SharedString::from(format!(
+                                            "completion-row-{i}"
+                                        )))
+                                        .inset(true)
+                                        .toggle_state(i == comp.selected)
+                                        .child(div().text_color(colors.text).child(w.clone()))
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(colors.text_muted)
+                                            .child("↑↓ 选择 · Enter/Tab 补全 · Esc 关闭"),
                                     ),
                             ),
                         ),
@@ -5030,45 +5441,46 @@ impl Editor {
         // 首帧无采样 → 跳过（首帧无断点，第二帧起生效）；断点回填后
         // 行数增长在下一帧 uniform_list 生效（一帧收敛，Zed 同款异步）。
         if self.soft_wrap {
-        if let Some(full_w) = *self.last_text_width.borrow() {
-            let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
-            if target > px(50.) {
-                let row_end = visible
-                    .end
-                    .min(self.display_map.display_row_count(&self.buffer));
-                for row in visible.start..row_end {
-                    let Some((line, seg)) = self.display_map.row_source(&self.buffer, row) else {
-                        continue;
-                    };
-                    if seg == display_map::FOLD_SEG || self.display_map.has_wrap_points(line) {
-                        continue;
+            if let Some(full_w) = *self.last_text_width.borrow() {
+                let target = full_w - GUTTER_WIDTH - TEXT_PADDING;
+                if target > px(50.) {
+                    let row_end = visible
+                        .end
+                        .min(self.display_map.display_row_count(&self.buffer));
+                    for row in visible.start..row_end {
+                        let Some((line, seg)) = self.display_map.row_source(&self.buffer, row)
+                        else {
+                            continue;
+                        };
+                        if seg == display_map::FOLD_SEG || self.display_map.has_wrap_points(line) {
+                            continue;
+                        }
+                        let text = self.buffer.line(line);
+                        let n = text.chars().count();
+                        if n == 0 {
+                            self.display_map.set_wrap_points(&self.buffer, line, vec![]);
+                            continue;
+                        }
+                        let run = text_style.to_run(text.len());
+                        let font_size = text_style.font_size.to_pixels(window.rem_size());
+                        let shaped = window.text_system().shape_line(
+                            text.as_str().into(),
+                            font_size,
+                            &[run],
+                            None,
+                        );
+                        let advances: Vec<f32> = (1..=n)
+                            .map(|i| {
+                                let b = buffer::char_to_byte_pub(&text, i);
+                                f32::from(shaped.x_for_index(b))
+                            })
+                            .collect();
+                        let pts =
+                            display_map::wrap_points_from_advances(&advances, n, f32::from(target));
+                        self.display_map.set_wrap_points(&self.buffer, line, pts);
                     }
-                    let text = self.buffer.line(line);
-                    let n = text.chars().count();
-                    if n == 0 {
-                        self.display_map.set_wrap_points(&self.buffer, line, vec![]);
-                        continue;
-                    }
-                    let run = text_style.to_run(text.len());
-                    let font_size = text_style.font_size.to_pixels(window.rem_size());
-                    let shaped = window.text_system().shape_line(
-                        text.as_str().into(),
-                        font_size,
-                        &[run],
-                        None,
-                    );
-                    let advances: Vec<f32> = (1..=n)
-                        .map(|i| {
-                            let b = buffer::char_to_byte_pub(&text, i);
-                            f32::from(shaped.x_for_index(b))
-                        })
-                        .collect();
-                    let pts =
-                        display_map::wrap_points_from_advances(&advances, n, f32::from(target));
-                    self.display_map.set_wrap_points(&self.buffer, line, pts);
                 }
             }
-        }
         }
 
         // r42 阶段 C：光标集 display 化（多光标各头；caret 每处一竖线）
@@ -5941,952 +6353,6 @@ impl EntityInputHandler for Editor {
 // 各自模块内钉定，此处只测视图层的换算）
 // =============================================================================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn p(line: usize, col: usize) -> Point {
-        Point::new(line, col)
-    }
-
-    // ---------------- G2：跳转到行（纯函数面） ----------------
-
-    #[test]
-    fn goto_parse_valid_one_based() {
-        // 1 基输入 → 0 基目标行
-        assert_eq!(parse_goto_line("1", 100), Some(0));
-        assert_eq!(parse_goto_line("42", 100), Some(41));
-        assert_eq!(parse_goto_line(" 7 ", 100), Some(6), "容许前后空白");
-        assert_eq!(parse_goto_line("100", 100), Some(99), "末行恰好");
-    }
-
-    #[test]
-    fn goto_parse_out_of_range_clamps_not_crash() {
-        // 越界 clamp 到末行（不崩溃）；提示行由 hint 承载
-        assert_eq!(parse_goto_line("99999", 100), Some(99));
-        assert_eq!(parse_goto_line("1000000", 1), Some(0));
-    }
-
-    #[test]
-    fn goto_parse_invalid_inputs() {
-        assert_eq!(parse_goto_line("", 100), None, "空输入不跳");
-        assert_eq!(parse_goto_line("0", 100), None, "行号从 1 起");
-        assert_eq!(parse_goto_line("abc", 100), None, "非数字");
-        assert_eq!(parse_goto_line("12x", 100), None, "混合字符");
-        assert_eq!(parse_goto_line("-3", 100), None, "负号非法");
-        assert_eq!(parse_goto_line("1.5", 100), None, "小数点非法");
-    }
-
-    #[test]
-    fn goto_hint_three_states() {
-        let empty = goto_hint("", 100);
-        assert!(empty.contains("1-100"), "空输入给范围提示：{empty}");
-        let preview = goto_hint("42", 100);
-        assert_eq!(preview, "Enter 跳到第 42 行");
-        let over = goto_hint("999", 100);
-        assert_eq!(over, "越界 → 跳到末行（第 100 行）");
-        let bad = goto_hint("xyz", 100);
-        assert_eq!(bad, "非数字——请输入行号");
-        let zero = goto_hint("0", 100);
-        assert_eq!(zero, "行号从 1 起");
-    }
-
-    // ---------------- G3：缩进/反缩进（纯函数面） ----------------
-
-    #[test]
-    fn indent_line_edit_inserts_unit_at_line_start() {
-        let e = indent_line_edit(7, IndentUnit::Spaces2);
-        assert_eq!(e, (p(7, 0), p(7, 0), "  ".to_string()));
-        let e4 = indent_line_edit(0, IndentUnit::Spaces4);
-        assert_eq!(e4.2, "    ");
-        let et = indent_line_edit(3, IndentUnit::Tab);
-        assert_eq!(et.2, "\t");
-    }
-
-    #[test]
-    fn outdent_line_edit_partial_and_full_removal() {
-        let b = Buffer::from_plain_text("  two\n    four\nnone");
-        // 前导 2，单位 4 → 删 min(2,4)=2
-        assert_eq!(
-            outdent_line_edit(&b, 0, IndentUnit::Spaces4),
-            Some((p(0, 0), p(0, 2), String::new()))
-        );
-        // 前导 4，单位 4 → 删 4
-        assert_eq!(
-            outdent_line_edit(&b, 1, IndentUnit::Spaces4),
-            Some((p(1, 0), p(1, 4), String::new()))
-        );
-        // 无前导 → None（不产生空编辑）
-        assert_eq!(outdent_line_edit(&b, 2, IndentUnit::Spaces4), None);
-    }
-
-    #[test]
-    fn outdent_line_edit_prefers_leading_tab_char() {
-        let b = Buffer::from_plain_text("\tcode");
-        // Tab 单位：删 1 个 \t 字符
-        assert_eq!(
-            outdent_line_edit(&b, 0, IndentUnit::Tab),
-            Some((p(0, 0), p(0, 1), String::new()))
-        );
-        // Spaces2 单位：行首是 \t → 仍删 1 char（Tab 字符优先——单位
-        // 不改变 Tab 字符的删除粒度）
-        assert_eq!(
-            outdent_line_edit(&b, 0, IndentUnit::Spaces2),
-            Some((p(0, 0), p(0, 1), String::new()))
-        );
-    }
-
-    #[test]
-    fn outdent_line_edit_tab_unit_folds_spaces_by_width() {
-        let b = Buffer::from_plain_text("      six");
-        // 前导 6 空格，Tab 单位折算宽 4 → 删 4（留 2——渐进对齐语义）
-        assert_eq!(
-            outdent_line_edit(&b, 0, IndentUnit::Tab),
-            Some((p(0, 0), p(0, 4), String::new()))
-        );
-        // Spaces2 单位 → 删 2
-        assert_eq!(
-            outdent_line_edit(&b, 0, IndentUnit::Spaces2),
-            Some((p(0, 0), p(0, 2), String::new()))
-        );
-    }
-
-    #[test]
-    fn utf16_roundtrip_ascii() {
-        let b = Buffer::from_plain_text("hello\nworld");
-        assert_eq!(point_to_utf16_offset(&b, p(0, 0)), 0);
-        assert_eq!(point_to_utf16_offset(&b, p(0, 5)), 5);
-        assert_eq!(point_to_utf16_offset(&b, p(1, 0)), 6, "跨行 +1（换行符）");
-        assert_eq!(point_to_utf16_offset(&b, p(1, 5)), 11);
-        // 逆映射
-        assert_eq!(utf16_offset_to_point(&b, 0), p(0, 0));
-        assert_eq!(utf16_offset_to_point(&b, 6), p(1, 0));
-        assert_eq!(utf16_offset_to_point(&b, 11), p(1, 5));
-    }
-
-    #[test]
-    fn utf16_roundtrip_cjk() {
-        // 中文：每 char 3 字节 / 1 个 UTF16 码元；emoji "😀" 是 2 个码元。
-        let b = Buffer::from_plain_text("中文😀\nx");
-        // 行 0：中(1)文(1)😀(2) = 4 码元。
-        assert_eq!(
-            point_to_utf16_offset(&b, p(0, 3)),
-            4,
-            "3 个 char = 4 个 UTF16 码元"
-        );
-        assert_eq!(point_to_utf16_offset(&b, p(1, 0)), 5);
-        assert_eq!(point_to_utf16_offset(&b, p(1, 1)), 6);
-        // 逆：码元 3 落在 emoji 内 → clamp 到其后的 char 边界（col 3）。
-        assert_eq!(utf16_offset_to_point(&b, 3), p(0, 3));
-        assert_eq!(utf16_offset_to_point(&b, 5), p(1, 0));
-        assert_eq!(utf16_offset_to_point(&b, 6), p(1, 1));
-    }
-
-    #[test]
-    fn utf16_clamp_to_document_end() {
-        let b = Buffer::from_plain_text("ab");
-        // 越界偏移 clamp 到文尾。
-        assert_eq!(utf16_offset_to_point(&b, 999), p(0, 2));
-    }
-
-    /// 状态标签语义（构造 Editor 全字段有 App 依赖，标签逻辑钉定在
-    /// Buffer 纯逻辑层——此处验证组合格式）。
-    #[test]
-    fn label_format_semantics() {
-        let mut b = Buffer::from_plain_text("中文字");
-        let label = |b: &Buffer| {
-            let c = b.cursor();
-            format!("{}, {}", c.line + 1, c.col + 1)
-        };
-        assert_eq!(label(&b), "1, 1");
-        b.set_cursor(p(0, 2));
-        assert_eq!(label(&b), "1, 3");
-        assert_eq!(format!("{} 字符", b.char_count()), "3 字符");
-        assert!(!b.is_modified());
-        b.insert("新增");
-        assert!(b.is_modified());
-    }
-
-    // ---------------- #132-3：折叠 UI 入口（纯函数面） ----------------
-
-    #[test]
-    fn heading_level_parses_atx_forms() {
-        assert_eq!(heading_level_of("# 一级"), Some(1));
-        assert_eq!(heading_level_of("### 三级"), Some(3));
-        assert_eq!(heading_level_of("###### 六级"), Some(6));
-        assert_eq!(heading_level_of("#"), Some(1), "裸 # 也是标题");
-        assert_eq!(heading_level_of("####### 七级"), None, "7 个 # 不是标题");
-        assert_eq!(heading_level_of("#无空格"), None, "# 后须有空格");
-        assert_eq!(heading_level_of("正文 # 不是标题"), None, "行中 # 不算");
-        assert_eq!(heading_level_of(""), None);
-        assert_eq!(heading_level_of("  # 缩进"), None, "缩进 # 不认");
-    }
-
-    #[test]
-    fn heading_span_covers_subtree_until_same_level() {
-        let lines = ["# A", "正文", "正文2", "# B", "后文"];
-        assert_eq!(
-            heading_span_in(&lines, 0),
-            Some((0, 3)),
-            "到下一个同级标题前"
-        );
-        assert_eq!(heading_span_in(&lines, 3), Some((3, 5)), "末尾标题到文末");
-        assert_eq!(heading_span_in(&lines, 1), None, "正文不可折叠");
-    }
-
-    #[test]
-    fn heading_span_includes_deeper_subheadings() {
-        let lines = ["# A", "## B", "b-body", "### C", "c-body", "# D"];
-        assert_eq!(
-            heading_span_in(&lines, 0),
-            Some((0, 5)),
-            "一级标题吃掉所有下级小节"
-        );
-        assert_eq!(heading_span_in(&lines, 1), Some((1, 5)), "二级吃到 # D 前");
-        assert_eq!(heading_span_in(&lines, 3), Some((3, 5)), "三级同");
-    }
-
-    #[test]
-    fn heading_with_no_body_is_not_foldable() {
-        // 连续两个标题：前一个没有正文 → 区间 [0,1) 只有 1 行，不折。
-        let lines = ["# A", "# B", "body"];
-        assert_eq!(heading_span_in(&lines, 0), None, "无正文不折叠（无意义）");
-        assert_eq!(heading_span_in(&lines, 1), Some((1, 3)));
-    }
-
-    #[test]
-    fn top_level_spans_skip_nested_blocks() {
-        // A 小节含子标题 B：顶层只有 A，B 不单独出现（避免重叠区间）。
-        let lines = ["# A", "## B", "b-body", "# C", "c-body"];
-        let fenced = vec![false; lines.len()];
-        assert_eq!(
-            top_level_fold_spans(&lines, &fenced),
-            vec![(0, 3), (3, 5)],
-            "顶层两块（A 吃 B）"
-        );
-    }
-
-    #[test]
-    fn top_level_spans_handle_fenced_code() {
-        // fenced[i] = 行 i 行首在围栏内；开行/闭行行首 false。
-        // 行号：0=intro 1=开``` 2=code1 3=code2 4=闭``` 5=tail
-        // 区间 = [1, 4)：开行(1) 是折叠头行、闭行(4) 是**末可见行**，
-        // 被藏起来的是 2..3 两行代码。
-        let lines = ["intro", "```", "code1", "code2", "```", "tail"];
-        let fenced = vec![false, false, true, true, false, false];
-        assert_eq!(
-            top_level_fold_spans(&lines, &fenced),
-            vec![(1, 4)],
-            "围栏块 [开行, 闭行] —— 开行折叠头、闭行末可见行"
-        );
-    }
-
-    #[test]
-    fn top_level_spans_mix_headings_and_fences() {
-        // 0=# A 1=text 2=开``` 3=code 4=闭``` 5=# B 6=b
-        // A 小节 = [0, 5)（到 # B 前）；B 小节 = [5, 7)（到文末）。
-        // A 内的代码块不单独出现（顶层语义）。
-        let lines = ["# A", "text", "```", "code", "```", "# B", "b"];
-        let fenced = vec![false, false, false, true, false, false, false];
-        assert_eq!(
-            top_level_fold_spans(&lines, &fenced),
-            vec![(0, 5), (5, 7)],
-            "A 小节整体（代码块在其内）；B 小节其后"
-        );
-    }
-
-    #[test]
-    fn fold_persist_key_is_empty_for_unnamed() {
-        assert_eq!(fold_persist_key(None), "");
-        assert_eq!(
-            fold_persist_key(Some(std::path::Path::new("/w/notes.md"))),
-            "/w/notes.md"
-        );
-    }
-
-    // ---------------- #132-3：折叠 Editor 级行为面（#416 草稿抢救移植） ----------------
-    // 来源：根目录草稿 `_foldtests.txt`（#132/#134 折叠轮 rebase 散佚件，
-    // 见 #416 抢救判定）——原稿基于未落地的 `tests_support::make_editor`
-    // 设施，此处按仓内 gpui::TestAppContext 习惯重写装载面；断言与
-    // 语义照原稿。原稿第 10 条（docx 无折叠语义）需要真实 docx 编辑器
-    // 夹具，属 docx 编辑器测试面，不在本次移植范围（见 #416 PR 说明）。
-
-    /// 构造一个 md 编辑器，供折叠行为测试驱动（直接调方法面——不经
-    /// 命令分发，不触发 persist_folds 落盘）。
-    /// #111 P2：软换行开关行为（关 = 已有断点清空 + 后续回填段跳过；
-    /// 开 = 照常。显示行数随断点集回落真实行数）。
-    #[gpui::test]
-    fn soft_wrap_toggle_clears_and_restores_breaks(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "长行甲\n长行乙");
-        // 人工注入断点（模拟渲染回填后的 wraps 态——行 0/1 各一断点，
-        // 显示行 = 2 行 ×2 段 = 4）。
-        ed.update(cx, |e, _| {
-            e.display_map.set_wrap_points(&e.buffer, 0, vec![2]);
-            e.display_map.set_wrap_points(&e.buffer, 1, vec![2]);
-            assert_eq!(
-                e.display_map.display_row_count(&e.buffer),
-                4,
-                "两断点在：2 行 ×2 段"
-            );
-        });
-        // 关软换行：断点清空（显示行回落 2）+ 开关位 false。
-        ed.update(cx, |e, _| {
-            e.set_soft_wrap(false);
-            assert_eq!(e.soft_wrap_enabled(), false, "开关位已关");
-            assert_eq!(
-                e.display_map.display_row_count(&e.buffer),
-                2,
-                "断点清空：显示行回落真实行数"
-            );
-        });
-        // 再开：开关位 true（断点回填由渲染层下一帧照常——此处只验
-        // 开关语义与幂等）。
-        ed.update(cx, |e, _| {
-            e.set_soft_wrap(true);
-            assert_eq!(e.soft_wrap_enabled(), true, "再开");
-            e.set_soft_wrap(true); // 幂等不炸
-        });
-    }
-
-    /// #111 P2 续批②：选区大小写转换三态（Upper/Lower/Title）+
-    /// 无选区 no-op + CJK 恒等（无大小写变换——不产生编辑历史）。
-    #[gpui::test]
-    fn case_transform_upper_lower_title_roundtrip(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "hello WORLD 世界");
-        // Upper：选区 "hello"（0-5）→ "HELLO"。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(0, 0), p(0, 5));
-            assert!(e.transform_selection_case(CaseMode::Upper));
-            assert_eq!(e.buffer.line(0), "HELLO WORLD 世界", "Upper");
-        });
-        // Lower：选区 "WORLD"（6-11）→ "world"。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(0, 6), p(0, 11));
-            assert!(e.transform_selection_case(CaseMode::Lower));
-            assert_eq!(e.buffer.line(0), "HELLO world 世界", "Lower");
-        });
-        // Title：整行——词首大写（"HELLO world" → "Hello World"；
-        // CJK「世界」非词字符恒等）。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(0, 0), p(0, 17));
-            assert!(e.transform_selection_case(CaseMode::Title));
-            assert_eq!(e.buffer.line(0), "Hello World 世界", "Title");
-        });
-    }
-
-    /// #111 P2 续批②：边界——无选区 no-op（false 不改文本）+ 纯 CJK
-    /// 选区恒等（false 不产生编辑历史）。
-    #[gpui::test]
-    fn case_transform_no_selection_and_cjk_noop(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "世界 abc");
-        // 无选区（裸光标）→ no-op。
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(0, 0));
-            assert!(!e.transform_selection_case(CaseMode::Upper), "无选区 no-op");
-            assert_eq!(e.buffer.line(0), "世界 abc", "文本未动");
-        });
-        // 纯 CJK 选区 → 恒等 false（to_uppercase 天然不动的 Unicode 语义）。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(0, 0), p(0, 2));
-            assert!(!e.transform_selection_case(CaseMode::Upper), "CJK 恒等 no-op");
-            assert_eq!(e.buffer.line(0), "世界 abc", "文本未动");
-        });
-        // Title 里 CJK 邻接词（"abc世界" 单词串——世界非词字符重置词界）。
-        let ed2 = md_editor(cx, "abc世界");
-        ed2.update(cx, |e, _| {
-            e.buffer.set_selection(p(0, 0), p(0, 5));
-            assert!(e.transform_selection_case(CaseMode::Upper));
-            assert_eq!(e.buffer.line(0), "ABC世界", "CJK 混选 Upper 只动拉丁");
-        });
-    }
-
-    fn md_editor(cx: &mut gpui::TestAppContext, text: &str) -> gpui::Entity<Editor> {
-        cx.update(|cx| cx.new(|cx| Editor::new(Some("notes.md".into()), text.to_string(), cx)))
-    }
-
-    /// #111 批②：括号自动闭合——键入开括号插入对、光标居中；
-    /// 有选区 = 包裹语义。先红：键入 "(" 现状单插无闭合。
-    #[gpui::test]
-    fn auto_close_pairs_basic(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "");
-        ed.update(cx, |e, _| {
-            e.insert_text_multi("(");
-            assert_eq!(e.buffer.to_plain_text(), "()", "开括号自动闭合");
-            assert_eq!(e.buffer.cursor().col, 1, "光标居括号对间");
-
-            // over-type：光标右侧已是对应闭括号 → 跳过不插。
-            e.insert_text_multi(")");
-            assert_eq!(e.buffer.to_plain_text(), "()", "闭括号跳过");
-            assert_eq!(e.buffer.cursor().col, 2, "光标跳过闭合括号");
-        });
-    }
-
-    /// #111 批②：选区包裹——有选区键入开括号 = 选区被对围住。
-    #[gpui::test]
-    fn auto_close_pairs_wraps_selection(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "abc");
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(0, 1), p(0, 3));
-            e.insert_text_multi("(");
-            assert_eq!(e.buffer.to_plain_text(), "a(bc)", "选区被括号包裹");
-        });
-    }
-
-    /// #111 批②：配对表纯函数面（含引号对称——既 open 又 close）。
-    #[test]
-    fn auto_close_pair_table_pinned() {
-        assert_eq!(auto_close_pair_of('('), Some(')'));
-        assert_eq!(auto_close_pair_of('['), Some(']'));
-        assert_eq!(auto_close_pair_of('{'), Some('}'));
-        assert_eq!(auto_close_pair_of('"'), Some('"'));
-        assert_eq!(auto_close_pair_of('\u{300c}'), Some('\u{300d}')); // 「」
-        assert_eq!(auto_close_pair_of('\u{ff08}'), Some('\u{ff09}')); // （）
-        assert_eq!(auto_close_pair_of('x'), None, "普通字符不在配对表");
-        assert!(is_close_pair_char(')'));
-        assert!(is_close_pair_char('"'));
-        assert!(!is_close_pair_char('('), "开括号非闭合侧");
-    }
-
-    /// #111 批②：配对表全覆盖（方/花/引号/全角括号）+ 非配对键
-    /// 原样单插（回归面）。
-    #[gpui::test]
-    fn auto_close_pairs_table_and_plain_chars(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "");
-        ed.update(cx, |e, _| {
-            // 非配对字符：原样单插（回归面）。
-            e.insert_text_multi("x");
-            assert_eq!(e.buffer.to_plain_text(), "x", "普通字符原样单插");
-            // 方括号对。
-            e.buffer.set_cursor(p(0, 1));
-            e.insert_text_multi("[");
-            assert_eq!(e.buffer.to_plain_text(), "x[]", "方括号对闭合");
-        });
-    }
-
-    /// #111 G2 批⑧：围栏内切换注释——跨行批加（`// ` 前缀）→
-    /// 再切幂等往返（去）回原文。
-    #[gpui::test]
-    fn toggle_comment_roundtrip_in_rust_fence(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "```rust\nlet a = 1;\nlet b = 2;\n```\ntail");
-        // 选区跨 fence 内两行（行 1-2）。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(1, 0), p(2, 7));
-            e.sync_cursors_from_buffer();
-        });
-        ed.update(cx, |e, _| e.toggle_comment());
-        ed.update(cx, |e, _| {
-            assert_eq!(e.buffer.line(1), "// let a = 1;", "跨行批同加");
-            assert_eq!(e.buffer.line(2), "// let b = 2;");
-            assert_eq!(e.buffer.line(4), "tail", "围栏外不动");
-        });
-        // 再切（重设选区——首次切后选区存续不属本断言语义）——
-        // 全注释 → 去（幂等往返回原文）。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(1, 0), p(2, 10));
-            e.sync_cursors_from_buffer();
-        });
-        ed.update(cx, |e, _| e.toggle_comment());
-        ed.update(cx, |e, _| {
-            assert_eq!(e.buffer.line(1), "let a = 1;", "往返回原文");
-            assert_eq!(e.buffer.line(2), "let b = 2;");
-        });
-    }
-
-    fn toggle_comment_python_hash_and_md_body_noop(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "正文段\n```python\nx = 1\n```");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(0, 0));
-            e.sync_cursors_from_buffer();
-        });
-        // md 正文（围栏外）——D2 未裁：无操作。
-        ed.update(cx, |e, _| e.toggle_comment());
-        ed.update(cx, |e, _| {
-            assert_eq!(e.buffer.line(0), "正文段", "md 正文不动（D2 待裁）");
-        });
-        // python 围栏行 2——`#` 注释符。
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(2, 0));
-            e.sync_cursors_from_buffer();
-        });
-        ed.update(cx, |e, _| e.toggle_comment());
-        ed.update(cx, |e, _| {
-            assert_eq!(e.buffer.line(2), "# x = 1", "python 围栏 # 注释");
-        });
-        // 再切（重设选区——首次切后选区存续不属本断言语义）——
-        // 全注释 → 去（幂等往返回原文）。
-        ed.update(cx, |e, _| {
-            e.buffer.set_selection(p(1, 0), p(2, 10));
-            e.sync_cursors_from_buffer();
-        });
-        ed.update(cx, |e, _| e.toggle_comment());
-        ed.update(cx, |e, _| {
-            assert_eq!(e.buffer.line(1), "let a = 1;", "往返回原文");
-            assert_eq!(e.buffer.line(2), "let b = 2;");
-        });
-    }
-
-    /// #111 P2 批⑦：复制行——行块复制到自身下方（光标不动；undo
-    /// 一键复原）。先红面：copy_line/delete_line 方法不存在 = 编译红。
-    #[gpui::test]
-    fn copy_line_duplicates_below_keeps_cursor(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "aaa\nbbb\nccc");
-        ed.update(cx, |e, _| {
-            // 单行复制：bbb（行 1）复制到行 2；光标原地不动。
-            e.buffer.set_cursor(p(1, 2));
-            assert!(e.copy_line(), "中间行可复制");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "aaa\nbbb\nbbb\nccc",
-                "bbb 复制到自身下方"
-            );
-            assert_eq!(e.buffer.cursor().line, 1, "光标行不动");
-            assert_eq!(e.buffer.cursor().col, 2, "光标列不动");
-
-            // 多行块（选区覆盖 aaa+bbb）复制：块整体重复到下方。
-            e.buffer.set_selection(p(0, 0), p(2, 0));
-            assert!(e.copy_line(), "块复制成功");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "aaa\nbbb\naaa\nbbb\nbbb\nccc",
-                "块整体重复"
-            );
-        });
-    }
-
-    /// #111 P2 批⑦：删除行——整行删除含换行；单行文档保留语义
-    /// （不删到空——返回 false）。
-    #[gpui::test]
-    fn delete_line_removes_with_newline(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "aaa\nbbb\nccc");
-        ed.update(cx, |e, _| {
-            // 单行删除：bbb（行 1）整行含换行消失。
-            e.buffer.set_cursor(p(1, 1));
-            assert!(e.delete_line(), "中间行可删除");
-            assert_eq!(e.buffer.to_plain_text(), "aaa\nccc", "bbb 整行含换行删除");
-
-            // 多行块（选区 p(0,0)→p(2,0) 覆盖行 0-1）删除：余 ccc。
-            e.buffer.set_selection(p(0, 0), p(2, 0));
-            assert!(e.delete_line(), "块删除成功");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "ccc",
-                "行 0-1 块删除（选区尾行不含——line_block_range 口径）"
-            );
-        });
-    }
-
-    /// #111 D1：行移动 Alt+↑/↓（Q-IDE editing.rs:60-116 移植）。
-    /// 三语义：单行/多行块移动、首行拒移（buffer 不动）、光标列保持
-    /// 与行内位置复位。先红面：move_line_up/down 方法不存在 = 编译红。
-    #[gpui::test]
-    fn move_line_up_down_semantics(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "aaa\nbbb\nccc\nddd");
-        ed.update(cx, |e, _| {
-            // 单行上移：bbb（行 1）→ 行 0；光标随行。
-            e.buffer.set_cursor(p(1, 1));
-            assert!(e.move_line_up(), "中间行可上移");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "bbb\naaa\nccc\nddd",
-                "bbb 整行上移"
-            );
-            assert_eq!(e.buffer.cursor().line, 0, "光标随移动行");
-            assert_eq!(e.buffer.cursor().col, 1, "光标列保持");
-
-            // 首行拒移：语义「边界拒移」——返回 false、buffer 零变更。
-            assert!(!e.move_line_up(), "首行拒移返回 false");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "bbb\naaa\nccc\nddd",
-                "首行拒移 buffer 不动"
-            );
-        });
-    }
-
-    /// #111 D1：多行块下移 + undo 一键复原（编辑事务进撤销栈——
-    /// 同 Q-IDE「移动也是编辑」语义）。
-    #[gpui::test]
-    fn move_line_block_down_and_undo(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "aaa\nbbb\nccc\nddd");
-        ed.update(cx, |e, _| {
-            // 多行块（选区覆盖 aaa+bbb）下移：与 ccc 换位。
-            e.buffer.set_selection(p(0, 0), p(2, 0));
-            assert!(e.move_line_down(), "块下移成功");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "ccc\naaa\nbbb\nddd",
-                "aaa+bbb 块与 ccc 换位"
-            );
-            // undo 一键复原（行移动是编辑事务——可撤销）。
-            assert!(e.buffer.undo(), "行移动进撤销栈");
-            assert_eq!(
-                e.buffer.to_plain_text(),
-                "aaa\nbbb\nccc\nddd",
-                "undo 复原块移动"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn fold_current_collapses_heading_block(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "# A\npara1\npara2\n# B\nafter");
-        ed.update(cx, |e, _| {
-            // 光标在标题行本身 → 折叠整个小节。
-            e.buffer.set_cursor(p(0, 0));
-            assert!(e.fold_current(), "光标在标题行应折叠该小节");
-            assert_eq!(e.display_map.fold_heads(), vec![0], "折叠头 = 标题行 0");
-            assert_eq!(
-                e.display_map.fold_ranges(),
-                vec![(0, 3)],
-                "区间到下一个同级标题前（#B 行 3 可见）"
-            );
-            // #428：光标在小节正文行 → 回溯折所属小节（原稿语义；
-            // 断言随 fix/428 从「现行为钉死 false」翻转为正）。
-            e.unfold_all();
-            e.buffer.set_cursor(p(1, 0));
-            assert!(e.fold_current(), "光标在小节内应折叠该小节（跳到折叠头）");
-            assert_eq!(e.display_map.fold_heads(), vec![0], "折叠头 = 标题行 0");
-            assert_eq!(e.display_map.fold_ranges(), vec![(0, 3)]);
-        });
-    }
-
-    #[gpui::test]
-    fn fold_current_walkup_takes_innermost_section(cx: &mut gpui::TestAppContext) {
-        // #428：嵌套小节正文行回溯取最内层（### C 而非 # A）。
-        let ed = md_editor(cx, "# A\n## B\nb-body\n### C\nc-body\n# D");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(4, 0)); // c-body（### C 小节内）
-            assert!(e.fold_current());
-            assert_eq!(e.display_map.fold_ranges(), vec![(3, 5)], "折最内层 ### C");
-        });
-    }
-
-    #[gpui::test]
-    fn fold_current_walkup_refuses_text_above_first_heading(cx: &mut gpui::TestAppContext) {
-        // #428：首个标题之前的正文——之上没有覆盖它的标题块 → false
-        //（尾部正文会被末节区间覆盖到文末，故负例取头部）。
-        let ed = md_editor(cx, "前言\n# A\nbody");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(0, 0));
-            assert!(!e.fold_current(), "之上无标题块 → 不假装支持");
-        });
-    }
-
-    #[gpui::test]
-    fn fold_current_collapses_fenced_code_block(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "intro\n```rust\nlet a = 1;\nlet b = 2;\n```\ntail");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(2, 0)); // 代码块内部
-            assert!(e.fold_current());
-            assert_eq!(e.display_map.fold_ranges(), vec![(1, 5)], "含开闭 ``` 行");
-        });
-    }
-
-    #[gpui::test]
-    fn fold_current_refuses_plain_paragraph(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "普通正文\n第二行\n\n第三段");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(0, 0));
-            assert!(!e.fold_current(), "非标题非围栏 → 不可折叠（不假装支持）");
-            assert!(e.display_map.fold_heads().is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn unfold_current_restores_rows(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "# A\npara1\npara2\n# B");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(0, 0));
-            assert!(e.fold_current());
-            assert_eq!(e.display_map.fold_ranges().len(), 1);
-            assert!(e.unfold_current(), "展开当前");
-            assert!(e.display_map.fold_ranges().is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn fold_all_collapses_top_level_only(cx: &mut gpui::TestAppContext) {
-        // A 小节含子标题 B：顶层只有 A（B 已含在 A 区间内）。
-        let ed = md_editor(cx, "# A\n## B\nb-body\n# C\nc-body");
-        ed.update(cx, |e, _| {
-            let n = e.fold_all();
-            assert_eq!(n, 2, "顶层两块：[A...]、[C...]");
-            assert_eq!(e.display_map.fold_ranges(), vec![(0, 3), (3, 5)]);
-        });
-    }
-
-    #[gpui::test]
-    fn unfold_all_clears_every_fold(cx: &mut gpui::TestAppContext) {
-        let ed = md_editor(cx, "# A\nbody\n# B\nbody2");
-        ed.update(cx, |e, _| {
-            e.fold_all();
-            assert_eq!(e.display_map.fold_ranges().len(), 2);
-            assert!(e.unfold_all(), "全部展开返回 true");
-            assert!(e.display_map.fold_ranges().is_empty());
-            assert!(!e.unfold_all(), "已无折叠 → false（幂等）");
-        });
-    }
-
-    #[gpui::test]
-    fn fold_then_restore_by_head_lines(cx: &mut gpui::TestAppContext) {
-        // 持久化语义：存头行号 → 按当前文本重算区间尾（restore_folds 的
-        // 单步切片——整链落盘/读回在 settings.rs folds_roundtrip_per_file）。
-        let ed = md_editor(cx, "# A\nbody\n# B\nbody2");
-        let heads = ed.update(cx, |e, _| {
-            e.fold_all();
-            e.display_map.fold_heads()
-        });
-        assert_eq!(heads, vec![0, 2]);
-        // 模拟「重启」：新编辑器载同一文本，按头行恢复。
-        let ed2 = md_editor(cx, "# A\nbody\n# B\nbody2");
-        ed2.update(cx, |e2, _| {
-            for h in &heads {
-                if let Some((s, en)) = e2.foldable_span_at(*h) {
-                    e2.display_map
-                        .fold(&e2.buffer, Point::new(s, 0)..Point::new(en, 0));
-                }
-            }
-        });
-        let (a, b) = (
-            ed.update(cx, |e, _| e.display_map.fold_ranges()),
-            ed2.update(cx, |e, _| e.display_map.fold_ranges()),
-        );
-        assert_eq!(b, a, "按头行恢复应得到相同折叠集");
-    }
-
-    #[gpui::test]
-    fn restore_drops_heads_that_no_longer_fold(cx: &mut gpui::TestAppContext) {
-        // 头行漂移/不再是标题 → 该条丢弃（宁缺毋错）。
-        let ed = md_editor(cx, "普通正文\n# 真标题\nbody");
-        ed.update(cx, |e, _| {
-            assert_eq!(e.foldable_span_at(0), None, "行 0 不是标题");
-            assert_eq!(e.foldable_span_at(1), Some((1, 3)));
-        });
-    }
-
-    #[gpui::test]
-    fn heading_fold_runs_to_document_end(cx: &mut gpui::TestAppContext) {
-        // 末尾标题折叠到文末。
-        let ed = md_editor(cx, "# A\nx\n# Z\nz1\nz2");
-        ed.update(cx, |e, _| {
-            e.buffer.set_cursor(p(2, 0));
-            assert!(e.fold_current());
-            assert_eq!(e.display_map.fold_ranges(), vec![(2, 5)], "到文末");
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // #169：Cmd::ALL 运行时执行面（真实 GPUI TestAppContext——实体/上下文
-    // 全真，无头窗口）。静态三方对账（枚举↔ALL↔执行臂+桩检测）在
-    // tests/command_coverage.rs；本组钉「每条都真的能跑且有可见效果」。
-    // ------------------------------------------------------------------
-
-    /// 运行时测试共用文档：两个同级一级标题（折叠域——fold_all 收同级
-    /// 块）+ 嵌套二级标题 + 多行正文（移动/选区域）。
-    const CMD_TEST_DOC: &str =
-        "# 一级标题甲\n第一行正文内容\n# 一级标题乙\n第二行正文内容\n## 二级小节\n尾部正文一行\n";
-
-    /// 窗口宿主：Editor 非根视图（ShellApp 才 Render），测试以最小宿主
-    /// 开窗取真实 `Window`（exec_command 的焦点面需要——与 rpc.rs
-    /// `run_command` 同通道：`ed.update(cx, |ed, cx| ed.run_command(cmd, window, cx))`）。
-    struct EditorHost(gpui::Entity<Editor>);
-
-    impl gpui::Render for EditorHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            gpui::div()
-        }
-    }
-
-    /// 建编辑器 + 宿主窗口（返回编辑器实体与窗口句柄）。
-    fn editor_window(
-        cx: &mut gpui::TestAppContext,
-        path: Option<std::path::PathBuf>,
-    ) -> (gpui::Entity<Editor>, gpui::WindowHandle<EditorHost>) {
-        let ed = cx.update(|cx| cx.new(|cx| Editor::new(path, CMD_TEST_DOC.to_string(), cx)));
-        let ed_for_host = ed.clone();
-        let window = cx.add_window(move |_window, _cx| EditorHost(ed_for_host.clone()));
-        (ed, window)
-    }
-
-    /// #281（审计 R-f）：字数缓存 revision 守卫——`char_count` 是全文
-    /// Rope→String 物化（O(doc) 分配），状态栏/属性面板每帧读；缓存键
-    /// = Buffer revision：未变更读命中（键值对不动）、变更事务后首读
-    /// 重算（值与键同步跟进）、纯光标移动零重算（revision 不变——
-    /// 结构性保证：缓存键等于当前 revision 即必命中）。
-    #[gpui::test]
-    fn char_count_cache_follows_revision(cx: &mut gpui::TestAppContext) {
-        let (ed, _window) = editor_window(cx, None);
-        // 初读：构造期 (u64::MAX, 0) 恒 miss → 填充。
-        let n0 = cx.update(|cx| ed.read(cx).char_count());
-        assert!(n0 > 0, "前置：测试文档非空");
-        let (rev0, cached0) = cx.update(|cx| *ed.read(cx).char_count_cache.borrow());
-        assert_eq!(cached0, n0, "缓存值 = 物化值");
-        assert_eq!(
-            rev0,
-            cx.update(|cx| ed.read(cx).buffer.revision()),
-            "缓存键对齐当前 revision"
-        );
-        // 未变更复读：命中（键值对不动——纯重渲/纯光标移动的帧级语义）。
-        let _ = cx.update(|cx| ed.read(cx).char_label());
-        let (rev1, cached1) = cx.update(|cx| *ed.read(cx).char_count_cache.borrow());
-        assert_eq!((rev1, cached1), (rev0, cached0), "revision 未变零重算");
-        // 变更事务（buffer 单点入口）：revision +1 → 首读重算跟进。
-        let inserted = "追加的五个字";
-        cx.update(|cx| {
-            ed.update(cx, |ed, _| {
-                let last = Point::new(ed.buffer.line_count() - 1, 0);
-                assert!(ed.buffer.replace_range(last, last, inserted));
-            })
-        });
-        let n2 = cx.update(|cx| ed.read(cx).char_count());
-        assert_eq!(n2, n0 + inserted.chars().count(), "编辑后计数 = 原 + 插入");
-        let (rev2, cached2) = cx.update(|cx| *ed.read(cx).char_count_cache.borrow());
-        assert_eq!(cached2, n2, "缓存值跟进编辑后计数");
-        assert_eq!(rev2, rev0 + 1, "缓存键跟进新 revision（恰 +1）");
-        // char_label 行为面（状态栏消费口径）。
-        let label = cx.update(|cx| ed.read(cx).char_label());
-        assert!(
-            label.contains(&format!("{n2} 字符")),
-            "标签含最新计数：{label}"
-        );
-    }
-
-    /// #169 2.1 全量执行：遍历 `Cmd::ALL`，每条在真实编辑器上执行一遍
-    /// （Save 走临时文件），断言全程不 panic——「面板只列可执行的」
-    /// 声称的运行时面。
-    #[gpui::test]
-    fn runtime_every_cmd_in_all_executes(cx: &mut gpui::TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("mdc-cmd-all-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cmds.md");
-        std::fs::write(&path, CMD_TEST_DOC).unwrap();
-
-        let (ed, window) = editor_window(cx, Some(path.clone()));
-
-        // 顺序 = ALL 声明序；面板类命令（find/replace/goto）开后续命令
-        // 不受干扰（exec 直达，不走键路由）；折叠类先 fold 后 unfold
-        // 自愈；Save 无前置（未脏时写当前内容亦安全）。
-        for &cmd in Cmd::ALL {
-            window.update(cx, |_host, window, cx| {
-                ed.update(cx, |ed, cx| ed.run_command(cmd, window, cx));
-            });
-        }
-
-        // 收尾存活（缓冲仍可读 = 未 panic 未崩溃）+ 清理。
-        window.update(cx, |_host, _window, cx| {
-            ed.update(cx, |ed, _| {
-                assert!(ed.buffer.cursor().line < ed.buffer.line_count());
-            });
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #169 2.1 状态变化断言——导航/选区类：光标真动、选区真选。
-    #[gpui::test]
-    fn runtime_navigation_and_selection_change_state(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = editor_window(cx, None);
-
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.run_command(Cmd::DocStart, window, cx);
-                assert_eq!(
-                    (ed.buffer.cursor().line, ed.buffer.cursor().col),
-                    (0, 0),
-                    "DocStart 应回文首"
-                );
-                ed.run_command(Cmd::DocEnd, window, cx);
-                assert_eq!(
-                    ed.buffer.cursor().line,
-                    ed.buffer.line_count() - 1,
-                    "DocEnd 应到末行"
-                );
-                // 行内移动：回到首行行尾（非空行 col>0）→ MoveLeft 左移一格
-                //（无条件断言——防条件跳过形成覆盖洞）。
-                ed.run_command(Cmd::DocStart, window, cx);
-                ed.run_command(Cmd::MoveEnd, window, cx);
-                let col_end = ed.buffer.cursor().col;
-                assert!(col_end > 0, "前置：首行（标题）非空——MoveEnd 后 col>0");
-                ed.run_command(Cmd::MoveLeft, window, cx);
-                assert_eq!(ed.buffer.cursor().col, col_end - 1, "MoveLeft 应左移一格");
-                // 下移/上移往返。
-                ed.run_command(Cmd::DocStart, window, cx);
-                ed.run_command(Cmd::MoveDown, window, cx);
-                assert_eq!(ed.buffer.cursor().line, 1, "MoveDown 应下移一行");
-                ed.run_command(Cmd::MoveUp, window, cx);
-                assert_eq!(ed.buffer.cursor().line, 0, "MoveUp 应上移一行");
-
-                // 全选：选区文本 = 全文（SelectAll 真生效）。
-                ed.run_command(Cmd::SelectAll, window, cx);
-                assert_eq!(ed.buffer.selection_text(), CMD_TEST_DOC.to_string());
-            });
-        });
-    }
-
-    /// #169 2.1 状态变化断言——折叠/面板/撤销/保存类：每类一个可见效果。
-    #[gpui::test]
-    fn runtime_fold_panels_undo_save_change_state(cx: &mut gpui::TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("mdc-cmd-cls-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("edit.md");
-        std::fs::write(&path, CMD_TEST_DOC).unwrap();
-
-        let (ed, window) = editor_window(cx, Some(path.clone()));
-
-        // ① 折叠：FoldAll 收起两个同级一级标题块 → heads=2；UnfoldAll → 0
-        //    （二级小节嵌套在一级块内，不另立 head——heading_span 语义）。
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.run_command(Cmd::FoldAll, window, cx);
-                assert_eq!(
-                    ed.display_map.fold_heads().len(),
-                    2,
-                    "FoldAll 应收起两个一级标题块"
-                );
-                ed.run_command(Cmd::UnfoldAll, window, cx);
-                assert_eq!(ed.display_map.fold_heads().len(), 0, "UnfoldAll 应全部展开");
-            });
-        });
-
-        // ② 面板：OpenFind / OpenReplace / GotoLine 打开对应态。
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.run_command(Cmd::OpenFind, window, cx);
-                assert!(ed.find.is_some(), "OpenFind 应打开查找条");
-                ed.run_command(Cmd::OpenReplace, window, cx);
-                assert!(ed.find.is_some(), "OpenReplace 应打开替换条（find 态承载）");
-                ed.run_command(Cmd::GotoLine, window, cx);
-                assert!(ed.goto.is_some(), "GotoLine 应打开跳行框");
-            });
-        });
-
-        // ③ 撤销/重做：真实编辑 → Undo 复原 → Redo 重做。
-        // ④ 保存：脏内容落盘（文件 == 当前文本）。
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                let before = ed.buffer.to_plain_text();
-                ed.insert_text_at(0, 0, "X", cx);
-                assert_ne!(ed.buffer.to_plain_text(), before, "前置：插入应改变文本");
-                ed.run_command(Cmd::Undo, window, cx);
-                assert_eq!(ed.buffer.to_plain_text(), before, "Undo 应复原插入");
-                ed.run_command(Cmd::Redo, window, cx);
-                assert_ne!(ed.buffer.to_plain_text(), before, "Redo 应重做插入");
-
-                let now = ed.buffer.to_plain_text();
-                ed.run_command(Cmd::Save, window, cx);
-                assert_eq!(
-                    std::fs::read_to_string(&path).unwrap(),
-                    now,
-                    "Save 应把当前文本落盘"
-                );
-            });
-        });
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // #386：保存三态诚实化——旧裸 bool 在只读态 `return true` 假装成功
 //（PDF 批注静默丢失的根因）。运行时锁：只读干净 = Unmodified（不再
@@ -6894,105 +6360,6 @@ mod tests {
 // Unmodified / 脏 Saved+落盘）。Shell 分流与批注链另见 shell.rs /
 // pdf_pages.rs 的 #386 测试模块（三层互证，不重复钉定）。
 // ---------------------------------------------------------------------------
-#[cfg(test)]
-mod save_outcome_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// 临时夹具目录（进程号隔离；首尾各清一次）。
-    fn fixture_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mdc-386-ed-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// #386：只读态保存不再假装成功——干净只读 = `Unmodified`（no-op
-    /// 的诚实口径），且文本面恒不脏（pdf 的「脏」来自页视图批注，
-    /// 归 Shell 分流——语义分层各管各的）。
-    #[gpui::test]
-    fn readonly_save_is_unmodified_not_fake_success(cx: &mut gpui::TestAppContext) {
-        let dir = fixture_dir("ro");
-        let path = dir.join("doc.pdf");
-        std::fs::write(&path, b"%PDF-fixture").unwrap();
-        let ed = cx.update(|cx| {
-            cx.new(|cx| Editor::new_readonly(Some(path.clone()), "渲染态文本".into(), cx))
-        });
-        // 前置：只读 + 不脏（正常路径——只读门禁拦下一切编辑）。
-        assert!(cx.update(|cx| ed.read(cx).is_read_only()));
-        assert!(!cx.update(|cx| ed.read(cx).is_modified()));
-        // 旧实现在此 `return true`（保存「成功」的谎——调用方无从区分
-        // 「真存了」与「什么都没做」，PDF 批注静默丢失的根因）。
-        let outcome = cx.update(|cx| ed.update(cx, |ed, _| ed.save()));
-        assert_eq!(
-            outcome,
-            SaveOutcome::Unmodified,
-            "#386：只读干净 = Unmodified（no-op），不是 Saved"
-        );
-        // 盘上不动（只读文本面无写盘语义——「另存为」才迁移内容）。
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"%PDF-fixture",
-            "只读保存零写盘"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #386：可编辑文档三态——未命名 `Failed`（交调用方引导另存）/
-    /// 有名干净 `Unmodified`（零写盘）/ 有名脏 `Saved`（落盘 + 脏标清）。
-    #[gpui::test]
-    fn editable_save_three_states(cx: &mut gpui::TestAppContext) {
-        let dir = fixture_dir("rw");
-        let named = dir.join("a.md");
-        std::fs::write(&named, "L0\n").unwrap();
-
-        // ① 未命名（新文档无路径）→ Failed（不是静默 false——调用方
-        //    引导「另存为」）。
-        let unnamed = cx.update(|cx| cx.new(|cx| Editor::new(None, "新文档".into(), cx)));
-        assert_eq!(
-            cx.update(|cx| unnamed.update(cx, |ed, _| ed.save())),
-            SaveOutcome::Failed,
-            "未命名保存 = Failed（无路径可写）"
-        );
-
-        // ② 有名干净 → Unmodified（零写盘——盘上不动）。
-        let clean =
-            cx.update(|cx| cx.new(|cx| Editor::new(Some(named.clone()), "L0\n".into(), cx)));
-        assert_eq!(
-            cx.update(|cx| clean.update(cx, |ed, _| ed.save())),
-            SaveOutcome::Unmodified,
-            "干净保存 = no-op"
-        );
-        assert_eq!(std::fs::read_to_string(&named).unwrap(), "L0\n");
-
-        // ③ 有名脏 → Saved：盘上 = 行模型文本 + is_modified 清零。
-        cx.update(|cx| {
-            clean.update(cx, |ed, cx| {
-                ed.insert_text_at(0, 2, "X", cx);
-            })
-        });
-        assert!(
-            cx.update(|cx| clean.read(cx).is_modified()),
-            "前置：插入后脏"
-        );
-        assert_eq!(
-            cx.update(|cx| clean.update(cx, |ed, _| ed.save())),
-            SaveOutcome::Saved,
-            "脏保存 = Saved"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&named).unwrap(),
-            "L0X\n",
-            "Saved = 行模型文本落盘"
-        );
-        assert!(
-            !cx.update(|cx| clean.read(cx).is_modified()),
-            "保存成功后脏标清零"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // #47 A4：中文 IME 组合生命周期（EntityInputHandler 真接口面——预编辑
@@ -7001,384 +6368,6 @@ mod save_outcome_tests {
 // 运行时覆盖——本模块经真实 `Window` 调 trait 方法（与 GPUI 输入框架
 // 同一入口），键面经 `dispatch_key` 真分发。
 // ---------------------------------------------------------------------------
-#[cfg(test)]
-mod ime_composition_tests {
-    use super::*;
-    use gpui::EntityInputHandler;
-
-    /// 测试宿主（PalHost 同款——trait 方法需要真实 `&mut Window`）。
-    struct ImeHost {
-        _ed: gpui::Entity<Editor>,
-    }
-
-    impl gpui::Render for ImeHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            gpui::div()
-        }
-    }
-
-    fn ime_window(
-        cx: &mut gpui::TestAppContext,
-        text: &str,
-    ) -> (gpui::Entity<Editor>, gpui::WindowHandle<ImeHost>) {
-        let ed =
-            cx.update(|cx| cx.new(|cx| Editor::new(Some("ime.md".into()), text.to_string(), cx)));
-        let ed_for_host = ed.clone();
-        let window = cx.add_window(move |_window, _cx| ImeHost {
-            _ed: ed_for_host.clone(),
-        });
-        (ed, window)
-    }
-
-    fn plain_key(key: &str, key_char: Option<&str>) -> KeyDownEvent {
-        KeyDownEvent {
-            keystroke: gpui::Keystroke {
-                modifiers: gpui::Modifiers::default(),
-                key: key.into(),
-                key_char: key_char.map(str::to_string),
-            },
-            is_held: false,
-            prefer_character_input: false,
-        }
-    }
-
-    struct InputRouteHost {
-        ed: gpui::Entity<Editor>,
-    }
-
-    impl Render for InputRouteHost {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let ed = self.ed.clone();
-            gpui::div()
-                .track_focus(&ed.read(cx).focus)
-                .on_key_down(move |event, window, cx| {
-                    ed.update(cx, |ed, cx| ed.dispatch_key(event, window, cx));
-                })
-        }
-    }
-
-    #[gpui::test]
-    fn input_sequence_shell_keys_propagate(cx: &mut gpui::TestAppContext) {
-        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, "AB".into(), cx)));
-        let ed_host = ed.clone();
-        let window = cx.add_window(move |window, cx| {
-            ed_host.read(cx).focus.clone().focus(window, cx);
-            InputRouteHost { ed: ed_host }
-        });
-        cx.update_window(window.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            for key in ["s", "w", "tab", "k", "o"] {
-                let mut event = plain_key(key, None);
-                event.keystroke.modifiers.control = true;
-                let result = window.dispatch_event(gpui::PlatformInput::KeyDown(event), cx);
-                assert!(result.propagate, "shell must receive Ctrl+{key}");
-            }
-            assert_eq!(ed.read(cx).buffer_line(0), "AB");
-        });
-    }
-
-    // Model the platform sequence, not only a synthetic keydown: Windows WM_CHAR
-    // and the Linux/macOS fallback deliver text after the key event.
-    #[gpui::test]
-    fn input_sequence_ascii_once(cx: &mut gpui::TestAppContext) {
-        let ed = cx.update(|cx| cx.new(|cx| Editor::new(None, String::new(), cx)));
-        let ed_host = ed.clone();
-        let window = cx.add_window(move |window, cx| {
-            ed_host.read(cx).focus.clone().focus(window, cx);
-            InputRouteHost { ed: ed_host }
-        });
-        cx.update_window(window.into(), |_, window, cx| {
-            for ch in ["a", "b", "c"] {
-                window.draw(cx).clear(cx);
-                let result = window
-                    .dispatch_event(gpui::PlatformInput::KeyDown(plain_key(ch, Some(ch))), cx);
-                assert!(result.propagate, "platform must deliver printable text");
-                ed.update(cx, |ed, cx| ed.replace_text_in_range(None, ch, window, cx));
-            }
-            assert_eq!(ed.read(cx).buffer_line(0), "abc");
-            assert!(ed.read(cx).is_modified());
-        });
-    }
-
-    #[gpui::test]
-    fn input_sequence_ime_none_commit(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "X");
-        let path = std::env::temp_dir().join(format!("mang-input-ime-{}.md", std::process::id()));
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.file_path = Some(path.clone());
-                ed.replace_and_mark_text_in_range(None, "zh", Some(1..1), window, cx);
-                ed.replace_text_in_range(None, "中", window, cx);
-                assert_eq!(ed.buffer_line(0), "中X");
-                assert_eq!(ed.marked, None);
-                assert_eq!(ed.buffer.cursor(), Point::new(0, 1));
-                assert_eq!(ed.save(), SaveOutcome::Saved);
-                assert!(!ed.is_modified());
-            });
-        });
-        let saved = std::fs::read_to_string(&path).unwrap();
-        let reopened = cx.update(|cx| cx.new(|cx| Editor::new(Some(path.clone()), saved, cx)));
-        assert_eq!(cx.update(|cx| reopened.read(cx).buffer_line(0)), "中X");
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[gpui::test]
-    fn input_sequence_ime_cancel_and_explicit_range(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "😀AB");
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.buffer.set_cursor(Point::new(0, 1));
-                ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
-                ed.replace_text_in_range(None, "", window, cx);
-                assert_eq!(ed.buffer_line(0), "😀AB", "empty commit cancels preedit");
-                assert_eq!(ed.marked, None);
-                ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
-                // Explicit UTF16 replacement still takes precedence over marked.
-                ed.replace_text_in_range(Some(2..5), "中", window, cx);
-                assert_eq!(ed.buffer_line(0), "😀中B");
-                assert_eq!(ed.marked, None);
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn input_sequence_multicursor_callback(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "a\nb");
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.cursors.push(Point::new(1, 0), Point::new(1, 0));
-                ed.sync_buffer_from_cursors_primary();
-                ed.dispatch_key(&plain_key("x", Some("x")), window, cx);
-                ed.replace_text_in_range(None, "x", window, cx);
-                assert_eq!(ed.buffer_line(0), "xa");
-                assert_eq!(ed.buffer_line(1), "xb");
-                assert_eq!(ed.cursors.len(), 2);
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn input_sequence_character_preference_preserves_selection(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "AB");
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.buffer.set_cursor(Point::new(0, 1));
-                ed.sync_cursors_from_buffer();
-                // AltGr/layout text must win over a coincident Ctrl+A binding.
-                let mut event = plain_key("a", Some("á"));
-                event.keystroke.modifiers.control = true;
-                event.prefer_character_input = true;
-                ed.dispatch_key(&event, window, cx);
-                ed.replace_text_in_range(None, "á", window, cx);
-                assert_eq!(ed.buffer_line(0), "AáB");
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn input_sequence_enter_undo_dirty_save(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "AB");
-        let path = std::env::temp_dir().join(format!("mang-input-enter-{}.md", std::process::id()));
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.file_path = Some(path.clone());
-                for col in [0, 1, 2] {
-                    ed.buffer.set_cursor(Point::new(0, col));
-                    ed.sync_cursors_from_buffer();
-                    ed.dispatch_key(&plain_key("enter", None), window, cx);
-                    assert_eq!(ed.buffer.line_count(), 2);
-                    assert_eq!(ed.buffer.cursor(), Point::new(1, 0));
-                    assert!(ed.is_modified());
-                    let mut undo = plain_key("z", None);
-                    undo.keystroke.modifiers.control = true;
-                    ed.dispatch_key(&undo, window, cx);
-                    assert_eq!(ed.buffer_line(0), "AB");
-                    assert_eq!(ed.buffer.line_count(), 1);
-                    assert!(!ed.is_modified());
-                    let mut redo = plain_key("y", None);
-                    redo.keystroke.modifiers.control = true;
-                    ed.dispatch_key(&redo, window, cx);
-                    assert_eq!(ed.buffer.line_count(), 2);
-                    assert!(ed.is_modified());
-                    ed.dispatch_key(&undo, window, cx);
-                }
-                ed.dispatch_key(&plain_key("enter", None), window, cx);
-                assert_eq!(ed.save(), SaveOutcome::Saved);
-                assert!(!ed.is_modified());
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "AB\n");
-                // Enter on the trailing empty line, then continue typing without refocus.
-                ed.dispatch_key(&plain_key("enter", None), window, cx);
-                assert_eq!(ed.buffer.line_count(), 3);
-                ed.dispatch_key(&plain_key("x", Some("x")), window, cx);
-                ed.replace_text_in_range(None, "x", window, cx);
-                assert_eq!(ed.buffer_line(2), "x");
-            });
-        });
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// #201：Editor 层链路——编辑发生在任何 wrap 回填之前（零帧
-    /// render_lines 的回填块从未执行）时，display_row_count 仍须立即
-    /// 反映 buffer 行数。旧 reset_wraps 空 wraps 空转 → 行表陈旧 →
-    /// uniform_list 永不派新行（真机形态：脏点亮/磁盘已写/画面无
-    /// 新增文本）。纯 DisplayMap 单测（display_map.rs）之外，这里锁
-    /// `after_edit → refresh_caches → reset_wraps` 真实编辑路径。
-    #[gpui::test]
-    fn edit_before_wrap_backfill_editor_level_row_freshness(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "AB");
-        window.update(cx, |_host, _window, cx| {
-            ed.update(cx, |ed, cx| {
-                // 前置：不调用任何渲染路径——display_map.wraps 保持空
-                //（真实形态：开文件后 0/1 帧内的自动化连打）。
-                // 查询一次行数构建 RowTable 缓存（首帧 draw 的行为）。
-                let before = ed.display_map.display_row_count(&ed.buffer);
-                assert_eq!(before, 1, "「AB」1 行");
-                // 平台文本通道插入带换行文本（IME commit 形态）：
-                // 初始光标 (0,0) 无选区 → 行首插入 → "CD\nEF\nGHAB" 3 行。
-                ed.replace_text_in_range(None, "CD\nEF\nGH", _window, cx);
-                // #201 断言：编辑后行数立即反映 buffer（旧缺陷形态
-                // = 旧表 1 行卡死——首查询构建的缓存永不刷新）
-                let after = ed.display_map.display_row_count(&ed.buffer);
-                assert_eq!(
-                    after, 3,
-                    "#201：wrap 未回填时编辑后行表必须仍新鲜（行首插 CD/EF/GH + AB = 3 行）"
-                );
-                assert_eq!(ed.buffer.line_count(), 3);
-            });
-        });
-    }
-
-    /// 预编辑全链：起（ni）→ 更新（你好，带选中）→ 提交（unmark 保文）
-    /// ——marked 区间（UTF16）逐态断言 + 提交后脏。
-    #[gpui::test]
-    fn ime_preedit_update_commit_lifecycle(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "AB\n");
-        window.update(cx, |_host, window, cx| {
-            // 组合起：光标处预编辑 "ni"。
-            ed.update(cx, |ed, cx| {
-                ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
-            });
-            ed.update(cx, |ed, cx| {
-                assert_eq!(
-                    ed.marked_text_range(window, cx),
-                    Some(0..2),
-                    "预编辑起：marked = ni 的 UTF16 区间"
-                );
-                assert_eq!(ed.buffer_line(0), "niAB", "预编辑文本入 buffer");
-            });
-
-            // 组合更新：替换旧预编辑段为 "你好"（IME 候选确认的标准流），
-            // 带段内选中（new_selected_range——候选栏高亮语义）。
-            ed.update(cx, |ed, cx| {
-                ed.replace_and_mark_text_in_range(None, "你好", Some(0..2), window, cx);
-            });
-            ed.update(cx, |ed, cx| {
-                assert_eq!(
-                    ed.marked_text_range(window, cx),
-                    Some(0..2),
-                    "更新后 marked = 你好（2 字 × 1 UTF16）"
-                );
-                assert_eq!(ed.buffer_line(0), "你好AB", "预编辑段整体替换（不叠字）");
-                assert_eq!(
-                    ed.selection_points(),
-                    Some((Point::new(0, 0), Point::new(0, 2))),
-                    "new_selected_range 段内选中"
-                );
-            });
-
-            // 提交：unmark（保文提交——平台提交流之一）。
-            ed.update(cx, |ed, cx| {
-                ed.unmark_text(window, cx);
-                assert_eq!(ed.marked_text_range(window, cx), None, "提交清 marked");
-                assert_eq!(ed.buffer_line(0), "你好AB", "提交保文");
-                assert!(ed.is_modified(), "组合提交计入脏");
-            });
-        });
-    }
-
-    /// 提交第二流：replace_text_in_range（终文本替换预编辑段）——
-    /// marked 清 + 段替换正确（"zh" 预编辑 → "中" 提交）。
-    #[gpui::test]
-    fn ime_commit_via_replace_text_swaps_preedit(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "X\n");
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.replace_and_mark_text_in_range(None, "zh", None, window, cx);
-            });
-            ed.update(cx, |ed, cx| {
-                assert_eq!(ed.marked_text_range(window, cx), Some(0..2));
-            });
-            ed.update(cx, |ed, cx| {
-                // IME 终选提交通道：替换 0..2（预编辑段）为终文本。
-                ed.replace_text_in_range(Some(0..2), "中", window, cx);
-                assert_eq!(ed.marked_text_range(window, cx), None, "提交清 marked");
-                assert_eq!(ed.buffer_line(0), "中X", "终文本替换预编辑段");
-            });
-        });
-    }
-
-    /// 只读门禁（IME 双通道）：只读文档不接预编辑/替换——buffer 与
-    /// marked 均零变化。
-    #[gpui::test]
-    fn ime_readonly_rejects_both_channels(cx: &mut gpui::TestAppContext) {
-        let ed = cx.update(|cx| {
-            cx.new(|cx| Editor::new_readonly(Some("ro.md".into()), "RO\n".to_string(), cx))
-        });
-        let ed_for_host = ed.clone();
-        let window = cx.add_window(move |_window, _cx| ImeHost {
-            _ed: ed_for_host.clone(),
-        });
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.replace_and_mark_text_in_range(None, "拼", None, window, cx);
-                assert_eq!(ed.marked_text_range(window, cx), None, "只读不接预编辑");
-                assert_eq!(ed.buffer_line(0), "RO", "buffer 零变化");
-                ed.replace_text_in_range(None, "写", window, cx);
-                assert_eq!(ed.buffer_line(0), "RO", "只读拒替换");
-            });
-        });
-    }
-
-    /// 「不互相吞」卫（#47 A4 修复面）：预编辑期真实键分发（key_char
-    /// 直输路径）零插入——组合输入归输入法所有（直插会破坏 marked 区
-    /// 间与 buffer 的对应，提交时替换错段）；提交后直输路径恢复。
-    #[gpui::test]
-    fn ime_composition_guards_printable_keys(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = ime_window(cx, "AB\n");
-        window.update(cx, |_host, window, cx| {
-            ed.update(cx, |ed, cx| {
-                ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
-            });
-            // 预编辑期：真实键分发（'h'，无修饰）——不得直插。
-            ed.update(cx, |ed, cx| {
-                ed.dispatch_key(&plain_key("h", Some("h")), window, cx);
-                assert_eq!(
-                    ed.buffer_line(0),
-                    "niAB",
-                    "组合期 key_char 零直插（IME 所有）"
-                );
-                assert_eq!(
-                    ed.marked_text_range(window, cx),
-                    Some(0..2),
-                    "marked 区间不被键入破坏"
-                );
-            });
-            // 提交后：同一键分发——直输路径恢复（正常键入生效）。
-            ed.update(cx, |ed, cx| {
-                ed.unmark_text(window, cx);
-                ed.dispatch_key(&plain_key("h", Some("h")), window, cx);
-                ed.replace_text_in_range(None, "h", window, cx);
-                assert_eq!(
-                    ed.buffer_line(0),
-                    // 光标在预编辑段尾（replace_range 后 = (0,2)）——
-                    // 提交后直输在 "ni" 与 "AB" 之间。
-                    "nihAB",
-                    "提交后直输恢复"
-                );
-            });
-        });
-    }
-}
 
 // ---------------------------------------------------------------------------
 // #385 阶段 3 批 2：命令面板 / 跳行框交互测试（TestAppContext 无头面——
@@ -7387,416 +6376,25 @@ mod ime_composition_tests {
 // 零运行时覆盖——本模块经真实 `dispatch_key` 入口驱动（与焦点路径
 // 到达的同一分发体，#217 keymap 解析 + 面板拦截序全链）。
 // ---------------------------------------------------------------------------
-#[cfg(test)]
-mod palette_goto_interaction_tests {
-    use super::*;
 
-    /// 测试宿主（EditorHost 同款——模块间不共享私有设施，各 10 行）。
-    struct PalHost {
-        _ed: gpui::Entity<Editor>,
-    }
-
-    impl gpui::Render for PalHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            gpui::div()
-        }
-    }
-
-    /// md 编辑器 + 宿主窗口（面板键处理需要真实 `Window`）。
-    fn pal_window(
-        cx: &mut gpui::TestAppContext,
-        text: &str,
-    ) -> (gpui::Entity<Editor>, gpui::WindowHandle<PalHost>) {
-        let ed =
-            cx.update(|cx| cx.new(|cx| Editor::new(Some("pal.md".into()), text.to_string(), cx)));
-        let ed_for_host = ed.clone();
-        let window = cx.add_window(move |window, cx| {
-            let focus = ed_for_host.read(cx).focus.clone();
-            window.focus(&focus, cx);
-            PalHost {
-                _ed: ed_for_host.clone(),
-            }
-        });
-        (ed, window)
-    }
-
-    /// 无修饰键事件（`key_char` = 可打印字符入查询框；None = 控制键）。
-    fn key(key: &str, key_char: Option<&str>) -> KeyDownEvent {
-        KeyDownEvent {
-            keystroke: gpui::Keystroke {
-                modifiers: gpui::Modifiers::default(),
-                key: key.into(),
-                key_char: key_char.map(str::to_string),
-            },
-            is_held: false,
-            prefer_character_input: false,
-        }
-    }
-
-    /// Ctrl 组合键事件。
-    fn ctrl(key: &str) -> KeyDownEvent {
-        KeyDownEvent {
-            keystroke: gpui::Keystroke {
-                modifiers: gpui::Modifiers {
-                    control: true,
-                    ..Default::default()
-                },
-                key: key.into(),
-                key_char: None,
-            },
-            is_held: false,
-            prefer_character_input: false,
-        }
-    }
-
-    /// 经真实分发入口派一个键（dispatch_key = 焦点路径到达的同一分发体）。
-    fn press(ed: &gpui::Entity<Editor>, window: &mut Window, cx: &mut App, event: KeyDownEvent) {
-        // Legacy command lifecycle assertions remain unchanged. Text now uses the
-        // platform callback, not the removed printable-key fallback.
-        if let Some(text) = event.keystroke.key_char.as_deref() {
-            ed.update(cx, |ed, cx| {
-                ed.replace_text_in_range(None, text, window, cx)
-            });
-        } else {
-            ed.update(cx, |ed, cx| ed.dispatch_key(&event, window, cx));
-        }
-    }
-
-    /// 开合 + 键入过滤 + ↑↓ 选中移动 + Esc 关闭 + 重开换新（状态桥四段）。
-    #[gpui::test]
-    /// #112 P2 批④：Esc 两段式——查询非空先清查询（面板保持开，
-    /// 候选回全集）；查询空才关面板。先红面：现行为一步直接关。
-    #[gpui::test]
-    fn palette_esc_two_stage_clears_query_first(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = pal_window(cx, "# A\nbody\n");
-        let _ = window.update(cx, |_host, window, cx| {
-            let mut e = ctrl("p");
-            e.keystroke.modifiers.shift = true;
-            press(&ed, window, cx, e);
-        });
-        // 键入「折叠」——查询非空。
-        let _ = window.update(cx, |_host, window, cx| {
-            for ch in ["折", "叠"] {
-                press(&ed, window, cx, key(ch, Some(ch)));
-            }
-        });
-        // 第一记 Esc：清查询（面板保持开——两段式第一段）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, key("escape", None));
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("第一记 Esc 后面板保持开");
-            assert_eq!(pal.query, "", "Esc 第一段：清查询");
-            assert_eq!(
-                pal.items.len(),
-                commands::search("").len(),
-                "候选回全集（与空查询同源）"
-            );
-            assert_eq!(pal.selected, 0, "清查询后选中复位 0");
-        });
-        // 第二记 Esc：关面板（两段式第二段——回到一步语义）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, key("escape", None));
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.palette.is_none(), "第二记 Esc：关面板");
-        });
-    }
-
-    /// #112 P2 批④：面板内 Ctrl 组合令旁路——Ctrl+F 在面板打开时
-    /// 照常打开查找框（面板不吞编辑类组合令——冲突裁决归编辑键层，
-    /// Q-IDE R4 对照）。先红面：现面板吞一切 ctrl 组合。
-    #[gpui::test]
-    fn palette_open_ctrl_combo_bypasses_to_editor(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = pal_window(cx, "# A\nbody\n");
-        // 开面板。
-        let _ = window.update(cx, |_host, window, cx| {
-            let mut e = ctrl("p");
-            e.keystroke.modifiers.shift = true;
-            press(&ed, window, cx, e);
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.palette.is_some(), "前置：面板开");
-            assert!(ed.find.is_none(), "前置：查找框未开");
-        });
-        // 面板内 Ctrl+F：旁路执行（打开查找框——不被面板吞）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, ctrl("f"));
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.find.is_some(), "Ctrl+F 旁路：查找框打开（面板不吞）");
-        });
-    }
-
-    fn palette_open_type_navigate_esc_lifecycle(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = pal_window(cx, "# A\nbody\n");
-        // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。
-        let _ = window.update(cx, |_host, window, cx| {
-            let mut e = ctrl("p");
-            e.keystroke.modifiers.shift = true;
-            press(&ed, window, cx, e);
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("Ctrl+Shift+P 开面板");
-            assert_eq!(pal.query, "", "初开查询为空");
-            assert_eq!(pal.selected, 0, "选中复位 0");
-            assert_eq!(
-                pal.items.len(),
-                commands::search("").len(),
-                "空查询 = 全命令集（与 commands::search 同源）"
-            );
-        });
-        // 键入「折叠」两字——过滤到折叠族 + 选中复位。
-        let _ = window.update(cx, |_host, window, cx| {
-            for ch in ["折", "叠"] {
-                press(&ed, window, cx, key(ch, Some(ch)));
-            }
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("面板保持开");
-            assert_eq!(pal.query, "折叠", "可打印字符入查询");
-            assert_eq!(pal.selected, 0, "键入后选中复位 0");
-            assert_eq!(
-                pal.items.len(),
-                commands::search("折叠").len(),
-                "查询过滤 = commands::search 同源"
-            );
-            assert!(!pal.items.is_empty(), "折叠族命令在场（前置——防空集假绿）");
-        });
-        // ↑↓：down ×2 → up（min 夹紧语义）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, key("down", None));
-            press(&ed, window, cx, key("down", None));
-            press(&ed, window, cx, key("up", None));
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("面板保持开");
-            assert_eq!(pal.selected, 1, "↓↓↑ = 选中 1（0 基扁平序）");
-        });
-        // Esc 关闭 → 重开换新（残留查询不带入）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, key("escape", None));
-        });
-        ed.update(cx, |ed, _| assert!(ed.palette.is_none(), "Esc 关面板"));
-        let _ = window.update(cx, |_host, window, cx| {
-            let mut e = ctrl("p");
-            e.keystroke.modifiers.shift = true;
-            press(&ed, window, cx, e);
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("重开面板");
-            assert_eq!(pal.query, "", "重开 = 换新（不携带上次查询）");
-            assert_eq!(pal.selected, 0, "重开选中复位");
-        });
-    }
-
-    /// Enter 执行命令闭环：键入唯一命中「查找」→ Enter → 面板关 +
-    /// 查找条开 + 最近使用记账（#183 A-3——下次打开面板顶部可见）。
-    #[gpui::test]
-    fn palette_enter_executes_and_touches_recent(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = pal_window(cx, "# A\nbody\n");
-        ed.update(cx, |ed, _| {
-            assert!(ed.find.is_none(), "前置：查找条未开");
-            // #112 P1：构造点会从 settings 恢复 MRU（持久化接线后
-            // 本机/前序测试可能留档）——单测前置显式清零回到旧假设。
-            ed.palette_recent = crate::command_groups::RecentRing::new(4);
-            assert!(!ed.palette_recent.contains(Cmd::OpenFind), "前置：无记账");
-        });
-        let _ = window.update(cx, |_host, window, cx| {
-            let mut e = ctrl("p");
-            e.keystroke.modifiers.shift = true;
-            press(&ed, window, cx, e);
-            for ch in ["查", "找"] {
-                press(&ed, window, cx, key(ch, Some(ch)));
-            }
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("面板开");
-            // 「查找」在命令标题中唯一命中 OpenFind（替换条无此子序列）。
-            assert_eq!(
-                pal.items,
-                vec![Cmd::OpenFind],
-                "「查找」唯一命中 OpenFind（选中 0 即目标）"
-            );
-        });
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, key("enter", None));
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.palette.is_none(), "Enter 执行后面板关（选完即关）");
-            assert!(ed.find.is_some(), "OpenFind 执行 → 查找条开（状态变化）");
-            assert!(
-                ed.palette_recent.contains(Cmd::OpenFind),
-                "#183 A-3：面板执行记入最近使用"
-            );
-        });
-        // 重开面板：最近使用段置顶该命令（记账的消费面）。
-        let _ = window.update(cx, |_host, window, cx| {
-            let mut e = ctrl("p");
-            e.keystroke.modifiers.shift = true;
-            press(&ed, window, cx, e);
-        });
-        ed.update(cx, |ed, _| {
-            let pal = ed.palette.as_ref().expect("重开面板");
-            assert_eq!(
-                pal.items.first(),
-                Some(&Cmd::OpenFind),
-                "最近使用段置顶（扁平序首位）"
-            );
-        });
-    }
-
-    /// 跳行框闭环：Ctrl+G 开 → 键入行号 → Enter 跳转（光标可见移动）→
-    /// 越界 clamp → 非法输入不跳不关 → Esc 关闭不移动。
-    #[gpui::test]
-    fn goto_open_type_enter_jump_and_edges(cx: &mut gpui::TestAppContext) {
-        let (ed, window) = pal_window(cx, "L0\nL1\nL2\nL3\nL4");
-        // Ctrl+G 开框 → 键入 3 → Enter → 跳第 3 行（0 基 2）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, ctrl("g"));
-            press(&ed, window, cx, key("3", Some("3")));
-            press(&ed, window, cx, key("enter", None));
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.goto.is_none(), "Enter 跳转后框关");
-            assert_eq!(ed.buffer.cursor().line, 2, "跳到第 3 行（0 基 2）");
-        });
-        // 越界：999 → clamp 到末行。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, ctrl("g"));
-            for ch in ["9", "9", "9"] {
-                press(&ed, window, cx, key(ch, Some(ch)));
-            }
-            press(&ed, window, cx, key("enter", None));
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.goto.is_none(), "越界跳转同样关框");
-            assert_eq!(ed.buffer.cursor().line, 4, "越界 clamp 到末行（0 基 4）");
-        });
-        // 非法输入：Enter 不跳不关（提示行可见——不静默吞）。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, ctrl("g"));
-            for ch in ["a", "b"] {
-                press(&ed, window, cx, key(ch, Some(ch)));
-            }
-            press(&ed, window, cx, key("enter", None));
-        });
-        ed.update(cx, |ed, _| {
-            let goto = ed.goto.as_ref().expect("非法输入不关框（改提示）");
-            assert_eq!(goto.input, "ab");
-            assert_eq!(goto.hint, "未跳——请输入有效行号");
-            assert_eq!(ed.buffer.cursor().line, 4, "光标不动（不跳）");
-        });
-        // Esc 关闭不移动。
-        let _ = window.update(cx, |_host, window, cx| {
-            press(&ed, window, cx, key("escape", None));
-        });
-        ed.update(cx, |ed, _| {
-            assert!(ed.goto.is_none(), "Esc 关框");
-            assert_eq!(ed.buffer.cursor().line, 4, "关框不移动光标");
-        });
-    }
-    /// #112 P1（MRU 持久化）：跨「重启」回放——settings 往返 + restore 序 +
-    /// 落盘序三段真链（**注入形态**：直接走 `_for_test` 目录注入，不动进程
-    /// env——并行套件下 XDG 重定向会让同进程其他 Editor 构造测试读到污染窗，
-    /// 曾间歇红；构造点全链（restore_palette_recent）与段2同构，由
-    /// 段2的注入等价覆盖）。
-    #[gpui::test]
-    fn palette_recent_survives_restart(cx: &mut gpui::TestAppContext) {
-        let cfg = std::env::temp_dir().join(format!("mdc-112p1-mru-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cfg);
-        std::fs::create_dir_all(&cfg).unwrap();
-        // 段1：settings 层往返（注入形态）。
-        crate::settings::save_palette_recent_for_test(
-            &cfg,
-            &["Save".to_string(), "OpenFind".to_string()],
-        );
-        let names = crate::settings::load_palette_recent_from_test(&cfg);
-        assert_eq!(
-            names,
-            vec!["Save".to_string(), "OpenFind".to_string()],
-            "档往返"
-        );
-
-        // 段2：restore 序真链（与构造点 restore_palette_recent 同构——
-        // 稳定名反解 + touch 顺序回放到 RecentRing）。
-        let (ed, _window) = pal_window(cx, "# t\n正文");
-        ed.update(cx, |this, _| {
-            this.palette_recent = RecentRing::new(palette_view::RECENT_CAPACITY);
-            for name in names.clone() {
-                if let Some(c) = commands::from_key_name(&name) {
-                    this.palette_recent.touch(c);
-                }
-            }
-        });
-        assert!(
-            ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::Save)),
-            "恢复 Save（最新在前档）"
-        );
-        assert!(
-            ed.read_with(cx, |this, _| this.palette_recent.contains(Cmd::OpenFind)),
-            "恢复 OpenFind"
-        );
-        // 面板空查询 → 最近段在最前且含两条（palette_sections 真链）。
-        let sections = crate::palette_view::palette_sections(
-            "",
-            &ed.read_with(cx, |this, _| {
-                let mut r = crate::command_groups::RecentRing::new(4);
-                for c in this.palette_recent.iter() {
-                    r.touch(c);
-                }
-                r
-            }),
-        );
-        assert!(matches!(
-            sections.first().map(|s| s.group),
-            Some(crate::command_groups::Group::Recent)
-        ));
-        assert_eq!(sections[0].entries.len(), 2, "最近段两条");
-
-        // 段3：touch 后的落盘序真链（persist 同构——names 化后写注入档）。
-        let names_after: Vec<String> = ed.read_with(cx, |this, _| {
-            let mut r = this.palette_recent.clone();
-            r.touch(Cmd::GotoLine);
-            r.iter().map(|c| c.key_name().to_string()).collect()
-        });
-        crate::settings::save_palette_recent_for_test(&cfg, &names_after);
-        let after = std::fs::read_to_string(cfg.join("settings.json")).unwrap();
-        assert!(
-            after.contains("GotoLine"),
-            "touch 即落盘（write-through 序）"
-        );
-        assert!(after.contains("Save"), "既有项保留");
-
-        let _ = std::fs::remove_dir_all(&cfg);
-    }
-
-    /// #112 P1（命中高亮）：palette_sections 高亮集贯通（查询 → Entry.highlights）。
-    #[gpui::test]
-    fn palette_sections_carry_highlights(cx: &mut gpui::TestAppContext) {
-        let (ed, _window) = pal_window(cx, "# t\n正文");
-        let recent = ed.read_with(cx, |this, _| {
-            let mut r = crate::command_groups::RecentRing::new(4);
-            for c in this.palette_recent.iter() {
-                r.touch(c);
-            }
-            r
-        });
-        let sections = crate::palette_view::palette_sections("移左", &recent);
-        // 「移左」命中「移动：左」——该 Entry 的 highlights = [0, 3]。
-        let hit = sections
-            .iter()
-            .flat_map(|s| s.entries.iter())
-            .find(|e| e.cmd == Cmd::MoveLeft)
-            .expect("移左 命中 移动：左");
-        assert_eq!(hit.highlights, vec![0, 3], "命中下标集贯通到条目");
-        // 空查询无高亮（等价展示）。
-        let all = crate::palette_view::palette_sections("", &recent);
-        assert!(
-            all.iter()
-                .flat_map(|s| s.entries.iter())
-                .all(|e| e.highlights.is_empty()),
-            "空查询零高亮"
-        );
-    }
-}
+// ---------------------------------------------------------------------------
+// #111 G1 写回半：按原编码保存 round-trip（先红后绿）。
+//
+// 打开时探测的编码（document::open → status_info::detect_encoding）在
+// `OpenedDocument::EditableText` 上即被丢弃，`save`/`save_as` 恒以
+// UTF-8 写盘——GBK/UTF-16/BOM 文档一存即变 UTF-8（静默编码改写，
+// 中文环境 GBK 老文档 #221 探测半的「打开」收益一存即失效）。
+// 本组红测钉死目标行为：
+//   1. GBK 打开→编辑→保存 → 盘上仍是 GBK 字节（round-trip 自洽）；
+//   2. UTF-8 BOM → 保存补回 BOM；
+//   3. UTF-16LE（BOM）→ 保存写 BOM + LE 单元；
+//   4. GBK 不可映射字符（emoji）→ 保存拒绝（Failed）且盘上不动——
+//      拒绝静默替换造乱码；
+//   5. 外部改盘（GBK）→ reload_from_disk 能解码重载（#134 面）。
+// 字节全部手工钉死（与 document.rs 探测红测同源口径，不经运行时
+// 编码器自证）。
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// #111 G3：词补全交互面（编辑器级——触发/接受/键拦截/关门守卫）。
+// 纯函数面（词表/前缀/过滤）见 completion.rs 模块内测试。
+// ---------------------------------------------------------------------------

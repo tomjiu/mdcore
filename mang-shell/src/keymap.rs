@@ -457,6 +457,9 @@ pub enum ShellAction {
     /// #109 批②③：Ctrl+Shift+F 项目搜索面板（`toggle_search`——图标条
     /// 搜索钮/菜单「项目搜索」同链）。
     ToggleSearchPanel,
+    /// #108 P2③：转到符号（Ctrl+Shift+O——右栏大纲 + 过滤框聚焦；
+    /// 过滤即符号查找、Enter 跳行，「符号对话框」承接面）。
+    GotoSymbol,
 }
 
 /// 两域动作统一面（用户覆盖的 `action` 机器名解析目标 / 冲突检测的
@@ -616,6 +619,7 @@ impl ShellAction {
             ShellAction::FontReset => "font_reset",
             ShellAction::CycleTheme => "cycle_theme",
             ShellAction::ToggleSearchPanel => "project_search",
+            ShellAction::GotoSymbol => "goto_symbol",
         }
     }
 }
@@ -671,6 +675,7 @@ const SHELL_ACTION_IDS: &[ShellAction] = &[
     ShellAction::FontSmaller,
     ShellAction::FontReset,
     ShellAction::ToggleSearchPanel,
+    ShellAction::GotoSymbol,
     ShellAction::CycleTheme,
 ];
 
@@ -960,6 +965,9 @@ fn default_shell() -> Vec<Entry> {
         // Ctrl+K Ctrl+O 工作区同族——f 单键家族全归编辑器域（open_find
         // 是 shift Any 展开面），单键无处可错；chord 无冲突面）。
         e(Binding::Chord(plain("k"), plain("f")), A::ToggleSearchPanel),
+        // #108 P2③：转到符号（Ctrl+Shift+O——vscode 符号 goto 同款；
+        // Ctrl+G 已归「跳转到行」不抢）。
+        e(Binding::Single(KeyPattern::key("o").with(Mod::Yes, Mod::Yes, Mod::No)), A::GotoSymbol),
     ]
 }
 
@@ -2186,7 +2194,9 @@ mod tests {
         shell_miss("0", true, true, false); // plain_ctrl
         shell_hit("t", true, false, false, ShellAction::CycleTheme);
         shell_hit("o", true, false, false, ShellAction::PromptOpenFile);
-        shell_miss("o", true, true, false);
+        // #108 P2③：Ctrl+Shift+O → GotoSymbol（原「无命中」断言随
+        // 键位新增同步更新——行为扩展非回归）。
+        shell_hit("o", true, true, false, ShellAction::GotoSymbol);
         shell_miss("o", false, false, false);
     }
 
@@ -3015,5 +3025,17 @@ mod tests {
     fn global_store_defaults_without_init() {
         let label = store().label("save").expect("默认表应可查");
         assert_eq!(label, "Ctrl+S");
+    }
+
+    /// #108 P2③：Ctrl+Shift+O 解析到 GotoSymbol（shell 域——
+    /// 菜单/键位同链；Ctrl+G 归 EditorGoto 不抢；Ctrl+O 开文件不抢
+    ///——plain("o") 的 Any 修饰面在 best_single 特异性排序下让位
+    /// 给 ctrl+shift 特定约束）。
+    #[test]
+    fn goto_symbol_ctrl_shift_o_resolves() {
+        shell_hit("o", true, true, false, ShellAction::GotoSymbol);
+        // 守卫边界：Ctrl+O 归 PromptOpenFile（plain("o") Any 修饰域）——
+        // goto_symbol 的 ctrl+shift 特定约束不吞它。
+        shell_hit("o", true, false, false, ShellAction::PromptOpenFile);
     }
 }

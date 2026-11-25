@@ -72,6 +72,30 @@ pub struct FileTreeHooks {
     pub open_file: OpenFileHook,
     pub context_menu: ContextMenuHook,
     pub escape: EscapeHook,
+    /// #107 P1②：拖拽移动（树内拖→目录行放=移动进该目录——
+    /// confirm_move_path 确认链）。
+    pub move_file: MoveFileHook,
+}
+
+/// #107 P1②：拖拽移动钩子（old, new_dir——new = new_dir/old_name）。
+pub type MoveFileHook =
+    Arc<dyn Fn(PathBuf, PathBuf, &mut Window, &mut App) + Send + Sync>;
+
+/// #107 P1②：拖拽跟随幽灵（渲染被拖文件名——最小视觉）。
+#[derive(Clone)]
+pub struct DragGhost;
+
+impl gpui::Render for DragGhost {
+    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        ui::Label::new("移动中…").size(ui::LabelSize::XSmall)
+    }
+}
+
+/// #107 P1②：拖拽载荷（树行 on_drag——DragPanel #121 批③b 同型）。
+#[derive(Clone, Debug)]
+pub struct DraggedFile {
+    pub path: PathBuf,
+    pub is_dir: bool,
 }
 
 /// 目录条目。
@@ -461,6 +485,9 @@ impl Render for FileTree {
         // 走 main.rs 既有绑定；焦点经行点击落入树根句柄）。
         div()
             .id("file-tree")
+            // #247①：行命中锚（真实鼠标链测试用——树 bounds + 行高
+            // 22 × index 定位行中心，替代对面板头高度的脆弱硬编码）。
+            .debug_selector(|| "file-tree".into())
             .key_context("menu")
             .track_focus(&tree_focus)
             .on_action(cx.listener(|this, _: &menu::SelectNext, _, cx| {
@@ -606,7 +633,7 @@ impl FileTree {
         // 与迁移前语系一致）；深度缩进经组件 indent_level（14px 步进 =
         // 旧 depth*14 口径）；行高钉 22px。左/右键经组件 on_click /
         // on_secondary_mouse_down（MouseButton 枚举在组件内部接线）。
-        ListItem::new(gpui::SharedString::from(format!(
+        let item = ListItem::new(gpui::SharedString::from(format!(
             "ft-{}-{}",
             row.depth,
             row.path.display()
@@ -680,8 +707,35 @@ impl FileTree {
         // 当前打开文件高亮 + #575 键盘光标行（组件 selected 语系——
         // ghost_element_selected 通栏底色 + 上方 Label::Accent 文字色；
         // 两态同面：光标与激活文件共用选中底，Label::Accent 区分后者）。
-        .toggle_state(row.is_active || selected == Some(index))
-        .into_any_element()
+        .toggle_state(row.is_active || selected == Some(index));
+        // #107 P1②：拖拽移动（div 包裹——ListItem 无 on_drag，drag/drop
+        // 挂外层 stateful div：DraggedFile 载荷；目录行 on_drop = 移动进
+        // 该目录 → hooks.move_file → shell confirm_move_path 确认链）。
+        let drag_payload = DraggedFile { path: row.path.clone(), is_dir };
+        let dst = row.path.clone();
+        let move_hook = self.hooks.move_file.clone();
+        div()
+            .id(SharedString::from(format!("ft-row-drag-{index}")))
+            .on_drag(drag_payload, move |_, _, _, cx| {
+                cx.new(|_| DragGhost)
+            })
+            .when(is_dir, |el| {
+                el.on_drop::<DraggedFile>(cx.listener(
+                    move |_this, dragged: &DraggedFile, window, cx| {
+                        if dragged.path == dst {
+                            return; // 拖进自身无操作。
+                        }
+                        let name = dragged
+                            .path
+                            .file_name()
+                            .map(|n| n.to_owned())
+                            .unwrap_or_default();
+                        move_hook(dragged.path.clone(), dst.join(name), window, cx);
+                    },
+                ))
+            })
+            .child(item)
+            .into_any_element()
     }
 }
 
@@ -974,6 +1028,10 @@ mod keyboard_tests {
             open_file: Arc::new(move |path, _, _| opened.lock().unwrap().push(path)),
             context_menu: Arc::new(|_, _, _, _, _| {
                 panic!("unexpected context menu in keyboard test")
+            }),
+            // #107 P1②：测试域 no-op（移动链在 shell 域测）。
+            move_file: Arc::new(|_, _, _, _| {
+                panic!("unexpected move in keyboard test")
             }),
             escape: Arc::new(|_, _| panic!("unexpected escape in keyboard test")),
         }
