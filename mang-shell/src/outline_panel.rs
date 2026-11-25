@@ -992,27 +992,6 @@ mod tests {
         });
     }
 
-    fn select_next_moves_focus_to_next_row(cx: &mut TestAppContext) {
-        let (_editor, panel, mut visual) = panel_window(cx, "# A\n正文\n## B\n尾段");
-
-        let (first, second) = panel.read_with(&visual, |p, _| {
-            (
-                p.rows[0].focus_handle.clone(),
-                p.rows[1].focus_handle.clone(),
-            )
-        });
-        // 键盘导航起点：聚焦首行。
-        visual.update(|window, cx| first.focus(window, cx));
-        // ↑/↓ 的 action 直达（menu 键位族 = 真机同一入口）。
-        visual.dispatch_action(menu::SelectNext);
-        visual.update(|window, cx| {
-            assert!(
-                second.contains_focused(window, cx),
-                "SelectNext → 次行含焦点（Navigable 遍历语义）"
-            );
-        });
-    }
-
     /// 激活面：聚焦行 → Confirm → 编辑器光标跳行（jump_to_line 状态桥）。
     #[gpui::test]
     fn confirm_jumps_editor_cursor_to_row_line(cx: &mut TestAppContext) {

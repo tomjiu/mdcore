@@ -1388,6 +1388,7 @@ impl KeymapStore {
     /// 报告（不确定/叠加）：
     /// - **跨域**相交（非 Pass）——两域叠加执行（冒泡不拦）；
     /// - 同域 **pattern 完全相等**的重复绑定——表序遮蔽，后者永不触发。
+    #[allow(dead_code)]
     pub fn check_conflicts(&self) -> Vec<String> {
         let flat: Vec<(&Entry, Site)> = self
             .domains()
@@ -1436,6 +1437,7 @@ fn e_action_is_pass(e: &Entry) -> bool {
 }
 
 /// site 是否与动作域（编辑器 true / shell false）同域。
+#[allow(dead_code)]
 fn same_domain(site: Site, is_editor_action: bool) -> bool {
     let site_is_editor = matches!(
         site,

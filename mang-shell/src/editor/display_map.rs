@@ -168,6 +168,7 @@ impl DisplayMap {
     }
 
     /// 折叠区间快照（渲染/持久化恢复共用——`(start_line, end_line)`）。
+    #[allow(dead_code)]
     pub fn fold_ranges(&self) -> Vec<(usize, usize)> {
         self.folds
             .iter()

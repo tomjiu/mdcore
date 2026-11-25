@@ -125,6 +125,7 @@ impl MergeSpan {
     }
 
     /// 左上判定（值/选择/编辑锚点）。
+    #[allow(dead_code)]
     pub fn is_top_left(&self, row: usize, col: usize) -> bool {
         row == self.row_start && col == self.col_start
     }

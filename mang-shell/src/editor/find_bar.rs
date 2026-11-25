@@ -34,6 +34,7 @@ use super::form_input::FormInput;
 
 /// 查找历史上限（最近 N 条；VS Code 默认 50，此处取 20——面板/配置文件
 /// 都可控，够用且不膨胀 settings.json）。
+#[allow(dead_code)]
 pub const HISTORY_CAP: usize = 20;
 
 /// 查找条状态。

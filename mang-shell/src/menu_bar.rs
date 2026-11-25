@@ -117,6 +117,7 @@ pub struct MenuContext {
 /// 跟踪，留在代码注释里）。
 /// 编辑类（撤销/重做/剪切/复制/粘贴/替换）——read_only 灰显本就在，
 /// 页面态补原因说明。
+#[allow(dead_code)]
 pub const REASON_PAGE_EDIT: &str = "页面视图尚未就绪（LOK 会话建立后可编辑）——稍候或切换到文本视图";
 /// 查找/替换（编辑器浮层——页面态编辑器不在树内，开了也看不见）。
 pub const REASON_PAGE_FIND: &str = "页面视图暂不支持查找/替换——切换到文本视图后使用";

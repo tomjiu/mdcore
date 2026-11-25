@@ -101,6 +101,7 @@ impl Encoding {
 }
 
 /// BOM 长度（字节）。
+#[allow(dead_code)]
 pub fn bom_len(bytes: &[u8]) -> usize {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         3

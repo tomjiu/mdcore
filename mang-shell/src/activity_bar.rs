@@ -151,6 +151,7 @@ pub(crate) fn bar_button(
 /// Muted 图标色、无 hover 反馈、无 on_click；tooltip 说明原因
 /// （「明确禁用态与说明」，非静默无反应）。a11y 面与 bar_button
 /// 同纪录（模块文档：后续 PR）。
+#[allow(dead_code)]
 pub(crate) fn disabled_bar_button(
     id: &'static str,
     icon: IconName,

@@ -203,6 +203,7 @@ impl TreeState {
     }
 
     /// 清单缓存命中查询（懒加载语义测试面）。
+    #[allow(dead_code)]
     pub fn listing_loaded(&self, dir: &Path) -> bool {
         self.listings.contains_key(dir)
     }
@@ -947,26 +948,6 @@ mod tests {
             rows.len()
         );
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    fn forget_subtree_drops_expansion_and_cache() {
-        let dir = temp_fixture("forget");
-        let mut tree = TreeState::new(dir.clone());
-        let sub = dir.join("sub");
-        tree.toggle(&sub); // 展开 sub → 清单缓存 + deep 可见
-        assert!(tree.listing_loaded(&sub));
-        assert!(
-            visible_names(&tree).contains(&"deep".to_string()),
-            "前置：sub 展开中"
-        );
-        tree.forget_subtree(&sub);
-        assert!(!tree.listing_loaded(&sub), "sub 清单缓存丢弃");
-        assert!(!tree.expanded.contains(&sub), "sub 展开态丢弃");
-        assert!(
-            !visible_names(&tree).contains(&"deep".to_string()),
-            "子目录行随展开态消失"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

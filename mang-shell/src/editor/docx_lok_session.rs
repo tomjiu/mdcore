@@ -96,6 +96,7 @@ impl SessionError {
     }
 
     /// 是否为「内核缺失」（宿主回落文本视图的判据）。
+    #[allow(dead_code)]
     pub fn is_no_runtime(&self) -> bool {
         matches!(self, Self::NoRuntime(_))
     }
@@ -318,6 +319,7 @@ impl DocxLokSession {
     }
 
     /// 一次性会话目录（tile side file 落点）。
+    #[allow(dead_code)]
     pub fn session_dir(&self) -> &Path {
         &self.session_dir
     }
@@ -408,24 +410,6 @@ impl DocxLokSession {
             Ok(reply) => SessionRecv::Reply(reply),
             Err(TryRecvError::Empty) => SessionRecv::Empty,
             Err(TryRecvError::Disconnected) => SessionRecv::Disconnected,
-        }
-    }
-
-    /// #186 测试构造器：无 worker 线程的哑会话（cmd 通道无消费者——
-    /// request_tile 只 send 不回执；reply_rx 恒空）。用于显示链回归
-    /// （视口探针→派单→看门狗态机）——真实打开链由
-    /// `docx_lok_session::real_runtime_*` 与 bad_path 面锁定。
-    #[cfg(test)]
-    pub fn dummy_for_test(path: &Path) -> Self {
-        use std::sync::mpsc::channel;
-        let (cmd_tx, _cmd_rx) = channel::<SessionCmd>();
-        let (_reply_tx, reply_rx) = channel::<SessionReply>();
-        Self {
-            path: path.to_path_buf(),
-            session_dir: std::env::temp_dir(),
-            cmd_tx,
-            reply_rx,
-            closed: false,
         }
     }
 

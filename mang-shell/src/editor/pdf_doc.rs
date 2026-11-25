@@ -1430,6 +1430,7 @@ mod tests {
 // ── #306 ①：OCR 读面（with_ocr / ocr_page_lines 纯函数面） ─────────
 
 /// OCR 词构造（紧凑夹具）。
+#[allow(dead_code)]
 fn ocr_word(text: &str, line: (u32, u32, u32)) -> mdc_pdf::OcrWord {
     mdc_pdf::OcrWord {
         text: text.into(),

@@ -453,39 +453,6 @@ fn toggle_comment_roundtrip_in_rust_fence(cx: &mut gpui::TestAppContext) {
     });
 }
 
-fn toggle_comment_python_hash_and_md_body_noop(cx: &mut gpui::TestAppContext) {
-    let ed = md_editor(cx, "正文段\n```python\nx = 1\n```");
-    ed.update(cx, |e, _| {
-        e.buffer.set_cursor(p(0, 0));
-        e.sync_cursors_from_buffer();
-    });
-    // md 正文（围栏外）——D2 未裁：无操作。
-    ed.update(cx, |e, _| e.toggle_comment());
-    ed.update(cx, |e, _| {
-        assert_eq!(e.buffer.line(0), "正文段", "md 正文不动（D2 待裁）");
-    });
-    // python 围栏行 2——`#` 注释符。
-    ed.update(cx, |e, _| {
-        e.buffer.set_cursor(p(2, 0));
-        e.sync_cursors_from_buffer();
-    });
-    ed.update(cx, |e, _| e.toggle_comment());
-    ed.update(cx, |e, _| {
-        assert_eq!(e.buffer.line(2), "# x = 1", "python 围栏 # 注释");
-    });
-    // 再切（重设选区——首次切后选区存续不属本断言语义）——
-    // 全注释 → 去（幂等往返回原文）。
-    ed.update(cx, |e, _| {
-        e.buffer.set_selection(p(1, 0), p(2, 10));
-        e.sync_cursors_from_buffer();
-    });
-    ed.update(cx, |e, _| e.toggle_comment());
-    ed.update(cx, |e, _| {
-        assert_eq!(e.buffer.line(1), "let a = 1;", "往返回原文");
-        assert_eq!(e.buffer.line(2), "let b = 2;");
-    });
-}
-
 /// #111 P2 批⑦：复制行——行块复制到自身下方（光标不动；undo
 /// 一键复原）。先红面：copy_line/delete_line 方法不存在 = 编译红。
 #[gpui::test]

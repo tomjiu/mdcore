@@ -180,68 +180,6 @@ fn palette_open_ctrl_combo_bypasses_to_editor(cx: &mut gpui::TestAppContext) {
     });
 }
 
-fn palette_open_type_navigate_esc_lifecycle(cx: &mut gpui::TestAppContext) {
-    let (ed, window) = pal_window(cx, "# A\nbody\n");
-    // Ctrl+Shift+P 开面板（键位真实入口——keymap 表解析）。
-    let _ = window.update(cx, |_host, window, cx| {
-        let mut e = ctrl("p");
-        e.keystroke.modifiers.shift = true;
-        press(&ed, window, cx, e);
-    });
-    ed.update(cx, |ed, _| {
-        let pal = ed.palette.as_ref().expect("Ctrl+Shift+P 开面板");
-        assert_eq!(pal.query, "", "初开查询为空");
-        assert_eq!(pal.selected, 0, "选中复位 0");
-        assert_eq!(
-            pal.items.len(),
-            commands::search("").len(),
-            "空查询 = 全命令集（与 commands::search 同源）"
-        );
-    });
-    // 键入「折叠」两字——过滤到折叠族 + 选中复位。
-    let _ = window.update(cx, |_host, window, cx| {
-        for ch in ["折", "叠"] {
-            press(&ed, window, cx, key(ch, Some(ch)));
-        }
-    });
-    ed.update(cx, |ed, _| {
-        let pal = ed.palette.as_ref().expect("面板保持开");
-        assert_eq!(pal.query, "折叠", "可打印字符入查询");
-        assert_eq!(pal.selected, 0, "键入后选中复位 0");
-        assert_eq!(
-            pal.items.len(),
-            commands::search("折叠").len(),
-            "查询过滤 = commands::search 同源"
-        );
-        assert!(!pal.items.is_empty(), "折叠族命令在场（前置——防空集假绿）");
-    });
-    // ↑↓：down ×2 → up（min 夹紧语义）。
-    let _ = window.update(cx, |_host, window, cx| {
-        press(&ed, window, cx, key("down", None));
-        press(&ed, window, cx, key("down", None));
-        press(&ed, window, cx, key("up", None));
-    });
-    ed.update(cx, |ed, _| {
-        let pal = ed.palette.as_ref().expect("面板保持开");
-        assert_eq!(pal.selected, 1, "↓↓↑ = 选中 1（0 基扁平序）");
-    });
-    // Esc 关闭 → 重开换新（残留查询不带入）。
-    let _ = window.update(cx, |_host, window, cx| {
-        press(&ed, window, cx, key("escape", None));
-    });
-    ed.update(cx, |ed, _| assert!(ed.palette.is_none(), "Esc 关面板"));
-    let _ = window.update(cx, |_host, window, cx| {
-        let mut e = ctrl("p");
-        e.keystroke.modifiers.shift = true;
-        press(&ed, window, cx, e);
-    });
-    ed.update(cx, |ed, _| {
-        let pal = ed.palette.as_ref().expect("重开面板");
-        assert_eq!(pal.query, "", "重开 = 换新（不携带上次查询）");
-        assert_eq!(pal.selected, 0, "重开选中复位");
-    });
-}
-
 /// Enter 执行命令闭环：键入唯一命中「查找」→ Enter → 面板关 +
 /// 查找条开 + 最近使用记账（#183 A-3——下次打开面板顶部可见）。
 #[gpui::test]

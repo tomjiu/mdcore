@@ -233,6 +233,7 @@ pub trait DocxPort {
 // ---------------------------------------------------------------------------
 
 /// 在行列表里删除 `[start, count)` 行。
+#[allow(dead_code)]
 pub fn delete_rows(rows: &mut Vec<LineBlock>, start: usize, count: usize) {
     let end = (start + count).min(rows.len());
     if start < end {

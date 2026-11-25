@@ -303,6 +303,7 @@ pub fn infer_code_lang(text: &str) -> Option<highlight::CodeLang> {
 /// 语言态只有围栏一条来源；直接打开的 `.rs` / `.py` / `.ts` 用
 /// [`find_match_lang`]（渲染层走它——否则源码文件里的字符串/注释
 /// 排除不会生效）。
+#[allow(dead_code)]
 pub fn find_match(text: &str, cursor: (usize, usize)) -> BracketMatch {
     find_match_lang(text, cursor, None)
 }
@@ -363,6 +364,7 @@ pub fn find_match_lang(
 }
 
 /// 该字符是否属于被匹配的括号语法集（探针/渲染层的轻量判定）。
+#[allow(dead_code)]
 pub fn is_bracket_char(c: char) -> bool {
     classify(c).is_some()
 }
@@ -370,6 +372,7 @@ pub fn is_bracket_char(c: char) -> bool {
 /// 单行渲染辅助：给定全文 + 光标 + 目标行，返回本行需要上色的 char 列
 /// （匹配对 = 两列，不匹配 = 一列）。渲染层按光标缓存一次 [`find_match`]
 /// 结果即可逐行取列——本函数是它的便捷封装。
+#[allow(dead_code)]
 pub fn highlight_cols(text: &str, cursor: (usize, usize), line: usize) -> Vec<usize> {
     highlight_cols_lang(text, cursor, line, None)
 }

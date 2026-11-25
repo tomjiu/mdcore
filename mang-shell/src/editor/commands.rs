@@ -242,6 +242,7 @@ impl Cmd {
         }
     }
 
+    #[allow(dead_code)]
     pub fn matches_query(self, query: &str) -> Option<f32> {
         self.match_positions(query)
             .map(|(qi, _)| qi as f32 / self.title().chars().count() as f32)
@@ -281,6 +282,7 @@ pub fn from_key_name(name: &str) -> Option<Cmd> {
 }
 
 /// 按查询排序命令（匹配度降序；同度保文档序）。
+#[allow(dead_code)]
 pub fn search(query: &str) -> Vec<Cmd> {
     search_with_highlights(query)
         .into_iter()

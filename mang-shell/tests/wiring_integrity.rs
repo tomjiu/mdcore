@@ -67,48 +67,6 @@ fn line_of(file: &str, byte_idx: usize) -> usize {
     file[..byte_idx.min(file.len())].matches('\n').count() + 1
 }
 
-/// 提取 `decl`（如 `"fn exec_command("`）所在函数的**函数体**（含首尾
-/// 大括号）。
-///
-/// 大括号配对，字符串字面量感知（`"{"` 不计深度）；目标函数（mod.rs 的
-/// 方法、shell.rs 的方法）无 char 字面量与生命周期标注，无需处理 `'`。
-fn fn_body(file: &str, decl: &str) -> String {
-    let start = file.find(decl).unwrap_or_else(|| {
-        panic!("静态锚点缺失：源码里找不到 `{decl}`——函数被改名/删除？接线检查失效，请同步测试")
-    });
-    let body_open = file[start..]
-        .find('{')
-        .unwrap_or_else(|| panic!("`{decl}` 后无函数体开括号"));
-    let bytes = file.as_bytes();
-    let mut i = start + body_open;
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-        } else if c == b'"' {
-            in_str = true;
-        } else if c == b'{' {
-            depth += 1;
-        } else if c == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                return file[start + body_open..=i].to_string();
-            }
-        }
-        i += 1;
-    }
-    panic!("`{decl}` 函数体大括号不配对（字符串感知扫描到文件尾）");
-}
-
 /// 文件里所有字符串字面量（粗提取——供「未接线」措辞扫描）。
 fn string_literals(file: &str) -> Vec<(usize, String)> {
     let bytes = file.as_bytes();

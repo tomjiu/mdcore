@@ -31,6 +31,7 @@ pub const MAX_HITS: usize = 500;
 /// 总扫描字节预算（32MB——超限停扫并标记，Q-IDE R4 口径）。
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 /// 正则扫描步数预算（每文件——防回溯爆炸；子串引擎无此问题，正则才有）。
+#[allow(dead_code)]
 pub const MAX_STEPS_PER_FILE: usize = 2_000_000;
 /// 收集文件数上限（5000——Q-IDE R5 口径）。
 pub const MAX_FILE_COUNT: usize = 5000;
@@ -181,6 +182,7 @@ enum FileClass {
 /// 零宽保留。预算：步数闸（regex crate 无内建步数限制，用命中采样轮换
 /// 的保守近似——见 [`MAX_STEPS_PER_FILE`] 文档：超限文件整体标记跳过由
 /// 调用方处理，本函数只对**模式构造**报错）。
+#[allow(dead_code)]
 pub fn search_text(
     text: &str,
     pattern: &str,
@@ -235,6 +237,7 @@ fn regex_error_message(pattern: &str, err: &regex::Error) -> String {
 
 /// 工作区全量搜索（同步口径——批②将本函数放入后台线程；结果面含
 /// 预算/截断标记）。root 下 scope 限定按 [`collect_files`]。
+#[allow(dead_code)]
 pub fn search_workspace(
     root: &Path,
     pattern: &str,

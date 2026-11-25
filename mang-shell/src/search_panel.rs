@@ -209,6 +209,7 @@ impl LineInput {
         self.text.encode_utf16().count()
     }
 
+    #[allow(dead_code)]
     fn set_text(&mut self, text: &str) {
         self.text = text.to_owned();
         self.head = self.len_utf16();

@@ -2595,6 +2595,7 @@ impl PdfPagesView {
     /// #386 e2e 断言面：构造期引擎错误（None = 页视图在位可渲染；
     /// Some = error 态面板文案）。测试据此在无 pdfium 环境 SKIP
     /// （render_170_pdf 同口径——不伪装通过）。
+    #[allow(dead_code)]
     pub(crate) fn engine_error(&self) -> Option<&str> {
         self.error.as_deref()
     }

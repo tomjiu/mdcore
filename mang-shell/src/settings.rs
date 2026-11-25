@@ -61,6 +61,7 @@ pub fn save_indent_unit(key: &str) {
 
 /// #111 批②：括号自动闭合读写（`auto_close_brackets` 键：bool——
 /// 默认开；沿 indent_unit 载体先例）。
+#[allow(dead_code)]
 pub fn save_auto_close_brackets(on: bool) {
     if let Some(dir) = config_dir() {
         let mut value = load_from(&dir);
@@ -593,12 +594,14 @@ pub fn load_palette_recent() -> Vec<String> {
 
 /// 测试形态：直接写指定目录（e2e 注入用——不动进程 env，避免并行套件
 /// 下的 XDG 污染窗；生产路径走 [`save_palette_recent`]）。
+#[allow(dead_code)]
 pub fn save_palette_recent_for_test(dir: &Path, names: &[String]) {
     std::fs::create_dir_all(dir).unwrap();
     save_palette_recent_in(dir, names);
 }
 
 /// 测试形态：直接读指定目录（同上）。
+#[allow(dead_code)]
 pub fn load_palette_recent_from_test(dir: &Path) -> Vec<String> {
     load_palette_recent_in(dir)
 }
@@ -863,12 +866,14 @@ fn remembered_workspace_in(dir: &Path) -> Option<PathBuf> {
 /// #132 任务 2：查找历史读写（`find_history` 键：字符串数组，新→旧）。
 ///
 /// 容错口径与其余键一致：目录/文件不可得 → 静默跳过（历史是增强不是依赖）。
+#[allow(dead_code)]
 pub fn save_find_history(entries: &[String]) {
     if let Some(dir) = config_dir() {
         save_find_history_in(&dir, entries);
     }
 }
 
+#[allow(dead_code)]
 pub fn load_find_history() -> Vec<String> {
     config_dir()
         .map(|dir| load_find_history_in(&dir))
@@ -876,12 +881,14 @@ pub fn load_find_history() -> Vec<String> {
 }
 
 /// #132 任务 2：正则开关读写（`find_regex` 键：布尔）。
+#[allow(dead_code)]
 pub fn save_find_regex(on: bool) {
     if let Some(dir) = config_dir() {
         save_find_regex_in(&dir, on);
     }
 }
 
+#[allow(dead_code)]
 pub fn load_find_regex() -> bool {
     config_dir()
         .map(|dir| load_find_regex_in(&dir))
@@ -890,6 +897,7 @@ pub fn load_find_regex() -> bool {
 
 // ---- 目录显式传入的底层实现（单测用——并行测试不互相污染全局态） ----
 
+#[allow(dead_code)]
 fn save_find_history_in(dir: &Path, entries: &[String]) {
     let mut value = load_from(dir);
     value["find_history"] = serde_json::Value::Array(
@@ -901,6 +909,7 @@ fn save_find_history_in(dir: &Path, entries: &[String]) {
     save_to(dir, &value);
 }
 
+#[allow(dead_code)]
 fn load_find_history_in(dir: &Path) -> Vec<String> {
     load_from(dir)
         .get("find_history")
@@ -913,12 +922,14 @@ fn load_find_history_in(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn save_find_regex_in(dir: &Path, on: bool) {
     let mut value = load_from(dir);
     value["find_regex"] = serde_json::Value::Bool(on);
     save_to(dir, &value);
 }
 
+#[allow(dead_code)]
 fn load_find_regex_in(dir: &Path) -> bool {
     load_from(dir)
         .get("find_regex")

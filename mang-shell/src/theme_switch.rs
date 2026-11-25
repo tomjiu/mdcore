@@ -108,6 +108,7 @@ fn light_gray(lightness: f32) -> Hsla {
 }
 
 /// 解析主题模式（未知值 → system）。
+#[allow(dead_code)]
 pub fn parse_mode(value: Option<&str>) -> &'static str {
     match value {
         Some(MODE_LIGHT) => MODE_LIGHT,

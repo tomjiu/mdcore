@@ -111,6 +111,7 @@ pub fn palette_list(
 }
 
 /// 段标题是否应显示（最近组为空时不显示"最近使用"标题）。
+#[allow(dead_code)]
 pub fn section_visible(group: Group, entries: &[Entry]) -> bool {
     if group == Group::Recent {
         return !entries.is_empty();

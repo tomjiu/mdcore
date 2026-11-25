@@ -334,6 +334,7 @@ pub fn git_show_files(root: &Path, hash: &str) -> Option<String> {
 
 /// porcelain v1 -z 解析：路径不做 C 引号转义；R/C 记录的目标在前，
 /// 下一段是原路径。消费原路径记录，避免误当成第二条改动。
+#[allow(dead_code)]
 pub fn parse_porcelain_z(bytes: &[u8]) -> Vec<GitChange> {
     porcelain_z_records(bytes)
         .into_iter()
@@ -364,6 +365,7 @@ fn porcelain_z_records(bytes: &[u8]) -> Vec<(GitChange, Option<String>)> {
 
 /// porcelain 行解析（`XY path` / `XY orig -> new` / `?? path`）。
 /// 纯函数。
+#[allow(dead_code)]
 pub fn parse_porcelain(text: &str) -> Vec<GitChange> {
     text.lines()
         .filter(|l| !l.trim().is_empty())

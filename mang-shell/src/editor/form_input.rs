@@ -126,6 +126,7 @@ impl FormInput {
         }
         self.marked = Some(r);
     }
+    #[allow(dead_code)]
     pub fn cursor_col(&self) -> usize {
         self.text[..self.byte(self.head)].chars().count()
     }

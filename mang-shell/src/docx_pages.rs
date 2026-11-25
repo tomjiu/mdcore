@@ -168,6 +168,7 @@ pub(crate) trait TileSession: Send {
     /// 页矩形坐标源；默认未接线返回 false，mock 未实现时调用面如实
     /// 「不可跳页」不假绿。真链消费 = real_chain_c5_matrix_parity；
     /// 产品翻页呈现接后续批次）。
+    #[allow(dead_code)]
     fn edit_page_geometry(&mut self, _seq: u64) -> bool {
         false
     }
@@ -262,6 +263,7 @@ pub enum Boot {
 
 impl Boot {
     /// 内核缺失判据（宿主回流文本视图口径——`SessionError::NoRuntime`）。
+    #[allow(dead_code)]
     pub fn is_no_runtime(&self) -> bool {
         matches!(
             self,
@@ -451,11 +453,13 @@ impl DocxPagesView {
     }
 
     /// 源路径（壳层槽位对账）。
+    #[allow(dead_code)]
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 
     /// 启动状态读数（壳层/测试面）。
+    #[allow(dead_code)]
     pub fn boot(&self) -> &Boot {
         &self.boot
     }
@@ -1960,6 +1964,7 @@ impl DocxPagesView {
     /// 同构：替换 + `preedit` 出清 + 定稿 `type_text` 下发——本方法
     /// 保留为文档锚点，不再承担提交判定（marked_text_range/unmark
     /// 组合时序已由平台协议保证）。
+    #[allow(dead_code)]
     fn preedit_commit_if_standalone(&mut self, cx: &mut Context<Self>) {
         let _ = cx;
     }

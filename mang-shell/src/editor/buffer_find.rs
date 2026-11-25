@@ -49,6 +49,7 @@ impl Buffer {
 
 /// 正则**是否可编译**（只校验不扫描——输入过程中的实时校验用，避免每键
 /// 全文扫描；完整匹配由 [`Buffer::find_matches_regex`] 在需要时算）。
+#[allow(dead_code)]
 pub fn regex_check(pattern: &str) -> Result<(), String> {
     if pattern.is_empty() {
         return Ok(());

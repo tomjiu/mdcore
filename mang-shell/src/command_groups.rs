@@ -231,6 +231,7 @@ pub fn build_sections(
 
 /// 兼容入口：消费纯 `search()` 输出（无高亮集）——空高亮拼装后委托
 /// [`build_sections`]（纯逻辑单测与既有调用面的旧口径）。
+#[allow(dead_code)]
 pub fn build_sections_plain(query: &str, results: &[Cmd], recent: &RecentRing) -> Vec<Section> {
     let with_hl: Vec<(Cmd, Vec<usize>)> = results.iter().map(|&c| (c, Vec::new())).collect();
     build_sections(query, &with_hl, recent)

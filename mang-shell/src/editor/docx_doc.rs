@@ -360,6 +360,7 @@ pub fn load_editable(path: &Path) -> Result<EditablePayload, String> {
 }
 
 /// 宽面文档序段落总数（表格单元格/文本框内段落逐层计——与引擎 w:p 同口径）。
+#[allow(dead_code)]
 fn width_paragraph_total(blocks: &[Block]) -> usize {
     blocks
         .iter()
