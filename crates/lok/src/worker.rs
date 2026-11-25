@@ -69,15 +69,15 @@
 //! 处理器（ElyOffice 实证：正常 exit 会走 LO 清理，慢且可能死锁）。
 
 use crate::abi::{
-    self, callbacks, DocType, LokDocClass, LokDocument, LokHook2, LokKit, LokKitClass,
+    self, DocType, LokDocClass, LokDocument, LokHook2, LokKit, LokKitClass, callbacks,
 };
 use crate::bmp;
-use crate::ffi::{cstr_take, Library};
+use crate::ffi::{Library, cstr_take};
 use crate::profile::SessionProfile;
 use crate::protocol::{self, codes};
 use crate::runtime::LokRuntime;
 use crate::sha256::sha256_hex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::BufReader;
@@ -326,6 +326,91 @@ fn windows_worker_preamble() {
 }
 
 /// kit 级回调（LO 内核线程调用；只入队）。
+// ── #115 缺口 #10：asked 模式（load 期内核问答哨兵——ely-lok worker/asked.rs 同构）──
+/// load 前装上的「一次性密码」；内核问（cb 20）时取走答给
+/// set_document_password 槽。二问 = 第一次答没对上（REFUSED）。
+static ASKED_GIVEN: Mutex<Option<String>> = Mutex::new(None);
+/// 内核问了密码而 GIVEN 空（或首答不对）→ load 后判 E_LOCKED。
+static ASKED_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 内核 cb 22 ERROR payload kind=brokenpackage → load 后判 E_DAMAGED。
+static ASKED_DAMAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 是否处在「load 进行中」（界定内联应答窗口——非 load 期 cb 20/22 照常透传宿主）。
+static ASKED_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// bind_kernel 装的 kit 指针快照（asked 内联应答从 LO 线程调 set_document_password
+/// 槽需要——dispatch 线程的 WorkerState 在 LO 线程不可达）。
+/// 裸指针非 Send——包 wrapper 声明线程穿越（kit 恒活到 worker 退出，无生命周期险）。
+#[derive(Clone)]
+struct KitSnapshot(*mut c_void, *mut c_void);
+unsafe impl Send for KitSnapshot {}
+static ASKED_KIT: Mutex<Option<KitSnapshot>> = Mutex::new(None);
+
+/// 装一次性密码并清哨兵（load 前调；password 空 = None——内核问则 REFUSED）。
+fn asked_arm(password: Option<String>) {
+    *ASKED_GIVEN.lock().expect("asked_given 锁") = password;
+    ASKED_REFUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+    ASKED_DAMAGED.store(false, std::sync::atomic::Ordering::SeqCst);
+    ASKED_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 撤销应答窗口并取走残余密码（load 返回后必调——防泄漏到下个 load）。
+fn asked_disarm() {
+    ASKED_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+    *ASKED_GIVEN.lock().expect("asked_given 锁") = None;
+}
+
+/// 内联应答：cb 20 → 答 set_document_password；cb 22 → 记 DAMAGED。
+/// 仅在 asked 窗口内消费（返回 true = 已内联处理，不再透传宿主）。
+fn asked_on_kit(n_type: c_int, payload: &str) -> bool {
+    if !ASKED_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    if n_type == crate::abi::callbacks::DOCUMENT_PASSWORD {
+        // payload = 正在问密码的文档 URL（ely asked.rs:52 同口径）。
+        let given = ASKED_GIVEN.lock().expect("asked_given 锁").take();
+        ASKED_REFUSED.store(given.is_none(), std::sync::atomic::Ordering::SeqCst);
+        let snap = ASKED_KIT.lock().expect("asked_kit 锁").clone();
+        if let (Some(snap), Some(password)) = (snap, given) {
+            let (kit, kit_class_ptr) = (snap.0, snap.1);
+            unsafe {
+                let kit_class = &*(kit_class_ptr as *const crate::abi::LokKitClass);
+                // 槽 #8（nSize 守卫——运行时过旧则按 refused 走：问而答不出）。
+                let n = kit_class.n_size;
+                if !crate::abi::has_member(
+                    n,
+                    crate::abi::kit_offsets::DOCUMENT_PASSWORD,
+                    std::mem::size_of::<usize>(),
+                ) {
+                    ASKED_REFUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else if let Some(f) = kit_class.set_document_password {
+                    let url_c = CString::new(payload)
+                        .unwrap_or_else(|_| CString::new("").expect("空 CString"));
+                    let pw_c = CString::new(password)
+                        .unwrap_or_else(|_| CString::new("").expect("空 CString"));
+                    f(
+                        kit as *mut crate::abi::LokKit,
+                        url_c.as_ptr(),
+                        pw_c.as_ptr(),
+                    );
+                }
+            }
+        }
+        // 内联消费——load 期的问密码事件不透传宿主（宿主无问答通道）。
+        return true;
+    }
+    if n_type == crate::abi::callbacks::ERROR {
+        // payload JSON {"kind": "brokenpackage", ...}（ely asked.rs:63-68 同构）。
+        let kind = serde_json::from_str::<Value>(payload)
+            .ok()
+            .and_then(|v| v["kind"].as_str().map(str::to_owned));
+        if kind.as_deref() == Some("brokenpackage") {
+            ASKED_DAMAGED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // ERROR 透传宿主（诊断面）+ 记哨兵——两不误。
+        return false;
+    }
+    false
+}
+
 unsafe extern "C" fn kit_callback(n_type: c_int, payload: *const c_char, data: *mut c_void) {
     let tx = &*(data as *const Sender<ToWriter>);
     let name = callbacks::name(n_type).unwrap_or("OTHER");
@@ -336,6 +421,10 @@ unsafe extern "C" fn kit_callback(n_type: c_int, payload: *const c_char, data: *
             .to_string_lossy()
             .into_owned()
     };
+    // #115 缺口 #10：load 窗口内的问答内联消费（cb 20 不透传宿主）。
+    if asked_on_kit(n_type, &payload) {
+        return;
+    }
     let _ = tx.send(ToWriter::Frame(protocol::cb_event_frame(
         n_type, name, &payload,
     )));
@@ -421,7 +510,9 @@ fn bind_kernel(
         if !abi::has_member(n, off, std::mem::size_of::<usize>()) {
             return Err((
                 codes::MEMBER,
-                format!("Kit 类 nSize={n} 缺成员 {name}（offset={off}）——运行时过旧，不支持 LOK 原型所需面"),
+                format!(
+                    "Kit 类 nSize={n} 缺成员 {name}（offset={off}）——运行时过旧，不支持 LOK 原型所需面"
+                ),
             ));
         }
     }
@@ -434,7 +525,9 @@ fn bind_kernel(
         if !abi::has_member(n, off, std::mem::size_of::<usize>()) {
             return Err((
                 codes::MEMBER,
-                format!("Kit 类 nSize={n} 缺成员 runLoop（offset={off}）——运行时过旧，不支持 LOK 原型所需面"),
+                format!(
+                    "Kit 类 nSize={n} 缺成员 runLoop（offset={off}）——运行时过旧，不支持 LOK 原型所需面"
+                ),
             ));
         }
     }
@@ -462,6 +555,11 @@ fn bind_kernel(
             f(kit, abi::FEATURE_PART_IN_INVALIDATION_CALLBACK);
         }
     }
+    // #115 缺口 #10：asked 内联应答的 kit 快照（LO 线程的 kit_callback 调
+    // set_document_password 槽需要 kit/kit_class 两指针——dispatch 线程的
+    // WorkerState 不可达。kit 恒活到 worker 退出，快照无需撤）。
+    *ASKED_KIT.lock().expect("asked_kit 锁") =
+        Some(KitSnapshot(kit as *mut c_void, kit_class as *mut c_void));
     Ok(state)
 }
 
@@ -520,13 +618,26 @@ impl WorkerState {
     }
 
     /// documentLoadWithOptions。
-    fn op_load(&mut self, url: &str, options: Option<&str>) -> DispatchResult {
+    fn op_load(
+        &mut self,
+        url: &str,
+        options: Option<&str>,
+        password: Option<&str>,
+    ) -> DispatchResult {
         if !self.doc.is_null() {
             return Err((
                 codes::INTERNAL,
                 "单文档 worker：已有打开文档（先 close）".into(),
             ));
         }
+        // #115 缺口 #10：asked 模式武装（ely worker.rs:324 `asked::arm(...)`
+        // 同构——一次性密码装上，load 窗口内内核问则内联答）。
+        if let Some(pw) = password {
+            if pw.contains('\0') {
+                return Err((codes::BAD_REQUEST, "password 含 NUL".into()));
+            }
+        }
+        asked_arm(password.filter(|p| !p.is_empty()).map(str::to_owned));
         unsafe {
             // kit 级成员守卫（不是 doc_guard：此处文档尚未打开）
             let n = (*self.kit_class).n_size;
@@ -560,7 +671,27 @@ impl WorkerState {
                 .unwrap_or(std::ptr::null());
             let doc = f(self.kit, url_c.as_ptr(), opt_ptr);
             if doc.is_null() {
+                // #115 缺口 #10：先撤 asked 窗口再判哨兵（ely worker.rs:332-337
+                // `let (refused, damaged) = ...; asked::arm(None)` 同构——
+                // 撤窗口与取哨兵必须原子序：先读后撤）。
+                let refused = ASKED_REFUSED.load(std::sync::atomic::Ordering::SeqCst);
+                let damaged = ASKED_DAMAGED.load(std::sync::atomic::Ordering::SeqCst);
+                asked_disarm();
                 let why = self.kit_error_text().unwrap_or_default();
+                if refused {
+                    return Err((
+                        codes::LOCKED,
+                        "文档需要密码（未提供或不对）：load 期内核问密码而答案未过（url={url}）"
+                            .into(),
+                    ));
+                }
+                if damaged {
+                    return Err((
+                        codes::DAMAGED,
+                        "文档损坏（brokenpackage）：内核 cb 22 kind=brokenpackage（url={url}）"
+                            .into(),
+                    ));
+                }
                 return Err((
                     codes::LOAD,
                     format!("documentLoad 失败：{why}（url={url}）"),
@@ -569,6 +700,8 @@ impl WorkerState {
             self.doc = doc;
             self.doc_class = (*doc).p_class;
             self.loaded_url = url.to_owned();
+            // load 成功也撤 asked 窗口（残余密码不滞留——下个 load 需重新装）。
+            asked_disarm();
         }
         // 加载即注册 doc 级回调（失效/搜索结果/UNO 结果事件持续透传）
         unsafe {
@@ -1902,7 +2035,8 @@ fn dispatch(state: &mut WorkerState, op: &str, v: &Value) -> DispatchResult {
             let url = protocol::req_str(v, "url")
                 .ok_or((codes::BAD_REQUEST, "load 需要 url".to_string()))?;
             let options = protocol::req_str(v, "options");
-            state.op_load(&url, options.as_deref())
+            let password = protocol::req_str(v, "password");
+            state.op_load(&url, options.as_deref(), password.as_deref())
         }
         "close" => state.op_close(),
         "init_rendering" => {

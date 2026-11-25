@@ -12,8 +12,8 @@
 //!   worker 死亡 / 保存失败一律保留（issue 明文）。
 
 use crate::protocol::{self, codes};
-use crate::runtime::{LokRuntime, LOK_HOME_ENV, LOK_LIB_ENV};
-use serde_json::{json, Value};
+use crate::runtime::{LOK_HOME_ENV, LOK_LIB_ENV, LokRuntime};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -650,10 +650,15 @@ impl<'a> DocHandle<'a> {
         client: &'a WorkerClient,
         url: &str,
         options: Option<&str>,
+        password: Option<&str>,
     ) -> Result<DocHandle<'a>, LokError> {
         let mut a = json!({"url": url});
         if let Some(o) = options {
             a["options"] = json!(o);
+        }
+        // #115 缺口 #10：load 密码贯通（worker asked 模式一次性应答）。
+        if let Some(p) = password {
+            a["password"] = json!(p);
         }
         client.request("load", a)?;
         Ok(DocHandle::new(client, url))
@@ -902,6 +907,18 @@ impl DocSession {
         url: &str,
         options: Option<&str>,
     ) -> Result<DocSession, LokError> {
+        Self::open_with_password(runtime, session_root, url, options, None)
+    }
+
+    /// [`DocSession::open`] 的带密码版（#115 缺口 #10：密码保护文档
+    /// 装载——worker asked 模式一次性应答；错/漏密码 → `E_LOCKED`）。
+    pub fn open_with_password(
+        runtime: Option<&crate::runtime::LokRuntime>,
+        session_root: &Path,
+        url: &str,
+        options: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<DocSession, LokError> {
         // runtime=None = 发现序自动定位（MDC_LOK_HOME / MDC_LOK_LIB →
         // 部署位 → 平台常见位）；显式传入用于测试与多运行时选择。
         let discovered;
@@ -917,6 +934,10 @@ impl DocSession {
         let mut a = json!({"url": url});
         if let Some(o) = options {
             a["options"] = json!(o);
+        }
+        // #115 缺口 #10：密码贯通（worker asked 模式一次性应答）。
+        if let Some(p) = password {
+            a["password"] = json!(p);
         }
         client.request("load", a)?;
         // 与 smoke 全链一致：init_rendering 空 args（25.2 实测

@@ -13,7 +13,7 @@
 use crate::client::{DocHandle, Event, LokError, WorkerClient};
 use crate::protocol::codes;
 use crate::runtime::{self, LokRuntime};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -181,7 +181,7 @@ pub fn run(
     );
 
     // ---- 4. 打开副本（documentLoadWithOptions）----
-    let doc = match DocHandle::load(&w1, &work_url, Some("DeviceFormFactor=desktop")) {
+    let doc = match DocHandle::load(&w1, &work_url, Some("DeviceFormFactor=desktop"), None) {
         Ok(d) => d,
         Err(e) => {
             log.check("doc.load", false, json!({"error": e.to_string()}));
@@ -494,7 +494,7 @@ pub fn run(
         let parent = std::fs::canonicalize(out_dir).map_err(|e| e.to_string())?;
         crate::profile::file_url_of(&parent.join("edited.docx"))
     };
-    let doc2 = match DocHandle::load(&w2, &edited_url2, Some("DeviceFormFactor=desktop")) {
+    let doc2 = match DocHandle::load(&w2, &edited_url2, Some("DeviceFormFactor=desktop"), None) {
         Ok(d) => d,
         Err(e) => {
             overall &= log.check("reopen.load_edited", false, json!({"error": e.to_string()}));
@@ -585,7 +585,7 @@ pub fn run(
         // 打开 + 编辑一笔（脏位宿主侧语义在 DocHandle；此处杀进程看错误面）
         let parent = std::fs::canonicalize(out_dir).map_err(|e| e.to_string())?;
         let url3 = crate::profile::file_url_of(&parent.join("work.docx"));
-        if let Ok(doc3) = DocHandle::load(&w3, &url3, Some("DeviceFormFactor=desktop")) {
+        if let Ok(doc3) = DocHandle::load(&w3, &url3, Some("DeviceFormFactor=desktop"), None) {
             let _ = doc3.type_text("杀前临时编辑");
         }
     }

@@ -30,6 +30,8 @@
 //! | `E_SAVE` | saveAs 失败（附 kit getError 原文） |
 //! | `E_MEMBER` | ABI 成员缺失（nSize 守卫拦截——运行时太老） |
 //! | `E_IO` | side file / 文件系统错误 |
+//! | `E_LOCKED` | load 需要密码而未给/不对（#115 缺口 #10 哨兵） |
+//! | `E_DAMAGED` | load 遇损坏包 brokenpackage（#115 缺口 #10 哨兵） |
 //! | `E_INTERNAL` | worker 内部不变量被破坏 |
 //!
 //! 宿主侧错误（不出现在线上，client 内部产生）：`E_TIMEOUT`（超时，
@@ -37,7 +39,7 @@
 //! `E_OVERSIZE`（请求行超限拒发）。
 
 use crate::MAX_FRAME_BYTES;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::BufRead as _;
 
 /// 错误码常量。
@@ -56,6 +58,10 @@ pub mod codes {
     pub const TIMEOUT: &str = "E_TIMEOUT";
     /// #115 #5：剪贴板三件套语义失败（paste 静默失败等——如实报，不装成功）。
     pub const CLIPBOARD: &str = "E_CLIPBOARD";
+    /// #115 缺口 #10：load 时内核问密码而未给 / 给了不对（Ely ipc::LOCKED 同构）。
+    pub const LOCKED: &str = "E_LOCKED";
+    /// #115 缺口 #10：load 时内核报 brokenpackage（Ely ipc::DAMAGED 同构）。
+    pub const DAMAGED: &str = "E_DAMAGED";
     pub const WORKER_DIED: &str = "E_WORKER_DIED";
 }
 

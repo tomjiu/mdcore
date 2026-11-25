@@ -388,6 +388,8 @@ pub mod kit_offsets {
     off!(FREE_ERROR, free_error);
     off!(REGISTER_CALLBACK, register_callback);
     off!(SET_OPTIONAL_FEATURES, set_optional_features);
+    // #115 缺口 #10：load 期答密码槽（asked 模式）。
+    off!(DOCUMENT_PASSWORD, set_document_password);
     off!(GET_VERSION_INFO, get_version_info);
     // B1：unipoll 主循环（worker unipoll_loop 进 runLoop；缺槽 = boot-failed）
     off!(RUN_LOOP, run_loop);
@@ -491,6 +493,10 @@ pub mod callbacks {
     pub const SEARCH_RESULT_SELECTION: i32 = 15;
     /// UNO 命令完成（payload: {"commandName","success"}）。
     pub const UNO_COMMAND_RESULT: i32 = 16;
+    /// load 期问密码（payload: 文档 URL；#115 缺口 #10——asked 模式应答面）。
+    pub const DOCUMENT_PASSWORD: i32 = 20;
+    /// 内核错误上报（payload JSON 含 kind；brokenpackage → DAMAGED 哨兵）。
+    pub const ERROR: i32 = 22;
 
     /// 回调类型名（诊断/事件帧用；未知值返回 None）。
     pub fn name(v: i32) -> Option<&'static str> {
@@ -503,6 +509,8 @@ pub mod callbacks {
             DOCUMENT_SIZE_CHANGED => "DOCUMENT_SIZE_CHANGED",
             SEARCH_RESULT_SELECTION => "SEARCH_RESULT_SELECTION",
             UNO_COMMAND_RESULT => "UNO_COMMAND_RESULT",
+            DOCUMENT_PASSWORD => "DOCUMENT_PASSWORD",
+            ERROR => "ERROR",
             _ => return None,
         })
     }
