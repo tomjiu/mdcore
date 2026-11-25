@@ -24,7 +24,7 @@
 //! ## 单测口径
 //!
 //! `candidate_commands` 是纯函数（候选序/参数形/转义——不 spawn），
-//! 沙箱可全断言；`show_error` 用受控 `PATH` 测试（空 PATH = 必 false；
+//! 沙箱可全断言；`show_error` 用受控 `PATH` 测试（spawn 级 env 覆写——进程 PATH 不动；
 //! 假 zenity 脚本 = true；假工具失败 = 换下一候选），**不依赖沙箱真装了
 //! 哪个桌面工具**——跨环境（CI 无桌面）不飘。
 
@@ -150,14 +150,29 @@ pub fn candidate_commands(spec: &DialogSpec) -> Vec<(String, Vec<String>)> {
 /// （调用方回退纯 stderr）。stdio 三路全 null——对话框工具的任何输出
 /// 不污染本进程 stdout/stderr（错误链已由调用方落 stderr）。
 pub fn show_error(spec: &DialogSpec) -> bool {
-    for (prog, args) in candidate_commands(spec) {
-        let Ok(mut child) = Command::new(&prog)
-            .args(&args)
+    show_error_with_path(candidate_commands(spec), None)
+}
+
+/// 送达判定内核（#422 并行隔离修复面）：`path_override = Some(dir)` 时仅对
+/// **本次 spawn 的子进程**覆写 PATH（`Command::env` 逐次注入——不动进程全局
+/// PATH）。产品路径传 `None` 走进程 PATH；测试传受控目录验证候选序/退出码
+/// 语义，零 `set_var`（进程级环境竞态根除——并行测试与 git 等子进程
+/// spawn 不再互踩）。
+fn show_error_with_path(
+    candidates: Vec<(String, Vec<String>)>,
+    path_override: Option<&std::path::Path>,
+) -> bool {
+    for (prog, args) in candidates {
+        let mut cmd = Command::new(&prog);
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
+            .stderr(Stdio::null());
+        if let Some(dir) = path_override {
+            // 单次子进程 env 覆写：进程全局 PATH 不变。
+            cmd.env("PATH", dir);
+        }
+        let Ok(mut child) = cmd.spawn() else {
             continue; // 工具不存在 → 下一候选
         };
         match child.wait() {
@@ -242,30 +257,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("zenity");
 
-        // 全程恢复式改 PATH（单测试内串行——无并发竞态面）。
-        let saved = std::env::var_os("PATH");
-        let restore = || match &saved {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
-        };
+        // 受控 PATH 经 spawn 级 env 覆写（#422 修复面）：不 set_var 进程
+        // 全局 PATH——并行测试与 git spawn 不互踩；三态矩阵语义不变。
+        let cands = || candidate_commands(&spec());
 
         // ① 空 PATH（目录无任何工具）：任何候选都找不到 → false。
-        unsafe { std::env::set_var("PATH", &dir) };
-        let r_empty = show_error(&spec());
+        let r_empty = show_error_with_path(cands(), Some(&dir));
 
         // ② 假 zenity exit 0 → 送达 true。
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         make_executable(&fake);
-        unsafe { std::env::set_var("PATH", &dir) };
-        let r_delivered = show_error(&spec());
+        let r_delivered = show_error_with_path(cands(), Some(&dir));
 
-        // ③ 假 zenity exit 1 且无后续候选（kdialog 等不在 PATH）→ false。
+        // ③ 假 zenity exit 1 且无后续候选（kdialog 等不在受控 PATH）→ false。
         std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
-        unsafe { std::env::set_var("PATH", &dir) };
-        let r_exhausted = show_error(&spec());
+        let r_exhausted = show_error_with_path(cands(), Some(&dir));
 
-        // 恒恢复（断言失败也不残留 PATH 污染同进程其他测试）。
-        restore();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(!r_empty, "空 PATH 下任何工具不可达 → 必 false");
