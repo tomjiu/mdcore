@@ -60,6 +60,11 @@ fn stage_of_open_error(e: &LokError) -> &'static str {
     match e {
         LokError::WorkerDied { .. } => "spawn",
         LokError::Protocol(m) if m.contains("spawn") || m.contains("可执行") => "spawn",
+        // #50 C 线消费批：密码/损坏哨兵专属阶（worker E_LOCKED/E_DAMAGED 码
+        // 分流——SessionError::Locked/Damaged 消费端 UI 呈现「需密码/损坏」
+        // 明确语义，与普通 load 失败分流）。
+        LokError::Lok { code, .. } if code == "E_LOCKED" => "locked",
+        LokError::Lok { code, .. } if code == "E_DAMAGED" => "damaged",
         _ => "load",
     }
 }

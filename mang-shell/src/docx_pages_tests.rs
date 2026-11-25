@@ -1841,3 +1841,95 @@ fn session_died_clears_edit_pending(cx: &mut gpui::TestAppContext) {
 fn next_edit_seq_for_test() -> u64 {
     EDIT_SEQ.load(std::sync::atomic::Ordering::Relaxed) + 1
 }
+
+/// #50 C 线消费批：密码哨兵的产品层接驳——worker `E_LOCKED` 的
+/// `locked` 阶经 SessionReply::Failed 落 `Boot::Failed`（阶保留），
+/// 面板标题翻成用户语（「此文档需要密码」——不是裸阶段名）。
+/// 与「打不开」（load 普通失败）分流的证据面。
+#[gpui::test]
+fn sentinel_locked_stage_lands_and_titles(cx: &mut gpui::TestAppContext) {
+    let (open_tx, open_rx) = channel();
+    let (reply_tx, reply_rx) = channel();
+    reply_tx
+        .send(SessionReply::Failed {
+            stage: "locked",
+            message: "[E_LOCKED] 文档需要密码（未提供或不对）：load 期内核问密码而答案未过".into(),
+        })
+        .unwrap();
+    open_tx
+        .send(Ok(DocxLokSession::from_reply_channel_for_test(reply_rx)))
+        .unwrap();
+    drop(open_tx);
+    drop(reply_tx);
+    let view =
+        cx.update(|app| app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, Some(open_rx))));
+    view.update(cx, |v, cx| v.drain(cx));
+    match view.read_with(cx, |v, _| v.boot.clone()) {
+        Boot::Failed { stage, message } => {
+            assert_eq!(stage, "locked", "哨兵阶保留");
+            assert!(message.contains("E_LOCKED"), "哨兵原文保留：{message}");
+            // 标题用户语（boot_failed_title 单源——面板与测试共用）。
+            assert_eq!(
+                super::boot_failed_title(stage),
+                "此文档需要密码（未提供或不对）",
+                "密码语义用户语"
+            );
+        }
+        other => panic!("必须是 locked 哨兵阶：{other:?}"),
+    }
+    // 幂等：多拍不覆盖。
+    for _ in 0..3 {
+        view.update(cx, |v, cx| v.drain(cx));
+    }
+    assert!(matches!(
+        view.read_with(cx, |v, _| v.boot.clone()),
+        Boot::Failed {
+            stage: "locked",
+            ..
+        }
+    ));
+}
+
+/// #50 C 线消费批：损坏哨兵同款（`damaged` 阶——标题「文档已损坏」，
+/// 与 load 普通失败分流）。
+#[gpui::test]
+fn sentinel_damaged_stage_lands_and_titles(cx: &mut gpui::TestAppContext) {
+    let (open_tx, open_rx) = channel();
+    let (reply_tx, reply_rx) = channel();
+    reply_tx
+        .send(SessionReply::Failed {
+            stage: "damaged",
+            message: "[E_DAMAGED] 文档损坏（brokenpackage）：内核 cb 22 kind=brokenpackage".into(),
+        })
+        .unwrap();
+    open_tx
+        .send(Ok(DocxLokSession::from_reply_channel_for_test(reply_rx)))
+        .unwrap();
+    drop(open_tx);
+    drop(reply_tx);
+    let view =
+        cx.update(|app| app.new(|cx| DocxPagesView::new_with_open_rx_for_test(cx, Some(open_rx))));
+    view.update(cx, |v, cx| v.drain(cx));
+    match view.read_with(cx, |v, _| v.boot.clone()) {
+        Boot::Failed { stage, .. } => {
+            assert_eq!(stage, "damaged", "损坏哨兵阶保留");
+            assert_eq!(
+                super::boot_failed_title(stage),
+                "文档已损坏（无法解析）",
+                "损坏语义用户语"
+            );
+        }
+        other => panic!("必须是 damaged 哨兵阶：{other:?}"),
+    }
+    // load 普通失败对照（通用文案 + 阶段名——分流证据）。
+    assert_eq!(
+        super::boot_failed_title("load"),
+        "LOK 页面视图不可用（阶段：load）",
+        "普通 load 保持通用诊断文案"
+    );
+    assert_eq!(
+        super::boot_failed_title("discover"),
+        "LOK 内核缺失（页面视图不可用）",
+        "discover 阶内核缺失语义"
+    );
+}

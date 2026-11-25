@@ -1590,10 +1590,7 @@ impl DocxPagesView {
                 "文档打开中…（LOK 内核首次启动可能需要数十秒）".to_string(),
                 format!("文件：{}", self.path.display()),
             ),
-            Boot::Failed { stage, message } => (
-                format!("LOK 页面视图不可用（阶段：{stage}）"),
-                message.clone(),
-            ),
+            Boot::Failed { stage, message } => (boot_failed_title(stage), message.clone()),
             Boot::Ready => ("文档已就绪".to_string(), String::new()),
         };
         // #176：状态面板同样接焦点域（focus_active 在 Starting/Failed
@@ -2218,6 +2215,19 @@ fn band_wrapper(slot: AnyElement, idx: usize) -> AnyElement {
 // ---------------------------------------------------------------------------
 // 测试面（几何纯函数已收拢 docx_geom；本文件：视图态机 + 缩放/失效链）
 // ---------------------------------------------------------------------------
+
+/// #50 C 线消费批：`Boot::Failed` 阶段名 → 用户标题（纯函数——面板渲染
+/// 与测试断言共用单源）。密码/损坏哨兵（worker `E_LOCKED`/`E_DAMAGED`
+/// 的 `locked`/`damaged` 阶）翻成用户语，与「打不开」分流；其余阶段
+/// 保持通用文案 + 阶段名诊断。
+fn boot_failed_title(stage: &str) -> String {
+    match stage {
+        "locked" => "此文档需要密码（未提供或不对）".to_string(),
+        "damaged" => "文档已损坏（无法解析）".to_string(),
+        "discover" => "LOK 内核缺失（页面视图不可用）".to_string(),
+        other => format!("LOK 页面视图不可用（阶段：{other}）"),
+    }
+}
 
 #[cfg(test)]
 #[path = "docx_pages_tests.rs"]
