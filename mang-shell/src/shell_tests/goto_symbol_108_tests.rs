@@ -1,7 +1,5 @@
 //! #47 巨石拆解批③：原 shell.rs 内嵌 `goto_symbol_108_tests` 纯迁出（零行为变化）。
 
-use super::*;
-
 /// #108 P2③：转到符号（Ctrl+Shift+O / goto_symbol——开右栏 +
 /// 大纲过滤框聚焦；无大纲提示不静默）。构造走 `workspace_layout_
 /// tests::host` 同型（带 editor → 大纲在场）。

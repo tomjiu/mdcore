@@ -1,7 +1,5 @@
 //! #47 巨石拆解批③：原 shell.rs 内嵌 `mtime_poll_tests` 纯迁出（零行为变化）。
 
-use super::*;
-
 fn temp_md(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("mang-mtime-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -17,7 +15,7 @@ fn mtime_poll_reloads_clean_tab(cx: &mut gpui::TestAppContext) {
     let path = temp_md("clean");
     let (shell, mut visual) = super::workspace_layout_tests::host(cx);
     // host() 自带 editor（layout.md）——用真文件开标签（走 open_document_tab
-    /// 链含基线建立）：
+    // 链含基线建立）：
     let shell2 = shell.clone();
     let p2 = path.clone();
     visual.update(|_window, app| {
