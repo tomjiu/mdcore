@@ -48,10 +48,7 @@
 
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
-
 use mang_shell::command_groups::{RecentRing, build_sections, flatten};
-use mang_shell::context_menu::{MenuItem, editor_menu, file_tree_menu};
 use mang_shell::editor::commands::{self, Cmd};
 
 // ---------------------------------------------------------------------------

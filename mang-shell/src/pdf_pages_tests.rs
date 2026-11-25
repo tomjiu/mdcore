@@ -2,6 +2,7 @@
 //!（零行为变化——字节原样剥壳，挂载 #[cfg(test)] + #[path] 在宿主文件）。
 
 use super::*;
+use mdc_pdf::page::Rotation;
 use std::path::PathBuf;
 
 /// #643：设备宽量化护栏（上限 = 引擎 S3-L2 钳制值）。

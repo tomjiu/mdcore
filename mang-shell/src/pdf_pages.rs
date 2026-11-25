@@ -163,7 +163,7 @@ use image::{Frame, ImageBuffer};
 use mdc_pdf::annotation::Point;
 use mdc_pdf::engine::DocumentEngine;
 use mdc_pdf::engine_pdfium::PdfiumEngine;
-use mdc_pdf::page::{PageGeometry, PageIndex, Rotation};
+use mdc_pdf::page::{PageGeometry, PageIndex};
 use mdc_pdf::render::{RenderKey, RenderRequest, RenderedPage};
 use mdc_pdf::table::PositionedChar;
 use mdc_pdf::transform::PageTransform;

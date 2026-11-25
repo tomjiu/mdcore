@@ -22,7 +22,6 @@
 //! 测试面：temp 目录真树（命中/预算截断/忽略收集/CRLF 保真/替换往返）。
 
 use crate::editor::buffer::byte_to_char;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// 单文件字节预算（2MB——超限跳过并计数，Q-IDE R4 口径）。
@@ -447,6 +446,7 @@ pub fn preview_replace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::fs;
 
     fn temp_tree(name: &str) -> PathBuf {

@@ -29,15 +29,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::project_search::{self, SearchHit, SearchOptions, SearchReport};
 use gpui::{
     App, AsyncApp, Bounds, Context, ElementInputHandler, FocusHandle, Pixels, ScrollHandle,
-    SharedString, Task, WeakEntity, Window, canvas,
+    SharedString, WeakEntity, Window, canvas,
 };
 use theme::ThemeColors;
 use ui::prelude::*;
-use ui::{Icon, IconName, IconSize, Label, LabelSize, List, ListHeader, ListItem};
-
-use crate::project_search::{self, SearchHit, SearchOptions, SearchReport};
+use ui::{Icon, IconName, IconSize, Label, LabelSize, List, ListHeader};
 
 /// #109 批②③：搜索面板的 dock 身份键（布局序列化——发布后不可改，
 /// 蓝本 dock.rs:37 警告同款）。

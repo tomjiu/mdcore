@@ -78,15 +78,18 @@ pub struct FileTreeHooks {
 }
 
 /// #107 P1②：拖拽移动钩子（old, new_dir——new = new_dir/old_name）。
-pub type MoveFileHook =
-    Arc<dyn Fn(PathBuf, PathBuf, &mut Window, &mut App) + Send + Sync>;
+pub type MoveFileHook = Arc<dyn Fn(PathBuf, PathBuf, &mut Window, &mut App) + Send + Sync>;
 
 /// #107 P1②：拖拽跟随幽灵（渲染被拖文件名——最小视觉）。
 #[derive(Clone)]
 pub struct DragGhost;
 
 impl gpui::Render for DragGhost {
-    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
         ui::Label::new("移动中…").size(ui::LabelSize::XSmall)
     }
 }
@@ -711,14 +714,15 @@ impl FileTree {
         // #107 P1②：拖拽移动（div 包裹——ListItem 无 on_drag，drag/drop
         // 挂外层 stateful div：DraggedFile 载荷；目录行 on_drop = 移动进
         // 该目录 → hooks.move_file → shell confirm_move_path 确认链）。
-        let drag_payload = DraggedFile { path: row.path.clone(), is_dir };
+        let drag_payload = DraggedFile {
+            path: row.path.clone(),
+            is_dir,
+        };
         let dst = row.path.clone();
         let move_hook = self.hooks.move_file.clone();
         div()
             .id(SharedString::from(format!("ft-row-drag-{index}")))
-            .on_drag(drag_payload, move |_, _, _, cx| {
-                cx.new(|_| DragGhost)
-            })
+            .on_drag(drag_payload, move |_, _, _, cx| cx.new(|_| DragGhost))
             .when(is_dir, |el| {
                 el.on_drop::<DraggedFile>(cx.listener(
                     move |_this, dragged: &DraggedFile, window, cx| {
@@ -1030,9 +1034,7 @@ mod keyboard_tests {
                 panic!("unexpected context menu in keyboard test")
             }),
             // #107 P1②：测试域 no-op（移动链在 shell 域测）。
-            move_file: Arc::new(|_, _, _, _| {
-                panic!("unexpected move in keyboard test")
-            }),
+            move_file: Arc::new(|_, _, _, _| panic!("unexpected move in keyboard test")),
             escape: Arc::new(|_, _| panic!("unexpected escape in keyboard test")),
         }
     }

@@ -31,11 +31,7 @@ pub const MODE_USER_PREFIX: &str = "user:";
 /// 具名态拆解：`"user:foo"` → Some("foo")；三态/乱值 → None。
 pub fn parse_user_mode(mode: &str) -> Option<&str> {
     let name = mode.strip_prefix(MODE_USER_PREFIX)?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// 具名态构造（`user:<name>`——存盘格式）。

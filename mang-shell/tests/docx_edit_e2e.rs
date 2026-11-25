@@ -19,7 +19,6 @@
 use std::path::Path;
 
 use mang_shell::editor::docx_doc;
-use mang_shell::editor::docx_edit_bridge::DocxPort;
 use mdc_office_io::docx_edit::DocxEditor;
 
 fn e2e_root() -> std::path::PathBuf {

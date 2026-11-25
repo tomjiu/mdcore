@@ -49,7 +49,6 @@
 use std::path::{Path, PathBuf};
 
 use mang_shell::editor::docx_doc;
-use mang_shell::editor::docx_edit_bridge::DocxPort;
 
 /// 夹具路径（黄金例——进仓，缺失即 FAIL）。
 fn fixture() -> PathBuf {

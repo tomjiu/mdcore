@@ -584,13 +584,14 @@ impl gpui::Render for OutlinePanel {
                         div()
                             .id(SharedString::from(format!("outline-row-{gindex}")))
                             .debug_selector(move || {
-                                format!("outline-row-{gindex}{}", if is_current { "-cur" } else { "" })
+                                format!(
+                                    "outline-row-{gindex}{}",
+                                    if is_current { "-cur" } else { "" }
+                                )
                             })
                             // #108 P2①：光标跟随高亮（selected 视觉——
                             // 光标所属节行 bg；与键盘焦点 focused 并列呈现）。
-                            .when(is_current, |el| {
-                                el.bg(cx.theme().colors().element_selected)
-                            })
+                            .when(is_current, |el| el.bg(cx.theme().colors().element_selected))
                             .track_focus(&handle)
                             .anchor_scroll(Some(anchor))
                             // 点击 = 聚焦该行（键盘导航起点）。
@@ -959,10 +960,13 @@ mod tests {
     fn cursor_follow_highlights_current_section_row(cx: &mut TestAppContext) {
         // #108 P2①：光标跟随高亮——光标落在「## B」段内（行 3 尾段）
         // → 大纲第二行（行 2 的 heading）呈 selected（outline-row-1-cur 锚）。
-        let (editor, panel, mut visual) = panel_window(cx, "# A
+        let (editor, panel, mut visual) = panel_window(
+            cx,
+            "# A
 正文
 ## B
-尾段");
+尾段",
+        );
 
         // 前置：光标先在第 0 行（首 heading 行——current_row=0 呈 selected）。
         let cur = editor.read_with(&visual, |ed, _| ed.cursor_point().line);
@@ -980,7 +984,11 @@ mod tests {
 
         // 数据面 API 直证：current_row_for_cursor = Some(1)。
         panel.read_with(&visual, |p, app| {
-            assert_eq!(p.current_row_for_cursor(app), Some(1), "所属节 = 第二 heading");
+            assert_eq!(
+                p.current_row_for_cursor(app),
+                Some(1),
+                "所属节 = 第二 heading"
+            );
         });
     }
 

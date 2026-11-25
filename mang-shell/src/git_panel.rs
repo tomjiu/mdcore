@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, IntoElement, MouseButton, Render, WeakEntity};
+use gpui::{Context, IntoElement, MouseButton, Render};
 use ui::prelude::*;
 use ui::{
     Chip, CountBadge, Icon, IconName, IconSize, Label, LabelSize, List, ListItem, Navigable,

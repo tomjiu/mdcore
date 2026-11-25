@@ -355,8 +355,7 @@ pub fn save_user_theme_file(
     // 即时替换（ThemeMeta 同名覆盖——非另存副本）。
     let path = dir.join(format!("{name}.json"));
     let tmp = dir.join(format!("{name}.json.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(&value).ok()?)
-        .ok()?;
+    std::fs::write(&tmp, serde_json::to_string_pretty(&value).ok()?).ok()?;
     if std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return None;
@@ -1048,25 +1047,24 @@ mod tests {
             // 高频六键（级联派生面）+ 直名槽抽样断言（31 全断言太脆——
             // 键→字段映射用编译期同构保证，这里抽各族代表）。
             let base = registry.get("One Dark").unwrap();
-            assert_ne!(c.background, base.styles.colors.background, "background 已覆盖");
             assert_ne!(
-                c.border_focused,
-                base.styles.colors.border_focused,
+                c.background, base.styles.colors.background,
+                "background 已覆盖"
+            );
+            assert_ne!(
+                c.border_focused, base.styles.colors.border_focused,
                 "border_focused 已覆盖"
             );
             assert_ne!(
-                c.element_selected,
-                base.styles.colors.element_selected,
+                c.element_selected, base.styles.colors.element_selected,
                 "element_selected 已覆盖"
             );
             assert_ne!(
-                c.ghost_element_disabled,
-                base.styles.colors.ghost_element_disabled,
+                c.ghost_element_disabled, base.styles.colors.ghost_element_disabled,
                 "ghost_element_disabled 已覆盖"
             );
             assert_ne!(
-                c.text_placeholder,
-                base.styles.colors.text_placeholder,
+                c.text_placeholder, base.styles.colors.text_placeholder,
                 "text_placeholder 已覆盖"
             );
             assert_ne!(c.icon, base.styles.colors.icon, "icon 已覆盖");
@@ -1119,11 +1117,7 @@ mod tests {
             let path = save_user_theme_file("g1c-replace", &slots, cx);
             assert!(path.is_some(), "第一存成功");
         });
-        assert_eq!(
-            cx.update(|cx| load_user_themes(cx)),
-            1,
-            "装载 1 份"
-        );
+        assert_eq!(cx.update(|cx| load_user_themes(cx)), 1, "装载 1 份");
         // 第二存（同名新值 #445566）——replace_saved：覆盖非副本。
         cx.update(|cx| {
             let slots = [("background".to_string(), "#445566".to_string())];
@@ -1140,11 +1134,7 @@ mod tests {
             assert_eq!(names.len(), 1, "registry 单份（同名 upsert）");
             // 取回实体 = 新值（背景亮度近似判定——#445566 ≠ #112233）。
             let t = registry.get("g1c-replace").expect("重存后可取");
-            assert_ne!(
-                t.styles.colors.background.l,
-                0.,
-                "背景已装载（非零）"
-            );
+            assert_ne!(t.styles.colors.background.l, 0., "背景已装载（非零）");
         });
         // 盘上单文件 + 无 .tmp 残留（原子 rename 收尾干净）。
         let entries: Vec<String> = std::fs::read_dir(&themes)
@@ -1152,7 +1142,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(
-            entries.iter().filter(|n| n.as_str() == "g1c-replace.json").count(),
+            entries
+                .iter()
+                .filter(|n| n.as_str() == "g1c-replace.json")
+                .count(),
             1,
             "盘上单 json"
         );

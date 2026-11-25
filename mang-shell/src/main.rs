@@ -282,9 +282,7 @@ fn main() {
             theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
             // #110 G1 批C：具名态（user:<name>——1.0s 真实动作链切自定义
             // 主题，与三态同链；断言链三帧的 B/C 帧后段）。
-            v if theme_switch::is_user_mode(v) => {
-                Some(Box::leak(v.to_string().into_boxed_str()))
-            }
+            v if theme_switch::is_user_mode(v) => Some(Box::leak(v.to_string().into_boxed_str())),
             _ => None,
         });
     // #110 G1 批C：自定义主题三帧烟雾（写盘具名主题 → 启动 user: 恢复 →
@@ -1802,9 +1800,7 @@ async fn run_custom_theme_script(
             shell.set_theme_mode(theme_switch::MODE_DARK, cx);
         })
     });
-    eprintln!(
-        "custom-theme-smoke: script done (user:g1c-smoke 恢复 → 4.2s 切 dark)"
-    );
+    eprintln!("custom-theme-smoke: script done (user:g1c-smoke 恢复 → 4.2s 切 dark)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1922,10 +1918,7 @@ async fn run_palette_script(
     cx: &mut gpui::AsyncApp,
     mode: &'static str,
 ) {
-    use gpui::{
-        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, point,
-        px,
-    };
+    use gpui::{Modifiers, MouseMoveEvent, PlatformInput, point, px};
 
     let park = |x: f32, y: f32| {
         PlatformInput::MouseMove(MouseMoveEvent {

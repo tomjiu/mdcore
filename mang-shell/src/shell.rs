@@ -31,45 +31,45 @@ mod home_view;
 #[path = "shell_tests/notice_tests.rs"]
 mod notice_tests;
 #[cfg(test)]
-#[path = "shell_tests/tab_workflow_tests.rs"]
-mod tab_workflow_tests;
+#[path = "shell_tests/statusbar_labels_runtime_tests.rs"]
+mod statusbar_labels_runtime_tests;
 #[cfg(test)]
 #[path = "shell_tests/statusbar_view_toggle_tests.rs"]
 mod statusbar_view_toggle_tests;
 #[cfg(test)]
-#[path = "shell_tests/statusbar_labels_runtime_tests.rs"]
-mod statusbar_labels_runtime_tests;
+#[path = "shell_tests/tab_workflow_tests.rs"]
+mod tab_workflow_tests;
 
-#[cfg(test)]
-#[path = "shell_tests/pdf_search_wiring_tests.rs"]
-mod pdf_search_wiring_tests;
-#[cfg(test)]
-#[path = "shell_tests/page_view_action_honesty_tests.rs"]
-mod page_view_action_honesty_tests;
-#[cfg(test)]
-#[path = "shell_tests/menu_bar_lifecycle_tests.rs"]
-mod menu_bar_lifecycle_tests;
-#[cfg(test)]
-#[path = "shell_tests/context_menu_lifecycle_tests.rs"]
-mod context_menu_lifecycle_tests;
-#[cfg(test)]
-#[path = "shell_tests/pdf_annot_save_tests.rs"]
-mod pdf_annot_save_tests;
-#[cfg(test)]
-#[path = "shell_tests/settings_lifecycle_tests.rs"]
-mod settings_lifecycle_tests;
 #[cfg(test)]
 #[path = "shell_tests/confirm_lifecycle_tests.rs"]
 mod confirm_lifecycle_tests;
 #[cfg(test)]
-#[path = "shell_tests/mtime_poll_tests.rs"]
-mod mtime_poll_tests;
+#[path = "shell_tests/context_menu_lifecycle_tests.rs"]
+mod context_menu_lifecycle_tests;
 #[cfg(test)]
 #[path = "shell_tests/g4_custom_theme_tests.rs"]
 mod g4_custom_theme_tests;
 #[cfg(test)]
 #[path = "shell_tests/goto_symbol_108_tests.rs"]
 mod goto_symbol_108_tests;
+#[cfg(test)]
+#[path = "shell_tests/menu_bar_lifecycle_tests.rs"]
+mod menu_bar_lifecycle_tests;
+#[cfg(test)]
+#[path = "shell_tests/mtime_poll_tests.rs"]
+mod mtime_poll_tests;
+#[cfg(test)]
+#[path = "shell_tests/page_view_action_honesty_tests.rs"]
+mod page_view_action_honesty_tests;
+#[cfg(test)]
+#[path = "shell_tests/pdf_annot_save_tests.rs"]
+mod pdf_annot_save_tests;
+#[cfg(test)]
+#[path = "shell_tests/pdf_search_wiring_tests.rs"]
+mod pdf_search_wiring_tests;
+#[cfg(test)]
+#[path = "shell_tests/settings_lifecycle_tests.rs"]
+mod settings_lifecycle_tests;
 #[cfg(test)]
 #[path = "shell_tests/xlsx_save_close_tests.rs"]
 mod xlsx_save_close_tests;
@@ -1174,7 +1174,11 @@ impl ShellApp {
         // 保存成功即切「user:<name>」四态轴（三态钮与具名下拉联动）。
         let name = {
             let n = self.theme_name_input.trim();
-            if n.is_empty() { "my-theme".to_string() } else { n.to_string() }
+            if n.is_empty() {
+                "my-theme".to_string()
+            } else {
+                n.to_string()
+            }
         };
         let slots: Vec<(String, String)> = self.custom_theme_effective_slots(cx)?;
         let path = crate::settings::save_user_theme_file(&name, &slots, cx)?;
@@ -1261,7 +1265,10 @@ impl ShellApp {
                 window.focus(&focus, cx);
             }
             None => {
-                self.show_notice("转到符号：当前无文档大纲（先打开 Markdown 文档）".into(), cx);
+                self.show_notice(
+                    "转到符号：当前无文档大纲（先打开 Markdown 文档）".into(),
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -3700,7 +3707,13 @@ impl ShellApp {
 
     /// #107 P1②：拖拽移动确认（二选一——默认「取消」危险侧；
     /// 守卫：目标已存在/移进自身拒前置 toast 不弹窗）。
-    pub fn confirm_move_path(&mut self, old: PathBuf, new: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn confirm_move_path(
+        &mut self,
+        old: PathBuf,
+        new: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if new == old {
             return; // 同路径无操作。
         }
@@ -3758,7 +3771,10 @@ impl ShellApp {
                 self.sync_tree_after_fs(new, false, cx);
                 self.sync_tree_active(cx);
                 self.show_notice(
-                    format!("已移动（{} 个打开标签路径改写）", if old.is_dir() { n } else { n.max(1) }),
+                    format!(
+                        "已移动（{} 个打开标签路径改写）",
+                        if old.is_dir() { n } else { n.max(1) }
+                    ),
                     cx,
                 );
             }
@@ -4210,7 +4226,10 @@ impl ShellApp {
                 .and_then(|m| m.modified())
                 .ok();
             let baseline = self.mtime_baselines.get(i).copied().flatten();
-            if now_m.is_none() || now_m == baseline || Some(now_m) == Some(baseline) && baseline.is_some() {
+            if now_m.is_none()
+                || now_m == baseline
+                || Some(now_m) == Some(baseline) && baseline.is_some()
+            {
                 continue;
             }
             changed += 1;
@@ -4250,7 +4269,9 @@ impl ShellApp {
         self.mtime_polling = true;
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
                 let mut stop = false;
                 let _ = this.update(cx, |shell, cx| {
                     shell.poll_mtimes_once(cx);
@@ -5744,7 +5765,6 @@ mod tab_menu;
 #[path = "tab_menu_tests.rs"]
 mod tab_menu_tests;
 
-
 // ---------------------------------------------------------------------------
 // #422：页内查找 Shell 接线——Ctrl+F 不切视图（页面视图内查找条）
 // ---------------------------------------------------------------------------
@@ -5847,7 +5867,6 @@ mod workspace_layout_tests;
 /// #107 P1② 测试（内联域）：拖拽移动全链（rename + 前缀重写 + 守卫）。
 #[cfg(test)]
 mod drag_move_tests {
-    use super::*;
 
     fn temp_ws(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mang-move-{tag}-{}", std::process::id()));
@@ -5917,7 +5936,11 @@ mod drag_move_tests {
             assert!(
                 shell.tabs.iter().any(|t| t.path == new.join("b.md")),
                 "前缀重写：标签路径 = sub2/b.md（实得 {:?}）",
-                shell.tabs.iter().map(|t| t.path.clone()).collect::<Vec<_>>()
+                shell
+                    .tabs
+                    .iter()
+                    .map(|t| t.path.clone())
+                    .collect::<Vec<_>>()
             );
         });
         let _ = std::fs::remove_dir_all(&ws);
@@ -5944,9 +5967,6 @@ mod drag_move_tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // #604：XLSX 统一保存与退出脏检查（#389 阶段 2 收口）——Shell 分流面。

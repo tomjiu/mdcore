@@ -369,5 +369,4 @@ fn layout_holds_at_hidpi_scale_factor_and_returns(cx: &mut TestAppContext) {
     same("editor-tabs", &tb0, &tb1);
     same("editor-content", &e0, &e1);
     same("right-panel", &r0, &r1);
-
 }

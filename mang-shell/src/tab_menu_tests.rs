@@ -736,7 +736,6 @@ fn tab_menu_late_dismiss_cannot_close_replacement(cx: &mut gpui::TestAppContext)
         assert_eq!(shell.context_menu_target, Some(dir.clone()));
     });
     std::fs::remove_dir_all(dir).unwrap();
-
 }
 
 /// #107 P2：树面「复制路径」（ft-copy-path——右键目标绝对路径进系统

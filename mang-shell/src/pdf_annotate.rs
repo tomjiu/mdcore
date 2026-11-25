@@ -46,10 +46,10 @@ use mdc_pdf::command::{Command, CommandError, Outcome, Source};
 use mdc_pdf::document::{DocumentMeta, PdfDocumentId, PdfSession};
 use mdc_pdf::outline::OutlineTree;
 use mdc_pdf::page::{PageCount, PageGeometry, PageIndex, Rotation};
-use mdc_pdf::security::{Limits, OpenAssessment};
+use mdc_pdf::security::Limits;
 use mdc_pdf::security_scan::open_scan;
 use mdc_pdf::transform::PageTransform;
-use mdc_pdf::writer::{AnnotationWriter, IncrementalSave};
+use mdc_pdf::writer::IncrementalSave;
 use mdc_pdf::writer_lopdf::{LopdfWriter, lopdf};
 
 /// 高亮缺省色（Acrobat 黄）。

@@ -176,7 +176,12 @@ fn modal_body(
                     theme_choices(theme_mode, colors, cx),
                 ))
                 // #110 G1 批B：具名主题行（下拉 + 删除钮——四态轴第四面）。
-                .child(named_theme_row(theme_mode, theme_name_input.as_str(), colors, cx)),
+                .child(named_theme_row(
+                    theme_mode,
+                    theme_name_input.as_str(),
+                    colors,
+                    cx,
+                )),
         )
         // ── #110 G4：自定义主题色（外观组内子区——D3 一期）─────────
         .section(
@@ -257,36 +262,33 @@ fn theme_name_field(
                 .border_1()
                 .border_color(colors.border)
                 .hover(|el| el.bg(hover))
-                .on_key_down(cx.listener(
-                    move |this, event: &gpui::KeyDownEvent, _, cx| {
-                        let ks = &event.keystroke;
-                        let key = ks.key.to_lowercase();
-                        let plain = !ks.modifiers.control
-                            && !ks.modifiers.alt
-                            && !ks.modifiers.platform;
-                        let mut text = this.theme_name_input().to_string();
-                        if plain && (key == "backspace" || key == "escape") {
-                            if key == "backspace" {
-                                text.pop();
-                            } else {
-                                text.clear();
-                            }
-                        } else if plain && key == "enter" {
-                            let _ = this.save_custom_theme(cx);
-                            cx.notify();
-                            return;
-                        } else if plain && key.chars().count() == 1 {
-                            // 名域单字符（非法字符 set_theme_name_input 过滤）。
-                            let mut ch = key.chars().next().unwrap();
-                            if ks.modifiers.shift && ch.is_ascii_alphabetic() {
-                                ch = ch.to_ascii_uppercase();
-                            }
-                            text.push(ch);
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                    let ks = &event.keystroke;
+                    let key = ks.key.to_lowercase();
+                    let plain =
+                        !ks.modifiers.control && !ks.modifiers.alt && !ks.modifiers.platform;
+                    let mut text = this.theme_name_input().to_string();
+                    if plain && (key == "backspace" || key == "escape") {
+                        if key == "backspace" {
+                            text.pop();
+                        } else {
+                            text.clear();
                         }
-                        this.set_theme_name_input(text);
+                    } else if plain && key == "enter" {
+                        let _ = this.save_custom_theme(cx);
                         cx.notify();
-                    },
-                ))
+                        return;
+                    } else if plain && key.chars().count() == 1 {
+                        // 名域单字符（非法字符 set_theme_name_input 过滤）。
+                        let mut ch = key.chars().next().unwrap();
+                        if ks.modifiers.shift && ch.is_ascii_alphabetic() {
+                            ch = ch.to_ascii_uppercase();
+                        }
+                        text.push(ch);
+                    }
+                    this.set_theme_name_input(text);
+                    cx.notify();
+                }))
                 .child(
                     Label::new(if theme_name_input.is_empty() {
                         // 空名占位：my-theme（保存旧行为提示）。
@@ -337,16 +339,14 @@ fn named_theme_row(
     let current_name = theme_switch::parse_user_mode(theme_mode);
     let delete_target = {
         // 删除目标：选中名优先，否则名框输入名（都无 → None 禁删）。
-        current_name
-            .map(|n| n.to_string())
-            .or_else(|| {
-                let t = theme_name_input.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                }
-            })
+        current_name.map(|n| n.to_string()).or_else(|| {
+            let t = theme_name_input.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
     };
     v_flex()
         .id("sg-named-theme-row")
@@ -590,8 +590,7 @@ fn custom_theme_editor(
                                 if ks.modifiers.shift && ch.is_ascii_alphabetic() {
                                     ch = ch.to_ascii_uppercase();
                                 }
-                                if (ch.is_ascii_hexdigit() || ch == '#')
-                                    && text.chars().count() < 7
+                                if (ch.is_ascii_hexdigit() || ch == '#') && text.chars().count() < 7
                                 {
                                     text.push(ch);
                                 }
@@ -612,7 +611,11 @@ fn custom_theme_editor(
                                 raw.clone()
                             })
                             .size(LabelSize::XSmall)
-                            .color(if bad { ui::Color::Error } else { ui::Color::Default }),
+                            .color(if bad {
+                                ui::Color::Error
+                            } else {
+                                ui::Color::Default
+                            }),
                         ),
                 )
                 // 坏色行内报错。
@@ -626,40 +629,37 @@ fn custom_theme_editor(
         }))
         // 「保存为主题」钮（choice_button 同视觉语系——div+Label+on_click）。
         .child(
-            h_flex()
-                .id("sg-custom-theme-save")
-                .justify_end()
-                .child(
-                    div()
-                        .id("sg-theme-save")
-                        .h(CONTROL_H)
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded_sm()
-                        .hover(|el| el.bg(hover))
-                        .child(
-                            Label::new("保存为主题")
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            match this.save_custom_theme(cx) {
-                                Some(path) => {
-                                    this.notice_message(format!(
-                                        "自定义主题已保存并应用（{}）",
-                                        path.display()
-                                    ), cx);
-                                }
-                                None => {
-                                    this.notice_message(
-                                        "自定义主题未保存——槽色无效（见行内报错）".into(),
-                                        cx,
-                                    );
-                                }
+            h_flex().id("sg-custom-theme-save").justify_end().child(
+                div()
+                    .id("sg-theme-save")
+                    .h(CONTROL_H)
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .hover(|el| el.bg(hover))
+                    .child(
+                        Label::new("保存为主题")
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .on_click(
+                        cx.listener(|this, _, _, cx| match this.save_custom_theme(cx) {
+                            Some(path) => {
+                                this.notice_message(
+                                    format!("自定义主题已保存并应用（{}）", path.display()),
+                                    cx,
+                                );
                             }
-                        })),
-                ),
+                            None => {
+                                this.notice_message(
+                                    "自定义主题未保存——槽色无效（见行内报错）".into(),
+                                    cx,
+                                );
+                            }
+                        }),
+                    ),
+            ),
         )
 }
 
