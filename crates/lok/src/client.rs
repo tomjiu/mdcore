@@ -1074,6 +1074,27 @@ impl DocSession {
         self.client.request("uno", a)
     }
 
+    /// #115 #5：剪贴板三件套——copy（多味读回：plain + html 键）。
+    /// 变更面（内核剪贴板/选区锚）——走 edit_ok 记账。
+    pub fn clipboard_copy(&mut self) -> Result<Value, LokError> {
+        self.edit_ok();
+        self.client.request("clipboard_copy", json!({}))
+    }
+
+    /// #115 #5：剪贴板三件套——cut（含剪后校验：`removed` 位 =
+    /// 选区内容已移除证据；剪前选区文本在应答 `plain`）。
+    pub fn clipboard_cut(&mut self) -> Result<Value, LokError> {
+        self.edit_ok();
+        self.client.request("clipboard_cut", json!({}))
+    }
+
+    /// #115 #5：剪贴板三件套——paste（未生效时 worker 侧已 Undo 补偿
+    /// 并报 E_CLIPBOARD；生效则 `{pasted: true}`）。
+    pub fn clipboard_paste(&mut self) -> Result<Value, LokError> {
+        self.edit_ok();
+        self.client.request("clipboard_paste", json!({}))
+    }
+
     /// getTextSelection（mime 用 `text/plain;charset=utf-8`——裸
     /// `text/plain` 不是 transferable flavor，返回空）。
     pub fn text_selection(&self, mime: &str) -> Result<(String, String), LokError> {
