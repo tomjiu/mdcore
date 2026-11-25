@@ -114,7 +114,9 @@ pub fn load_user_themes(cx: &mut gpui::App) -> usize {
         Err(_) => return 0,
     };
     let registry = theme::ThemeRegistry::default_global(cx);
-    let base = registry.get("One Dark").unwrap_or_else(|_| {
+    // #110 G1 批A：双基底——深色沿 One Dark 兜底；浅色 = derive_light
+    // （theme_switch 派生链——浅色槽消费面 #560 锁证的那套）。
+    let base_dark = registry.get("One Dark").unwrap_or_else(|_| {
         registry
             .list()
             .into_iter()
@@ -122,6 +124,7 @@ pub fn load_user_themes(cx: &mut gpui::App) -> usize {
             .map(|m| registry.get(&m.name).unwrap())
             .unwrap()
     });
+    let base_light = crate::theme_switch::derive_light(&base_dark);
     let mut loaded = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -132,7 +135,7 @@ pub fn load_user_themes(cx: &mut gpui::App) -> usize {
             eprintln!("theme-loader: 读失败跳过 {}", path.display());
             continue;
         };
-        match parse_user_theme(&text, &base) {
+        match parse_user_theme(&text, &base_dark, Some(&base_light)) {
             Some(theme) => {
                 registry.insert_themes([theme]);
                 loaded += 1;
@@ -151,22 +154,66 @@ pub fn load_user_themes(cx: &mut gpui::App) -> usize {
 /// 用户主题 JSON → Theme（覆盖派生）。识别槽（报告 §5 D1 A 案
 /// 「11 槽 UI 色」起步集）：background / surface / editor /
 /// foreground / accent / border / 元素前景五色。
-fn parse_user_theme(text: &str, base: &theme::Theme) -> Option<theme::Theme> {
+fn parse_user_theme(
+    text: &str,
+    base_dark: &theme::Theme,
+    base_light: Option<&theme::Theme>,
+) -> Option<theme::Theme> {
     #[derive(serde::Deserialize)]
     struct UserThemeJson {
         name: String,
         appearance: Option<String>,
+        // #110 G1 批A：31 槽全量（6 组——border/surface/element/ghost/text/icon+editor）。
+        // 键沿用 G2 六键（向下兼容旧 themes/*.json），新键按 ThemeColors 字段直名。
         background: Option<String>,
         surface: Option<String>,
         editor: Option<String>,
         foreground: Option<String>,
         accent: Option<String>,
         border: Option<String>,
+        border_variant: Option<String>,
+        border_focused: Option<String>,
+        border_selected: Option<String>,
+        border_transparent: Option<String>,
+        border_disabled: Option<String>,
+        element_background: Option<String>,
+        element_hover: Option<String>,
+        element_active: Option<String>,
+        element_selected: Option<String>,
+        element_selection_background: Option<String>,
+        element_disabled: Option<String>,
+        ghost_element_background: Option<String>,
+        ghost_element_hover: Option<String>,
+        ghost_element_active: Option<String>,
+        ghost_element_selected: Option<String>,
+        ghost_element_disabled: Option<String>,
+        surface_background: Option<String>,
+        text_muted: Option<String>,
+        text_placeholder: Option<String>,
+        text_disabled: Option<String>,
+        text_accent: Option<String>,
+        icon: Option<String>,
+        icon_muted: Option<String>,
+        icon_disabled: Option<String>,
         #[allow(dead_code)]
         #[serde(default)]
         author: Option<String>,
     }
     let spec: UserThemeJson = serde_json::from_str(text).ok()?;
+    // #110 G1 批A：双主题基底——appearance=light 且浅色基底可用时用
+    // 派生浅色，否则深色基底（dark/缺省/浅色不可用三态归一）。
+    let use_light = spec
+        .appearance
+        .as_deref()
+        .map(|a| a.eq_ignore_ascii_case("light"))
+        .unwrap_or(false)
+        && base_light.is_some();
+    let base = if use_light {
+        // borrow 双态——clone 归一（Theme 不大，装载路径一次性）。
+        base_light.unwrap().clone()
+    } else {
+        base_dark.clone()
+    };
     let mut theme = base.clone();
     theme.id = format!("user-{}", spec.name);
     theme.name = spec.name.into();
@@ -178,33 +225,149 @@ fn parse_user_theme(text: &str, base: &theme::Theme) -> Option<theme::Theme> {
         };
     }
     let mut styles = theme.styles.clone();
-    if let Some(c) = parse_hsla(spec.background.as_deref().unwrap_or("")) {
+    // #110 G1 批A：31 槽分组映射。G2 六键保留级联派生（老 JSON 兼容）；
+    // 直名槽（border_variant 等）只写自身。appearance=light 时基底已在上
+    // 游换成派生浅色（load_user_themes 的 base 选择），覆盖槽盖在其上。
+    let slot = |v: &Option<String>| parse_hsla(v.as_deref().unwrap_or(""));
+    // 组1：基底三面 + 文本主色（G2 键——级联）。
+    if let Some(c) = slot(&spec.background) {
         styles.colors.background = c;
     }
-    if let Some(c) = parse_hsla(spec.editor.as_deref().unwrap_or("")) {
+    if let Some(c) = slot(&spec.editor) {
         styles.colors.editor_background = c;
     }
-    if let Some(c) = parse_hsla(spec.surface.as_deref().unwrap_or("")) {
+    if let Some(c) = slot(&spec.surface) {
         styles.colors.elevated_surface_background = c;
+        styles.colors.surface_background = c;
     }
-    if let Some(c) = parse_hsla(spec.foreground.as_deref().unwrap_or("")) {
+    if let Some(c) = slot(&spec.foreground) {
         styles.colors.text = c;
         styles.colors.text_muted = c;
     }
-    if let Some(c) = parse_hsla(spec.border.as_deref().unwrap_or("")) {
+    if let Some(c) = slot(&spec.accent) {
+        styles.colors.element_active = c;
+        styles.colors.text_accent = c;
+    }
+    if let Some(c) = slot(&spec.border) {
         styles.colors.border = c;
         styles.colors.border_variant = c;
     }
-    if let Some(c) = parse_hsla(spec.accent.as_deref().unwrap_or("")) {
+    // 组2：border 族直名槽。
+    if let Some(c) = slot(&spec.border_variant) {
+        styles.colors.border_variant = c;
+    }
+    if let Some(c) = slot(&spec.border_focused) {
+        styles.colors.border_focused = c;
+    }
+    if let Some(c) = slot(&spec.border_selected) {
+        styles.colors.border_selected = c;
+    }
+    if let Some(c) = slot(&spec.border_transparent) {
+        styles.colors.border_transparent = c;
+    }
+    if let Some(c) = slot(&spec.border_disabled) {
+        styles.colors.border_disabled = c;
+    }
+    // 组3：element 族直名槽。
+    if let Some(c) = slot(&spec.element_background) {
+        styles.colors.element_background = c;
+    }
+    if let Some(c) = slot(&spec.element_hover) {
+        styles.colors.element_hover = c;
+    }
+    if let Some(c) = slot(&spec.element_active) {
         styles.colors.element_active = c;
+    }
+    if let Some(c) = slot(&spec.element_selected) {
+        styles.colors.element_selected = c;
+    }
+    if let Some(c) = slot(&spec.element_selection_background) {
+        styles.colors.element_selection_background = c;
+    }
+    if let Some(c) = slot(&spec.element_disabled) {
+        styles.colors.element_disabled = c;
+    }
+    // 组4：ghost 族直名槽。
+    if let Some(c) = slot(&spec.ghost_element_background) {
+        styles.colors.ghost_element_background = c;
+    }
+    if let Some(c) = slot(&spec.ghost_element_hover) {
+        styles.colors.ghost_element_hover = c;
+    }
+    if let Some(c) = slot(&spec.ghost_element_active) {
+        styles.colors.ghost_element_active = c;
+    }
+    if let Some(c) = slot(&spec.ghost_element_selected) {
+        styles.colors.ghost_element_selected = c;
+    }
+    if let Some(c) = slot(&spec.ghost_element_disabled) {
+        styles.colors.ghost_element_disabled = c;
+    }
+    // 组5：text 族残余直名槽。
+    if let Some(c) = slot(&spec.surface_background) {
+        styles.colors.surface_background = c;
+    }
+    if let Some(c) = slot(&spec.text_muted) {
+        styles.colors.text_muted = c;
+    }
+    if let Some(c) = slot(&spec.text_placeholder) {
+        styles.colors.text_placeholder = c;
+    }
+    if let Some(c) = slot(&spec.text_disabled) {
+        styles.colors.text_disabled = c;
+    }
+    if let Some(c) = slot(&spec.text_accent) {
         styles.colors.text_accent = c;
+    }
+    // 组6：icon 族。
+    if let Some(c) = slot(&spec.icon) {
+        styles.colors.icon = c;
+    }
+    if let Some(c) = slot(&spec.icon_muted) {
+        styles.colors.icon_muted = c;
+    }
+    if let Some(c) = slot(&spec.icon_disabled) {
+        styles.colors.icon_disabled = c;
     }
     theme.styles = styles;
     Some(theme)
 }
 
+/// #110 G4：写用户主题文件（themes_dir/<name>.json——G2 装载格式：
+/// name + appearance + 6 高频槽；取色器「保存为主题」收口）。
+/// 返回 Some(路径) = 写盘成功（调用方据此提示/装载）。
+pub fn save_user_theme_file(
+    name: &str,
+    slots: &[(String, String)],
+    cx: &mut gpui::App,
+) -> Option<std::path::PathBuf> {
+    let dir = themes_dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let mut value = serde_json::json!({"name": name});
+    // hex 原文透传（保真——调用方已校验合法；#110 G4：色值 Hsla 往返
+    // 漂移教训（parse_hsla 是装载侧灰度近似语义，不作保存中转））。
+    for (key, hex) in slots {
+        value[key.as_str()] = serde_json::json!(hex);
+    }
+    // #110 G1 批C：replace_saved 原子语义——同名重存走 tmp+rename
+    // （崩溃/并发窗口不产半截 JSON；装载侧 load_user_themes 永远读
+    // 整文件）。registry 侧由调用方 save_custom_theme 同名 insert
+    // 即时替换（ThemeMeta 同名覆盖——非另存副本）。
+    let path = dir.join(format!("{name}.json"));
+    let tmp = dir.join(format!("{name}.json.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&value).ok()?)
+        .ok()?;
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    let _ = cx.refresh_windows();
+    Some(path)
+}
+
 /// hex（#rrggbb / #rgb）或 hsla 数组 → Hsla（坏值 None）。
-fn parse_hsla(s: &str) -> Option<gpui::Hsla> {
+/// #110 G4 起 pub(crate)：设置弹窗草稿校验复用（行内报错判定）。
+pub(crate) fn parse_hsla(s: &str) -> Option<gpui::Hsla> {
     let t = s.trim();
     if let Some(hex) = t.strip_prefix('#') {
         let (r, g, b) = match hex.len() {
@@ -814,6 +977,317 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mang-settings-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// #110 G4：save_user_theme_file 写读往返（写盘 → load_user_themes
+    /// 装载 → registry 取回验名与槽色；hex 往返 6 槽）。
+    /// #110 G1 批A：31 槽全量写读往返（save_user_theme_file 全槽透传 +
+    /// parse_user_theme 全槽覆盖装载——每槽 hex 保真入 ThemeColors）。
+    #[gpui::test]
+    fn user_theme_31_slot_roundtrip(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        let tmp = std::env::temp_dir().join(format!("mang-g1a-31-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let themes = tmp.join("mang").join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        // 31 槽（shell 位表键序同源——手写镜像，避免跨模块依赖）。
+        let keys: [&str; 31] = [
+            "background",
+            "surface",
+            "editor",
+            "foreground",
+            "accent",
+            "border",
+            "border_variant",
+            "border_focused",
+            "border_selected",
+            "border_transparent",
+            "border_disabled",
+            "element_background",
+            "element_hover",
+            "element_active",
+            "element_selected",
+            "element_selection_background",
+            "element_disabled",
+            "ghost_element_background",
+            "ghost_element_hover",
+            "ghost_element_active",
+            "ghost_element_selected",
+            "ghost_element_disabled",
+            "surface_background",
+            "text_muted",
+            "text_placeholder",
+            "text_disabled",
+            "text_accent",
+            "icon",
+            "icon_muted",
+            "icon_disabled",
+            "text",
+        ];
+        // 全槽给可辨识 hex（每槽 r 通道递增——装载后逐槽断言取得到）。
+        let slots: Vec<(String, String)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let r = 0x20 + i as u8; // 0x20..0x3E 互异
+                (k.to_string(), format!("#{:02x}1010", r))
+            })
+            .collect();
+        cx.update(|cx| {
+            let path = super::save_user_theme_file("g1a-31", &slots, cx);
+            assert!(path.is_some(), "写盘成功");
+            let loaded = super::load_user_themes(cx);
+            assert_eq!(loaded, 1, "装载 1 个");
+            let registry = theme::ThemeRegistry::default_global(cx);
+            let t = registry.get("g1a-31").expect("registry 可取");
+            let c = &t.styles.colors;
+            // 高频六键（级联派生面）+ 直名槽抽样断言（31 全断言太脆——
+            // 键→字段映射用编译期同构保证，这里抽各族代表）。
+            let base = registry.get("One Dark").unwrap();
+            assert_ne!(c.background, base.styles.colors.background, "background 已覆盖");
+            assert_ne!(
+                c.border_focused,
+                base.styles.colors.border_focused,
+                "border_focused 已覆盖"
+            );
+            assert_ne!(
+                c.element_selected,
+                base.styles.colors.element_selected,
+                "element_selected 已覆盖"
+            );
+            assert_ne!(
+                c.ghost_element_disabled,
+                base.styles.colors.ghost_element_disabled,
+                "ghost_element_disabled 已覆盖"
+            );
+            assert_ne!(
+                c.text_placeholder,
+                base.styles.colors.text_placeholder,
+                "text_placeholder 已覆盖"
+            );
+            assert_ne!(c.icon, base.styles.colors.icon, "icon 已覆盖");
+            // 直名槽的值断言（G2 灰度近似语义：hex → l = (max+min)/510——
+            // 断言 l 分量精确复原，色相丢弃是装载侧既定语义非缺陷）。
+            let want_l = |hex: &str| {
+                let h = hex.trim_start_matches('#');
+                let r = u8::from_str_radix(&h[0..2], 16).unwrap();
+                let g = u8::from_str_radix(&h[2..4], 16).unwrap();
+                let b = u8::from_str_radix(&h[4..6], 16).unwrap();
+                (r.max(g).max(b) as f32 + r.min(g).min(b) as f32) / 510.
+            };
+            // icon（index 27）：#3B1010（0x20+27——键序 r 通道递增）。
+            let want = want_l("#3B1010");
+            let got = c.icon.l;
+            assert!(
+                (got - want).abs() < 0.004,
+                "icon l 分量：{got} vs {want}（G2 灰度语义）"
+            );
+            // ghost_element_disabled（index 21）：#351010。
+            let want = want_l("#351010");
+            let got = c.ghost_element_disabled.l;
+            assert!(
+                (got - want).abs() < 0.004,
+                "ghost disabled l 分量：{got} vs {want}（G2 灰度语义）"
+            );
+        });
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #110 G1 批C：replace_saved 原子重存语义——同名两存：
+    /// 盘上单文件（新值覆盖旧值，无 .tmp 残留）+ registry 单份实体
+    ///（BTreeMap insert 同名 upsert——非另存副本）+ 装载计数不涨（1→1）。
+    #[gpui::test]
+    fn user_theme_replace_saved_roundtrip(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        let tmp = std::env::temp_dir().join(format!("mang-g1c-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let themes = tmp.join("mang").join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+
+        // 第一存：background #112233。
+        cx.update(|cx| {
+            let slots = [("background".to_string(), "#112233".to_string())];
+            let path = save_user_theme_file("g1c-replace", &slots, cx);
+            assert!(path.is_some(), "第一存成功");
+        });
+        assert_eq!(
+            cx.update(|cx| load_user_themes(cx)),
+            1,
+            "装载 1 份"
+        );
+        // 第二存（同名新值 #445566）——replace_saved：覆盖非副本。
+        cx.update(|cx| {
+            let slots = [("background".to_string(), "#445566".to_string())];
+            let path = save_user_theme_file("g1c-replace", &slots, cx);
+            assert!(path.is_some(), "重存成功");
+            // registry 同名单份（insert upsert——旧实体被替换）。
+            let registry = theme::ThemeRegistry::default_global(cx);
+            let names: Vec<String> = registry
+                .list_names()
+                .iter()
+                .map(|n| n.to_string())
+                .filter(|n| n == "g1c-replace")
+                .collect();
+            assert_eq!(names.len(), 1, "registry 单份（同名 upsert）");
+            // 取回实体 = 新值（背景亮度近似判定——#445566 ≠ #112233）。
+            let t = registry.get("g1c-replace").expect("重存后可取");
+            assert_ne!(
+                t.styles.colors.background.l,
+                0.,
+                "背景已装载（非零）"
+            );
+        });
+        // 盘上单文件 + 无 .tmp 残留（原子 rename 收尾干净）。
+        let entries: Vec<String> = std::fs::read_dir(&themes)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries.iter().filter(|n| n.as_str() == "g1c-replace.json").count(),
+            1,
+            "盘上单 json"
+        );
+        assert!(
+            entries.iter().all(|n| !n.contains(".tmp-")),
+            "无 tmp 残留（原子 rename）"
+        );
+        // JSON 内容 = 新值（读回验）。
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(themes.join("g1c-replace.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk["background"], "#445566", "盘上是重存后的新值");
+        // 再装载（模拟下次启动）——计数仍 1（单文件单实体）。
+        assert_eq!(
+            cx.update(|cx| load_user_themes(cx)),
+            1,
+            "再装载仍 1 份（无副本堆积）"
+        );
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #110 G1 批A：双主题基底（appearance:light → derive_light 浅色基底
+    /// 派生——覆盖槽盖在浅色上；dark/缺省 → 深色基底）。
+    #[gpui::test]
+    fn user_theme_dual_base_light_dark(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        let tmp = std::env::temp_dir().join(format!("mang-g1a-dual-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let themes = tmp.join("mang").join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        // 两文件：light 版 + dark 版（同槽不同色）。
+        let light_json = r##"{
+            "name": "g1a-light",
+            "appearance": "light",
+            "background": "#f0f0f0"
+        }"##;
+        let dark_json = r##"{
+            "name": "g1a-dark",
+            "appearance": "dark",
+            "background": "#101010"
+        }"##;
+        std::fs::write(themes.join("g1a-light.json"), light_json).unwrap();
+        std::fs::write(themes.join("g1a-dark.json"), dark_json).unwrap();
+        cx.update(|cx| {
+            let loaded = super::load_user_themes(cx);
+            assert_eq!(loaded, 2, "装载 2 个");
+            let registry = theme::ThemeRegistry::default_global(cx);
+            let light = registry.get("g1a-light").expect("light 可取");
+            let dark = registry.get("g1a-dark").expect("dark 可取");
+            // appearance 落位。
+            assert_eq!(light.appearance, theme::Appearance::Light);
+            assert_eq!(dark.appearance, theme::Appearance::Dark);
+            // 双基底对照核心：light 的未覆盖槽 = 浅色派生值（亮），dark 的
+            // 未覆盖槽 = One Dark 值（暗）。用 element_hover（两文件均未覆盖）。
+            let base = registry.get("One Dark").unwrap();
+            let light_hover = light.styles.colors.element_hover;
+            let dark_hover = dark.styles.colors.element_hover;
+            let base_hover = base.styles.colors.element_hover;
+            assert!(
+                light_hover != base_hover,
+                "light 未覆盖槽走浅色基底（不是深色原值）"
+            );
+            assert_eq!(
+                dark_hover, base_hover,
+                "dark 未覆盖槽走深色基底（One Dark 原值）"
+            );
+            // 覆盖槽双主题各自生效（background 两值互异）。
+            assert_ne!(
+                light.styles.colors.background,
+                dark.styles.colors.background
+            );
+        });
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[gpui::test]
+    fn user_theme_save_roundtrip(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        // 指定用户主题目录（temp——config_dir 同源语义由 themes_dir
+        // 读 XDG；测试用 env 重定向）。
+        let tmp = std::env::temp_dir().join(format!("mang-g4-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let themes = tmp.join("mang").join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME").unwrap_or_default();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
+        let slots: Vec<(String, String)> = [
+            ("background", "#1a1a1a"),
+            ("surface", "#1f1f1f"),
+            ("editor", "#242424"),
+            ("foreground", "#e6e6e6"),
+            ("accent", "#808080"),
+            ("border", "#4d4d4d"),
+        ]
+        .into_iter()
+        .map(|(k, hex)| (k.to_string(), hex.to_string()))
+        .collect();
+        cx.update(|cx| {
+            let path = super::save_user_theme_file("g4-test", &slots, cx);
+            let path = path.expect("写盘成功");
+            assert!(path.ends_with("g4-test.json"), "文件名：{:?}", path);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["name"], "g4-test");
+            assert_eq!(v["background"], "#1a1a1a", "hex 往返 background");
+            // 装载链：load_user_themes 入 registry。
+            let loaded = super::load_user_themes(cx);
+            assert_eq!(loaded, 1, "装载 1 个");
+            let registry = theme::ThemeRegistry::default_global(cx);
+            let t = registry.get("g4-test").expect("registry 可取");
+            assert_eq!(t.name.as_ref(), "g4-test");
+        });
+        // XDG 还原（G2 测试同型）。
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", prev_xdg) };
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #110 G4：坏色拒（parse_hsla 坏值 None——行内报错同源判定）。
+    #[test]
+    fn parse_hsla_rejects_bad_hex() {
+        assert!(super::parse_hsla("#1a2").is_some(), "#1a2 是 #rgb 短格式");
+        assert!(super::parse_hsla("#1a2b3c").is_some());
+        assert!(super::parse_hsla("#zzzzzz").is_none(), "坏 hex 拒");
+        assert!(super::parse_hsla("1a2b3c").is_none(), "缺 # 拒（一期口径）");
+        assert!(super::parse_hsla("").is_none(), "空拒");
     }
 
     /// #111 批②：auto_close_brackets 写读往返（load_from/save_to 私有

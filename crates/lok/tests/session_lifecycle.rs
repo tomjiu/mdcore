@@ -174,9 +174,7 @@ fn two_sessions_concurrent_edit_and_save() {
         for _round in 0..6 {
             s.uno(".uno:SelectAll", None).expect("全选以读全文");
             for _ in 0..20 {
-                let (_, t) = s
-                    .text_selection("text/plain;charset=utf-8")
-                    .expect("选区");
+                let (_, t) = s.text_selection("text/plain;charset=utf-8").expect("选区");
                 if t.contains(want) {
                     return;
                 }
@@ -210,9 +208,7 @@ fn two_sessions_concurrent_edit_and_save() {
         for _round in 0..6 {
             s.uno(".uno:SelectAll", None).expect("全选");
             for _ in 0..20 {
-                let (_, t) = s
-                    .text_selection("text/plain;charset=utf-8")
-                    .expect("选区");
+                let (_, t) = s.text_selection("text/plain;charset=utf-8").expect("选区");
                 if t.contains(want) && !t.contains(reject) {
                     return t;
                 }
@@ -223,12 +219,22 @@ fn two_sessions_concurrent_edit_and_save() {
         panic!("{tag}：轮询 6×20 后仍未落定（实际：{last:?}）");
     }
 
-    let t1 = settled_selection(&mut v1, "会话一内容", "会话二内容", "会话 1 产物只含自己的编辑");
+    let t1 = settled_selection(
+        &mut v1,
+        "会话一内容",
+        "会话二内容",
+        "会话 1 产物只含自己的编辑",
+    );
     assert!(
         t1.contains("会话一内容") && !t1.contains("会话二内容"),
         "会话 1 产物只含自己的编辑（隔离；实际：{t1:?}）"
     );
-    let t2 = settled_selection(&mut v2, "会话二内容", "会话一内容", "会话 2 产物只含自己的编辑");
+    let t2 = settled_selection(
+        &mut v2,
+        "会话二内容",
+        "会话一内容",
+        "会话 2 产物只含自己的编辑",
+    );
     assert!(
         t2.contains("会话二内容") && !t2.contains("会话一内容"),
         "会话 2 产物只含自己的编辑（隔离；实际：{t2:?}）"

@@ -149,6 +149,12 @@ impl OutlinePanel {
     }
 
     /// 行集是否为空（left_panel 沿用「无标题不渲染分组」的批 5a 前语义）。
+    /// #108 P2③：过滤框聚焦句柄（goto 符号链——开右栏后聚焦此处，
+    /// 用户输入即符号过滤、Enter 跳行——「符号对话框」承接面）。
+    pub fn filter_focus_handle(&self) -> &FocusHandle {
+        &self.filter_focus
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -306,6 +312,19 @@ impl OutlinePanel {
     }
 
     /// #108 批②：可见行标签（测试断言面——渲染同源 visible_rows_indexed）。
+    /// #108 P2①：光标跟随高亮——光标所属 heading 的全量行号。
+    /// 语义（Q-IDE outline.rs 参照）：光标行 >= 某 heading 行的
+    /// 「最后一个 heading」= 当前节；光标在首个 heading 前 → None。
+    pub fn current_row_for_cursor(&self, cx: &App) -> Option<usize> {
+        let cursor_line = self.editor.read(cx).cursor_point().line;
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.line <= cursor_line)
+            .map(|(i, _)| i)
+            .next_back()
+    }
+
     pub fn visible_labels(&self) -> Vec<&str> {
         self.visible_rows_indexed()
             .iter()
@@ -406,6 +425,9 @@ impl gpui::Render for OutlinePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let editor = self.editor.clone();
         let hook = self.activate_hook.clone();
+        // #108 P2①：光标跟随行（渲染时读编辑器光标——独立实体读合法；
+        // 光标动 → 编辑器 notify 重绘，本面板随 shell 全树 notify 链重渲染）。
+        let current_row = self.current_row_for_cursor(cx);
         // #108 批②：渲染行集走折叠视图（visible_rows_indexed——折叠头
         // 保留、子行隐藏；行身份 = 全量索引（句柄协议不变——解折叠
         // 即恢复），折叠箭头 toggle 按全量索引落点）。
@@ -558,9 +580,17 @@ impl gpui::Render for OutlinePanel {
                             focus_handle: handle.clone(),
                             scroll_anchor: Some(anchor.clone()),
                         });
+                        let is_current = Some(*gindex) == current_row;
                         div()
                             .id(SharedString::from(format!("outline-row-{gindex}")))
-                            .debug_selector(move || format!("outline-row-{gindex}"))
+                            .debug_selector(move || {
+                                format!("outline-row-{gindex}{}", if is_current { "-cur" } else { "" })
+                            })
+                            // #108 P2①：光标跟随高亮（selected 视觉——
+                            // 光标所属节行 bg；与键盘焦点 focused 并列呈现）。
+                            .when(is_current, |el| {
+                                el.bg(cx.theme().colors().element_selected)
+                            })
                             .track_focus(&handle)
                             .anchor_scroll(Some(anchor))
                             // 点击 = 聚焦该行（键盘导航起点）。
@@ -923,6 +953,35 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
         let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    #[gpui::test]
+    fn cursor_follow_highlights_current_section_row(cx: &mut TestAppContext) {
+        // #108 P2①：光标跟随高亮——光标落在「## B」段内（行 3 尾段）
+        // → 大纲第二行（行 2 的 heading）呈 selected（outline-row-1-cur 锚）。
+        let (editor, panel, mut visual) = panel_window(cx, "# A
+正文
+## B
+尾段");
+
+        // 前置：光标先在第 0 行（首 heading 行——current_row=0 呈 selected）。
+        let cur = editor.read_with(&visual, |ed, _| ed.cursor_point().line);
+        assert_eq!(cur, 0, "前置：光标在第 0 行");
+        // 光标移到「尾段」（行 3——## B 之后的段内）。
+        editor.update(&mut visual, |ed, cx| {
+            ed.jump_to_line(3);
+        });
+        visual.update(|window, app| window.draw(app).clear(app));
+        // 渲染面：第二行（gindex=1）= selected 锚在场；首行无 -cur。
+        let second_cur = visual.debug_bounds("outline-row-1-cur");
+        let first_cur = visual.debug_bounds("outline-row-0-cur");
+        assert!(second_cur.is_some(), "光标在 ## B 段内 → 第二行 selected");
+        assert!(first_cur.is_none(), "首行不在光标所属段");
+
+        // 数据面 API 直证：current_row_for_cursor = Some(1)。
+        panel.read_with(&visual, |p, app| {
+            assert_eq!(p.current_row_for_cursor(app), Some(1), "所属节 = 第二 heading");
+        });
     }
 
     fn select_next_moves_focus_to_next_row(cx: &mut TestAppContext) {

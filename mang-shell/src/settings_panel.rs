@@ -68,10 +68,13 @@ const LABEL_W: Pixels = px(64.);
 /// （调用处传入），点击经 `cx.listener` 回写 ShellApp（单一状态源，
 /// 弹窗自身零状态）。
 pub fn settings_modal(
-    theme_mode: &'static str,
+    theme_mode: &str,
     font_size: f32,
     indent_unit: IndentUnit,
     soft_wrap: bool,
+    custom_theme_draft: [String; 31],
+    theme_name_input: String,
+    color_slot_focus: Vec<gpui::FocusHandle>,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
     let colors = cx.theme().colors().clone();
@@ -94,17 +97,30 @@ pub fn settings_modal(
         .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
             this.close_settings(cx);
         }))
-        .child(ui_modal(theme_mode, font_size, indent_unit, soft_wrap, &colors, cx))
+        .child(ui_modal(
+            theme_mode,
+            font_size,
+            indent_unit,
+            soft_wrap,
+            custom_theme_draft,
+            theme_name_input.clone(),
+            color_slot_focus,
+            &colors,
+            cx,
+        ))
 }
 
 /// 弹窗卡片（#385 批 3：骨架迁 `ui::Modal`——header/section 排版全
 /// 组件；卡片尺寸/浮层视觉容器由本层提供，`Modal` 是填充式骨架
 /// （size_full——zed 用法即「放进预设尺寸的卡片容器」）。
 fn ui_modal(
-    theme_mode: &'static str,
+    theme_mode: &str,
     font_size: f32,
     indent_unit: IndentUnit,
     soft_wrap: bool,
+    custom_theme_draft: [String; 31],
+    theme_name_input: String,
+    color_slot_focus: Vec<gpui::FocusHandle>,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
@@ -119,15 +135,28 @@ fn ui_modal(
         .rounded_md()
         .shadow_lg()
         .overflow_y_scroll()
-        .child(modal_body(theme_mode, font_size, indent_unit, soft_wrap, colors, cx))
+        .child(modal_body(
+            theme_mode,
+            font_size,
+            indent_unit,
+            soft_wrap,
+            custom_theme_draft,
+            theme_name_input.clone(),
+            color_slot_focus,
+            colors,
+            cx,
+        ))
 }
 
 /// `ui::Modal` 骨架（标题行 + 分区——排版/间距/主题色全组件）。
 fn modal_body(
-    theme_mode: &'static str,
+    theme_mode: &str,
     font_size: f32,
     indent_unit: IndentUnit,
     soft_wrap: bool,
+    custom_theme_draft: [String; 31],
+    theme_name_input: String,
+    color_slot_focus: Vec<gpui::FocusHandle>,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
 ) -> Modal {
@@ -145,6 +174,20 @@ fn modal_body(
                     "sg-theme-row",
                     "主题",
                     theme_choices(theme_mode, colors, cx),
+                ))
+                // #110 G1 批B：具名主题行（下拉 + 删除钮——四态轴第四面）。
+                .child(named_theme_row(theme_mode, theme_name_input.as_str(), colors, cx)),
+        )
+        // ── #110 G4：自定义主题色（外观组内子区——D3 一期）─────────
+        .section(
+            Section::new()
+                .header(SectionHeader::new("自定义主题色"))
+                .child(custom_theme_editor(
+                    custom_theme_draft,
+                    theme_name_input,
+                    color_slot_focus,
+                    colors,
+                    cx,
                 )),
         )
         // ── 编辑器 ─────────────────────────────────────────
@@ -185,9 +228,202 @@ fn modal_body(
         )
 }
 
+/// #110 G1 批B：主题名输入框（hex 槽同款键捕获——plain 守卫 + Enter 保存快捷）。
+fn theme_name_field(
+    theme_name_input: &str,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    h_flex()
+        .id("sg-theme-name-field")
+        .gap_2()
+        .items_center()
+        .child(
+            div().w(px(44.)).child(
+                Label::new("主题名")
+                    .size(LabelSize::XSmall)
+                    .color(ui::Color::Default),
+            ),
+        )
+        .child(
+            div()
+                .id("sg-theme-name-input")
+                .flex_1()
+                .min_w_0()
+                .h(px(22.))
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border)
+                .hover(|el| el.bg(hover))
+                .on_key_down(cx.listener(
+                    move |this, event: &gpui::KeyDownEvent, _, cx| {
+                        let ks = &event.keystroke;
+                        let key = ks.key.to_lowercase();
+                        let plain = !ks.modifiers.control
+                            && !ks.modifiers.alt
+                            && !ks.modifiers.platform;
+                        let mut text = this.theme_name_input().to_string();
+                        if plain && (key == "backspace" || key == "escape") {
+                            if key == "backspace" {
+                                text.pop();
+                            } else {
+                                text.clear();
+                            }
+                        } else if plain && key == "enter" {
+                            let _ = this.save_custom_theme(cx);
+                            cx.notify();
+                            return;
+                        } else if plain && key.chars().count() == 1 {
+                            // 名域单字符（非法字符 set_theme_name_input 过滤）。
+                            let mut ch = key.chars().next().unwrap();
+                            if ks.modifiers.shift && ch.is_ascii_alphabetic() {
+                                ch = ch.to_ascii_uppercase();
+                            }
+                            text.push(ch);
+                        }
+                        this.set_theme_name_input(text);
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    Label::new(if theme_name_input.is_empty() {
+                        // 空名占位：my-theme（保存旧行为提示）。
+                        "my-theme"
+                    } else {
+                        theme_name_input
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(ui::Color::Default),
+                ),
+        )
+}
+
+/// #110 G1 批B：磁盘枚举用户主题名（渲染期安全版——settings 静态面）。
+fn user_theme_names_from_disk() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(dir) = crate::settings::themes_dir() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("json") {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// #110 G1 批B：具名主题行（下拉 = registry 用户主题选择钮排 + 删除钮）。
+/// 选中态 = theme_mode 是 user:<name>；点击 → set_theme_mode(user:<name>)
+/// （apply_mode 具名分支 registry 命中即切）。删除钮只对已保存主题有效
+/// （键入名与枚举集都不含时禁用语义——点删无效果提示）。
+fn named_theme_row(
+    theme_mode: &str,
+    theme_name_input: &str,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    let selected = colors.element_selected;
+    // 磁盘直读（与 ShellApp::user_theme_names 同逻辑——渲染期零
+    // entity.update 嵌套；themes_dir 是 settings 静态函数）。
+    let names = user_theme_names_from_disk();
+    let current_name = theme_switch::parse_user_mode(theme_mode);
+    let delete_target = {
+        // 删除目标：选中名优先，否则名框输入名（都无 → None 禁删）。
+        current_name
+            .map(|n| n.to_string())
+            .or_else(|| {
+                let t = theme_name_input.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            })
+    };
+    v_flex()
+        .id("sg-named-theme-row")
+        .gap_1()
+        .when(names.is_empty(), |el| {
+            el.child(
+                Label::new("（无自定义主题——下方编辑后「保存为主题」）")
+                    .size(LabelSize::XSmall)
+                    .color(ui::Color::Muted),
+            )
+        })
+        .children(names.iter().map(|name| {
+            let is_selected = current_name == Some(name.as_str());
+            h_flex()
+                .id(SharedString::from(format!("sg-user-theme-{name}")))
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("sg-user-theme-pick-{name}")))
+                        .h(px(20.))
+                        .px_2()
+                        .rounded_sm()
+                        .when(is_selected, |el| el.bg(selected))
+                        .hover(|el| el.bg(hover))
+                        .child(
+                            Label::new(name.as_str())
+                                .size(LabelSize::XSmall)
+                                .color(ui::Color::Default),
+                        )
+                        .on_click({
+                            let name = name.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                let mode = theme_switch::user_mode(&name);
+                                this.set_theme_mode(&mode, cx);
+                                cx.notify();
+                            })
+                        }),
+                )
+                .when(delete_target.as_deref() == Some(name.as_str()), |el| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("sg-user-theme-del-{name}")))
+                            .h(px(20.))
+                            .px_2()
+                            .rounded_sm()
+                            .hover(|el| el.bg(hover))
+                            .child(
+                                Label::new("删除")
+                                    .size(LabelSize::XSmall)
+                                    .color(ui::Color::Error),
+                            )
+                            .on_click({
+                                let name = name.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    if this.delete_user_theme(&name, cx) {
+                                        this.notice_message(
+                                            format!("主题 {name} 已删除（回退深色）"),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.notice_message(
+                                            format!("主题 {name} 不存在（未删）"),
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                })
+                            }),
+                    )
+                })
+        }))
+}
+
 /// 主题三选钮（跟随系统/浅色/深色）。
 fn theme_choices(
-    theme_mode: &'static str,
+    theme_mode: &str,
     colors: &theme::ThemeColors,
     cx: &mut Context<ShellApp>,
 ) -> impl IntoElement {
@@ -220,6 +456,211 @@ fn theme_choices(
             selected,
             cx.listener(|this, _, _, cx| this.set_theme_mode(theme_switch::MODE_DARK, cx)),
         ))
+}
+
+/// #110 G4：自定义主题色编辑子区（D3 一期降级——色块预览 + hex
+/// 文本输入 + 坏色行内报错；outline 过滤框同款键捕获范式）。
+/// 6 高频槽与 G2 装载器同源（background/surface/editor/foreground/
+/// accent/border）；空槽初值 = 当前主题实际色（所见即所改）。
+fn custom_theme_editor(
+    custom_theme_draft: [String; 31],
+    theme_name_input: String,
+    color_slot_focus: Vec<gpui::FocusHandle>,
+    colors: &theme::ThemeColors,
+    cx: &mut Context<ShellApp>,
+) -> impl IntoElement {
+    let hover = colors.element_hover;
+    let slot_labels = [
+        ("background", "背景"),
+        ("surface", "面板"),
+        ("editor", "编辑器"),
+        ("foreground", "前景"),
+        ("accent", "强调"),
+        ("border", "边框"),
+    ];
+    let draft: Vec<String> = custom_theme_draft
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    let slot_handles: Vec<gpui::FocusHandle> = color_slot_focus;
+    let current = [
+        colors.background,
+        colors.elevated_surface_background,
+        colors.editor_background,
+        colors.text,
+        colors.element_active,
+        colors.border,
+    ];
+    v_flex()
+        .id("sg-custom-theme")
+        .gap_1()
+        // #110 G1 批B：主题名输入框（保存用——空 = my-theme 旧行为；
+        // 键捕获范式同 hex 槽：plain 守卫 + 非法字符拒 + 40 界）。
+        .child(theme_name_field(theme_name_input.as_str(), colors, cx))
+        .children(slot_labels.iter().enumerate().map(|(i, (key, label))| {
+            let raw = &draft[i];
+            let cur = ShellApp::custom_theme_slot_current(i, colors);
+            let parsed = if raw.is_empty() {
+                Some(cur)
+            } else {
+                crate::settings::parse_hsla(raw)
+            };
+            let bad = parsed.is_none();
+            let swatch = parsed.unwrap_or(gpui::hsla(0., 0., 0.5, 1.));
+            let error_color = colors.border;
+            h_flex()
+                // #110 G1 批A：组界组头（0/6/11/17/22/27 六组——行首组
+                // 标签，31 槽分组的视觉锚）。
+                .when(matches!(i, 0 | 6 | 11 | 17 | 22 | 27), |el| {
+                    let group = match i {
+                        0 => "高频六槽（G2 键）",
+                        6 => "边框族",
+                        11 => "元素族",
+                        17 => "幽灵族（透明系）",
+                        22 => "文本与面板",
+                        _ => "图标族与主色",
+                    };
+                    el.mt_1().child(
+                        div()
+                            .id(SharedString::from(format!("sg-color-group-{i}")))
+                            .w_full()
+                            .child(
+                                Label::new(group)
+                                    .size(LabelSize::XSmall)
+                                    .color(ui::Color::Muted),
+                            ),
+                    )
+                })
+                .id(SharedString::from(format!("sg-color-slot-{key}")))
+                .gap_2()
+                .items_center()
+                .child(
+                    div().w(px(44.)).child(
+                        Label::new(*label)
+                            .size(LabelSize::XSmall)
+                            .color(ui::Color::Default),
+                    ),
+                )
+                // 色块预览（坏色灰显）。
+                .child(
+                    div()
+                        .id(SharedString::from(format!("sg-color-swatch-{key}")))
+                        .size(px(18.))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(bad.then_some(colors.border).unwrap_or(swatch)),
+                )
+                // hex 文本输入（键捕获范式——一期单行编辑语义）。
+                .child(
+                    div()
+                        .id(SharedString::from(format!("sg-color-input-{key}")))
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(22.))
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(if bad { error_color } else { colors.border })
+                        .track_focus(&slot_handles[i])
+                        .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                            // 键读法照 outline 过滤框先例（keystroke.key
+                            // 小写化 + plain 守卫——修饰组合不进编辑）。
+                            let ks = &event.keystroke;
+                            let key = ks.key.to_lowercase();
+                            let plain = !ks.modifiers.control
+                                && !ks.modifiers.alt
+                                && !ks.modifiers.platform;
+                            let slot = i;
+                            let mut text = this.custom_theme_draft()[slot].clone();
+                            if plain && (key == "backspace" || key == "escape") {
+                                if key == "backspace" {
+                                    text.pop();
+                                } else {
+                                    text.clear();
+                                }
+                            } else if plain && key == "enter" {
+                                // Enter = 保存快捷（草稿链收口）。
+                                let _ = this.save_custom_theme(cx);
+                                cx.notify();
+                                return;
+                            } else if plain && key.chars().count() == 1 {
+                                // hex 域单字符（# 与 0-9a-f；超 7 字符拒收——#rrggbb）。
+                                let mut ch = key.chars().next().unwrap();
+                                if ks.modifiers.shift && ch.is_ascii_alphabetic() {
+                                    ch = ch.to_ascii_uppercase();
+                                }
+                                if (ch.is_ascii_hexdigit() || ch == '#')
+                                    && text.chars().count() < 7
+                                {
+                                    text.push(ch);
+                                }
+                            }
+                            this.set_custom_theme_slot(slot, text);
+                            cx.notify();
+                        }))
+                        .child(
+                            Label::new(if raw.is_empty() {
+                                // 空槽显示当前主题实际色 hex（初值语义）。
+                                format!(
+                                    "#{:02x}{:02x}{:02x}",
+                                    ((gpui::Rgba::from(cur).r * 255.0).round() as u8),
+                                    (gpui::Rgba::from(cur).g * 255.0).round() as u8,
+                                    (gpui::Rgba::from(cur).b * 255.0).round() as u8
+                                )
+                            } else {
+                                raw.clone()
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(if bad { ui::Color::Error } else { ui::Color::Default }),
+                        ),
+                )
+                // 坏色行内报错。
+                .when(bad, |el| {
+                    el.child(
+                        Label::new("无效颜色")
+                            .size(LabelSize::XSmall)
+                            .color(ui::Color::Error),
+                    )
+                })
+        }))
+        // 「保存为主题」钮（choice_button 同视觉语系——div+Label+on_click）。
+        .child(
+            h_flex()
+                .id("sg-custom-theme-save")
+                .justify_end()
+                .child(
+                    div()
+                        .id("sg-theme-save")
+                        .h(CONTROL_H)
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .hover(|el| el.bg(hover))
+                        .child(
+                            Label::new("保存为主题")
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match this.save_custom_theme(cx) {
+                                Some(path) => {
+                                    this.notice_message(format!(
+                                        "自定义主题已保存并应用（{}）",
+                                        path.display()
+                                    ), cx);
+                                }
+                                None => {
+                                    this.notice_message(
+                                        "自定义主题未保存——槽色无效（见行内报错）".into(),
+                                        cx,
+                                    );
+                                }
+                            }
+                        })),
+                ),
+        )
 }
 
 /// 字号步进（−/值/+；域界 8-32 灰显）。

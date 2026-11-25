@@ -54,6 +54,8 @@ pub mod codes {
     pub const INTERNAL: &str = "E_INTERNAL";
     // 宿主侧（client 本地产生，不在线上）
     pub const TIMEOUT: &str = "E_TIMEOUT";
+    /// #115 #5：剪贴板三件套语义失败（paste 静默失败等——如实报，不装成功）。
+    pub const CLIPBOARD: &str = "E_CLIPBOARD";
     pub const WORKER_DIED: &str = "E_WORKER_DIED";
 }
 

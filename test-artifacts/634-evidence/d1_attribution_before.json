@@ -1,0 +1,48 @@
+{
+ "grid_matrix": {
+  "W(win-pdfium)": {
+   "W(win-pdfium)": 0.0,
+   "P160(linux-pdfium)": 0.173168,
+   "L25(poppler 25.03)": 0.256942,
+   "L26(poppler 26.09)": 0.824736,
+   "S(静态网格)": 0.256928
+  },
+  "P160(linux-pdfium)": {
+   "W(win-pdfium)": 0.173168,
+   "P160(linux-pdfium)": 0.0,
+   "L25(poppler 25.03)": 0.183067,
+   "L26(poppler 26.09)": 0.824736,
+   "S(静态网格)": 0.183067
+  },
+  "L25(poppler 25.03)": {
+   "W(win-pdfium)": 0.256942,
+   "P160(linux-pdfium)": 0.183067,
+   "L25(poppler 25.03)": 0.0,
+   "L26(poppler 26.09)": 0.824736,
+   "S(静态网格)": 5e-05
+  },
+  "L26(poppler 26.09)": {
+   "W(win-pdfium)": 0.824736,
+   "P160(linux-pdfium)": 0.824736,
+   "L25(poppler 25.03)": 0.824736,
+   "L26(poppler 26.09)": 0.0,
+   "S(静态网格)": 0.824736
+  },
+  "S(静态网格)": {
+   "W(win-pdfium)": 0.256928,
+   "P160(linux-pdfium)": 0.183067,
+   "L25(poppler 25.03)": 5e-05,
+   "L26(poppler 26.09)": 0.824736,
+   "S(静态网格)": 0.0
+  }
+ },
+ "components": {
+  "poppler 版本差 (L25 vs L26)": 0.824736,
+  "引擎间差 Linux (P160 vs L25)": 0.183067,
+  "引擎间差 Linux (P160 vs L26)": 0.824736,
+  "PDFium 平台差 (W vs P160)": 0.173168,
+  "Windows 静态门路径 (W vs S)": 0.256928,
+  "Linux 静态门路径 (P160 vs S)": 0.183067,
+  "参照复现性 (L25 vs S)": 5e-05
+ }
+}

@@ -280,8 +280,17 @@ fn main() {
         .and_then(|v| match v.as_str() {
             theme_switch::MODE_LIGHT => Some(theme_switch::MODE_LIGHT),
             theme_switch::MODE_DARK => Some(theme_switch::MODE_DARK),
+            // #110 G1 批C：具名态（user:<name>——1.0s 真实动作链切自定义
+            // 主题，与三态同链；断言链三帧的 B/C 帧后段）。
+            v if theme_switch::is_user_mode(v) => {
+                Some(Box::leak(v.to_string().into_boxed_str()))
+            }
             _ => None,
         });
+    // #110 G1 批C：自定义主题三帧烟雾（写盘具名主题 → 启动 user: 恢复 →
+    // 4.2s 切回 dark 三态；A/B 帧自定义色、C 帧 dark 回退——批B 四态轴
+    // 的像素证据段）。
+    let smoke_custom_theme = args.iter().any(|a| a == "--smoke-custom-theme");
     // 接线登记批次 7（#47 A4/按钮六问⑥）：--smoke-menu <light|dark>——
     // 点击「文件」标题触发器（36,18）真实打开菜单下拉（open_menu_bar
     // 完整链 + menu: open 证据行）→ 再次点击同触发器 toggle 关闭
@@ -433,6 +442,48 @@ fn main() {
     application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            // #110 G1 批C：--smoke-custom-theme 夹具——启动装载前写盘
+            // 具名主题（高辨识度色：background #3366cc 偏蓝 vs dark 基底
+            // 近黑——custom_theme_check.py A/C 帧判异依据）+ settings
+            // theme=user:g1c-smoke（shell.rs 启动链 user: 恢复——批B 四态
+            // 轴的启动面像素证据）。
+            if smoke_custom_theme {
+                let xdg = std::env::temp_dir().join("mang-g1c-smoke");
+                let themes_dir = xdg.join("mang").join("themes");
+                let _ = std::fs::create_dir_all(&themes_dir);
+                // 可见面全蓝调（主底/浮层/编辑器底/元素底——A 帧
+                // custom_theme_check.py 采样区主导槽；其余 27 槽继承
+                // dark 基底，前景文本留浅色可读）。
+                let json = serde_json::json!({
+                    "name": "g1c-smoke",
+                    "appearance": "dark",
+                    "background": "#3366cc",
+                    "surface": "#2a5cb8",
+                    "editor": "#2447a0",
+                    "foreground": "#e8e8e8",
+                    "element_background": "#2460b0",
+                    "element_hover": "#2a68b8",
+                    "element_active": "#2a68b8",
+                    "element_selected": "#2a68b8"
+                });
+                let _ = std::fs::write(
+                    themes_dir.join("g1c-smoke.json"),
+                    serde_json::to_string_pretty(&json).unwrap_or_default(),
+                );
+                // settings theme 键（XDG 隔离场——烟测脚本 HOME 不同但
+                // XDG_CONFIG_HOME 未设时 config 落 HOME 下 mang/settings.json；
+                // 此处直接写盘该路径，零全局污染）。
+                let settings_path = xdg.join("mang").join("settings.json");
+                let settings_json = serde_json::json!({ "theme": "user:g1c-smoke" });
+                let _ = std::fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&settings_json).unwrap_or_default(),
+                );
+                // XDG 重定向（隔离——本进程全局；smoke 主场已在
+                // theme_visual_smoke.sh HOME 隔离，双保险）。
+                unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+                eprintln!("custom-theme-smoke: 夹具就绪（g1c-smoke.json + user: 模式）");
+            }
             theme::init(theme::LoadThemes::JustBase, cx);
             theme::set_theme_settings_provider(Box::new(settings::ShellThemeSettings), cx);
             // #110 G2：用户主题装载（磁盘 themes/*.json → registry——
@@ -780,6 +831,17 @@ fn main() {
                             shell.set_theme_mode(mode, cx);
                         })
                     });
+                })
+                .detach();
+            }
+
+            // 接线登记批次 10（#110 G1 批C）：自定义主题三帧——启动即
+            // user: 恢复（写盘夹具先行，见 run 段夹具准备），4.2s 切回
+            // dark 真实动作链。
+            if smoke_custom_theme {
+                let handle = window_handle.clone();
+                cx.spawn(async move |cx| {
+                    run_custom_theme_script(&handle, cx).await;
                 })
                 .detach();
             }
@@ -1714,6 +1776,35 @@ async fn run_menu_script(
     step(window, cx, 3450, down(36., 18.), false).await; // script 9.6s：toggle 关（B 帧后宽窗）
     step(window, cx, 150, up(36., 18.), false).await; // script 9.75s
     eprintln!("menu-smoke: script done (theme {mode} → park → click 文件 open → click close)");
+}
+
+// ---------------------------------------------------------------------------
+// 接线登记批次 10（#110 G1 批C）：--smoke-custom-theme 脚本（自定义主题
+// 三帧——具名恢复 + 切回三态）。
+//
+// 时间线（--smoke-sec 12 配套）：
+//   0.0s  启动（预写盘 g1c-smoke.json + settings theme=user:g1c-smoke——
+//         启动链装载并应用自定义色）
+//   5.0s  set_theme_mode(dark)（真实动作链——与设置面板三态钮同源）
+//   帧时刻（theme_visual_smoke.sh 拍）：
+//   A=3.5s（自定义色应用态）/ B=5.8s（dark 切换后）/ C=9.4s（dark 稳态）
+async fn run_custom_theme_script(
+    window: &gpui::WindowHandle<shell::ShellApp>,
+    cx: &mut gpui::AsyncApp,
+) {
+    // 5.0s：切回 dark（真实动作链）。帧时刻（theme_visual_smoke.sh 批 10）：
+    // A=3.5s（user: 自定义色应用态）/ B=5.8s（dark 切换后）/ C=9.4s（稳态）。
+    cx.background_executor()
+        .timer(Duration::from_millis(5000))
+        .await;
+    let _ = cx.update(|cx| {
+        window.update(cx, |shell, _window, cx| {
+            shell.set_theme_mode(theme_switch::MODE_DARK, cx);
+        })
+    });
+    eprintln!(
+        "custom-theme-smoke: script done (user:g1c-smoke 恢复 → 4.2s 切 dark)"
+    );
 }
 
 // ---------------------------------------------------------------------------

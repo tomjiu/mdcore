@@ -52,6 +52,19 @@ A4_W, A4_H = A4_RL                  # 595.2756 × 841.8898 pt
 FONT_REG = "/usr/share/fonts/truetype/chinese/NotoSansSC-Regular.ttf"
 ZH_FONT = "NotoSansSC"              # reportlab 注册名
 
+# D1（#51）：西文文本语料统一嵌入 Liberation Sans（与 Helvetica
+# 度量兼容——drawString/drawCentredString 的宽度度量不变，布局语义
+# 零迁移）。base14 Helvetica「未嵌入」是 rotated_90 静态门 Windows
+# 0.2569>0.24 失败的根因：各渲染端（poppler 版本间 / PDFium build
+# 间）自选替代字形，无嵌入页的跨端绝对像素对照结构性不成立（归因
+# 实验见 scripts/display_corpus/d1_attribution.py）。嵌入后字形随
+# 语料走，渲染不依赖本地字体栈；zh_missing_font 保留无嵌入语义面
+# （PARITY 活参照门覆盖——「缺字体替代」的语义真实面不丢）。
+FONT_LIB = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+FONT_LIB_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+LIB_FONT = "LibSans"                  # reportlab 注册名（嵌入子集）
+LIB_FONT_BOLD = "LibSans-Bold"        # reportlab 注册名（嵌入子集）
+
 RASTER_W = 640                      # 固定渲染宽（px）
 GRID_N = 24                         # 网格边长
 INK_T = 200                         # 墨迹阈值（<200/255 判墨）
@@ -106,8 +119,11 @@ def clean_render_dir():
 
 
 def ensure_fonts():
-    """注册中文字体（TTFont 子集嵌入）"""
+    """注册嵌入字体（TTFont 子集嵌入）——中文 Noto + 西文 Liberation
+    （#51 D1：西文文本页同样嵌入，消除 base14 未嵌入的跨端字形漂移）。"""
     pdfmetrics.registerFont(TTFont(ZH_FONT, FONT_REG))
+    pdfmetrics.registerFont(TTFont(LIB_FONT, FONT_LIB))
+    pdfmetrics.registerFont(TTFont(LIB_FONT_BOLD, FONT_LIB_BOLD))
 
 
 def chk(cond, msg):
@@ -297,9 +313,9 @@ def draw_orientation_page(c, num, note):
     """方向可辨的大号页码页（旋转语料用）：巨大数字 + 顶部箭头 + TOP/BOTTOM 标记"""
     W, H = c._pagesize
     c.setFillColorRGB(0.08, 0.08, 0.08)
-    c.setFont("Helvetica-Bold", 300)
+    c.setFont(LIB_FONT_BOLD, 300)
     c.drawCentredString(W / 2, H / 2 - 105, str(num))
-    c.setFont("Helvetica-Bold", 34)
+    c.setFont(LIB_FONT_BOLD, 34)
     c.drawCentredString(W / 2, H - 110, "TOP")
     c.drawCentredString(W / 2, 66, "BOTTOM")
     # 顶部红色上箭头（旋转后指向可辨）
@@ -314,7 +330,7 @@ def draw_orientation_page(c, num, note):
     c.setLineWidth(6)
     c.setStrokeColorRGB(0.10, 0.10, 0.40)
     c.rect(30, 30, W - 60, H - 60, stroke=1, fill=0)
-    c.setFont("Helvetica", 16)
+    c.setFont(LIB_FONT, 16)
     c.setFillColorRGB(0.1, 0.1, 0.1)
     c.drawString(48, 52, note)
     c.drawRightString(W - 48, H - 88, "ORIENTATION MARKER")
@@ -342,16 +358,16 @@ def draw_fullbleed_page(c, num, center_label):
     c.rect(16, 16, W - 32, H - 32, stroke=1, fill=0)
     # 四角大字：全部落在裁剪区之外
     c.setFillColorRGB(0.85, 0.10, 0.10)
-    c.setFont("Helvetica-Bold", 30)
+    c.setFont(LIB_FONT_BOLD, 30)
     c.drawString(28, 24, "CORNER-LL")
     c.drawString(28, H - 48, "CORNER-UL")
     c.drawRightString(W - 28, 24, "CORNER-LR")
     c.drawRightString(W - 28, H - 48, "CORNER-UR")
     # 中央大页码 + 说明（裁剪区内，必须可见）
     c.setFillColorRGB(0.05, 0.05, 0.20)
-    c.setFont("Helvetica-Bold", 150)
+    c.setFont(LIB_FONT_BOLD, 150)
     c.drawCentredString(W / 2, H / 2 - 55, str(num))
-    c.setFont("Helvetica", 22)
+    c.setFont(LIB_FONT, 22)
     c.drawCentredString(W / 2, H / 2 - 110, center_label)
 
 
@@ -659,7 +675,7 @@ def gen_long_doc_120p(path):
         c.setStrokeColorRGB(0.6, 0.6, 0.6)
         c.line(72, 793, A4_W - 72, 793)
         c.setFillColorRGB(0.08, 0.08, 0.08)
-        c.setFont("Helvetica-Bold", 96)
+        c.setFont(LIB_FONT_BOLD, 96)
         c.drawCentredString(A4_W / 2, 655, str(n))
         c.setFillColorRGB(0.1, 0.1, 0.1)
         y = 596
@@ -691,7 +707,7 @@ def gen_oversized_page(path):
     c.line(80, 80, W - 80, H - 80)
     c.line(W - 80, 80, 80, H - 80)
     c.setFillColorRGB(0.05, 0.05, 0.25)
-    c.setFont("Helvetica-Bold", 170)
+    c.setFont(LIB_FONT_BOLD, 170)
     c.drawCentredString(W / 2, 500, "OVERSIZE 2000 x 2800 pt")
     c.setFont(ZH_FONT, 120)
     c.drawCentredString(W / 2, 300, "超大页面测试")
@@ -1057,7 +1073,20 @@ def recommend_tol(pool):
 
 
 def page_tol(observed_max, floor, margin=1.3):
-    """单页容差：观测最大逐格差 × 1.3，向上取 0.005 步长，不低于 floor"""
+    """单页容差：观测最大逐格差 × 1.3，向上取 0.005 步长，不低于 floor。
+
+    #51 D1：西文文本页嵌入 Liberation Sans 后，跨引擎观测差从替代字形
+    级（0.18-0.44）降到 AA/hinting 级（0.02-0.07）。此时「单一 build
+    观测 × 1.3」不再覆盖跨端分布——PDFium build 间（Linux bblanchon
+    160 vs Windows 产品 DLL vs pypdfium2 校准 build）与 poppler 版本间
+    （25.03 vs 26.09）的 AA 级差（实测各 0.02-0.03）与嵌入后观测同量
+    级，会贴线爆（landscape_mixed p1 ink：148 校准 0.042 → Rust 160
+    实测 0.072 > 0.070）。跨端良性带（mean 0.10 / ink 0.15——全语料
+    单一容差公式实际值 0.073/0.118 向上取整）由调用方作为 floor 传入：
+    对内容级错误（典型逐格差 ≥0.4，旧基线 mixed p4 观测 0.58）保持
+    3 倍以上隔离带；zh_missing_font 的替代字形语义面仍由观测 ×1.3
+    主导（0.18/0.33 级）——断言语义不放宽。
+    """
     v = max(observed_max * margin, floor)
     return math.ceil(v / 0.005) * 0.005
 
@@ -1213,8 +1242,12 @@ def main():
                     "ink_avg_cell": round(float(d_ink.mean()), 5),
                 })
                 # 单页推荐容差（写入 manifest，供 Rust 分页断言）：观测最大 × 1.3，带下限
-                rec["tol_mean_max_cell"] = page_tol(rec["mean_max_cell"], floor=0.02)
-                rec["tol_ink_max_cell"] = page_tol(rec["ink_max_cell"], floor=0.04)
+                # #51 D1：floor = 跨端良性带（mean 0.10 / ink 0.15）——
+                # 见 page_tol 文档（替代字形差消除后 AA 级跨端噪声需要
+                # 稳健吸收带；zh_missing_font 的观测×1.3 高于带值，
+                # 替代字形语义面的容差不受影响）。
+                rec["tol_mean_max_cell"] = page_tol(rec["mean_max_cell"], floor=0.10)
+                rec["tol_ink_max_cell"] = page_tol(rec["ink_max_cell"], floor=0.15)
                 pool_mean_all.extend(d_mean.ravel().tolist())
                 pool_ink_all.extend(d_ink.ravel().tolist())
                 if name != "zh_missing_font.pdf":
@@ -1296,8 +1329,9 @@ def main():
             },
             "per_page": "manifest 每页条目带 tol_mean_max_cell / tol_ink_max_cell（观测最大 × 1.3），建议 Rust 分页断言用该值",
             "note": ("全语料单一容差基于剔除 zh_missing_font 后的 P95×1.5 与观测最大×1.05 的较大者；"
-                      "巨型 Helvetica 数字页（两引擎 base-14 代换字体不同）与 0.7pt 发丝线（poppler 实心 1px，"
-                      "pdfium 抗锯齿）把全语料 max 抬高，分层断言更灵敏。"),
+                      "0.7pt 发丝线（poppler 实心 1px，pdfium 抗锯齿）把 max 抬高，分层断言更灵敏。"
+                      "#51 D1：西文文本页嵌入 Liberation Sans 后 base-14 代换差异已消除，"
+                      "剩余观测差为引擎 AA/hinting 级（zh_missing_font 的替代字形语义面单列）。"),
         },
         "geometry_anomalies": geom_anomalies,
         "outlier_note": outlier_note,

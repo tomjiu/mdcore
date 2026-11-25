@@ -45,3 +45,5 @@ mang-shell/mdc-tab-rel-*/
 /_*.txt
 /.t.log
 *.log
+# #260：进程 core dump（ulimit -c 崩溃产物——926MB 误提交事故的防再入）
+core

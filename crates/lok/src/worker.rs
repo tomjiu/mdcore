@@ -80,7 +80,7 @@ use crate::sha256::sha256_hex;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -926,6 +926,73 @@ impl WorkerState {
             ));
         }
         Ok(v)
+    }
+
+    /// #115 比对缺口 #5：剪贴板三件套 worker 侧（ely-lok 同构语义）。
+    ///
+    /// `copy`：`.uno:Copy` + `getTextSelection` **多味读回**（plain + html
+    /// 两味键都在应答里——LO 有 html 味才非空，契约面稳定可编程）。
+    /// 空选区 = 两味皆空串（如实报空，不误报错——空剪贴板是合法态）。
+    fn op_clipboard_copy(&mut self) -> DispatchResult {
+        self.op_uno(".uno:Copy", None, false)?;
+        let plain = self
+            .op_text_selection("text/plain;charset=utf-8")
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(String::from)))
+            .unwrap_or_default();
+        let html = self
+            .op_text_selection("text/html")
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(String::from)))
+            .unwrap_or_default();
+        Ok(json!({"plain": plain, "html": html}))
+    }
+
+    /// `cut`：`.uno:Cut` + **剪后校验**（比 copy 多一层「真剪掉」的证据：
+    /// 剪前选区文本留档，剪后读回——内容已移除则 `removed: true`；
+    /// 读回不变 = cut 未生效，如实报 `removed: false` 不装成功）。
+    fn op_clipboard_cut(&mut self) -> DispatchResult {
+        let before = self
+            .op_text_selection("text/plain;charset=utf-8")
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(String::from)))
+            .unwrap_or_default();
+        self.op_uno(".uno:Cut", None, false)?;
+        let after = self
+            .op_text_selection("text/plain;charset=utf-8")
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(String::from)))
+            .unwrap_or_default();
+        // 剪后选区已让位（LO 清选区或锚移位）：读回落空 = 内容移除证据。
+        let removed = after != before;
+        Ok(json!({"plain": before, "removed": removed}))
+    }
+
+    /// `paste`：`.uno:Paste` + **前后全文对比**（LOK paste 无同步错误码
+    /// ——静默失败 = 文档态污染还装成功。本 op 以 paste 前后选区读回
+    /// 对比判生效；未生效时 `.uno:Undo` 补偿（防半粘贴态）+ 如实报
+    /// E_CLIPBOARD 不装成功）。
+    fn op_clipboard_paste(&mut self) -> DispatchResult {
+        let before = self
+            .op_text_selection("text/plain;charset=utf-8")
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(String::from)))
+            .unwrap_or_default();
+        self.op_uno(".uno:Paste", None, false)?;
+        let after = self
+            .op_text_selection("text/plain;charset=utf-8")
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(String::from)))
+            .unwrap_or_default();
+        if after == before {
+            // 静默失败面：Undo 补偿（best-effort——补偿自身失败不掩盖主错）。
+            let _ = self.op_uno(".uno:Undo", None, false);
+            return Err((
+                codes::CLIPBOARD,
+                "paste 未生效（剪贴板空或内核拒粘）——已 Undo 补偿".to_string(),
+            ));
+        }
+        Ok(json!({"pasted": true}))
     }
 
     /// save 选项白名单（#115 比对缺口 #9；ely-lok save.rs 同构）：
@@ -1892,6 +1959,10 @@ fn dispatch(state: &mut WorkerState, op: &str, v: &Value) -> DispatchResult {
                 .ok_or((codes::BAD_REQUEST, "text_selection 需要 mime".to_string()))?;
             state.op_text_selection(&mime)
         }
+        // #115 #5：剪贴板三件套（copy 多味 / cut 校验 / paste 失败 Undo 补偿）。
+        "clipboard_copy" => state.op_clipboard_copy(),
+        "clipboard_cut" => state.op_clipboard_cut(),
+        "clipboard_paste" => state.op_clipboard_paste(),
         "save_as" => {
             let url = protocol::req_str(v, "url")
                 .ok_or((codes::BAD_REQUEST, "save_as 需要 url".to_string()))?;

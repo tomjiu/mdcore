@@ -24,6 +24,30 @@ pub const MODE_SYSTEM: &str = "system";
 pub const MODE_LIGHT: &str = "light";
 pub const MODE_DARK: &str = "dark";
 
+/// #110 G1 批B：具名主题态前缀（`user:<name>`——settings.json `theme`
+/// 键第四值域；三态钮与具名下拉并存，报告 §4-1「四态并存」裁定）。
+pub const MODE_USER_PREFIX: &str = "user:";
+
+/// 具名态拆解：`"user:foo"` → Some("foo")；三态/乱值 → None。
+pub fn parse_user_mode(mode: &str) -> Option<&str> {
+    let name = mode.strip_prefix(MODE_USER_PREFIX)?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// 具名态构造（`user:<name>`——存盘格式）。
+pub fn user_mode(name: &str) -> String {
+    format!("{MODE_USER_PREFIX}{name}")
+}
+
+/// 是否具名态（下拉选中判定同源）。
+pub fn is_user_mode(mode: &str) -> bool {
+    parse_user_mode(mode).is_some()
+}
+
 /// 派生浅色主题（One Light 风格手调色板——覆盖 mang-shell 全部消费面）。
 pub fn derive_light(base: &Theme) -> Theme {
     let mut theme = base.clone();
@@ -118,6 +142,16 @@ pub fn mode_label(mode: &str) -> &'static str {
 /// 系统级深浅检测时恒为深色[边界登记]；light = 派生浅色；dark = 基础
 /// 主题原样）。全窗重绘由 `refresh_windows` 收口。
 pub fn apply_mode(mode: &str, base_theme: &Arc<Theme>, cx: &mut App) {
+    // #110 G1 批B：具名态优先（registry 用户主题/内置主题名命中即切；
+    // 不命中回退三态轴——坏名容错，启动与切换同一条链）。
+    if let Some(name) = parse_user_mode(mode) {
+        let registry = theme::ThemeRegistry::default_global(cx);
+        if let Ok(theme) = registry.get(name) {
+            theme::GlobalTheme::update_theme(cx, theme);
+            cx.refresh_windows();
+            return;
+        }
+    }
     let theme: Arc<Theme> = match mode {
         MODE_LIGHT => Arc::new(derive_light(base_theme)),
         MODE_DARK => base_theme.clone(),
@@ -139,6 +173,20 @@ pub fn apply_mode(mode: &str, base_theme: &Arc<Theme>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #110 G1 批B：具名态解析/构造/判定。
+    #[test]
+    fn user_mode_parsing() {
+        assert_eq!(parse_user_mode("user:foo"), Some("foo"));
+        assert_eq!(parse_user_mode("user:"), None, "空名非具名态");
+        assert_eq!(parse_user_mode("system"), None);
+        assert_eq!(parse_user_mode("light"), None);
+        assert_eq!(parse_user_mode("dark"), None);
+        assert_eq!(parse_user_mode("乱写"), None);
+        assert_eq!(user_mode("foo"), "user:foo");
+        assert!(is_user_mode("user:foo"));
+        assert!(!is_user_mode("dark"));
+    }
 
     #[test]
     fn mode_parsing_and_cycling() {
