@@ -995,6 +995,8 @@ mod tests {
     /// parse_user_theme 全槽覆盖装载——每槽 hex 保真入 ThemeColors）。
     #[gpui::test]
     fn user_theme_31_slot_roundtrip(cx: &mut gpui::TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头——并行族互踩致间歇红）。
+        let _xdg = crate::test_env::xdg_lock();
         cx.update(|cx| {
             theme::init(theme::LoadThemes::JustBase, cx);
         });
@@ -1187,6 +1189,8 @@ mod tests {
     /// 派生——覆盖槽盖在浅色上；dark/缺省 → 深色基底）。
     #[gpui::test]
     fn user_theme_dual_base_light_dark(cx: &mut gpui::TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头——并行族互踩致间歇红）。
+        let _xdg = crate::test_env::xdg_lock();
         cx.update(|cx| {
             theme::init(theme::LoadThemes::JustBase, cx);
         });
@@ -1244,6 +1248,8 @@ mod tests {
 
     #[gpui::test]
     fn user_theme_save_roundtrip(cx: &mut gpui::TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头——并行族互踩致间歇红）。
+        let _xdg = crate::test_env::xdg_lock();
         cx.update(|cx| {
             theme::init(theme::LoadThemes::JustBase, cx);
         });
@@ -1337,6 +1343,8 @@ mod tests {
     /// 容错 + registry 可见性三面）。
     #[gpui::test]
     fn user_theme_loads_into_registry(cx: &mut gpui::TestAppContext) {
+        // XDG 全局窗口互斥（见 test_env 模块头——并行族互踩致间歇红）。
+        let _xdg = crate::test_env::xdg_lock();
         let xdg = std::env::temp_dir().join(format!("mg2-themes-{}", std::process::id()));
         let themes = xdg.join("mang").join("themes");
         let _ = std::fs::create_dir_all(&themes);
@@ -1410,6 +1418,8 @@ mod tests {
     /// #114 批①：session_tabs/session_active 写读往返（隔离 temp dir）。
     #[test]
     fn session_tabs_roundtrip() {
+        // XDG 全局窗口互斥（见 test_env 模块头——并行族互踩致间歇红）。
+        let _xdg = crate::test_env::xdg_lock();
         // 容器布局：XDG=container → config_dir=container/mang →
         // settings.json=container/mang/settings.json。
         let container = std::env::temp_dir().join(format!("m114-session-{}", std::process::id()));
