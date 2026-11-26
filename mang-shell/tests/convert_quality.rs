@@ -69,6 +69,17 @@ fn docx_to_pdf_quality_via_product_pdf_reader() {
     let pdf_bytes = docx_to_pdf(&fixture_docx())
         .unwrap_or_else(|e| panic!("转换失败：{e}（指引：{}）", e.guidance()));
 
+    // pdfium 资产缺失 skip 门（与上方 LO skip 同款诚实语义）：定位序
+    //（bin/lib 取件位或系统装载）全落空时跳过而非假红——资产是沙箱
+    // 回收敏感物（非 git 管理），恢复脚见 scripts/restore_pdfium.sh。
+    if PdfiumEngine::open(pdf_bytes.clone()).is_err()
+        && std::env::var_os("MDC_PDFIUM_LIB").is_none()
+        && !std::path::Path::new("../../bin/lib/libpdfium.so").exists()
+    {
+        eprintln!("SKIP: pdfium 资产缺失（回收敏感物）——scripts/restore_pdfium.sh 恢复后真跑");
+        return;
+    }
+
     // 产品 PDF 读面作独立 oracle：与桌面打开 PDF 同一入口
     //（`PdfiumEngine::open` 统一绑定 + `extract_text` 文本层）。
     let engine = PdfiumEngine::open(pdf_bytes)
